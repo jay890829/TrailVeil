@@ -32,10 +32,25 @@ subst T: $trailVeilRoot
 Set-Location T:\
 ```
 
-Run the host-side scaffold quality checks from Windows PowerShell with:
+### Host build and tests
+
+Run the debug quality gate; it intentionally requires no internal-signing material:
 
 ```powershell
 .\gradlew.bat clean assembleDebug lintDebug testDebugUnitTest
+```
+
+After configuring the external key described below, run the equivalent internal build and lint gate with the shared JVM tests:
+
+```powershell
+.\gradlew.bat clean assembleInternal lintInternal testDebugUnitTest
+```
+
+The fixed-signature APK is written to `app/build/outputs/apk/internal/app-internal.apk`. Build either APK without the other checks with:
+
+```powershell
+.\gradlew.bat assembleDebug
+.\gradlew.bat assembleInternal
 ```
 
 Run the scaffold JVM test alone with:
@@ -44,12 +59,25 @@ Run the scaffold JVM test alone with:
 .\gradlew.bat testDebugUnitTest --tests "io.github.jay890829.trailveil.navigation.PlaceholderRouteTest.placeholderRouteIsStable"
 ```
 
-With an Android device or emulator connected, run all instrumentation tests or only the placeholder Compose test with:
+### Connected-device commands
+
+With an Android device or compatible emulator connected, install one build lineage with:
+
+```powershell
+.\gradlew.bat installDebug
+.\gradlew.bat installInternal
+```
+
+`debug` and `internal` intentionally share the application ID but use different signing certificates. Android will not replace one with the other; uninstall the currently installed package before switching lineages. Repeated `internal` builds use the fixed external key and are upgrade-compatible when `versionCode` increases.
+
+Run all debug instrumentation tests or only the placeholder Compose test with:
 
 ```powershell
 .\gradlew.bat connectedDebugAndroidTest
 .\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=io.github.jay890829.trailveil.PlaceholderDestinationTest
 ```
+
+These instrumentation commands require a compatible device/emulator. The suite is continuously verified on the API 36 GitHub Actions emulator; the local MuMu API 32 instance is suitable for install/launch checks but has not been reliable for Android Test instrumentation.
 
 ## Internal signing
 
@@ -70,11 +98,7 @@ keyPassword=replace-with-the-external-secret
 
 A relative `storeFile` is resolved from the properties file's directory. Never place the properties file, keystore, passwords, private key, certificate-fingerprint record, or recovery details in this checkout. The repository ignores common keystore formats and `internal-signing.properties` as defense in depth, but the external location remains the security boundary.
 
-With no signing material present, debug builds and CI remain available; any task that includes the `internal` variant fails with the required path and property names. Once the external signing material is configured, build the fixed-signature APK with:
-
-```powershell
-.\gradlew.bat assembleInternal
-```
+With no signing material present, debug builds and CI remain available; any task that includes the `internal` variant fails with the required path and property names. Once configured, the `assembleInternal` and `installInternal` commands above use this fixed identity.
 
 Control of the `jay890829` publisher namespace was reconfirmed on 2026-07-28 by an authenticated `jay890829` GitHub account successfully pushing this repository. Keep the actual certificate SHA-256 fingerprint and key-custody/recovery record outside Git with the protected key backup.
 
