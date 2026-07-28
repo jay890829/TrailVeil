@@ -27,10 +27,31 @@ Prerequisites currently verified for the scaffold:
 - Android SDK Platform 37.0
 - Android SDK Build Tools 36.0.0
 
-Build the debug scaffold APK with:
+AGP and the JDK 17 test worker require an ASCII-only absolute project path on Windows. If the checkout path contains non-ASCII characters, create a temporary drive mapping before running Gradle:
 
-```bash
-./gradlew clean assembleDebug
+```powershell
+$trailVeilRoot = (Get-Location).Path
+subst T: $trailVeilRoot
+Set-Location T:\
 ```
 
-The full build, lint, test, install, internal-signing, and single-test command reference will be added after the corresponding quality and signing tasks are implemented and verified.
+Run the host-side scaffold quality checks from Windows PowerShell with:
+
+```powershell
+.\gradlew.bat clean assembleDebug lintDebug testDebugUnitTest
+```
+
+Run the scaffold JVM test alone with:
+
+```powershell
+.\gradlew.bat testDebugUnitTest --tests "io.github.jay890829.trailveil.navigation.PlaceholderRouteTest.placeholderRouteIsStable"
+```
+
+With an Android device or emulator connected, run all instrumentation tests or only the placeholder Compose test with:
+
+```powershell
+.\gradlew.bat connectedDebugAndroidTest
+.\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=io.github.jay890829.trailveil.PlaceholderDestinationTest
+```
+
+GitHub Actions runs the equivalent build, lint, and JVM checks on JDK 17 with SDK Platform 37.0 and Build Tools 36.0.0, plus the instrumentation suite on an API 36 emulator. The install and internal-signing command reference remains deferred until those tasks are implemented and verified.

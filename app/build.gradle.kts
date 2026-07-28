@@ -26,6 +26,21 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
+
+    lint {
+        abortOnError = true
+        checkTestSources = true
+        warningsAsErrors = true
+        disable += setOf(
+            // Deliberate pins and target choice from docs/ANDROID_BASELINE.md.
+            "AndroidGradlePluginVersion",
+            "NewerVersionAvailable",
+            "OldTargetApi",
+            // Assigned before sensitive storage and production branding land.
+            "DataExtractionRules",
+            "MissingApplicationIcon",
+        )
+    }
 }
 
 kotlin {
