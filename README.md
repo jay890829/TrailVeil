@@ -6,10 +6,7 @@ TrailVeil is a privacy-first Android exploration-map app inspired by [Fog of Wor
 
 TrailVeil now has a buildable single-module Android Gradle scaffold and a minimal Compose application shell. The placeholder destination installs and launches successfully on a local Android emulator; product UI and runtime features have not yet been implemented.
 
-- [MVP plan](docs/PLAN.md)
-- [Task ledger](docs/TODO.md)
 - [Android technical baseline](docs/ANDROID_BASELINE.md)
-- [Claude Code guidance](CLAUDE.md)
 
 ## MVP principles
 
@@ -54,4 +51,31 @@ With an Android device or emulator connected, run all instrumentation tests or o
 .\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=io.github.jay890829.trailveil.PlaceholderDestinationTest
 ```
 
-GitHub Actions runs the equivalent build, lint, and JVM checks on JDK 17 with SDK Platform 37.0 and Build Tools 36.0.0, plus the instrumentation suite on an API 36 emulator. The install and internal-signing command reference remains deferred until those tasks are implemented and verified.
+## Internal signing
+
+The `internal` build type keeps the fixed `io.github.jay890829.trailveil` application ID and uses a non-debug signing key stored outside the repository. By default, Gradle reads:
+
+```text
+~/.trailveil/signing/internal-signing.properties
+```
+
+Set `TRAILVEIL_INTERNAL_SIGNING_PROPERTIES` to an absolute path to use another external properties file. The file must contain:
+
+```properties
+storeFile=C:/absolute/or/properties-relative/path/trailveil-internal.p12
+storePassword=replace-with-the-external-secret
+keyAlias=trailveil-internal
+keyPassword=replace-with-the-external-secret
+```
+
+A relative `storeFile` is resolved from the properties file's directory. Never place the properties file, keystore, passwords, private key, certificate-fingerprint record, or recovery details in this checkout. The repository ignores common keystore formats and `internal-signing.properties` as defense in depth, but the external location remains the security boundary.
+
+With no signing material present, debug builds and CI remain available; any task that includes the `internal` variant fails with the required path and property names. Once the external signing material is configured, build the fixed-signature APK with:
+
+```powershell
+.\gradlew.bat assembleInternal
+```
+
+Control of the `jay890829` publisher namespace was reconfirmed on 2026-07-28 by an authenticated `jay890829` GitHub account successfully pushing this repository. Keep the actual certificate SHA-256 fingerprint and key-custody/recovery record outside Git with the protected key backup.
+
+GitHub Actions runs the equivalent debug build, lint, and JVM checks on JDK 17 with SDK Platform 37.0 and Build Tools 36.0.0, plus the instrumentation suite on an API 36 emulator. Internal signing material is intentionally not available to CI.

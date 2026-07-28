@@ -1,7 +1,109 @@
+import java.io.File
+import java.nio.file.Files
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.compose.compiler)
     alias(libs.plugins.ksp)
+}
+
+val defaultInternalSigningPropertiesFile = File(
+    System.getProperty("user.home"),
+    ".trailveil/signing/internal-signing.properties",
+)
+val internalSigningPropertiesOverride = providers
+    .environmentVariable("TRAILVEIL_INTERNAL_SIGNING_PROPERTIES")
+    .orNull
+val internalSigningPropertiesFile = internalSigningPropertiesOverride
+    ?.let(::file)
+    ?: defaultInternalSigningPropertiesFile
+val internalSigningProperties = Properties().apply {
+    if (internalSigningPropertiesFile.isFile) {
+        internalSigningPropertiesFile.inputStream().use(::load)
+    }
+}
+val internalStoreFile = internalSigningProperties
+    .getProperty("storeFile")
+    ?.takeIf(String::isNotBlank)
+    ?.let { configuredPath ->
+        File(configuredPath).let { configuredFile ->
+            if (configuredFile.isAbsolute) {
+                configuredFile
+            } else {
+                internalSigningPropertiesFile.parentFile.resolve(configuredFile)
+            }
+        }
+    }
+val repositoryRoot = rootProject.projectDir.canonicalFile
+
+fun File.isInsideRepository(): Boolean {
+    var candidate: File? = canonicalFile
+    while (candidate != null) {
+        if (Files.isSameFile(candidate.toPath(), repositoryRoot.toPath())) {
+            return true
+        }
+        candidate = candidate.parentFile
+    }
+    return false
+}
+
+fun missingInternalSigningConfiguration(): List<String> = buildList {
+    if (internalSigningPropertiesOverride != null && !File(internalSigningPropertiesOverride).isAbsolute) {
+        add("TRAILVEIL_INTERNAL_SIGNING_PROPERTIES must be an absolute path")
+    }
+    if (!internalSigningPropertiesFile.isFile) {
+        add("properties file ${internalSigningPropertiesFile.absolutePath}")
+        return@buildList
+    }
+    if (internalSigningPropertiesFile.isInsideRepository()) {
+        add("properties file must be outside the repository: ${internalSigningPropertiesFile.absolutePath}")
+    }
+
+    listOf("storeFile", "storePassword", "keyAlias", "keyPassword").forEach { key ->
+        if (internalSigningProperties.getProperty(key).isNullOrBlank()) {
+            add("property $key")
+        }
+    }
+    if (internalStoreFile != null) {
+        if (!internalStoreFile.isFile) {
+            add("keystore file ${internalStoreFile.absolutePath}")
+        } else if (internalStoreFile.isInsideRepository()) {
+            add("keystore file must be outside the repository: ${internalStoreFile.absolutePath}")
+        }
+    }
+}
+
+fun requireInternalSigningConfiguration() {
+    val missing = missingInternalSigningConfiguration()
+    if (missing.isNotEmpty()) {
+        throw GradleException(
+            """
+            Internal signing is not configured.
+            Missing: ${missing.joinToString()}.
+            Create ${defaultInternalSigningPropertiesFile.absolutePath} or set
+            TRAILVEIL_INTERNAL_SIGNING_PROPERTIES to an absolute external properties file.
+            Required keys: storeFile, storePassword, keyAlias, keyPassword.
+            Keep the properties file and keystore outside this repository.
+            See README.md#internal-signing.
+            """.trimIndent(),
+        )
+    }
+}
+
+val explicitlyRequestsInternal = gradle.startParameter.taskNames.any { requestedTask ->
+    requestedTask.substringAfterLast(':').contains("Internal", ignoreCase = true)
+}
+if (explicitlyRequestsInternal) {
+    requireInternalSigningConfiguration()
+}
+
+tasks.configureEach {
+    if (name.contains("Internal", ignoreCase = true)) {
+        doFirst {
+            requireInternalSigningConfiguration()
+        }
+    }
 }
 
 android {
@@ -16,6 +118,26 @@ android {
         versionName = "0.1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    signingConfigs {
+        create("internal") {
+            if (missingInternalSigningConfiguration().isEmpty()) {
+                storeFile = requireNotNull(internalStoreFile)
+                storePassword = internalSigningProperties.getProperty("storePassword")
+                keyAlias = internalSigningProperties.getProperty("keyAlias")
+                keyPassword = internalSigningProperties.getProperty("keyPassword")
+            }
+        }
+    }
+
+    buildTypes {
+        create("internal") {
+            initWith(getByName("debug"))
+            signingConfig = signingConfigs.getByName("internal")
+            versionNameSuffix = "-internal"
+            matchingFallbacks += listOf("debug")
+        }
     }
 
     buildFeatures {

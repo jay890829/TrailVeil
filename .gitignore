@@ -29,4 +29,11 @@ Thumbs.db
 # Signing and secrets
 *.jks
 *.keystore
+*.p12
+*.pfx
 keystore.properties
+internal-signing.properties
+internal-signing-record.*
+internal-signing-fingerprint.*
+internal-signing-custody.*
+internal-signing-recovery.*
