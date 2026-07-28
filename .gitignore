@@ -1,0 +1,32 @@
+# Gradle
+.gradle/
+build/
+**/build/
+
+# Local Android SDK configuration
+local.properties
+
+# Android Studio / IntelliJ IDEA
+.idea/
+*.iml
+
+# Local coding-agent state
+.claude/
+
+# Local planning and agent instructions
+CLAUDE.md
+docs/PLAN.md
+docs/TODO.md
+
+# Native build output
+.externalNativeBuild/
+.cxx/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Signing and secrets
+*.jks
+*.keystore
+keystore.properties
