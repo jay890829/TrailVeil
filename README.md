@@ -77,7 +77,7 @@ Run all debug instrumentation tests or only the placeholder Compose test with:
 .\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=io.github.jay890829.trailveil.PlaceholderDestinationTest
 ```
 
-These instrumentation commands require a compatible device/emulator. The suite is continuously verified on the API 36 GitHub Actions emulator; the local MuMu API 32 instance is suitable for install/launch checks but has not been reliable for Android Test instrumentation.
+These instrumentation commands require a compatible device/emulator. The suite is continuously verified on the API 36 GitHub Actions emulator and was also run successfully on the local official Android Emulator AVD `TrailVeil_API_36` (Android 16/API 36, Google APIs x86_64). The former MuMu instance is no longer part of the local validation path.
 
 ## Internal signing
 

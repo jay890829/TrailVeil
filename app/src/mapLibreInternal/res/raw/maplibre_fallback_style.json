@@ -1,0 +1,14 @@
+{
+  "version": 8,
+  "name": "TrailVeil offline fallback",
+  "sources": {},
+  "layers": [
+    {
+      "id": "background",
+      "type": "background",
+      "paint": {
+        "background-color": "#D6DBD2"
+      }
+    }
+  ]
+}

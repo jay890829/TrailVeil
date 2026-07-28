@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission
+        android:name="android.permission.ACCESS_COARSE_LOCATION"
+        tools:node="remove" />
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION"
+        tools:node="remove" />
+    <uses-permission
+        android:name="android.permission.ACCESS_WIFI_STATE"
+        tools:node="remove" />
+
+    <application>
+        <meta-data
+            android:name="io.github.jay890829.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES"
+            android:resource="@raw/maplibre_third_party_notices" />
+        <activity
+            android:name=".map.poc.MapLibrePocActivity"
+            android:exported="true" />
+    </application>
+</manifest>

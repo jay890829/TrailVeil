@@ -138,6 +138,12 @@ android {
             versionNameSuffix = "-internal"
             matchingFallbacks += listOf("debug")
         }
+        create("mapLibreInternal") {
+            initWith(getByName("debug"))
+            signingConfig = signingConfigs.getByName("internal")
+            versionNameSuffix = "-maplibre-internal"
+            matchingFallbacks += listOf("debug")
+        }
     }
 
     buildFeatures {
@@ -200,4 +206,5 @@ dependencies {
 
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)
+    "mapLibreInternalImplementation"(libs.maplibre.opengl)
 }
