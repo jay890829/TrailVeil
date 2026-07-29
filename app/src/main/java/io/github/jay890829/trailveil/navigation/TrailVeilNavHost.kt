@@ -1,23 +1,24 @@
 package io.github.jay890829.trailveil.navigation
 
+import androidx.activity.ComponentActivity
 import androidx.compose.runtime.Composable
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
-import io.github.jay890829.trailveil.feature.placeholder.PlaceholderScreen
+import io.github.jay890829.trailveil.feature.recording.RecordingEntryRoute
 
-internal const val PlaceholderRoute = "placeholder"
+internal const val RecordingRoute = "recording"
 
 @Composable
-fun TrailVeilNavHost() {
+fun TrailVeilNavHost(activity: ComponentActivity) {
     val navController = rememberNavController()
 
     NavHost(
         navController = navController,
-        startDestination = PlaceholderRoute,
+        startDestination = RecordingRoute,
     ) {
-        composable(PlaceholderRoute) {
-            PlaceholderScreen()
+        composable(RecordingRoute) {
+            RecordingEntryRoute(activity = activity)
         }
     }
 }

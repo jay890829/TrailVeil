@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TrailVeil</string>
+    <string name="recording_entry_brand">TRAILVEIL</string>
+    <string name="recording_entry_title">走過的地方，才會顯現</string>
+    <string name="recording_entry_body">開始探索後，TrailVeil 會精確記錄足跡；螢幕鎖定時也能持續。</string>
+    <string name="recording_entry_privacy_title_first">第一次探索前</string>
+    <string name="recording_entry_privacy_title">足跡只留在這台裝置</string>
+    <string name="recording_entry_privacy_body">位置紀錄儲存在本機，TrailVeil 不會上傳你的路線。</string>
+    <string name="recording_entry_permissions_summary">精確位置用來繪製可靠足跡。通知權限可顯示持續記錄狀態，但拒絕通知不會阻止記錄。</string>
+    <string name="recording_entry_start">開始探索</string>
+    <string name="recording_entry_stop">停止探索</string>
+    <string name="recording_entry_starting">正在開始…</string>
+    <string name="recording_entry_consent_note">只有按下「開始探索」後才會請求權限；在此之前不會收集位置。</string>
+    <string name="location_rationale_title">需要位置才能畫出足跡</string>
+    <string name="location_rationale_body">允許 TrailVeil 在使用期間取得位置，之後才能透過前景服務在鎖定螢幕後持續探索。</string>
+    <string name="location_permission_settings_title">位置權限已關閉</string>
+    <string name="location_permission_settings_body">Android 不會再顯示權限對話框。請到 TrailVeil 的應用程式設定允許精確位置，返回後再按一次「開始探索」。</string>
+    <string name="precise_location_title">請選擇精確位置</string>
+    <string name="precise_location_body">約略位置不足以產生可靠的步行足跡。Android 可以再請求一次精確位置。</string>
+    <string name="precise_location_settings_title">精確位置仍然關閉</string>
+    <string name="precise_location_settings_body">請到 TrailVeil 的應用程式設定開啟精確位置，返回後再按一次「開始探索」。</string>
+    <string name="location_services_title">裝置定位已關閉</string>
+    <string name="location_services_body">請在 Android 設定中開啟裝置定位，返回後再按一次「開始探索」。</string>
+    <string name="notification_permission_title">仍可記錄，但通知會被隱藏</string>
+    <string name="notification_permission_body">TrailVeil 仍可透過前景服務記錄。開啟通知後，通知列會顯示持續記錄狀態與停止按鈕。</string>
+    <string name="permission_try_again">再試一次</string>
+    <string name="permission_request_precise">請求精確位置</string>
+    <string name="permission_open_app_settings">開啟應用程式設定</string>
+    <string name="permission_open_location_settings">開啟定位設定</string>
+    <string name="permission_open_notification_settings">開啟通知設定</string>
+    <string name="permission_not_now">稍後再說</string>
+    <string name="recording_started">探索已開始；可返回此處或從記錄通知停止。</string>
+    <string name="recording_stop_requested">已要求停止；TrailVeil 正在安全結束足跡記錄。</string>
+    <string name="recording_persistence_failure">無法安全建立記錄，因此尚未開始。請再試一次。</string>
+    <string name="recording_launch_failure">Android 無法啟動記錄服務。請返回 TrailVeil 後再試一次。</string>
+    <string name="recording_activity_not_visible">開始記錄時 TrailVeil 必須顯示在畫面上。請返回 App 後再試一次。</string>
+    <string name="recording_notification_channel_name">足跡記錄</string>
+    <string name="recording_notification_title">正在記錄足跡</string>
+    <string name="recording_notification_text">TrailVeil 正在背景記錄位置。</string>
+    <string name="recording_notification_stop">停止記錄</string>
+</resources>

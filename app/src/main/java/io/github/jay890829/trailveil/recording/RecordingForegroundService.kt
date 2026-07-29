@@ -394,5 +394,16 @@ class RecordingForegroundService : Service() {
                 },
             )
         }
+
+        /** Visible in-app fallback when the user has hidden foreground-service notifications. */
+        fun stopFromVisibleActivity(context: Context, sessionId: Long) {
+            require(sessionId > 0L)
+            context.startService(
+                Intent(context, RecordingForegroundService::class.java).apply {
+                    action = ACTION_STOP
+                    putExtra(EXTRA_SESSION_ID, sessionId)
+                },
+            )
+        }
     }
 }
