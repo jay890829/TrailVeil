@@ -133,11 +133,15 @@ internal class RoomRecordingStore(
                 sessionId = transaction.sessionId,
                 stoppedAt = transaction.stoppedAtEpochMillis,
                 reason = transaction.reason,
+                terminalStatus = when (transaction.terminalStatus) {
+                    RecordingTerminalStatus.COMPLETED -> RecordingStatus.COMPLETED
+                    RecordingTerminalStatus.INTERRUPTED -> RecordingStatus.INTERRUPTED
+                },
                 operationId = transaction.operationId.value,
-                commandKind = RecordingOperationKind.STOP.name,
+                commandKind = transaction.operationKind.name,
                 createdAt = transaction.stoppedAtEpochMillis,
             ),
-            RecordingOperationKind.STOP,
+            transaction.operationKind,
         )
 
     override suspend fun recover(transaction: RecoverRecordingTransaction): StoreReceipt =

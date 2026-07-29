@@ -359,12 +359,20 @@ internal abstract class RecordingDao {
         sessionId: Long,
         stoppedAt: Long,
         reason: String,
+        terminalStatus: RecordingStatus,
         operationId: String,
         commandKind: String,
         createdAt: Long,
     ): RecordingOperationResult {
         replay(operationId, commandKind)?.let { return it }
         require(stoppedAt >= 0L && reason.isNotBlank())
+        require(
+            terminalStatus == RecordingStatus.COMPLETED ||
+                terminalStatus == RecordingStatus.INTERRUPTED,
+        )
+        val terminalPrefix = if (terminalStatus == RecordingStatus.COMPLETED) "STOP:" else "INTERRUPT:"
+        val expectedKind = if (terminalStatus == RecordingStatus.COMPLETED) "STOP" else "INTERRUPT"
+        require(commandKind == expectedKind) { "terminal status and operation kind must agree" }
         val session = sessionById(sessionId)
             ?: return record(
                 RecordingOperationReceiptEntity(
@@ -379,8 +387,13 @@ internal abstract class RecordingDao {
             RecordingStatus.STARTING -> {
                 val open = openSegmentForSession(sessionId)
                 val terminalAt = maxOf(stoppedAt, session.startedAt, open?.startedAt ?: session.startedAt)
+                val startPrefix = if (terminalStatus == RecordingStatus.COMPLETED) {
+                    "STOP_DURING_START:"
+                } else {
+                    "INTERRUPT_DURING_START:"
+                }
                 if (open != null) {
-                    check(closeSegmentRow(sessionId, open.id, terminalAt, "STOP_DURING_START:".plus(reason)) == 1)
+                    check(closeSegmentRow(sessionId, open.id, terminalAt, startPrefix.plus(reason)) == 1)
                 }
                 check(
                     closeSessionRow(
@@ -388,7 +401,7 @@ internal abstract class RecordingDao {
                         RecordingStatus.STARTING,
                         RecordingStatus.INTERRUPTED,
                         terminalAt,
-                        "STOP_DURING_START:".plus(reason),
+                        startPrefix.plus(reason),
                     ) == 1,
                 )
                 return record(
@@ -405,15 +418,15 @@ internal abstract class RecordingDao {
                 val open = openSegmentForSession(sessionId)
                 val terminalAt = maxOf(stoppedAt, session.startedAt, open?.startedAt ?: session.startedAt)
                 if (open != null) {
-                    check(closeSegmentRow(sessionId, open.id, terminalAt, "STOP:".plus(reason)) == 1)
+                    check(closeSegmentRow(sessionId, open.id, terminalAt, terminalPrefix.plus(reason)) == 1)
                 }
                 check(
                     closeSessionRow(
                         sessionId,
                         RecordingStatus.ACTIVE,
-                        RecordingStatus.COMPLETED,
+                        terminalStatus,
                         terminalAt,
-                        "STOP:".plus(reason),
+                        terminalPrefix.plus(reason),
                     ) == 1,
                 )
                 return record(

@@ -48,6 +48,31 @@ class RecordingRepositoryTest {
         try { repository.stop(id("one"), begin.sessionId, 3, "user") ; throw AssertionError("expected collision") } catch (_: OperationIdCollisionException) { }
     }
 
+    @Test fun technicalInterruptIsDurableIdempotentAndDistinctFromUserStop() = runBlocking {
+        val store = FakeTransactionalRecordingStore()
+        val repository = RecordingRepository(store)
+        val session = repository.begin(id("begin"), 0).sessionId
+        repository.completeStart(id("activate"), session, 1)
+
+        val interrupted = repository.interrupt(id("interrupt"), session, 2, "LOCATION_DISABLED")
+        assertTrue(interrupted.stopped)
+        assertEquals(interrupted, repository.interrupt(id("interrupt"), session, 999, "replay"))
+        assertEquals(listOf(RecordingTerminalStatus.INTERRUPTED), store.terminalStatuses)
+        assertEquals(RecordingLifecycle.STOPPED, repository.state().lifecycle)
+
+        try {
+            repository.stop(id("interrupt"), session, 3, "user")
+            throw AssertionError("expected operation kind collision")
+        } catch (_: OperationIdCollisionException) { }
+
+        val next = repository.begin(id("next-begin"), 4).sessionId
+        repository.completeStart(id("next-activate"), next, 5)
+        assertTrue(repository.stop(id("user-stop"), next, 6, "USER").stopped)
+        assertEquals(
+            listOf(RecordingTerminalStatus.INTERRUPTED, RecordingTerminalStatus.COMPLETED),
+            store.terminalStatuses,
+        )
+    }
     @Test fun storeFailuresRestoreFilterAndDoNotAcknowledgeOrAdvanceState() = runBlocking {
         val store = FakeTransactionalRecordingStore()
         val repository = RecordingRepository(store)
@@ -333,6 +358,7 @@ private class FakeTransactionalRecordingStore : RecordingStore {
     val acceptedKinds = mutableListOf<AcceptedLocationKind>()
     val acceptedDistances = mutableListOf<Double>()
     val closedReasons = mutableListOf<String>()
+    val terminalStatuses = mutableListOf<RecordingTerminalStatus>()
     var recoveryRotations = 0
     var receivedRawCoordinate = false
 
@@ -450,11 +476,12 @@ private class FakeTransactionalRecordingStore : RecordingStore {
     ): StoreReceipt = once(transaction.operationId, RecordingOperationKind.LOCATION) {
         StoreOutcome.SessionGuardRejected(transaction.requestedSessionId)
     }
-    override suspend fun stop(transaction: StopRecordingTransaction): StoreReceipt = once(transaction.operationId, RecordingOperationKind.STOP) {
+    override suspend fun stop(transaction: StopRecordingTransaction): StoreReceipt = once(transaction.operationId, transaction.operationKind) {
         val current = session
         when {
             current?.id != transaction.sessionId -> StoreOutcome.AlreadyStopped(transaction.sessionId)
             current.lifecycle == RecordingLifecycle.ACTIVE || current.lifecycle == RecordingLifecycle.STARTING -> {
+                terminalStatuses += transaction.terminalStatus
                 current.openSegment?.let { closedReasons += "STOP" }
                 current.openSegment = null
                 current.openSegmentReason = null

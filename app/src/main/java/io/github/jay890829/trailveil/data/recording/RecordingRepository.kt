@@ -25,10 +25,11 @@ private object RecordingProcessIdentity {
 }
 
 internal enum class RecordingOperationKind {
-    BEGIN_START, COMPLETE_START, FAIL_START, LOCATION, STOP, RECOVERY,
+    BEGIN_START, COMPLETE_START, FAIL_START, LOCATION, STOP, INTERRUPT, RECOVERY,
 }
 
 internal enum class RecordingLifecycle { STARTING, ACTIVE, FAILED_TO_START, STOPPED }
+internal enum class RecordingTerminalStatus { COMPLETED, INTERRUPTED }
 
 /** The store-derived state the repository may cache only after a committed transaction. */
 internal data class RecordingProjection(
@@ -114,8 +115,15 @@ internal data class StopRecordingTransaction(
     val sessionId: Long,
     val stoppedAtEpochMillis: Long,
     val reason: String,
+    val terminalStatus: RecordingTerminalStatus,
 ) {
     init { require(sessionId > 0L && stoppedAtEpochMillis >= 0L && reason.isNotBlank()) }
+
+    val operationKind: RecordingOperationKind
+        get() = when (terminalStatus) {
+            RecordingTerminalStatus.COMPLETED -> RecordingOperationKind.STOP
+            RecordingTerminalStatus.INTERRUPTED -> RecordingOperationKind.INTERRUPT
+        }
 }
 internal data class RecoverRecordingTransaction(
     val operationId: RecordingOperationId,
@@ -357,19 +365,32 @@ internal class RecordingRepository(
         stoppedAtEpochMillis: Long,
         reason: String,
     ): StopResult = mutex.withLock {
-        val receipt = receiptOrNull(operationId, RecordingOperationKind.STOP)
-            ?: commit(
-                store.stop(
-                    StopRecordingTransaction(operationId, sessionId, stoppedAtEpochMillis, reason),
-                ),
-            )
-        val result = stopResult(receipt)
-        if (result.stopped && !receipt.replayed) {
-            resetFilter()
-            locationDeliveryEnabled = false
-            locationOwnerToken = null
-        }
-        result
+        finishLocked(
+            StopRecordingTransaction(
+                operationId,
+                sessionId,
+                stoppedAtEpochMillis,
+                reason,
+                RecordingTerminalStatus.COMPLETED,
+            ),
+        )
+    }
+
+    suspend fun interrupt(
+        operationId: RecordingOperationId,
+        sessionId: Long,
+        interruptedAtEpochMillis: Long,
+        reason: String,
+    ): StopResult = mutex.withLock {
+        finishLocked(
+            StopRecordingTransaction(
+                operationId,
+                sessionId,
+                interruptedAtEpochMillis,
+                reason,
+                RecordingTerminalStatus.INTERRUPTED,
+            ),
+        )
     }
 
     suspend fun recover(
@@ -410,6 +431,18 @@ internal class RecordingRepository(
 
     private fun apply(projection: RecordingProjection) { cachedState = projection.state }
     private fun resetFilter() = qualityFilter.restore(initialFilterCheckpoint)
+
+    private suspend fun finishLocked(transaction: StopRecordingTransaction): StopResult {
+        val receipt = receiptOrNull(transaction.operationId, transaction.operationKind)
+            ?: commit(store.stop(transaction))
+        val result = stopResult(receipt)
+        if (result.stopped && !receipt.replayed) {
+            resetFilter()
+            locationDeliveryEnabled = false
+            locationOwnerToken = null
+        }
+        return result
+    }
 
     private fun beginResult(receipt: StoreReceipt): BeginStartResult = when (val outcome = receipt.outcome) {
         is StoreOutcome.StartPrepared -> BeginStartResult(receipt.operationId, outcome.sessionId, StartDisposition.PREPARED, receipt.projection.state)

@@ -114,6 +114,39 @@ class RoomRecordingStoreTest {
     }
 
     @Test
+    fun activeTechnicalInterruptPersistsInterruptedTerminalAndStableReceipt() = runBlocking {
+        val repository = repository()
+        val sessionId = repository.begin("begin-interrupt", 1_000).sessionId
+        assertTrue(repository.completeStart(id("activate-interrupt"), sessionId, 1_001).activated)
+
+        val first = repository.interrupt(
+            id("interrupt-location-disabled"),
+            sessionId,
+            1_100,
+            "LOCATION_DISABLED",
+        )
+        val replay = repository.interrupt(
+            id("interrupt-location-disabled"),
+            sessionId,
+            9_999,
+            "replayed-different-input",
+        )
+
+        assertEquals(first, replay)
+        assertTrue(first.stopped)
+        val session = requireNotNull(dao.sessionById(sessionId))
+        assertEquals(RecordingStatus.INTERRUPTED, session.status)
+        assertEquals("INTERRUPT:LOCATION_DISABLED", session.stopReason)
+        val segment = requireNotNull(dao.sessionWithSegments(sessionId)).segments.single()
+        assertEquals("INTERRUPT:LOCATION_DISABLED", segment.endReason)
+        assertEquals("INTERRUPT", dao.receiptByOperationId("interrupt-location-disabled")?.commandKind)
+
+        val nextId = repository.begin("begin-completed", 1_200).sessionId
+        assertTrue(repository.completeStart(id("activate-completed"), nextId, 1_201).activated)
+        assertTrue(repository.stop(id("user-stop"), nextId, 1_300, "USER").stopped)
+        assertEquals(RecordingStatus.COMPLETED, dao.sessionById(nextId)?.status)
+    }
+    @Test
     fun processRecoveryRotatesOnceAndStartsANewZeroDistanceAnchor() = runBlocking {
         val original = repository()
         val sessionId = original.begin("begin", 1_000).sessionId
