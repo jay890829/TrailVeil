@@ -1,5 +1,6 @@
 package io.github.jay890829.trailveil.data.db
 
+import androidx.room.ColumnInfo
 import androidx.room.Dao
 import androidx.room.Embedded
 import androidx.room.Insert
@@ -12,6 +13,15 @@ import io.github.jay890829.trailveil.data.recording.OperationIdCollisionExceptio
 internal data class StartedRecording(val sessionId: Long, val segmentId: Long)
 internal data class RecordingOperationResult(val receipt: RecordingOperationReceiptEntity, val replayed: Boolean)
 internal data class RecordingSessionWithSegments(@Embedded val session: RecordingSessionEntity, @Relation(parentColumn = "id", entityColumn = "session_id") val segments: List<TrackSegmentEntity>)
+internal data class ViewportTrackPointRow(
+    @ColumnInfo(name = "point_id") val pointId: Long,
+    @ColumnInfo(name = "session_id") val sessionId: Long,
+    @ColumnInfo(name = "segment_id") val segmentId: Long,
+    @ColumnInfo(name = "segment_sequence") val segmentSequence: Long,
+    @ColumnInfo(name = "point_sequence") val pointSequence: Long,
+    val latitude: Double,
+    val longitude: Double,
+)
 
 /** Snapshot used by the recording adapter to resume an ACTIVE or STARTING command safely. */
 internal data class RecordingStateProjection(
@@ -205,6 +215,30 @@ internal abstract class RecordingDao {
     abstract suspend fun recordingState(sessionId: Long): RecordingStateProjection?
     @Query("SELECT * FROM track_points WHERE segment_id = :segmentId ORDER BY sequence ASC") abstract suspend fun pointsForSegment(segmentId: Long): List<TrackPointEntity>
     @Query("SELECT * FROM track_points WHERE session_id = :sessionId AND latitude BETWEEN :south AND :north AND longitude BETWEEN :west AND :east ORDER BY timestamp ASC, id ASC") abstract suspend fun pointsInBoundingBox(sessionId: Long, south: Double, west: Double, north: Double, east: Double): List<TrackPointEntity>
+    @Query(
+        """
+        SELECT
+            p.id AS point_id,
+            p.session_id AS session_id,
+            p.segment_id AS segment_id,
+            s.sequence AS segment_sequence,
+            p.sequence AS point_sequence,
+            p.latitude AS latitude,
+            p.longitude AS longitude
+        FROM track_points p
+        INNER JOIN track_segments s
+            ON s.id = p.segment_id AND s.session_id = p.session_id
+        WHERE p.latitude BETWEEN :south AND :north
+            AND p.longitude BETWEEN :west AND :east
+        ORDER BY p.session_id ASC, s.sequence ASC, p.sequence ASC, p.id ASC
+        """,
+    )
+    abstract suspend fun fogPointsInLongitudeInterval(
+        south: Double,
+        west: Double,
+        north: Double,
+        east: Double,
+    ): List<ViewportTrackPointRow>
     @Query("SELECT COUNT(*) FROM recording_sessions") abstract suspend fun sessionCount(): Int
     @Query("SELECT COUNT(*) FROM track_segments") abstract suspend fun segmentCount(): Int
     @Query("SELECT COUNT(*) FROM track_points") abstract suspend fun pointCount(): Int
