@@ -8,12 +8,12 @@ This document records the P0-001 baseline selected on 2026-07-26. It uses stable
 |---|---:|---|
 | `namespace` | `io.github.jay890829.trailveil` | Matches the repository publisher namespace without claiming a separate TrailVeil domain. Confirm continued control of the `jay890829` GitHub namespace before the first internal distribution. |
 | `applicationId` | `io.github.jay890829.trailveil` | Fix before internal distribution so state-bearing APKs retain one update lineage. Do not change after testers install the first internal build. |
-| `minSdk` | 26 | Deliberate Android 8.0 MVP/test-fleet floor; higher than all selected library floors and reduces old-platform background behavior branches. |
+| `minSdk` | 34 | Product decision: support Android 14 and newer only for the initial MVP, so runtime and device validation target API 34–36 without API 26–33 compatibility branches. |
 | `compileSdk` | 37 | Google announced the Android 17/API 37 base release on 2026-06-16, published matching AOSP release source, and distributes the numeric, non-preview `platforms;android-37.0` SDK package. Some first-party pages retained preview-era labels on the decision date, so this does not claim that the documentation corpus is uniformly current. |
 | `targetSdk` | 36 | Proactive stable runtime target. On 2026-07-26 Play requires API 35 for ordinary phone/tablet submissions; API 36 becomes required on 2026-08-31, subject to Google's documented extension process. Move to target 37 only after testing Android 17 target-gated behavior. |
 | Java bytecode | 17 | Matches the selected AGP runtime baseline. |
 
-`compileSdk` controls build-time API and dependency compatibility; `targetSdk` opts into compatibility behavior and policy expectations. Compiling with API 37 does not itself opt TrailVeil into Android 17 target-gated behavior, raise `minSdk`, or permit unguarded API 37 calls on older devices.
+`compileSdk` controls build-time API and dependency compatibility; `targetSdk` opts into compatibility behavior and policy expectations. Compiling with API 37 does not itself opt TrailVeil into Android 17 target-gated behavior or permit unguarded API 37 calls on supported API 34–36 devices. Devices below Android 14/API 34 are intentionally unsupported by the initial MVP.
 
 ## Build toolchain
 
@@ -99,7 +99,7 @@ Compatibility constraints:
 ### P3-001 / P3-002
 
 - Inspect the merged manifest for only approved permissions and service declarations.
-- Test API 26, 33, 34, 35, and 36 behavior for permission variants, background-start rejection, process death, force stop, Task Manager Stop, and OEM power management.
+- Test API 34, 35, and 36 behavior for permission variants, background-start rejection, process death, force stop, Task Manager Stop, and OEM power management.
 
 ### P5-001 / P5-002
 

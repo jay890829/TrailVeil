@@ -112,7 +112,7 @@ android {
 
     defaultConfig {
         applicationId = "io.github.jay890829.trailveil"
-        minSdk = 26
+        minSdk = 34
         targetSdk = 36
         versionCode = 1
         versionName = "0.1.0"
@@ -150,6 +150,10 @@ android {
         compose = true
     }
 
+    sourceSets {
+        getByName("androidTest").assets.directories.add("$projectDir/schemas")
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
@@ -165,10 +169,13 @@ android {
             "NewerVersionAvailable",
             "OldTargetApi",
             // Assigned before sensitive storage and production branding land.
-            "DataExtractionRules",
             "MissingApplicationIcon",
         )
     }
+}
+
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }
 
 kotlin {
@@ -193,6 +200,9 @@ dependencies {
     implementation(libs.room.runtime)
     implementation(libs.datastore.preferences)
     implementation(libs.coroutines.android)
+    // Room 2.8.4 migration bundles require serialization 1.8.1 at runtime.
+    // Pin the tested app so its parent class loader cannot supply the older 1.7.3 API.
+    implementation(libs.kotlinx.serialization.json)
 
     ksp(libs.room.compiler)
 
@@ -203,6 +213,8 @@ dependencies {
     androidTestImplementation(libs.androidx.test.junit)
     androidTestImplementation(libs.espresso.core)
     androidTestImplementation(libs.compose.ui.test.junit4)
+    androidTestImplementation(libs.room.testing)
+    androidTestImplementation(libs.coroutines.test)
 
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)

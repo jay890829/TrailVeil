@@ -18,6 +18,8 @@ TrailVeil now has a buildable single-module Android Gradle scaffold and a minima
 
 ## Development
 
+The initial MVP supports Android 14 (API 34) and newer.
+
 Prerequisites currently verified for the scaffold:
 
 - JDK 17
