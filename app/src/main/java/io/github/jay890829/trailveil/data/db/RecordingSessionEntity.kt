@@ -5,6 +5,8 @@ import androidx.room.Entity
 import androidx.room.Index
 import androidx.room.PrimaryKey
 
+internal const val LEGACY_DIRECT_START_LOCATION_OWNER_TOKEN = "LEGACY_DIRECT_START"
+
 @Entity(
     tableName = "recording_sessions",
     indices = [
@@ -34,7 +36,20 @@ data class RecordingSessionEntity(
     @ColumnInfo(name = "created_app_version")
     val createdAppVersion: String,
     @ColumnInfo(name = "active_slot")
-    val activeSlot: Int? = if (status == RecordingStatus.ACTIVE) ACTIVE_SESSION_SLOT else null,
+    val activeSlot: Int? = if (
+        status == RecordingStatus.STARTING || status == RecordingStatus.ACTIVE
+    ) {
+        ACTIVE_SESSION_SLOT
+    } else {
+        null
+    },
+    /** ACTIVE sessions are exclusively writable by this token; legacy direct DAO tests use a sentinel. */
+    @ColumnInfo(name = "location_owner_token")
+    val locationOwnerToken: String? = if (status == RecordingStatus.ACTIVE) {
+        LEGACY_DIRECT_START_LOCATION_OWNER_TOKEN
+    } else {
+        null
+    },
 ) {
     init {
         require(startedAt >= 0) { "startedAt must be non-negative" }
@@ -48,13 +63,19 @@ data class RecordingSessionEntity(
         require(rejectedPointCount >= 0) { "rejectedPointCount must be non-negative" }
         require(createdAppVersion.isNotBlank()) { "createdAppVersion must not be blank" }
         require(
-            if (status == RecordingStatus.ACTIVE) {
+            if (status == RecordingStatus.STARTING || status == RecordingStatus.ACTIVE) {
                 activeSlot == ACTIVE_SESSION_SLOT && endedAt == null
             } else {
                 activeSlot == null && endedAt != null
             },
         ) {
-            "active status, active slot, and end timestamp are inconsistent"
+            "reserved status, active slot, and end timestamp are inconsistent"
         }
+        require(
+            when (status) {
+                RecordingStatus.ACTIVE -> !locationOwnerToken.isNullOrBlank()
+                else -> locationOwnerToken == null
+            },
+        ) { "location owner token is inconsistent with session status" }
     }
 }

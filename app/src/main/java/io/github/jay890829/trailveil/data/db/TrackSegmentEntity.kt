@@ -28,6 +28,11 @@ import androidx.room.PrimaryKey
             value = ["id", "session_id"],
             unique = true,
         ),
+        Index(
+            name = "index_track_segments_session_id_open_slot",
+            value = ["session_id", "open_slot"],
+            unique = true,
+        ),
     ],
 )
 data class TrackSegmentEntity(
@@ -44,6 +49,8 @@ data class TrackSegmentEntity(
     val startReason: String,
     @ColumnInfo(name = "end_reason")
     val endReason: String? = null,
+    @ColumnInfo(name = "open_slot")
+    val openSlot: Int? = if (endedAt == null) OPEN_SEGMENT_SLOT else null,
 ) {
     init {
         require(sequence >= 0) { "sequence must be non-negative" }
@@ -54,6 +61,9 @@ data class TrackSegmentEntity(
         require(startReason.isNotBlank()) { "startReason must not be blank" }
         require((endedAt == null) == (endReason == null)) {
             "endedAt and endReason must both be present or both be absent"
+        }
+        require(if (endedAt == null) openSlot == OPEN_SEGMENT_SLOT else openSlot == null) {
+            "open slot and end state are inconsistent"
         }
     }
 }

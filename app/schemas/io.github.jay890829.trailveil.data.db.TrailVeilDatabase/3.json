@@ -1,0 +1,437 @@
+{
+  "formatVersion": 1,
+  "database": {
+    "version": 3,
+    "identityHash": "2afe392db30925d0326f7dee46d5bd9e",
+    "entities": [
+      {
+        "tableName": "recording_sessions",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `started_at` INTEGER NOT NULL, `ended_at` INTEGER, `status` TEXT NOT NULL, `stop_reason` TEXT, `distance_meters` REAL NOT NULL, `accepted_point_count` INTEGER NOT NULL, `rejected_point_count` INTEGER NOT NULL, `created_app_version` TEXT NOT NULL, `active_slot` INTEGER, `location_owner_token` TEXT)",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "startedAt",
+            "columnName": "started_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "endedAt",
+            "columnName": "ended_at",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "status",
+            "columnName": "status",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "stopReason",
+            "columnName": "stop_reason",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "distanceMeters",
+            "columnName": "distance_meters",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "acceptedPointCount",
+            "columnName": "accepted_point_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "rejectedPointCount",
+            "columnName": "rejected_point_count",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "createdAppVersion",
+            "columnName": "created_app_version",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "activeSlot",
+            "columnName": "active_slot",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "locationOwnerToken",
+            "columnName": "location_owner_token",
+            "affinity": "TEXT"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_recording_sessions_active_slot",
+            "unique": true,
+            "columnNames": [
+              "active_slot"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_recording_sessions_active_slot` ON `${TABLE_NAME}` (`active_slot`)"
+          }
+        ]
+      },
+      {
+        "tableName": "track_segments",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `session_id` INTEGER NOT NULL, `sequence` INTEGER NOT NULL, `started_at` INTEGER NOT NULL, `ended_at` INTEGER, `start_reason` TEXT NOT NULL, `end_reason` TEXT, `open_slot` INTEGER, FOREIGN KEY(`session_id`) REFERENCES `recording_sessions`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "session_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sequence",
+            "columnName": "sequence",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "startedAt",
+            "columnName": "started_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "endedAt",
+            "columnName": "ended_at",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "startReason",
+            "columnName": "start_reason",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "endReason",
+            "columnName": "end_reason",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "openSlot",
+            "columnName": "open_slot",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_track_segments_session_id_sequence",
+            "unique": true,
+            "columnNames": [
+              "session_id",
+              "sequence"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_track_segments_session_id_sequence` ON `${TABLE_NAME}` (`session_id`, `sequence`)"
+          },
+          {
+            "name": "index_track_segments_id_session_id",
+            "unique": true,
+            "columnNames": [
+              "id",
+              "session_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_track_segments_id_session_id` ON `${TABLE_NAME}` (`id`, `session_id`)"
+          },
+          {
+            "name": "index_track_segments_session_id_open_slot",
+            "unique": true,
+            "columnNames": [
+              "session_id",
+              "open_slot"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_track_segments_session_id_open_slot` ON `${TABLE_NAME}` (`session_id`, `open_slot`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "recording_sessions",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "session_id"
+            ],
+            "referencedColumns": [
+              "id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "track_points",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `session_id` INTEGER NOT NULL, `segment_id` INTEGER NOT NULL, `sequence` INTEGER NOT NULL, `timestamp` INTEGER NOT NULL, `latitude` REAL NOT NULL, `longitude` REAL NOT NULL, `horizontal_accuracy` REAL NOT NULL, `altitude` REAL, `speed` REAL, `bearing` REAL, `is_mock` INTEGER, FOREIGN KEY(`segment_id`, `session_id`) REFERENCES `track_segments`(`id`, `session_id`) ON UPDATE NO ACTION ON DELETE CASCADE )",
+        "fields": [
+          {
+            "fieldPath": "id",
+            "columnName": "id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "session_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "segmentId",
+            "columnName": "segment_id",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sequence",
+            "columnName": "sequence",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "timestamp",
+            "columnName": "timestamp",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "latitude",
+            "columnName": "latitude",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "longitude",
+            "columnName": "longitude",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "horizontalAccuracy",
+            "columnName": "horizontal_accuracy",
+            "affinity": "REAL",
+            "notNull": true
+          },
+          {
+            "fieldPath": "altitude",
+            "columnName": "altitude",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "speed",
+            "columnName": "speed",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "bearing",
+            "columnName": "bearing",
+            "affinity": "REAL"
+          },
+          {
+            "fieldPath": "isMock",
+            "columnName": "is_mock",
+            "affinity": "INTEGER"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": true,
+          "columnNames": [
+            "id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_track_points_segment_id_sequence",
+            "unique": true,
+            "columnNames": [
+              "segment_id",
+              "sequence"
+            ],
+            "orders": [],
+            "createSql": "CREATE UNIQUE INDEX IF NOT EXISTS `index_track_points_segment_id_sequence` ON `${TABLE_NAME}` (`segment_id`, `sequence`)"
+          },
+          {
+            "name": "index_track_points_session_id_timestamp",
+            "unique": false,
+            "columnNames": [
+              "session_id",
+              "timestamp"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_track_points_session_id_timestamp` ON `${TABLE_NAME}` (`session_id`, `timestamp`)"
+          },
+          {
+            "name": "index_track_points_segment_id_session_id",
+            "unique": false,
+            "columnNames": [
+              "segment_id",
+              "session_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_track_points_segment_id_session_id` ON `${TABLE_NAME}` (`segment_id`, `session_id`)"
+          }
+        ],
+        "foreignKeys": [
+          {
+            "table": "track_segments",
+            "onDelete": "CASCADE",
+            "onUpdate": "NO ACTION",
+            "columns": [
+              "segment_id",
+              "session_id"
+            ],
+            "referencedColumns": [
+              "id",
+              "session_id"
+            ]
+          }
+        ]
+      },
+      {
+        "tableName": "recording_operation_receipts",
+        "createSql": "CREATE TABLE IF NOT EXISTS `${TABLE_NAME}` (`operation_id` TEXT NOT NULL, `command_kind` TEXT NOT NULL, `outcome` TEXT NOT NULL, `session_id` INTEGER, `segment_id` INTEGER, `point_id` INTEGER, `created_at` INTEGER NOT NULL, `projection_session_id` INTEGER, `projection_lifecycle` TEXT, `projection_open_segment_id` INTEGER, `projection_accepted_point_count` INTEGER, `projection_rejected_point_count` INTEGER, `projection_distance_meters` REAL, PRIMARY KEY(`operation_id`))",
+        "fields": [
+          {
+            "fieldPath": "operationId",
+            "columnName": "operation_id",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "commandKind",
+            "columnName": "command_kind",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "outcome",
+            "columnName": "outcome",
+            "affinity": "TEXT",
+            "notNull": true
+          },
+          {
+            "fieldPath": "sessionId",
+            "columnName": "session_id",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "segmentId",
+            "columnName": "segment_id",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "pointId",
+            "columnName": "point_id",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "createdAt",
+            "columnName": "created_at",
+            "affinity": "INTEGER",
+            "notNull": true
+          },
+          {
+            "fieldPath": "projectionSessionId",
+            "columnName": "projection_session_id",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "projectionLifecycle",
+            "columnName": "projection_lifecycle",
+            "affinity": "TEXT"
+          },
+          {
+            "fieldPath": "projectionOpenSegmentId",
+            "columnName": "projection_open_segment_id",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "projectionAcceptedPointCount",
+            "columnName": "projection_accepted_point_count",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "projectionRejectedPointCount",
+            "columnName": "projection_rejected_point_count",
+            "affinity": "INTEGER"
+          },
+          {
+            "fieldPath": "projectionDistanceMeters",
+            "columnName": "projection_distance_meters",
+            "affinity": "REAL"
+          }
+        ],
+        "primaryKey": {
+          "autoGenerate": false,
+          "columnNames": [
+            "operation_id"
+          ]
+        },
+        "indices": [
+          {
+            "name": "index_recording_operation_receipts_command_kind",
+            "unique": false,
+            "columnNames": [
+              "command_kind"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_recording_operation_receipts_command_kind` ON `${TABLE_NAME}` (`command_kind`)"
+          },
+          {
+            "name": "index_recording_operation_receipts_session_id",
+            "unique": false,
+            "columnNames": [
+              "session_id"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_recording_operation_receipts_session_id` ON `${TABLE_NAME}` (`session_id`)"
+          },
+          {
+            "name": "index_recording_operation_receipts_created_at",
+            "unique": false,
+            "columnNames": [
+              "created_at"
+            ],
+            "orders": [],
+            "createSql": "CREATE INDEX IF NOT EXISTS `index_recording_operation_receipts_created_at` ON `${TABLE_NAME}` (`created_at`)"
+          }
+        ]
+      }
+    ],
+    "setupQueries": [
+      "CREATE TABLE IF NOT EXISTS room_master_table (id INTEGER PRIMARY KEY,identity_hash TEXT)",
+      "INSERT OR REPLACE INTO room_master_table (id,identity_hash) VALUES(42, '2afe392db30925d0326f7dee46d5bd9e')"
+    ]
+  }
+}

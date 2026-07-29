@@ -89,6 +89,13 @@ internal enum class LocationBreakReason {
     IMPOSSIBLE_JUMP,
 }
 
+/** A reversible snapshot used when a downstream transaction does not commit. */
+internal data class LocationQualityFilterCheckpoint(
+    val continuityAnchor: QualifiedLocationFix?,
+    val latestAcceptedElapsedRealtimeNanos: Long?,
+    val pendingBreakReason: LocationBreakReason?,
+)
+
 /**
  * The only output that should cross the boundary into persistence. A rejected decision
  * intentionally contains no provider fix or coordinate fields.
@@ -131,6 +138,19 @@ internal class LocationQualityFilter(
     private var continuityAnchor: QualifiedLocationFix? = null
     private var latestAcceptedElapsedRealtimeNanos: Long? = null
     private var pendingBreakReason: LocationBreakReason? = null
+
+    /** Captures decision state so an uncommitted store write can be rolled back. */
+    fun checkpoint(): LocationQualityFilterCheckpoint = LocationQualityFilterCheckpoint(
+        continuityAnchor = continuityAnchor,
+        latestAcceptedElapsedRealtimeNanos = latestAcceptedElapsedRealtimeNanos,
+        pendingBreakReason = pendingBreakReason,
+    )
+
+    fun restore(checkpoint: LocationQualityFilterCheckpoint) {
+        continuityAnchor = checkpoint.continuityAnchor
+        latestAcceptedElapsedRealtimeNanos = checkpoint.latestAcceptedElapsedRealtimeNanos
+        pendingBreakReason = checkpoint.pendingBreakReason
+    }
 
     fun evaluate(
         rawFix: RawLocationFix,

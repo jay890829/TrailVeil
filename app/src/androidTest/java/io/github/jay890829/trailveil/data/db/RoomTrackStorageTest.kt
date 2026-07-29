@@ -5,6 +5,7 @@ import android.database.sqlite.SQLiteConstraintException
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import io.github.jay890829.trailveil.data.recording.OperationIdCollisionException
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -165,6 +166,177 @@ class RoomTrackStorageTest {
         assertNull(active?.endedAt)
     }
 
+    @Test
+    fun openSlotInvariantRejectsMalformedOrSecondOpenSegmentAtSqlBoundary() = runBlocking {
+        val recording = startRecording(startedAt = 100)
+        val sql = database.openHelper.writableDatabase
+
+        assertThrows(SQLiteConstraintException::class.java) {
+            sql.execSQL(
+                """
+                INSERT INTO track_segments(
+                    session_id, sequence, started_at, ended_at, start_reason, end_reason, open_slot
+                ) VALUES (?, 1, 110, NULL, 'SECOND_OPEN', NULL, 1)
+                """.trimIndent(),
+                arrayOf(recording.sessionId),
+            )
+        }
+        assertThrows(SQLiteConstraintException::class.java) {
+            sql.execSQL(
+                """
+                INSERT INTO track_segments(
+                    session_id, sequence, started_at, ended_at, start_reason, end_reason, open_slot
+                ) VALUES (?, 1, 110, 120, 'MALFORMED_CLOSED', 'STOP', 1)
+                """.trimIndent(),
+                arrayOf(recording.sessionId),
+            )
+        }
+        assertEquals(1, dao.segmentCount())
+    }
+
+    @Test
+    fun receiptReplayDoesNotWriteSecondPointOrSummaryAndRejectsCommandCollision() = runBlocking {
+        val recording = startRecording(startedAt = 100)
+        val first = dao.persistAcceptedPoint(
+            point(recording, sequence = 777),
+            distanceDeltaMeters = 12.5,
+            operationId = "accepted-once",
+            commandKind = "LOCATION_ACCEPTED",
+            outcome = "ACCEPTED",
+            createdAt = 120,
+        )
+        val replay = dao.persistAcceptedPoint(
+            point(recording, sequence = 778, latitude = 26.0),
+            distanceDeltaMeters = 99.0,
+            operationId = "accepted-once",
+            commandKind = "LOCATION_ACCEPTED",
+            outcome = "ACCEPTED",
+            createdAt = 121,
+        )
+
+        assertEquals(false, first.replayed)
+        assertEquals(true, replay.replayed)
+        assertEquals(first.receipt.pointId, replay.receipt.pointId)
+        assertEquals(1, dao.pointCount())
+        dao.sessionById(recording.sessionId).also { session ->
+            assertEquals(1L, session?.acceptedPointCount)
+            assertEquals(12.5, session?.distanceMeters ?: -1.0, 0.0)
+        }
+        assertThrows(OperationIdCollisionException::class.java) {
+            runBlocking {
+                dao.persistAcceptedPoint(
+                    point(recording, sequence = 779),
+                    distanceDeltaMeters = 0.0,
+                    operationId = "accepted-once",
+                    commandKind = "STOP",
+                    outcome = "STOPPED",
+                    createdAt = 122,
+                )
+            }
+        }
+        val sql = database.openHelper.writableDatabase
+        sql.execSQL(
+            """
+            INSERT INTO recording_operation_receipts(
+                operation_id, command_kind, outcome, session_id, segment_id, point_id, created_at
+            ) VALUES ('raw-receipt', 'RAW', 'STORED', ?, NULL, NULL, 123)
+            """.trimIndent(),
+            arrayOf(recording.sessionId),
+        )
+        assertThrows(SQLiteConstraintException::class.java) {
+            sql.execSQL(
+                """
+                INSERT INTO recording_operation_receipts(
+                    operation_id, command_kind, outcome, session_id, segment_id, point_id, created_at
+                ) VALUES ('raw-receipt', 'RAW', 'DUPLICATE', ?, NULL, NULL, 124)
+                """.trimIndent(),
+                arrayOf(recording.sessionId),
+            )
+        }
+        Unit
+    }
+
+    @Test
+    fun afterBreakRollbackOnReceiptFailureProtectsCanonicalState() = runBlocking {
+        val recording = startRecording(startedAt = 100)
+        dao.appendAcceptedPoint(point(recording, sequence = 0), distanceDeltaMeters = 0.0)
+        val sql = database.openHelper.writableDatabase
+        sql.execSQL(
+            """
+            CREATE TRIGGER fail_after_break_receipt
+            BEFORE INSERT ON recording_operation_receipts
+            WHEN NEW.operation_id = 'after-break-rollback'
+            BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END
+            """.trimIndent(),
+        )
+
+        assertThrows(SQLiteConstraintException::class.java) {
+            runBlocking {
+                dao.afterBreak(
+                    point = point(recording, sequence = 0, latitude = 25.1),
+                    newSegment = TrackSegmentEntity(
+                        sessionId = recording.sessionId,
+                        sequence = 999,
+                        startedAt = 140,
+                        startReason = "GAP_RECOVERY",
+                    ),
+                    oldSegmentId = recording.segmentId,
+                    oldEndedAt = 140,
+                    oldEndReason = "GAP",
+                    distanceDeltaMeters = 5.0,
+                    operationId = "after-break-rollback",
+                    commandKind = "LOCATION_AFTER_BREAK",
+                    outcome = "AFTER_BREAK",
+                    createdAt = 140,
+                )
+            }
+        }
+
+        assertEquals(1, dao.segmentCount())
+        assertEquals(1, dao.pointCount())
+        assertEquals(RecordingStatus.ACTIVE, dao.sessionById(recording.sessionId)?.status)
+        sql.query("SELECT ended_at, open_slot FROM track_segments WHERE id = ${recording.segmentId}").use { cursor ->
+            assertEquals(true, cursor.moveToFirst())
+            assertEquals(true, cursor.isNull(0))
+            assertEquals(1, cursor.getInt(1))
+        }
+    }
+
+    @Test
+    fun stopRollbackOnReceiptFailureLeavesActiveSessionAndOpenSegment() = runBlocking {
+        val recording = startRecording(startedAt = 100)
+        database.openHelper.writableDatabase.execSQL(
+            """
+            CREATE TRIGGER fail_stop_receipt
+            BEFORE INSERT ON recording_operation_receipts
+            WHEN NEW.operation_id = 'stop-rollback'
+            BEGIN SELECT RAISE(ABORT, 'injected receipt failure'); END
+            """.trimIndent(),
+        )
+
+        assertThrows(SQLiteConstraintException::class.java) {
+            runBlocking {
+                dao.stopRecording(
+                    sessionId = recording.sessionId,
+                    segmentId = recording.segmentId,
+                    endedAt = 150,
+                    status = RecordingStatus.COMPLETED,
+                    stopReason = "USER_STOP",
+                    segmentEndReason = "USER_STOP",
+                    operationId = "stop-rollback",
+                    commandKind = "STOP",
+                    outcome = "STOPPED",
+                    createdAt = 150,
+                )
+            }
+        }
+
+        dao.sessionById(recording.sessionId).also { session ->
+            assertEquals(RecordingStatus.ACTIVE, session?.status)
+            assertNull(session?.endedAt)
+        }
+        assertEquals(recording.segmentId, dao.recordingState(recording.sessionId)?.openSegment?.id)
+    }
     @Test
     fun relationshipQueryBoundingBoxAndCascadeRemainConsistent() = runBlocking {
         val recording = startRecording(startedAt = 100)

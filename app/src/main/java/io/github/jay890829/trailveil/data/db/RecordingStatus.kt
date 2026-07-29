@@ -3,6 +3,7 @@ package io.github.jay890829.trailveil.data.db
 import androidx.room.TypeConverter
 
 enum class RecordingStatus {
+    STARTING,
     ACTIVE,
     COMPLETED,
     INTERRUPTED,
@@ -10,6 +11,7 @@ enum class RecordingStatus {
 }
 
 internal const val ACTIVE_SESSION_SLOT = 1
+internal const val OPEN_SEGMENT_SLOT = 1
 
 internal object RecordingStatusConverters {
     @TypeConverter

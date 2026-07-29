@@ -147,6 +147,82 @@ class TrailVeilDatabaseMigrationTest {
         migrated.close()
     }
 
+    @Test
+    fun migrate2To3RepairsOpenSegmentsAndPreservesPoints() {
+        migrationHelper.createDatabase("migration-p2-003", 2).apply {
+            execSQL("INSERT INTO recording_sessions(id, started_at, ended_at, status, stop_reason, distance_meters, accepted_point_count, rejected_point_count, created_app_version, active_slot) VALUES (1, 100, NULL, 'ACTIVE', NULL, 0, 0, 0, 'v2', 1)")
+            execSQL("INSERT INTO recording_sessions(id, started_at, ended_at, status, stop_reason, distance_meters, accepted_point_count, rejected_point_count, created_app_version, active_slot) VALUES (2, 200, 210, 'COMPLETED', 'STOP', 0, 0, 0, 'v2', NULL)")
+            execSQL("INSERT INTO track_segments(id, session_id, sequence, started_at, ended_at, start_reason, end_reason) VALUES (10, 1, 0, 100, NULL, 'START', NULL)")
+            execSQL("INSERT INTO track_segments(id, session_id, sequence, started_at, ended_at, start_reason, end_reason) VALUES (11, 1, 1, 130, NULL, 'BREAK', 'DANGLING')")
+            execSQL("INSERT INTO track_segments(id, session_id, sequence, started_at, ended_at, start_reason, end_reason) VALUES (20, 2, 0, 200, NULL, 'START', NULL)")
+            execSQL("INSERT INTO track_segments(id, session_id, sequence, started_at, ended_at, start_reason, end_reason) VALUES (21, 2, 1, 205, 210, 'CLOSED', NULL)")
+            execSQL("INSERT INTO track_points(id, session_id, segment_id, sequence, timestamp, latitude, longitude, horizontal_accuracy, altitude, speed, bearing, is_mock) VALUES (100, 1, 10, 0, 120, 25, 121, 5, NULL, NULL, NULL, 0)")
+            execSQL("INSERT INTO track_points(id, session_id, segment_id, sequence, timestamp, latitude, longitude, horizontal_accuracy, altitude, speed, bearing, is_mock) VALUES (200, 2, 20, 0, 220, 25, 121, 5, NULL, NULL, NULL, 0)")
+            close()
+        }
+        val migrated = migrationHelper.runMigrationsAndValidate("migration-p2-003", 3, true, MIGRATION_2_3)
+        assertEquals(0, migrated.query("PRAGMA foreign_key_check").use { it.count })
+        migrated.query("SELECT id, location_owner_token FROM recording_sessions ORDER BY id").use { cursor ->
+            assertEquals(true, cursor.moveToFirst())
+            assertEquals(1L, cursor.getLong(0))
+            assertEquals("MIGRATION_REQUIRES_RECOVERY", cursor.getString(1))
+            assertEquals(true, cursor.moveToNext())
+            assertEquals(2L, cursor.getLong(0))
+            assertEquals(true, cursor.isNull(1))
+        }
+        assertThrows(SQLiteConstraintException::class.java) {
+            migrated.execSQL("UPDATE recording_sessions SET location_owner_token = NULL WHERE id = 1")
+        }
+        migrated.query("SELECT id, ended_at, open_slot, end_reason FROM track_segments ORDER BY id").use { cursor ->
+            assertEquals(true, cursor.moveToFirst()); assertEquals(10L, cursor.getLong(0)); assertEquals(130L, cursor.getLong(1)); assertEquals(true, cursor.isNull(2))
+            assertEquals(true, cursor.moveToNext()); assertEquals(11L, cursor.getLong(0)); assertEquals(true, cursor.isNull(1)); assertEquals(1, cursor.getInt(2)); assertEquals(true, cursor.isNull(3))
+            assertEquals(true, cursor.moveToNext()); assertEquals(20L, cursor.getLong(0)); assertEquals(210L, cursor.getLong(1)); assertEquals(true, cursor.isNull(2))
+            assertEquals(true, cursor.moveToNext()); assertEquals(21L, cursor.getLong(0)); assertEquals(210L, cursor.getLong(1)); assertEquals(true, cursor.isNull(2))
+        }
+        migrated.query("SELECT end_reason FROM track_segments WHERE id = 21").use { cursor ->
+            assertEquals(true, cursor.moveToFirst())
+            assertEquals("MIGRATION_RECOVERY_MISSING_END_REASON", cursor.getString(0))
+        }
+        migrated.query("SELECT id, segment_id, timestamp FROM track_points ORDER BY id").use { cursor ->
+            assertEquals(true, cursor.moveToFirst())
+            assertEquals(100L, cursor.getLong(0))
+            assertEquals(10L, cursor.getLong(1))
+            assertEquals(120L, cursor.getLong(2))
+            assertEquals(true, cursor.moveToNext())
+            assertEquals(200L, cursor.getLong(0))
+            assertEquals(20L, cursor.getLong(1))
+            assertEquals(220L, cursor.getLong(2))
+            assertEquals(false, cursor.moveToNext())
+        }
+        assertEquals(4, migrated.query("SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('recording_sessions_validate_insert', 'recording_sessions_validate_update', 'track_segments_validate_insert', 'track_segments_validate_update')").use { cursor -> cursor.moveToFirst(); cursor.getInt(0) })
+        assertThrows(SQLiteConstraintException::class.java) {
+            migrated.execSQL("INSERT INTO track_segments(session_id, sequence, started_at, ended_at, start_reason, end_reason, open_slot) VALUES (1, 2, 140, NULL, 'SECOND_OPEN', NULL, 1)")
+        }
+        assertEquals(
+            setOf(
+                "index_track_segments_session_id_open_slot",
+                "index_recording_operation_receipts_command_kind",
+                "index_recording_operation_receipts_session_id",
+                "index_recording_operation_receipts_created_at",
+            ),
+            migrated.query(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'index' AND name IN (
+                    'index_track_segments_session_id_open_slot',
+                    'index_recording_operation_receipts_command_kind',
+                    'index_recording_operation_receipts_session_id',
+                    'index_recording_operation_receipts_created_at'
+                )
+                """.trimIndent(),
+            ).use { cursor ->
+                buildSet {
+                    while (cursor.moveToNext()) add(cursor.getString(0))
+                }
+            },
+        )
+        migrated.close()
+    }
     private companion object {
         const val TEST_DATABASE = "migration-p2-001"
     }
