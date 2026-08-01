@@ -45,7 +45,8 @@ object SyntheticFogDatasets {
         ),
     )
 
-    internal fun generate(        pointCount: Int,
+    internal fun generate(
+        pointCount: Int,
         segmentCount: Int,
         seed: Long,
     ): List<TrackSegment> {
