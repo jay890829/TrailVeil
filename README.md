@@ -4,23 +4,23 @@ TrailVeil is a privacy-first Android exploration-map app inspired by [Fog of Wor
 
 ## Project status
 
-TrailVeil now has a buildable single-module Android Gradle scaffold and a minimal Compose application shell. The placeholder destination installs and launches successfully on a local Android emulator; product UI and runtime features have not yet been implemented.
+TrailVeil now has an Android 14+ application with canonical Room track storage, a deterministic location-quality and recording state machine, a location foreground service, contextual permission/settings UX, and provider-neutral fog and viewport cores. The production basemap, cumulative fog integration, history UI, and physical-device endurance gates remain unfinished.
 
-- [Android technical baseline](docs/ANDROID_BASELINE.md)
+The development requirements and current limitations are summarized below.
 
 ## MVP principles
 
 - Deliver the smallest reliable record–reveal–review experience first.
 - Keep canonical location tracks on the device; TrailVeil app code must not transmit stored tracks or precise coordinates. Audit map/tile and transitive SDK networking separately, and do not add accounts, cloud sync, analytics, ads, or remote crash reporting to the MVP.
 - Continue explicitly started recording through background and locked-screen use with an Android location foreground service.
-- Select the production map stack only after comparing MapLibre and Google Maps with the same correctness, lifecycle, performance, privacy, licensing, and cost criteria.
+- Keep the technically validated MapLibre integration isolated until a sustainable production basemap is approved. Do not add a map provider that requires billing enablement, a paid endpoint, or an API key without an explicit product decision.
 - Treat real-device GPS, background behavior, battery use, and APK upgrade testing as required validation rather than optional final checks.
 
 ## Development
 
 The initial MVP supports Android 14 (API 34) and newer.
 
-Prerequisites currently verified for the scaffold:
+Prerequisites currently verified for the project:
 
 - JDK 17
 - Android SDK Platform 37.0
@@ -55,10 +55,10 @@ The fixed-signature APK is written to `app/build/outputs/apk/internal/app-intern
 .\gradlew.bat assembleInternal
 ```
 
-Run the scaffold JVM test alone with:
+Run the provider-neutral viewport JVM suite alone with:
 
 ```powershell
-.\gradlew.bat testDebugUnitTest --tests "app.trailveil.navigation.PlaceholderRouteTest.placeholderRouteIsStable"
+.\gradlew.bat testDebugUnitTest --tests "app.trailveil.data.map.ViewportTrackDataSourceTest"
 ```
 
 ### Connected-device commands
@@ -72,14 +72,14 @@ With an Android device or compatible emulator connected, install one build linea
 
 `debug` and `internal` intentionally share the application ID but use different signing certificates. Android will not replace one with the other; uninstall the currently installed package before switching lineages. Repeated `internal` builds use the fixed external key and are upgrade-compatible when `versionCode` increases.
 
-Run all debug instrumentation tests or only the placeholder Compose test with:
+Run all debug instrumentation tests or only the recording-entry Compose tests with:
 
 ```powershell
 .\gradlew.bat connectedDebugAndroidTest
-.\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.PlaceholderDestinationTest
+.\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.RecordingEntryScreenTest
 ```
 
-These instrumentation commands require a compatible device/emulator. The suite is continuously verified on the API 36 GitHub Actions emulator and was also run successfully on the local official Android Emulator AVD `TrailVeil_API_36` (Android 16/API 36, Google APIs x86_64). The former MuMu instance is no longer part of the local validation path.
+These instrumentation commands require a compatible device/emulator. The complete suite has passed on official Android Emulator AVDs for API 34, 35, and 36. After the application ID changed to `app.trailveil`, host compilation, JVM tests, all three builds, and all three lint variants passed; a connected rerun remains pending because the local emulator service could not be started during that validation window.
 
 ## Internal signing
 
@@ -102,6 +102,6 @@ A relative `storeFile` is resolved from the properties file's directory. Never p
 
 With no signing material present, debug builds and CI remain available; any task that includes the `internal` variant fails with the required path and property names. Once configured, the `assembleInternal` and `installInternal` commands above use this fixed identity.
 
-Control of the `jay890829` publisher namespace was reconfirmed on 2026-07-28 by an authenticated `jay890829` GitHub account successfully pushing this repository. Keep the actual certificate SHA-256 fingerprint and key-custody/recovery record outside Git with the protected key backup.
+The Android package identity is `app.trailveil` and is independent of the repository owner's account name. Keep the actual certificate SHA-256 fingerprint and key-custody/recovery record outside Git with the protected key backup.
 
-GitHub Actions runs the equivalent debug build, lint, and JVM checks on JDK 17 with SDK Platform 37.0 and Build Tools 36.0.0, plus the instrumentation suite on an API 36 emulator. Internal signing material is intentionally not available to CI.
+GitHub Actions is configured to run the equivalent debug build, lint, and JVM checks on JDK 17 with SDK Platform 37.0 and Build Tools 36.0.0, plus the instrumentation suite on an API 36 emulator. Internal signing material is intentionally not available to CI.
