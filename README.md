@@ -13,7 +13,7 @@ The development requirements and current limitations are summarized below.
 - Deliver the smallest reliable record–reveal–review experience first.
 - Keep canonical location tracks on the device; TrailVeil app code must not transmit stored tracks or precise coordinates. Audit map/tile and transitive SDK networking separately, and do not add accounts, cloud sync, analytics, ads, or remote crash reporting to the MVP.
 - Continue explicitly started recording through background and locked-screen use with an Android location foreground service.
-- Keep the technically validated MapLibre integration isolated until a sustainable production basemap is approved. Do not add a map provider that requires billing enablement, a paid endpoint, or an API key without an explicit product decision.
+- Keep the technically validated MapLibre integration isolated until a sustainable production basemap is approved. Do not add a map provider that requires billing enablement, a paid endpoint, or an API key without an explicit product decision. The current no-key architecture candidate is local or self-hosted PMTiles, which still requires a supported-region/offline-size/hosting-ownership decision.
 - Treat real-device GPS, background behavior, battery use, and APK upgrade testing as required validation rather than optional final checks.
 
 ## Development
@@ -79,7 +79,7 @@ Run all debug instrumentation tests or only the recording-entry Compose tests wi
 .\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.RecordingEntryScreenTest
 ```
 
-These instrumentation commands require a compatible device/emulator. The complete suite has passed on official Android Emulator AVDs for API 34, 35, and 36. After the application ID changed to `app.trailveil`, host compilation, JVM tests, all three builds, and all three lint variants passed; a connected rerun remains pending because the local emulator service could not be started during that validation window.
+These instrumentation commands require a compatible device/emulator. The complete suite has passed on official Android Emulator AVDs for API 34, 35, and 36. After the application ID changed to `app.trailveil`, the host gates above and GitHub Actions API 36 instrumentation passed at commit `7855fac`; a local official-AVD rerun on API 34, 35, and 36 remains pending because the emulator service could not be started during that validation window.
 
 ## Internal signing
 
