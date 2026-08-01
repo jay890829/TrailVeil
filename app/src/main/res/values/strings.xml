@@ -15,6 +15,8 @@
     <string name="map_content_description">Interactive exploration map</string>
     <string name="map_loading">Loading the online basemap…</string>
     <string name="map_unavailable">Online basemap unavailable. Trail recording still works.</string>
+    <string name="map_fog_loading">Rebuilding explored areas…</string>
+    <string name="map_fog_unavailable">Exploration overlay unavailable — unknown areas stay hidden</string>
     <string name="location_rationale_title">Location is needed to draw your trail</string>
     <string name="location_rationale_body">Allow location while using TrailVeil so an exploration can continue through a foreground service after the screen is locked.</string>
     <string name="location_permission_settings_title">Location permission is turned off</string>

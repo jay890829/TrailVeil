@@ -9,6 +9,7 @@ import androidx.room.Query
 import androidx.room.Relation
 import androidx.room.Transaction
 import app.trailveil.data.recording.OperationIdCollisionException
+import kotlinx.coroutines.flow.Flow
 
 internal data class StartedRecording(val sessionId: Long, val segmentId: Long)
 internal data class RecordingOperationResult(val receipt: RecordingOperationReceiptEntity, val replayed: Boolean)
@@ -21,6 +22,23 @@ internal data class ViewportTrackPointRow(
     @ColumnInfo(name = "point_sequence") val pointSequence: Long,
     val latitude: Double,
     val longitude: Double,
+)
+
+/** Flat Room projection for one canonical point and its predecessor in the same segment. */
+internal data class PersistedTrackPointChangeRow(
+    @ColumnInfo(name = "point_id") val pointId: Long,
+    @ColumnInfo(name = "session_id") val sessionId: Long,
+    @ColumnInfo(name = "segment_id") val segmentId: Long,
+    @ColumnInfo(name = "segment_sequence") val segmentSequence: Long,
+    @ColumnInfo(name = "point_sequence") val pointSequence: Long,
+    @ColumnInfo(name = "point_timestamp") val pointTimestamp: Long,
+    @ColumnInfo(name = "point_latitude") val pointLatitude: Double,
+    @ColumnInfo(name = "point_longitude") val pointLongitude: Double,
+    @ColumnInfo(name = "previous_point_id") val previousPointId: Long?,
+    @ColumnInfo(name = "previous_point_sequence") val previousPointSequence: Long?,
+    @ColumnInfo(name = "previous_point_timestamp") val previousPointTimestamp: Long?,
+    @ColumnInfo(name = "previous_point_latitude") val previousPointLatitude: Double?,
+    @ColumnInfo(name = "previous_point_longitude") val previousPointLongitude: Double?,
 )
 
 /** Snapshot used by the recording adapter to resume an ACTIVE or STARTING command safely. */
@@ -239,6 +257,47 @@ internal abstract class RecordingDao {
         north: Double,
         east: Double,
     ): List<ViewportTrackPointRow>
+    /** Room observes only `track_points`; lifecycle changes cannot emit a revision. */
+    @Query("SELECT COALESCE(MAX(id), 0) FROM track_points")
+    abstract fun observeLatestPersistedPointId(): Flow<Long>
+
+    @Query("SELECT COALESCE(MAX(id), 0) FROM track_points")
+    abstract suspend fun latestPersistedPointId(): Long
+
+    /**
+     * Reads every canonical point after an id cursor in insertion order, with its direct same-
+     * segment predecessor even when that predecessor is older than the cursor.
+     */
+    @Query(
+        """
+        SELECT
+            p.id AS point_id,
+            p.session_id AS session_id,
+            p.segment_id AS segment_id,
+            s.sequence AS segment_sequence,
+            p.sequence AS point_sequence,
+            p.timestamp AS point_timestamp,
+            p.latitude AS point_latitude,
+            p.longitude AS point_longitude,
+            previous.id AS previous_point_id,
+            previous.sequence AS previous_point_sequence,
+            previous.timestamp AS previous_point_timestamp,
+            previous.latitude AS previous_point_latitude,
+            previous.longitude AS previous_point_longitude
+        FROM track_points p
+        INNER JOIN track_segments s ON s.id = p.segment_id AND s.session_id = p.session_id
+        LEFT JOIN track_points previous ON previous.id = (
+            SELECT candidate.id FROM track_points candidate
+            WHERE candidate.session_id = p.session_id AND candidate.segment_id = p.segment_id
+                AND (candidate.sequence < p.sequence OR (candidate.sequence = p.sequence AND candidate.id < p.id))
+            ORDER BY candidate.sequence DESC, candidate.id DESC LIMIT 1
+        )
+        WHERE p.id > :afterPointId
+        ORDER BY p.id ASC
+        """,
+    )
+    abstract suspend fun persistedPointChangesAfter(afterPointId: Long): List<PersistedTrackPointChangeRow>
+
     @Query("SELECT COUNT(*) FROM recording_sessions") abstract suspend fun sessionCount(): Int
     @Query("SELECT COUNT(*) FROM track_segments") abstract suspend fun segmentCount(): Int
     @Query("SELECT COUNT(*) FROM track_points") abstract suspend fun pointCount(): Int

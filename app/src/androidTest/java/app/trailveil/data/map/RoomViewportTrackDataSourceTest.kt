@@ -82,6 +82,30 @@ class RoomViewportTrackDataSourceTest {
         assertEquals(listOf(178.0, -179.0), result.segments.single().points.map { it.longitude })
     }
 
+    @Test
+    fun bboxGapSplitsOnePersistedSegmentWithoutConnectingAcrossExcludedPoints() = runBlocking {
+        val recording = startRecording(startedAt = 100)
+        (0L..6L).forEach { sequence ->
+            append(
+                recording,
+                sequence = sequence,
+                latitude = if (sequence in 3L..4L) 30.0 else sequence.toDouble(),
+                longitude = 121.0,
+            )
+        }
+        stop(recording, endedAt = 150)
+
+        val result = dataSource.read(
+            ViewportBounds(south = 0.5, north = 6.5, west = 120.0, east = 122.0),
+        )
+
+        assertEquals(listOf(recording.segmentId, recording.segmentId), result.segments.map { it.segmentId })
+        assertEquals(
+            listOf(listOf(1.0, 2.0), listOf(5.0, 6.0)),
+            result.segments.map { segment -> segment.points.map { it.latitude } },
+        )
+    }
+
     private suspend fun startRecording(startedAt: Long): StartedRecording =
         dao.startSession(
             session = RecordingSessionEntity(

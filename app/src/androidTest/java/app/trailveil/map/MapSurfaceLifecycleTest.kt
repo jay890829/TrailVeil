@@ -8,6 +8,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -19,9 +20,18 @@ import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
+import org.maplibre.android.style.layers.RasterLayer
+import org.maplibre.android.style.sources.ImageSource
 
 @RunWith(AndroidJUnit4::class)
 class MapSurfaceLifecycleTest {
+    @Test
+    fun productionFogSourceAndLayerAreInstalled() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            assertProductionFogInstalled(scenario)
+        }
+    }
+
     @Test
     fun cameraStateSurvivesActivityRecreation() {
         val expectedTarget = LatLng(25.0330, 121.5654)
@@ -44,7 +54,26 @@ class MapSurfaceLifecycleTest {
             assertEquals(expectedTarget.latitude, camera.target?.latitude ?: Double.NaN, 0.0001)
             assertEquals(expectedTarget.longitude, camera.target?.longitude ?: Double.NaN, 0.0001)
             assertEquals(expectedZoom, camera.zoom, 0.01)
+            assertProductionFogInstalled(scenario)
         }
+    }
+
+    private fun assertProductionFogInstalled(scenario: ActivityScenario<MainActivity>) {
+        val installed = AtomicBoolean(false)
+        repeat(100) {
+            scenario.onActivity { activity ->
+                activity.window.decorView.findMapView()?.getMapAsync { map ->
+                    val style = map.style
+                    installed.set(
+                        style?.getSourceAs<ImageSource>(FogOverlayIds.Source) != null &&
+                            style.getLayerAs<RasterLayer>(FogOverlayIds.Layer) != null,
+                    )
+                }
+            }
+            if (installed.get()) return
+            Thread.sleep(100L)
+        }
+        assertTrue("Production fog source/layer were not installed", installed.get())
     }
 
     private fun withMap(

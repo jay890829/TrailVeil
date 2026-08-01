@@ -26,6 +26,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.trailveil.R
 import app.trailveil.map.TrailVeilMapSurface
+import app.trailveil.map.fog.FogRuntime
 
 internal enum class LocationNotice {
     RATIONALE,
@@ -77,6 +78,8 @@ internal fun RecordingEntryScreen(
     onDismissLocationNotice: () -> Unit,
     onNotificationAction: () -> Unit,
     modifier: Modifier = Modifier,
+    fogRuntime: FogRuntime? = null,
+    fogRequired: Boolean = false,
 ) {
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -170,6 +173,8 @@ internal fun RecordingEntryScreen(
                     .fillMaxWidth()
                     .height(280.dp)
                     .clip(MaterialTheme.shapes.large),
+                fogRuntime = fogRuntime,
+                fogRequired = fogRequired,
             )
         }
     }

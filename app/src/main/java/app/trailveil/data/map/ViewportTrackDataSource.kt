@@ -112,7 +112,8 @@ data class ViewportTrackReadModel(
 
 /**
  * Queries one or two storage intervals, removes overlap duplicates, and reconstructs only
- * persisted segment boundaries. This core deliberately knows nothing about Room or a map SDK.
+ * persisted segment boundaries and point-sequence continuity. This core deliberately knows
+ * nothing about Room or a map SDK.
  */
 class ViewportTrackDataSource(
     private val reader: ViewportTrackPointReader,
@@ -131,17 +132,37 @@ class ViewportTrackDataSource(
         return ViewportTrackReadModel(
             segments = merged
                 .groupBy { point -> SegmentKey(point.sessionId, point.segmentId, point.segmentSequence) }
-                .map { (key, points) ->
-                    ViewportTrackSegment(
-                        sessionId = key.sessionId,
-                        segmentId = key.segmentId,
-                        segmentSequence = key.segmentSequence,
-                        points = points.map { point ->
-                            GeoPoint(latitude = point.latitude, longitude = point.longitude)
-                        },
-                    )
+                .flatMap { (key, points) ->
+                    points.contiguousSequenceRuns().map { run ->
+                        ViewportTrackSegment(
+                            sessionId = key.sessionId,
+                            segmentId = key.segmentId,
+                            segmentSequence = key.segmentSequence,
+                            points = run.map { point ->
+                                GeoPoint(latitude = point.latitude, longitude = point.longitude)
+                            },
+                        )
+                    }
                 },
         )
+    }
+
+    /** A bbox can omit middle points from one persisted segment; never draw across that gap. */
+    private fun List<ViewportTrackPoint>.contiguousSequenceRuns(): List<List<ViewportTrackPoint>> {
+        val runs = mutableListOf<MutableList<ViewportTrackPoint>>()
+        forEach { point ->
+            val previous = runs.lastOrNull()?.lastOrNull()
+            if (
+                previous != null &&
+                previous.pointSequence != Long.MAX_VALUE &&
+                point.pointSequence == previous.pointSequence + 1
+            ) {
+                runs.last().add(point)
+            } else {
+                runs += mutableListOf(point)
+            }
+        }
+        return runs
     }
 
     private data class SegmentKey(

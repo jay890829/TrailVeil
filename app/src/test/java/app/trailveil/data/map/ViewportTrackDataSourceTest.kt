@@ -98,6 +98,31 @@ class ViewportTrackDataSourceTest {
     }
 
     @Test
+    fun nonContiguousViewportPointsFromOnePersistedSegmentAreSplit() = runTest {
+        val interval = LongitudeInterval(0.0, 10.0)
+        val reader = RecordingReader(
+            responses = mapOf(
+                interval to listOf(
+                    point(pointId = 6, pointSequence = 6),
+                    point(pointId = 2, pointSequence = 2),
+                    point(pointId = 5, pointSequence = 5),
+                    point(pointId = 1, pointSequence = 1),
+                ),
+            ),
+        )
+
+        val result = ViewportTrackDataSource(reader).read(
+            ViewportBounds(south = 0.0, north = 10.0, west = 0.0, east = 10.0),
+        )
+
+        assertEquals(listOf(10L, 10L), result.segments.map(ViewportTrackSegment::segmentId))
+        assertEquals(
+            listOf(listOf(1.0, 2.0), listOf(5.0, 6.0)),
+            result.segments.map { segment -> segment.points.map { it.latitude } },
+        )
+    }
+
+    @Test
     fun invalidBoundsIntervalsAndProjectionPointsAreRejected() = runTest {
         assertThrows(IllegalArgumentException::class.java) {
             ViewportBounds(south = 1.0, north = 0.0, west = 0.0, east = 1.0)

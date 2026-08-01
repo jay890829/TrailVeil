@@ -31,9 +31,12 @@ import app.trailveil.data.recording.RecordingLifecycle
 import app.trailveil.recording.RecordingForegroundService
 import app.trailveil.recording.RecordingStartBlocker
 import app.trailveil.recording.RecordingStartOutcome
+import app.trailveil.map.fog.FogRuntime
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 internal fun RecordingEntryRoute(activity: ComponentActivity) {
@@ -62,9 +65,14 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
     var startNotice by rememberSaveable { mutableStateOf<RecordingStartNotice?>(null) }
     var activeSessionId by remember { mutableStateOf<Long?>(null) }
     var starting by remember { mutableStateOf(false) }
+    var fogRuntime by remember { mutableStateOf<FogRuntime?>(null) }
 
     LaunchedEffect(historyStore) {
         historyStore.history.collectLatest { history = it }
+    }
+
+    LaunchedEffect(appContainer) {
+        fogRuntime = withContext(Dispatchers.IO) { appContainer.fogRuntime() }
     }
 
     DisposableEffect(activity) {
@@ -394,6 +402,8 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
                 null -> Unit
             }
         },
+        fogRuntime = fogRuntime,
+        fogRequired = true,
     )
 }
 

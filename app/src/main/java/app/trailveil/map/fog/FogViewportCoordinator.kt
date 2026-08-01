@@ -1,0 +1,258 @@
+package app.trailveil.map.fog
+
+import app.trailveil.data.map.ViewportBounds
+import app.trailveil.data.map.PersistedTrackPointChangeFeed
+import app.trailveil.data.map.ViewportTrackDataSource
+import kotlin.math.abs
+import kotlin.math.cos
+import kotlin.math.floor
+import kotlin.math.max
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+
+data class FogViewportRequest(
+    val center: GeoPoint,
+    val mapZoom: Double,
+) {
+    init {
+        require(mapZoom.isFinite()) { "mapZoom must be finite" }
+    }
+}
+
+data class FogViewportRender(
+    val request: FogViewportRequest,
+    val keys: List<FogTileKey>,
+    val queryBounds: ViewportBounds,
+    val mosaic: FogTileMosaic,
+)
+
+data class FogRuntime(
+    val viewportCoordinator: FogViewportCoordinator,
+    val pointChanges: PersistedTrackPointChangeFeed,
+)
+
+/**
+ * Serializes canonical Room reads, derived-cache access, and persisted reveal merges.
+ *
+ * The query includes the maximum accepted continuous-segment distance plus the reveal radius, so
+ * clipping a viewport read does not drop the predecessor needed to render a capsule at its edge.
+ */
+class FogViewportCoordinator(
+    private val trackDataSource: ViewportTrackDataSource,
+    private val pipeline: FogTilePipeline,
+    private val style: FogRenderStyle = FogRenderStyle(),
+    private val renderVersion: Int = FogRenderVersions.CURRENT,
+    private val queryMarginMeters: Double = DEFAULT_QUERY_MARGIN_METERS,
+) {
+    private val mutex = Mutex()
+    private val placeholderRenderer = FogTileRenderer(style)
+    private val invalidator = FogTileInvalidator(0..22, style)
+
+    init {
+        require(renderVersion >= 0) { "renderVersion must be non-negative" }
+        require(queryMarginMeters.isFinite() && queryMarginMeters >= style.revealRadiusMeters) {
+            "queryMarginMeters must be finite and include the reveal radius"
+        }
+    }
+
+    suspend fun render(request: FogViewportRequest): FogViewportRender = mutex.withLock {
+        val keys = FogViewportTileGrid.around(
+            center = request.center,
+            zoom = renderZoom(request.mapZoom),
+            renderVersion = renderVersion,
+        )
+        val queryBounds = FogViewportTileGrid.queryBounds(
+            keys = keys,
+            marginMeters = queryMarginMeters,
+        )
+        val segments = trackDataSource.read(queryBounds).toFogTrackSegments()
+        val selected = FogPocSpatialSelection.select(keys, segments, style)
+        val tiles = keys.map { key ->
+            FogMosaicTile(
+                key = key,
+                mask = pipeline.load(key, selected.getValue(key)).mask,
+            )
+        }
+        FogViewportRender(
+            request = request,
+            keys = keys,
+            queryBounds = queryBounds,
+            mosaic = FogPocMosaic.compose(tiles),
+        )
+    }
+
+    /** Builds a safe opaque-loading mosaic without reading or populating derived caches. */
+    fun placeholder(request: FogViewportRequest): FogViewportRender {
+        val keys = FogViewportTileGrid.around(
+            center = request.center,
+            zoom = renderZoom(request.mapZoom),
+            renderVersion = renderVersion,
+        )
+        val queryBounds = FogViewportTileGrid.queryBounds(
+            keys = keys,
+            marginMeters = queryMarginMeters,
+        )
+        val tiles = keys.map { key ->
+            FogMosaicTile(
+                key = key,
+                mask = placeholderRenderer.render(key, emptyList()),
+            )
+        }
+        return FogViewportRender(
+            request = request,
+            keys = keys,
+            queryBounds = queryBounds,
+            mosaic = FogPocMosaic.compose(tiles),
+        )
+    }
+
+    /**
+     * Unions only renderer-proven affected tiles after their points have committed to Room.
+     * Cache misses stay misses and are rebuilt from canonical Room data on the next viewport load.
+     */
+    suspend fun mergePersistedReveals(updates: List<FogRevealUpdate>): FogRevealMerge =
+        mutex.withLock {
+            if (updates.isEmpty()) {
+                return@withLock FogRevealMerge(emptySet(), emptySet())
+            }
+            val keys = updates
+                .flatMap { update -> invalidator.affectedKeys(update, renderVersion) }
+                .toSet()
+            val segments = updates.mapIndexed { index, update ->
+                TrackSegment(
+                    id = index,
+                    points = update.previousInSegment
+                        ?.let { previous -> listOf(previous, update.current) }
+                        ?: listOf(update.current),
+                )
+            }
+            pipeline.mergeReveal(keys, segments)
+        }
+
+    suspend fun clearDerivedCache() = mutex.withLock { pipeline.clear() }
+
+    private fun renderZoom(mapZoom: Double): Int =
+        floor(mapZoom).toInt().coerceIn(0, 22)
+
+    companion object {
+        // 100 m/s * 60 s accepted continuity ceiling + 25 m reveal radius + rounding allowance.
+        const val DEFAULT_QUERY_MARGIN_METERS = 6_100.0
+    }
+}
+
+object FogViewportTileGrid {
+    fun around(
+        center: GeoPoint,
+        zoom: Int,
+        renderVersion: Int,
+        paddingTiles: Int = 1,
+    ): List<FogTileKey> {
+        require(zoom in 0..22) { "zoom must be in 0..22" }
+        require(renderVersion >= 0) { "renderVersion must be non-negative" }
+        require(paddingTiles >= 0) { "paddingTiles must be non-negative" }
+        val centerTile = WebMercator.tile(center, zoom)
+        val tileCount = 1 shl zoom
+        val desiredColumns = Math.addExact(Math.multiplyExact(paddingTiles, 2), 1)
+        val columnCount = minOf(tileCount, desiredColumns)
+        val startX = if (columnCount == tileCount) {
+            0
+        } else {
+            Math.floorMod(centerTile.x - paddingTiles, tileCount)
+        }
+        val firstY = max(0, centerTile.y - paddingTiles)
+        val lastY = minOf(tileCount - 1, centerTile.y + paddingTiles)
+
+        return buildList {
+            for (y in firstY..lastY) {
+                repeat(columnCount) { offset ->
+                    add(
+                        FogTileKey(
+                            zoom = zoom,
+                            x = Math.floorMod(startX + offset, tileCount),
+                            y = y,
+                            renderVersion = renderVersion,
+                        ),
+                    )
+                }
+            }
+        }
+    }
+
+    fun queryBounds(keys: List<FogTileKey>, marginMeters: Double): ViewportBounds {
+        require(keys.isNotEmpty()) { "keys must not be empty" }
+        require(marginMeters.isFinite() && marginMeters >= 0.0) {
+            "marginMeters must be finite and non-negative"
+        }
+        val zoom = keys.first().zoom
+        val renderVersion = keys.first().renderVersion
+        require(keys.all { it.zoom == zoom && it.renderVersion == renderVersion }) {
+            "keys must share zoom and render version"
+        }
+        val rows = keys.groupBy(FogTileKey::y).toSortedMap()
+        val firstRow = rows.values.first()
+        val expectedX = firstRow.map(FogTileKey::x)
+        require(rows.values.all { row -> row.map(FogTileKey::x) == expectedX }) {
+            "keys must form a complete row-major rectangle"
+        }
+        val tileCount = 1 shl zoom
+        expectedX.zipWithNext().forEach { (prior, next) ->
+            require(next == Math.floorMod(prior + 1, tileCount)) {
+                "tile columns must be consecutive"
+            }
+        }
+        rows.keys.zipWithNext().forEach { (prior, next) ->
+            require(next == prior + 1) { "tile rows must be consecutive" }
+        }
+
+        val north = FogPocTileGrid.bounds(firstRow.first()).northLatitude
+        val south = FogPocTileGrid.bounds(rows.values.last().last()).southLatitude
+        val unexpanded = if (expectedX.size == tileCount) {
+            ViewportBounds(south = south, north = north, west = -180.0, east = 180.0)
+        } else {
+            ViewportBounds(
+                south = south,
+                north = north,
+                west = FogPocTileGrid.bounds(firstRow.first()).westLongitude,
+                east = FogPocTileGrid.bounds(firstRow.last()).eastLongitude,
+            )
+        }
+        return unexpanded.expandByMeters(marginMeters)
+    }
+
+    private fun ViewportBounds.expandByMeters(meters: Double): ViewportBounds {
+        if (meters == 0.0) return this
+        val latitudeMargin = meters / METERS_PER_LATITUDE_DEGREE
+        val expandedSouth = (south - latitudeMargin).coerceAtLeast(-90.0)
+        val expandedNorth = (north + latitudeMargin).coerceAtMost(90.0)
+        val limitingLatitude = max(abs(expandedSouth), abs(expandedNorth))
+            .coerceAtMost(WebMercator.MAX_LATITUDE)
+        val longitudeMargin = meters / (
+            METERS_PER_LATITUDE_DEGREE *
+                cos(Math.toRadians(limitingLatitude))
+            )
+        val longitudeSpan = if (west <= east) east - west else 360.0 - west + east
+        if (longitudeSpan + longitudeMargin * 2.0 >= 360.0) {
+            return ViewportBounds(
+                south = expandedSouth,
+                north = expandedNorth,
+                west = -180.0,
+                east = 180.0,
+            )
+        }
+        return ViewportBounds(
+            south = expandedSouth,
+            north = expandedNorth,
+            west = wrapBoundaryLongitude(west - longitudeMargin),
+            east = wrapBoundaryLongitude(east + longitudeMargin),
+        )
+    }
+
+    private fun wrapBoundaryLongitude(longitude: Double): Double {
+        var wrapped = longitude
+        while (wrapped < -180.0) wrapped += 360.0
+        while (wrapped > 180.0) wrapped -= 360.0
+        return if (wrapped == -0.0) 0.0 else wrapped
+    }
+
+    private const val METERS_PER_LATITUDE_DEGREE = 111_320.0
+}
