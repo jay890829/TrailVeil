@@ -1,6 +1,6 @@
 {
   "version": 8,
-  "name": "TrailVeil offline fallback",
+  "name": "TrailVeil local fallback",
   "sources": {},
   "layers": [
     {

@@ -6,12 +6,15 @@
     <string name="recording_entry_body">Start an exploration to record a precise trail, including while your screen is locked.</string>
     <string name="recording_entry_privacy_title_first">Before your first exploration</string>
     <string name="recording_entry_privacy_title">Your trail stays on this device</string>
-    <string name="recording_entry_privacy_body">TrailVeil stores location history locally. It does not upload your route.</string>
+    <string name="recording_entry_privacy_body">TrailVeil stores location history locally and does not upload your route. Online basemap requests go to OpenFreeMap and reveal the approximate area being viewed.</string>
     <string name="recording_entry_permissions_summary">Precise location is required for a useful track. Notification access keeps the active recording visible, but declining it will not prevent recording.</string>
     <string name="recording_entry_start">Start exploration</string>
     <string name="recording_entry_stop">Stop exploration</string>
     <string name="recording_entry_starting">Starting…</string>
     <string name="recording_entry_consent_note">Permissions are requested only after you press Start exploration. No location is collected before then.</string>
+    <string name="map_content_description">Interactive exploration map</string>
+    <string name="map_loading">Loading the online basemap…</string>
+    <string name="map_unavailable">Online basemap unavailable. Trail recording still works.</string>
     <string name="location_rationale_title">Location is needed to draw your trail</string>
     <string name="location_rationale_body">Allow location while using TrailVeil so an exploration can continue through a foreground service after the screen is locked.</string>
     <string name="location_permission_settings_title">Location permission is turned off</string>

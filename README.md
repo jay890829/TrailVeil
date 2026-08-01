@@ -4,7 +4,7 @@ TrailVeil is a privacy-first Android exploration-map app inspired by [Fog of Wor
 
 ## Project status
 
-TrailVeil now has an Android 14+ application with canonical Room track storage, a deterministic location-quality and recording state machine, a location foreground service, contextual permission/settings UX, and provider-neutral fog and viewport cores. The production basemap, cumulative fog integration, history UI, and physical-device endurance gates remain unfinished.
+TrailVeil now has an Android 14+ application with canonical Room track storage, a deterministic location-quality and recording state machine, a location foreground service, contextual permission/settings UX, provider-neutral fog and viewport cores, and a production MapLibre Native + OpenFreeMap surface with a local no-network fallback. Cumulative fog wiring, history UI, and physical-device endurance gates remain unfinished.
 
 The development requirements and current limitations are summarized below.
 
@@ -13,7 +13,7 @@ The development requirements and current limitations are summarized below.
 - Deliver the smallest reliable record–reveal–review experience first.
 - Keep canonical location tracks on the device; TrailVeil app code must not transmit stored tracks or precise coordinates. Audit map/tile and transitive SDK networking separately, and do not add accounts, cloud sync, analytics, ads, or remote crash reporting to the MVP.
 - Continue explicitly started recording through background and locked-screen use with an Android location foreground service.
-- Keep the technically validated MapLibre integration isolated until a sustainable production basemap is approved. Do not add a map provider that requires billing enablement, a paid endpoint, or an API key without an explicit product decision. The current no-key architecture candidate is local or self-hosted PMTiles, which still requires a supported-region/offline-size/hosting-ownership decision.
+- Use MapLibre Native with the no-key OpenFreeMap Liberty style as the replaceable default basemap. Provider or network failure must not interrupt recording or locally rebuilt fog. Do not bulk download or prefetch offline regions from the public endpoint; future local/self-hosted PMTiles remains an optional replacement path.
 - Treat real-device GPS, background behavior, battery use, and APK upgrade testing as required validation rather than optional final checks.
 
 ## Development
@@ -79,7 +79,7 @@ Run all debug instrumentation tests or only the recording-entry Compose tests wi
 .\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.RecordingEntryScreenTest
 ```
 
-These instrumentation commands require a compatible device/emulator. The complete suite has passed on official Android Emulator AVDs for API 34, 35, and 36. After the application ID changed to `app.trailveil`, the host gates above and GitHub Actions API 36 instrumentation passed at commit `7855fac`; a local official-AVD rerun on API 34, 35, and 36 remains pending because the emulator service could not be started during that validation window.
+These instrumentation commands require a compatible device/emulator. The complete suite has passed on official Android Emulator AVDs for API 34, 35, and 36. After the application ID changed to `app.trailveil`, the host gates above and GitHub Actions API 36 instrumentation passed at commit `7855fac`; the current production map integration has also passed the complete 33-test suite on a local official API 36 AVD.
 
 ## Internal signing
 

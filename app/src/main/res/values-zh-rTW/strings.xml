@@ -6,12 +6,15 @@
     <string name="recording_entry_body">開始探索後，TrailVeil 會精確記錄足跡；螢幕鎖定時也能持續。</string>
     <string name="recording_entry_privacy_title_first">第一次探索前</string>
     <string name="recording_entry_privacy_title">足跡只留在這台裝置</string>
-    <string name="recording_entry_privacy_body">位置紀錄儲存在本機，TrailVeil 不會上傳你的路線。</string>
+    <string name="recording_entry_privacy_body">位置紀錄儲存在本機，TrailVeil 不會上傳你的路線；線上底圖請求會傳送到 OpenFreeMap，並透露目前瀏覽的大約區域。</string>
     <string name="recording_entry_permissions_summary">精確位置用來繪製可靠足跡。通知權限可顯示持續記錄狀態，但拒絕通知不會阻止記錄。</string>
     <string name="recording_entry_start">開始探索</string>
     <string name="recording_entry_stop">停止探索</string>
     <string name="recording_entry_starting">正在開始…</string>
     <string name="recording_entry_consent_note">只有按下「開始探索」後才會請求權限；在此之前不會收集位置。</string>
+    <string name="map_content_description">互動式探索地圖</string>
+    <string name="map_loading">正在載入線上底圖…</string>
+    <string name="map_unavailable">線上底圖目前無法使用；足跡記錄仍可正常運作。</string>
     <string name="location_rationale_title">需要位置才能畫出足跡</string>
     <string name="location_rationale_body">允許 TrailVeil 在使用期間取得位置，之後才能透過前景服務在鎖定螢幕後持續探索。</string>
     <string name="location_permission_settings_title">位置權限已關閉</string>

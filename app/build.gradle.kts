@@ -138,12 +138,6 @@ android {
             versionNameSuffix = "-internal"
             matchingFallbacks += listOf("debug")
         }
-        create("mapLibreInternal") {
-            initWith(getByName("debug"))
-            signingConfig = signingConfigs.getByName("internal")
-            versionNameSuffix = "-maplibre-internal"
-            matchingFallbacks += listOf("debug")
-        }
     }
 
     buildFeatures {
@@ -200,6 +194,7 @@ dependencies {
     implementation(libs.room.runtime)
     implementation(libs.datastore.preferences)
     implementation(libs.coroutines.android)
+    implementation(libs.maplibre.opengl)
     // Room 2.8.4 migration bundles require serialization 1.8.1 at runtime.
     // Pin the tested app so its parent class loader cannot supply the older 1.7.3 API.
     implementation(libs.kotlinx.serialization.json)
@@ -218,5 +213,4 @@ dependencies {
 
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)
-    "mapLibreInternalImplementation"(libs.maplibre.opengl)
 }
