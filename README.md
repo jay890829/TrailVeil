@@ -58,7 +58,7 @@ The fixed-signature APK is written to `app/build/outputs/apk/internal/app-intern
 Run the scaffold JVM test alone with:
 
 ```powershell
-.\gradlew.bat testDebugUnitTest --tests "io.github.jay890829.trailveil.navigation.PlaceholderRouteTest.placeholderRouteIsStable"
+.\gradlew.bat testDebugUnitTest --tests "app.trailveil.navigation.PlaceholderRouteTest.placeholderRouteIsStable"
 ```
 
 ### Connected-device commands
@@ -76,14 +76,14 @@ Run all debug instrumentation tests or only the placeholder Compose test with:
 
 ```powershell
 .\gradlew.bat connectedDebugAndroidTest
-.\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=io.github.jay890829.trailveil.PlaceholderDestinationTest
+.\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.PlaceholderDestinationTest
 ```
 
 These instrumentation commands require a compatible device/emulator. The suite is continuously verified on the API 36 GitHub Actions emulator and was also run successfully on the local official Android Emulator AVD `TrailVeil_API_36` (Android 16/API 36, Google APIs x86_64). The former MuMu instance is no longer part of the local validation path.
 
 ## Internal signing
 
-The `internal` build type keeps the fixed `io.github.jay890829.trailveil` application ID and uses a non-debug signing key stored outside the repository. By default, Gradle reads:
+The `internal` build type keeps the fixed `app.trailveil` application ID and uses a non-debug signing key stored outside the repository. By default, Gradle reads:
 
 ```text
 ~/.trailveil/signing/internal-signing.properties

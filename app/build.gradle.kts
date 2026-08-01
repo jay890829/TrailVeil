@@ -107,11 +107,11 @@ tasks.configureEach {
 }
 
 android {
-    namespace = "io.github.jay890829.trailveil"
+    namespace = "app.trailveil"
     compileSdk = 37
 
     defaultConfig {
-        applicationId = "io.github.jay890829.trailveil"
+        applicationId = "app.trailveil"
         minSdk = 34
         targetSdk = 36
         versionCode = 1
