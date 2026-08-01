@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="history_title">Exploration history</string>
+    <string name="history_list_body">Saved explorations stay on this device.</string>
+    <string name="history_loading">Loading saved exploration data…</string>
+    <string name="history_empty_title">No saved explorations yet</string>
+    <string name="history_empty_body">Finish an exploration and its durable summary will appear here.</string>
+    <string name="history_detail_title">Exploration detail</string>
+    <string name="history_back">Back to history</string>
+    <string name="history_missing_title">This exploration is unavailable</string>
+    <string name="history_missing_body">It may have been removed from this device.</string>
+    <string name="history_status_starting">Starting</string>
+    <string name="history_status_starting_description">TrailVeil is creating the durable exploration record.</string>
+    <string name="history_status_active">Active</string>
+    <string name="history_status_active_description">This exploration is currently being recorded.</string>
+    <string name="history_status_completed">Completed</string>
+    <string name="history_status_completed_description">This exploration was safely stopped and saved.</string>
+    <string name="history_status_interrupted">Interrupted</string>
+    <string name="history_status_interrupted_description">Recording ended unexpectedly; saved points remain available.</string>
+    <string name="history_status_failed_to_start">Could not start</string>
+    <string name="history_status_failed_to_start_description">TrailVeil could not create an active recording.</string>
+    <string name="history_started_at">Started</string>
+    <string name="history_ended_at">Ended</string>
+    <string name="history_ongoing">Ongoing for</string>
+    <string name="history_stop_reason">Stop reason</string>
+    <string name="history_track_title">Recorded track</string>
+    <string name="history_track_empty">No accepted track points were saved.</string>
+    <string name="history_metrics">%1$s · %2$s · %3$s</string>
+    <string name="history_detail_metrics">%1$s · %2$s · %3$s · %4$s</string>
+    <plurals name="history_accepted_points">
+        <item quantity="one">%d accepted point</item>
+        <item quantity="other">%d accepted points</item>
+    </plurals>
+    <plurals name="history_rejected_points">
+        <item quantity="one">%d rejected point</item>
+        <item quantity="other">%d rejected points</item>
+    </plurals>
+    <string name="history_segments_title">Segments</string>
+    <string name="history_segments_empty">No segment summary was saved.</string>
+    <string name="history_segment_number">Segment %1$d</string>
+    <string name="history_segment_started">Started: %1$s</string>
+    <string name="history_segment_ended">Ended: %1$s</string>
+    <string name="history_segment_ongoing">Ongoing for: %1$s</string>
+    <string name="history_segment_start_reason">Start reason</string>
+    <string name="history_segment_end_reason">End reason</string>
+    <string name="history_label_value">%1$s: %2$s</string>
+</resources>

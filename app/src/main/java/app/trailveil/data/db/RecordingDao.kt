@@ -41,6 +41,17 @@ internal data class PersistedTrackPointChangeRow(
     @ColumnInfo(name = "previous_point_longitude") val previousPointLongitude: Double?,
 )
 
+/** Flat Room projection for ordered accepted points used by the provider-neutral history detail. */
+internal data class HistoryAcceptedTrackPointRow(
+    @ColumnInfo(name = "point_id") val pointId: Long,
+    @ColumnInfo(name = "segment_id") val segmentId: Long,
+    @ColumnInfo(name = "segment_sequence") val segmentSequence: Long,
+    @ColumnInfo(name = "point_sequence") val pointSequence: Long,
+    val timestamp: Long,
+    val latitude: Double,
+    val longitude: Double,
+)
+
 /** Snapshot used by the recording adapter to resume an ACTIVE or STARTING command safely. */
 internal data class RecordingStateProjection(
     @Embedded val session: RecordingSessionEntity,
@@ -228,6 +239,35 @@ internal abstract class RecordingDao {
     @Query("SELECT * FROM recording_sessions ORDER BY id DESC LIMIT 1") abstract suspend fun latestSession(): RecordingSessionEntity?
     @Query("SELECT * FROM recording_sessions WHERE id = :sessionId") abstract suspend fun sessionById(sessionId: Long): RecordingSessionEntity?
     @Transaction @Query("SELECT * FROM recording_sessions WHERE id = :sessionId") abstract suspend fun sessionWithSegments(sessionId: Long): RecordingSessionWithSegments?
+    @Query("SELECT * FROM recording_sessions ORDER BY started_at DESC, id DESC")
+    abstract fun observeHistorySessions(): Flow<List<RecordingSessionEntity>>
+    @Transaction
+    @Query("SELECT * FROM recording_sessions WHERE id = :sessionId")
+    abstract fun observeHistorySessionWithSegments(sessionId: Long): Flow<RecordingSessionWithSegments?>
+    @Transaction
+    @Query("SELECT * FROM recording_sessions ORDER BY id DESC LIMIT 1")
+    abstract fun observeLatestHistorySessionWithSegments(): Flow<RecordingSessionWithSegments?>
+    @Query("SELECT outcome FROM recording_operation_receipts WHERE session_id = :sessionId ORDER BY created_at DESC, rowid DESC LIMIT 1")
+    abstract fun observeLatestOperationOutcome(sessionId: Long): Flow<String?>
+    @Query("SELECT * FROM track_points WHERE session_id = :sessionId ORDER BY id DESC LIMIT 1")
+    abstract fun observeLatestAcceptedPoint(sessionId: Long): Flow<TrackPointEntity?>
+    @Query(
+        """
+        SELECT
+            p.id AS point_id,
+            p.segment_id AS segment_id,
+            s.sequence AS segment_sequence,
+            p.sequence AS point_sequence,
+            p.timestamp AS timestamp,
+            p.latitude AS latitude,
+            p.longitude AS longitude
+        FROM track_points p
+        INNER JOIN track_segments s ON s.id = p.segment_id AND s.session_id = p.session_id
+        WHERE p.session_id = :sessionId
+        ORDER BY s.sequence ASC, p.sequence ASC, p.id ASC
+        """,
+    )
+    abstract fun observeHistoryAcceptedPoints(sessionId: Long): Flow<List<HistoryAcceptedTrackPointRow>>
     @Transaction
     @Query("""SELECT s.*, o.id AS segment_id, o.sequence AS segment_sequence, o.started_at AS segment_started_at, p.id AS point_id, p.sequence AS point_sequence, p.timestamp AS point_timestamp, COALESCE((SELECT MAX(sequence) + 1 FROM track_segments x WHERE x.session_id = s.id), 0) AS nextSegmentSequence, COALESCE((SELECT MAX(sequence) + 1 FROM track_points q WHERE q.segment_id = o.id), 0) AS nextPointSequence FROM recording_sessions s LEFT JOIN track_segments o ON o.session_id = s.id AND o.open_slot = 1 LEFT JOIN track_points p ON p.id = (SELECT z.id FROM track_points z JOIN track_segments zs ON zs.id = z.segment_id WHERE z.session_id = s.id ORDER BY zs.sequence DESC, z.sequence DESC, z.id DESC LIMIT 1) WHERE s.id = :sessionId""")
     abstract suspend fun recordingState(sessionId: Long): RecordingStateProjection?

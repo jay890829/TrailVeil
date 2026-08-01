@@ -53,15 +53,24 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.maplibre.android.MapLibre
+import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.geometry.LatLngBounds
 import org.maplibre.android.geometry.LatLngQuad
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
+import org.maplibre.android.style.layers.CircleLayer
+import org.maplibre.android.style.layers.LineLayer
 import org.maplibre.android.style.layers.Property
 import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.layers.RasterLayer
 import org.maplibre.android.style.sources.ImageSource
+import org.maplibre.android.style.sources.GeoJsonSource
+import org.maplibre.geojson.Feature
+import org.maplibre.geojson.FeatureCollection
+import org.maplibre.geojson.LineString
+import org.maplibre.geojson.Point
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -82,6 +91,38 @@ internal object FogOverlayIds {
     const val Layer = "trailveil-cumulative-fog-layer"
 }
 
+internal object CurrentLocationOverlayIds {
+    const val Source = "trailveil-current-location-source"
+    const val Layer = "trailveil-current-location-layer"
+}
+
+internal object TrackOverlayIds {
+    const val LineSource = "trailveil-session-track-line-source"
+    const val LineLayer = "trailveil-session-track-line-layer"
+    const val PointSource = "trailveil-session-track-point-source"
+    const val PointLayer = "trailveil-session-track-point-layer"
+}
+
+internal data class MapCameraRequest(
+    val requestId: Long,
+    val point: GeoPoint,
+    val zoom: Double = 16.0,
+) {
+    init {
+        require(requestId >= 0L) { "requestId must be non-negative" }
+        require(zoom.isFinite() && zoom in 0.0..22.0) { "zoom must be in 0..22" }
+    }
+}
+
+internal data class MapTrackOverlay(
+    val requestId: Long,
+    val segments: List<List<GeoPoint>>,
+) {
+    init {
+        require(requestId >= 0L) { "requestId must be non-negative" }
+    }
+}
+
 /**
  * Provider failure is deliberately contained inside this surface. It never owns recording,
  * location permissions, canonical points, or fog state.
@@ -94,6 +135,9 @@ internal fun TrailVeilMapSurface(
     savedStateKey: String = "trailveil.map.primary",
     fogRuntime: FogRuntime? = null,
     fogRequired: Boolean = false,
+    cameraRequest: MapCameraRequest? = null,
+    currentLocation: GeoPoint? = null,
+    trackOverlay: MapTrackOverlay? = null,
     onFogRendered: ((FogViewportRender) -> Unit)? = null,
     onFogFailure: (Throwable) -> Unit = {},
 ) {
@@ -241,6 +285,45 @@ internal fun TrailVeilMapSurface(
                 loadState == BasemapLoadState.LOADING
             ) {
                 useLocalFallback()
+            }
+        }
+    }
+
+    LaunchedEffect(readyMap, cameraRequest) {
+        val map = readyMap ?: return@LaunchedEffect
+        val request = cameraRequest ?: return@LaunchedEffect
+        map.animateCamera(
+            CameraUpdateFactory.newLatLngZoom(
+                LatLng(request.point.latitude, request.point.longitude),
+                request.zoom,
+            ),
+        )
+    }
+
+    LaunchedEffect(readyStyle, currentLocation) {
+        readyStyle?.installCurrentLocation(currentLocation)
+    }
+
+    LaunchedEffect(readyStyle, trackOverlay) {
+        readyStyle?.installTrackOverlay(trackOverlay)
+    }
+
+    LaunchedEffect(readyMap, trackOverlay?.requestId) {
+        val map = readyMap ?: return@LaunchedEffect
+        val points = trackOverlay?.segments?.flatten().orEmpty()
+        when (points.size) {
+            0 -> Unit
+            1 -> map.animateCamera(
+                CameraUpdateFactory.newLatLngZoom(
+                    LatLng(points.single().latitude, points.single().longitude),
+                    16.0,
+                ),
+            )
+            else -> {
+                val bounds = LatLngBounds.Builder()
+                    .includes(points.map { LatLng(it.latitude, it.longitude) })
+                    .build()
+                map.animateCamera(CameraUpdateFactory.newLatLngBounds(bounds, TRACK_CAMERA_PADDING_PX))
             }
         }
     }
@@ -483,12 +566,91 @@ private fun Style.installFogMosaic(mosaic: FogTileMosaic) {
         source.setImage(bitmap)
     }
     if (getLayer(FogOverlayIds.Layer) == null) {
+        val layer = RasterLayer(FogOverlayIds.Layer, FogOverlayIds.Source).withProperties(
+            PropertyFactory.rasterFadeDuration(0f),
+            PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
+        )
+        if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
+            addLayer(layer)
+        } else {
+            addLayerBelow(layer, CurrentLocationOverlayIds.Layer)
+        }
+    }
+}
+
+private fun Style.installCurrentLocation(point: GeoPoint?) {
+    val collection = point?.let {
+        FeatureCollection.fromFeature(
+            Feature.fromGeometry(Point.fromLngLat(it.longitude, it.latitude)),
+        )
+    } ?: FeatureCollection.fromFeatures(emptyList<Feature>())
+    val source = getSourceAs<GeoJsonSource>(CurrentLocationOverlayIds.Source)
+    if (source == null) {
+        addSource(GeoJsonSource(CurrentLocationOverlayIds.Source, collection))
+    } else {
+        source.setGeoJson(collection)
+    }
+    if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
         addLayer(
-            RasterLayer(FogOverlayIds.Layer, FogOverlayIds.Source).withProperties(
-                PropertyFactory.rasterFadeDuration(0f),
-                PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
+            CircleLayer(
+                CurrentLocationOverlayIds.Layer,
+                CurrentLocationOverlayIds.Source,
+            ).withProperties(
+                PropertyFactory.circleRadius(7f),
+                PropertyFactory.circleColor("#1565C0"),
+                PropertyFactory.circleStrokeWidth(3f),
+                PropertyFactory.circleStrokeColor("#FFFFFF"),
             ),
         )
+    }
+}
+
+private fun Style.installTrackOverlay(overlay: MapTrackOverlay?) {
+    val segments = overlay?.segments.orEmpty()
+    val lineFeatures = segments
+        .filter { it.size >= 2 }
+        .map { segment ->
+            Feature.fromGeometry(
+                LineString.fromLngLats(
+                    segment.map { Point.fromLngLat(it.longitude, it.latitude) },
+                ),
+            )
+        }
+    val isolatedPointFeatures = segments
+        .filter { it.size == 1 }
+        .map { segment ->
+            val point = segment.single()
+            Feature.fromGeometry(Point.fromLngLat(point.longitude, point.latitude))
+        }
+    installGeoJsonSource(TrackOverlayIds.LineSource, FeatureCollection.fromFeatures(lineFeatures))
+    installGeoJsonSource(TrackOverlayIds.PointSource, FeatureCollection.fromFeatures(isolatedPointFeatures))
+    if (getLayer(TrackOverlayIds.LineLayer) == null) {
+        addLayer(
+            LineLayer(TrackOverlayIds.LineLayer, TrackOverlayIds.LineSource).withProperties(
+                PropertyFactory.lineColor("#6A1B9A"),
+                PropertyFactory.lineWidth(5f),
+                PropertyFactory.lineOpacity(0.9f),
+            ),
+        )
+    }
+    if (getLayer(TrackOverlayIds.PointLayer) == null) {
+        addLayer(
+            CircleLayer(TrackOverlayIds.PointLayer, TrackOverlayIds.PointSource).withProperties(
+                PropertyFactory.circleRadius(5f),
+                PropertyFactory.circleColor("#6A1B9A"),
+                PropertyFactory.circleStrokeWidth(2f),
+                PropertyFactory.circleStrokeColor("#FFFFFF"),
+            ),
+        )
+    }
+}
+
+private fun Style.installGeoJsonSource(id: String, collection: FeatureCollection) {
+    val source = getSourceAs<GeoJsonSource>(id)
+    if (source == null) {
+        addSource(GeoJsonSource(id, collection))
+    } else {
+        source.setGeoJson(collection)
     }
 }
 
@@ -569,6 +731,7 @@ private suspend fun MapView.awaitFullyRenderedFrameAfter(action: () -> Unit) {
 
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
+private const val TRACK_CAMERA_PADDING_PX = 72
 
 private fun PersistedTrackPointChange.toFogRevealUpdate(): FogRevealUpdate =
     FogRevealUpdate(

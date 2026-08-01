@@ -16,6 +16,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -27,10 +28,13 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import app.trailveil.TrailVeilApplication
-import app.trailveil.data.recording.RecordingLifecycle
+import app.trailveil.data.history.RecordingHistoryDetail
+import app.trailveil.map.MapCameraRequest
+import app.trailveil.map.fog.GeoPoint
 import app.trailveil.recording.RecordingForegroundService
 import app.trailveil.recording.RecordingStartBlocker
 import app.trailveil.recording.RecordingStartOutcome
+import app.trailveil.recording.RecordingServiceLocation
 import app.trailveil.map.fog.FogRuntime
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -39,7 +43,10 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 @Composable
-internal fun RecordingEntryRoute(activity: ComponentActivity) {
+internal fun RecordingEntryRoute(
+    activity: ComponentActivity,
+    onOpenHistory: () -> Unit = {},
+) {
     val scope = rememberCoroutineScope()
     val historyStore = remember(activity.applicationContext) {
         PermissionHistoryStore(activity.applicationContext)
@@ -63,7 +70,13 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
     var startAfterNotificationResult by remember { mutableStateOf(false) }
     var locationNotice by rememberSaveable { mutableStateOf<LocationNotice?>(null) }
     var startNotice by rememberSaveable { mutableStateOf<RecordingStartNotice?>(null) }
-    var activeSessionId by remember { mutableStateOf<Long?>(null) }
+    var latestHistoryDetail by remember { mutableStateOf<RecordingHistoryDetail?>(null) }
+    var stoppingSessionId by remember(appContainer) { mutableStateOf<Long?>(null) }
+    var serviceLocation by remember(appContainer) {
+        mutableStateOf<RecordingServiceLocation?>(null)
+    }
+    var cameraRequestId by remember { mutableLongStateOf(0L) }
+    var cameraRequest by remember { mutableStateOf<MapCameraRequest?>(null) }
     var starting by remember { mutableStateOf(false) }
     var fogRuntime by remember { mutableStateOf<FogRuntime?>(null) }
 
@@ -73,6 +86,24 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
 
     LaunchedEffect(appContainer) {
         fogRuntime = withContext(Dispatchers.IO) { appContainer.fogRuntime() }
+    }
+
+    LaunchedEffect(appContainer) {
+        appContainer.recordingHistory.latestSessionDetail().collectLatest { detail ->
+            latestHistoryDetail = detail
+        }
+    }
+
+    LaunchedEffect(appContainer) {
+        appContainer.recordingServiceState.stoppingSessionId.collectLatest {
+            stoppingSessionId = it
+        }
+    }
+
+    LaunchedEffect(appContainer) {
+        appContainer.recordingServiceState.latestAcceptedLocation.collectLatest {
+            serviceLocation = it
+        }
     }
 
     DisposableEffect(activity) {
@@ -99,16 +130,6 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
             )
         }
     }
-    LaunchedEffect(currentHistory, platformRefresh, activityResumed) {
-        if (currentHistory != null && activityResumed) {
-            val repositoryState = appContainer.recordingRepository.state()
-            activeSessionId = repositoryState.sessionId.takeIf {
-                repositoryState.lifecycle == RecordingLifecycle.STARTING ||
-                    repositoryState.lifecycle == RecordingLifecycle.ACTIVE
-            }
-        }
-    }
-
     val permissionUi = snapshot?.let(RecordingPermissionStateMachine::uiState)
     val notificationNotice = when (permissionUi?.notifications) {
         NotificationAccessState.DENIED_SHOW_RATIONALE -> NotificationNotice.RATIONALE
@@ -140,7 +161,6 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
         )
         startNotice = when (outcome) {
             is RecordingStartOutcome.ServiceRequested -> {
-                activeSessionId = outcome.sessionId
                 RecordingStartNotice.STARTED
             }
             is RecordingStartOutcome.PersistenceFailure ->
@@ -291,6 +311,13 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
         }
     }
 
+    val recordingPresentation = latestHistoryDetail.toRecordingPresentation(stoppingSessionId)
+    val currentLocation = serviceLocation
+        ?.takeIf { it.sessionId == recordingPresentation.activeSessionId }
+        ?.let { GeoPoint(latitude = it.latitude, longitude = it.longitude) }
+        ?: recordingPresentation.latestAcceptedPoint?.let { point ->
+            GeoPoint(latitude = point.latitude, longitude = point.longitude)
+        }
     RecordingEntryScreen(
         state = RecordingEntryUiState(
             loading = currentHistory == null,
@@ -298,8 +325,10 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
             locationNotice = locationNotice,
             notificationNotice = notificationNotice,
             startNotice = startNotice,
-            recordingActive = activeSessionId != null,
+            recordingActive = recordingPresentation.activeSessionId != null,
             starting = starting,
+            recordingState = recordingPresentation.state,
+            canRecenter = currentLocation != null,
         ),
         onStart = {
             if (!starting) {
@@ -328,12 +357,11 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
             }
         },
         onStop = {
-            val sessionId = activeSessionId
+            val sessionId = recordingPresentation.activeSessionId
             if (!starting && sessionId != null) {
                 starting = true
                 try {
                     RecordingForegroundService.stopFromVisibleActivity(activity, sessionId)
-                    activeSessionId = null
                     startNotice = RecordingStartNotice.STOP_REQUESTED
                 } catch (_: RuntimeException) {
                     startNotice = RecordingStartNotice.LAUNCH_FAILURE
@@ -402,8 +430,20 @@ internal fun RecordingEntryRoute(activity: ComponentActivity) {
                 null -> Unit
             }
         },
+        onRecenter = {
+            currentLocation?.let { point ->
+                cameraRequestId += 1L
+                cameraRequest = MapCameraRequest(
+                    requestId = cameraRequestId,
+                    point = point,
+                )
+            }
+        },
+        onOpenHistory = onOpenHistory,
         fogRuntime = fogRuntime,
         fogRequired = true,
+        cameraRequest = cameraRequest,
+        currentLocation = currentLocation,
     )
 }
 

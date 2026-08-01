@@ -18,6 +18,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
@@ -26,6 +27,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import app.trailveil.R
 import app.trailveil.map.TrailVeilMapSurface
+import app.trailveil.map.MapCameraRequest
+import app.trailveil.map.fog.GeoPoint
 import app.trailveil.map.fog.FogRuntime
 
 internal enum class LocationNotice {
@@ -49,6 +52,17 @@ internal enum class RecordingStartNotice {
     STOP_REQUESTED,
 }
 
+internal enum class RecordingDisplayState {
+    IDLE,
+    STARTING,
+    RECORDING,
+    POOR_SIGNAL,
+    STOPPING,
+    COMPLETED,
+    INTERRUPTED,
+    FAILED_TO_START,
+}
+
 internal data class RecordingEntryUiState(
     val loading: Boolean = false,
     val firstVisit: Boolean = true,
@@ -57,6 +71,8 @@ internal data class RecordingEntryUiState(
     val startNotice: RecordingStartNotice? = null,
     val recordingActive: Boolean = false,
     val starting: Boolean = false,
+    val recordingState: RecordingDisplayState = RecordingDisplayState.IDLE,
+    val canRecenter: Boolean = false,
 )
 
 internal object RecordingEntryTestTags {
@@ -67,6 +83,9 @@ internal object RecordingEntryTestTags {
     const val NotificationNotice = "recording_entry_notification_notice"
     const val NotificationAction = "recording_entry_notification_action"
     const val StartNotice = "recording_entry_start_notice"
+    const val RecordingState = "recording_entry_recording_state"
+    const val Recenter = "recording_entry_recenter"
+    const val History = "recording_entry_history"
 }
 
 @Composable
@@ -78,8 +97,12 @@ internal fun RecordingEntryScreen(
     onDismissLocationNotice: () -> Unit,
     onNotificationAction: () -> Unit,
     modifier: Modifier = Modifier,
+    onRecenter: () -> Unit = {},
+    onOpenHistory: () -> Unit = {},
     fogRuntime: FogRuntime? = null,
     fogRequired: Boolean = false,
+    cameraRequest: MapCameraRequest? = null,
+    currentLocation: GeoPoint? = null,
 ) {
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -131,11 +154,14 @@ internal fun RecordingEntryScreen(
                 StartNoticeCard(notice)
             }
 
+            RecordingStateCard(state.recordingState)
+
             Spacer(modifier = Modifier.height(2.dp))
             if (state.recordingActive) {
                 OutlinedButton(
                     onClick = onStop,
-                    enabled = !state.starting,
+                    enabled = !state.starting &&
+                        state.recordingState != RecordingDisplayState.STOPPING,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(56.dp)
@@ -175,8 +201,63 @@ internal fun RecordingEntryScreen(
                     .clip(MaterialTheme.shapes.large),
                 fogRuntime = fogRuntime,
                 fogRequired = fogRequired,
+                cameraRequest = cameraRequest,
+                currentLocation = currentLocation,
             )
+            OutlinedButton(
+                onClick = onRecenter,
+                enabled = state.canRecenter,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag(RecordingEntryTestTags.Recenter),
+            ) {
+                Text(text = stringResource(R.string.map_center_latest_location))
+            }
+            TextButton(
+                onClick = onOpenHistory,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag(RecordingEntryTestTags.History),
+            ) {
+                Text(text = stringResource(R.string.history_open))
+            }
         }
+    }
+}
+
+@Composable
+private fun RecordingStateCard(state: RecordingDisplayState) {
+    if (state == RecordingDisplayState.IDLE) return
+    val text = when (state) {
+        RecordingDisplayState.IDLE -> return
+        RecordingDisplayState.STARTING -> R.string.recording_state_starting
+        RecordingDisplayState.RECORDING -> R.string.recording_state_recording
+        RecordingDisplayState.POOR_SIGNAL -> R.string.recording_state_poor_signal
+        RecordingDisplayState.STOPPING -> R.string.recording_state_stopping
+        RecordingDisplayState.COMPLETED -> R.string.recording_state_completed
+        RecordingDisplayState.INTERRUPTED -> R.string.recording_state_interrupted
+        RecordingDisplayState.FAILED_TO_START -> R.string.recording_state_failed
+    }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag(RecordingEntryTestTags.RecordingState),
+        colors = CardDefaults.cardColors(
+            containerColor = when (state) {
+                RecordingDisplayState.POOR_SIGNAL,
+                RecordingDisplayState.INTERRUPTED,
+                RecordingDisplayState.FAILED_TO_START,
+                -> MaterialTheme.colorScheme.errorContainer
+                else -> MaterialTheme.colorScheme.secondaryContainer
+            },
+        ),
+    ) {
+        Text(
+            text = stringResource(text),
+            modifier = Modifier.padding(18.dp),
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+        )
     }
 }
 

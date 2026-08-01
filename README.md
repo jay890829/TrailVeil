@@ -4,7 +4,7 @@ TrailVeil is a privacy-first Android exploration-map app inspired by [Fog of Wor
 
 ## Project status
 
-TrailVeil now has an Android 14+ application with canonical Room track storage, a deterministic location-quality and recording state machine, a location foreground service, contextual permission/settings UX, and a production MapLibre Native + OpenFreeMap surface with a local no-network fallback and Room-backed cumulative fog. History UI, scale validation, and physical-device endurance gates remain unfinished.
+TrailVeil now has an Android 14+ application with canonical Room track storage, a deterministic location-quality and recording state machine, a location foreground service, contextual permission/settings UX, and a production MapLibre Native + OpenFreeMap surface with a local no-network fallback and Room-backed cumulative fog. The app also provides persisted recording states, a live accepted-location marker, recentering, and local history list/detail screens with segment-safe single-session tracks. Scale validation and physical-device endurance gates remain unfinished.
 
 The development requirements and current limitations are summarized below.
 
@@ -79,7 +79,7 @@ Run all debug instrumentation tests or only the recording-entry Compose tests wi
 .\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.RecordingEntryScreenTest
 ```
 
-These instrumentation commands require a compatible device/emulator. The current 39-test suite has passed on official Android Emulator AVDs for API 34, 35, and 36. The Room-to-MapLibre cumulative-fog gate also measured 20 persisted-point samples through the next fully rendered frame on API 36 at p95 411 ms and maximum 441 ms against the 2,000 ms target.
+These instrumentation commands require a compatible device/emulator. The current 52-test suite has passed on official Android Emulator AVDs for API 34, 35, and 36. The Room-to-MapLibre cumulative-fog gate also measured 20 persisted-point samples through the next fully rendered frame on API 36 at p95 411 ms and maximum 441 ms against the 2,000 ms target.
 
 ## Internal signing
 

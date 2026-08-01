@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="history_title">探索紀錄</string>
+    <string name="history_list_body">已儲存的探索資料只會留在這台裝置上。</string>
+    <string name="history_loading">正在載入已儲存的探索資料…</string>
+    <string name="history_empty_title">尚無已儲存的探索</string>
+    <string name="history_empty_body">完成一次探索後，這裡會顯示它的持久化摘要。</string>
+    <string name="history_detail_title">探索詳情</string>
+    <string name="history_back">返回紀錄</string>
+    <string name="history_missing_title">此探索資料無法使用</string>
+    <string name="history_missing_body">它可能已從這台裝置移除。</string>
+    <string name="history_status_starting">正在開始</string>
+    <string name="history_status_starting_description">TrailVeil 正在建立可持久保存的探索紀錄。</string>
+    <string name="history_status_active">進行中</string>
+    <string name="history_status_active_description">這次探索目前仍在記錄中。</string>
+    <string name="history_status_completed">已完成</string>
+    <string name="history_status_completed_description">這次探索已安全停止並儲存。</string>
+    <string name="history_status_interrupted">已中斷</string>
+    <string name="history_status_interrupted_description">記錄意外結束；已儲存的點位仍可使用。</string>
+    <string name="history_status_failed_to_start">無法開始</string>
+    <string name="history_status_failed_to_start_description">TrailVeil 無法建立進行中的記錄。</string>
+    <string name="history_started_at">開始時間</string>
+    <string name="history_ended_at">結束時間</string>
+    <string name="history_ongoing">已進行</string>
+    <string name="history_stop_reason">停止原因</string>
+    <string name="history_track_title">已記錄軌跡</string>
+    <string name="history_track_empty">未儲存合格的軌跡點。</string>
+    <string name="history_metrics">%1$s · %2$s · %3$s</string>
+    <string name="history_detail_metrics">%1$s · %2$s · %3$s · %4$s</string>
+    <plurals name="history_accepted_points">
+        <item quantity="other">已接受 %d 個點位</item>
+    </plurals>
+    <plurals name="history_rejected_points">
+        <item quantity="other">已拒絕 %d 個點位</item>
+    </plurals>
+    <string name="history_segments_title">路段</string>
+    <string name="history_segments_empty">未儲存路段摘要。</string>
+    <string name="history_segment_number">路段 %1$d</string>
+    <string name="history_segment_started">開始：%1$s</string>
+    <string name="history_segment_ended">結束：%1$s</string>
+    <string name="history_segment_ongoing">已進行：%1$s</string>
+    <string name="history_segment_start_reason">開始原因</string>
+    <string name="history_segment_end_reason">結束原因</string>
+    <string name="history_label_value">%1$s：%2$s</string>
+</resources>

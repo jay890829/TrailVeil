@@ -44,4 +44,13 @@
     <string name="recording_notification_title">正在記錄足跡</string>
     <string name="recording_notification_text">TrailVeil 正在背景記錄位置。</string>
     <string name="recording_notification_stop">停止記錄</string>
+    <string name="recording_state_starting">正在建立可安全保存的探索記錄…</string>
+    <string name="recording_state_recording">正在記錄這次探索。</string>
+    <string name="recording_state_poor_signal">目前定位訊號不足，暫時不會寫入不可靠的位置；記錄仍會持續並自動恢復。</string>
+    <string name="recording_state_stopping">正在安全停止並保存這次探索…</string>
+    <string name="recording_state_completed">最近一次探索已完成並保存。</string>
+    <string name="recording_state_interrupted">最近一次探索曾中斷，已保存的位置仍保留在歷史中。</string>
+    <string name="recording_state_failed">最近一次探索無法開始，目前沒有進行中的記錄。</string>
+    <string name="map_center_latest_location">移至最新記錄位置</string>
+    <string name="history_open">探索歷史</string>
 </resources>

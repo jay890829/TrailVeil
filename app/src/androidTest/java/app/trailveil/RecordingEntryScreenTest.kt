@@ -1,10 +1,13 @@
 package app.trailveil
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.feature.recording.LocationNotice
@@ -12,6 +15,7 @@ import app.trailveil.feature.recording.NotificationNotice
 import app.trailveil.feature.recording.RecordingEntryScreen
 import app.trailveil.feature.recording.RecordingEntryTestTags
 import app.trailveil.feature.recording.RecordingEntryUiState
+import app.trailveil.feature.recording.RecordingDisplayState
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -136,5 +140,71 @@ class RecordingEntryScreenTest {
             .assertIsDisplayed()
             .performClick()
         assertEquals(1, stopCalls.get())
+    }
+
+    @Test
+    fun poorSignalAndStoppingStatesAreExplicit() {
+        val poorSignal = InstrumentationRegistry.getInstrumentation()
+            .targetContext
+            .getString(R.string.recording_state_poor_signal)
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    recordingActive = true,
+                    recordingState = RecordingDisplayState.POOR_SIGNAL,
+                ),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.RecordingState).assertIsDisplayed()
+        composeRule.onNodeWithText(poorSignal).assertIsDisplayed()
+    }
+
+    @Test
+    fun mapRecenterAndHistoryControlsAreExplicitUserActions() {
+        val recenterCalls = AtomicInteger()
+        val historyCalls = AtomicInteger()
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(canRecenter = true),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+                onRecenter = recenterCalls::incrementAndGet,
+                onOpenHistory = historyCalls::incrementAndGet,
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Recenter)
+            .performScrollTo()
+            .performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.History)
+            .performScrollTo()
+            .performClick()
+        assertEquals(1, recenterCalls.get())
+        assertEquals(1, historyCalls.get())
+    }
+
+    @Test
+    fun mapRecenterIsDisabledUntilAPersistedPointExists() {
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(canRecenter = false),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Recenter).assertIsNotEnabled()
     }
 }

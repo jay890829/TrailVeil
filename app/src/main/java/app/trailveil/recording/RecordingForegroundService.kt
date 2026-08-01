@@ -7,6 +7,7 @@ import android.os.IBinder
 import androidx.core.content.ContextCompat
 import app.trailveil.TrailVeilApplication
 import app.trailveil.data.recording.RecordingLifecycle
+import app.trailveil.data.recording.LocationDisposition
 import app.trailveil.data.location.LocationPermissionException
 import app.trailveil.data.location.LocationProviderDisabledException
 import app.trailveil.data.location.LocationProviderUnavailableException
@@ -74,6 +75,7 @@ class RecordingForegroundService : Service() {
         collectorJob?.cancel()
         commands.close()
         serviceScope.cancel()
+        if (::dependencies.isInitialized) dependencies.recordingServiceState.clearStopping()
         super.onDestroy()
     }
 
@@ -187,6 +189,7 @@ class RecordingForegroundService : Service() {
             NotificationStopDecision.STOP_CURRENT_SESSION -> Unit
         }
         val activeSessionId = requireNotNull(sessionId)
+        dependencies.recordingServiceState.markStopping(activeSessionId)
         try {
             // User intent is the only service path that records COMPLETED.
             dependencies.recordingRepository.stop(
@@ -283,10 +286,19 @@ class RecordingForegroundService : Service() {
             try {
                 dependencies.locationEngine.fixes().collect { fix ->
                     try {
-                        dependencies.recordingRepository.deliverLocation(
+                        val result = dependencies.recordingRepository.deliverLocation(
                             dependencies.operationIds.next("location"), sessionId, fix,
                             dependencies.clock.elapsedRealtimeNanos(), dependencies.clock.epochMillis(),
                         )
+                        if (result.disposition == LocationDisposition.ACCEPTED) {
+                            dependencies.recordingServiceState.publishAcceptedLocation(
+                                RecordingServiceLocation(
+                                    sessionId = sessionId,
+                                    latitude = fix.latitude,
+                                    longitude = fix.longitude,
+                                ),
+                            )
+                        }
                     } catch (cancelled: CancellationException) {
                         throw cancelled
                     } catch (failure: Exception) {
@@ -335,6 +347,8 @@ class RecordingForegroundService : Service() {
         collectorJob?.cancel()
         collectorJob = null
         collectorSessionId = null
+        dependencies.recordingServiceState.clearStopping()
+        dependencies.recordingServiceState.clearLocation()
         notifier.dismiss(this)
         stopSelfResult(startId)
     }

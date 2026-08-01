@@ -5,6 +5,8 @@ import android.location.LocationManager
 import app.trailveil.data.db.TrailVeilDatabase
 import app.trailveil.data.location.LocationEngine
 import app.trailveil.data.location.PlatformLocationEngine
+import app.trailveil.data.history.RecordingHistoryDataSource
+import app.trailveil.data.history.RoomRecordingHistoryDataSource
 import app.trailveil.data.map.RoomPersistedTrackPointChangeFeed
 import app.trailveil.data.map.RoomViewportTrackPointReader
 import app.trailveil.data.map.ViewportTrackDataSource
@@ -33,11 +35,14 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     override val recordingRepository: RecordingRepository = RecordingRepository(
         RoomRecordingStore(database.recordingDao()),
     )
+    val recordingHistory: RecordingHistoryDataSource =
+        RoomRecordingHistoryDataSource(database.recordingDao())
     override val locationEngine: LocationEngine = PlatformLocationEngine(
         requireNotNull(context.applicationContext.getSystemService(LocationManager::class.java)),
     )
     override val clock: RecordingServiceClock = SystemRecordingServiceClock
     override val operationIds: RecordingOperationIdFactory = UuidRecordingOperationIdFactory
+    override val recordingServiceState = RecordingServiceState()
 
     @Volatile
     private var createdFogRuntime: FogRuntime? = null
@@ -95,6 +100,7 @@ internal interface RecordingRuntimeDependencies {
     val locationEngine: LocationEngine
     val clock: RecordingServiceClock
     val operationIds: RecordingOperationIdFactory
+    val recordingServiceState: RecordingServiceState
 }
 
 internal interface RecordingServiceClock {
