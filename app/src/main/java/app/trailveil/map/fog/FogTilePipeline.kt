@@ -16,6 +16,11 @@ data class FogCacheInvalidation(
     val diskEntries: Int,
 )
 
+data class FogRevealMerge(
+    val updatedKeys: Set<FogTileKey>,
+    val missingKeys: Set<FogTileKey>,
+)
+
 /**
  * Provider-neutral memory -> disk -> renderer chain for one complete fog mask.
  *
@@ -30,19 +35,46 @@ class FogTilePipeline(
 ) {
     @Synchronized
     fun load(key: FogTileKey, segments: List<TrackSegment>): FogTileLoad {
-        memoryCache.get(key)?.let { mask ->
-            return FogTileLoad(mask, FogTileLoadSource.MEMORY)
-        }
-
-        runCatching { diskCache?.get(key) }.getOrNull()?.let { mask ->
-            memoryCache.put(key, mask)
-            return FogTileLoad(mask, FogTileLoadSource.DISK)
-        }
+        cached(key)?.let { return it }
 
         val rendered = renderMask(key, segments)
-        memoryCache.put(key, rendered)
-        runCatching { diskCache?.put(key, rendered) }
+        store(key, rendered)
         return FogTileLoad(rendered, FogTileLoadSource.RENDERED)
+    }
+
+    /**
+     * Unions one newly persisted reveal into complete cached masks.
+     *
+     * Missing tiles are never populated from the delta alone because that would omit canonical
+     * history. Callers must rebuild [FogRevealMerge.missingKeys] from Room before display.
+     */
+    @Synchronized
+    fun mergeReveal(
+        keys: Collection<FogTileKey>,
+        revealSegments: List<TrackSegment>,
+    ): FogRevealMerge {
+        val updated = linkedSetOf<FogTileKey>()
+        val missing = linkedSetOf<FogTileKey>()
+        keys.distinct().forEach { key ->
+            val existing = cached(key)?.mask
+            if (existing == null) {
+                missing += key
+            } else {
+                val merged = try {
+                    mergeMasks(existing, renderMask(key, revealSegments))
+                } catch (failure: Exception) {
+                    invalidate(listOf(key))
+                    throw failure
+                }
+                if (store(key, merged)) {
+                    updated += key
+                } else {
+                    invalidate(listOf(key))
+                    missing += key
+                }
+            }
+        }
+        return FogRevealMerge(updatedKeys = updated, missingKeys = missing)
     }
 
     @Synchronized
@@ -67,5 +99,42 @@ class FogTilePipeline(
     fun clear() {
         memoryCache.clear()
         runCatching { diskCache?.clear() }
+    }
+
+    private fun cached(key: FogTileKey): FogTileLoad? {
+        memoryCache.get(key)?.let { mask ->
+            return FogTileLoad(mask, FogTileLoadSource.MEMORY)
+        }
+        runCatching { diskCache?.get(key) }.getOrNull()?.let { mask ->
+            memoryCache.put(key, mask)
+            return FogTileLoad(mask, FogTileLoadSource.DISK)
+        }
+        return null
+    }
+
+    private fun store(key: FogTileKey, mask: FogPixelMask): Boolean {
+        val memoryStored = memoryCache.put(key, mask)
+        val diskStored = diskCache?.let { cache ->
+            runCatching { cache.put(key, mask) }.getOrDefault(false)
+        } ?: false
+        diskCache?.takeIf { !diskStored }?.let { cache ->
+            runCatching { cache.invalidate(listOf(key)) }
+        }
+        return memoryStored || diskStored
+    }
+
+    private fun mergeMasks(existing: FogPixelMask, delta: FogPixelMask): FogPixelMask {
+        require(existing.width == delta.width && existing.height == delta.height) {
+            "fog reveal delta dimensions must match the cached mask"
+        }
+        val existingAlpha = existing.copyAlpha()
+        val deltaAlpha = delta.copyAlpha()
+        val merged = ByteArray(existingAlpha.size) { index ->
+            minOf(
+                existingAlpha[index].toInt() and 0xff,
+                deltaAlpha[index].toInt() and 0xff,
+            ).toByte()
+        }
+        return FogPixelMask(existing.width, existing.height, merged)
     }
 }

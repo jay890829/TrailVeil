@@ -1,7 +1,9 @@
 package app.trailveil.map.fog
 
 import java.util.concurrent.atomic.AtomicInteger
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertThrows
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -82,6 +84,70 @@ class FogTilePipelineTest {
     }
 
     @Test
+    fun revealDeltaUnionsWithCompleteMemoryAndDiskMasks() {
+        val memory = FogMemoryTileCache(maxBytes = 64)
+        val disk = FogDiskTileCache(temporaryFolder.newFolder(), maxBytes = 1_000)
+        val renderCount = AtomicInteger()
+        val base = alphaMask(0, 184, 184, 184)
+        val delta = alphaMask(184, 0, 184, 184)
+        val combined = alphaMask(0, 0, 184, 184)
+        val pipeline = FogTilePipeline(memory, disk) { _, segments ->
+            renderCount.incrementAndGet()
+            if (segments.single().id == 1) base else delta
+        }
+        val key = key(x = 0)
+        pipeline.load(key, segment(id = 1))
+
+        assertEquals(
+            FogRevealMerge(updatedKeys = setOf(key), missingKeys = emptySet()),
+            pipeline.mergeReveal(listOf(key, key), segment(id = 2)),
+        )
+        assertArrayEquals(
+            combined.copyAlpha(),
+            pipeline.load(key, emptyList()).mask.copyAlpha(),
+        )
+        memory.clear()
+        val diskLoad = pipeline.load(key, emptyList())
+        assertEquals(FogTileLoadSource.DISK, diskLoad.source)
+        assertArrayEquals(combined.copyAlpha(), diskLoad.mask.copyAlpha())
+        assertEquals(2, renderCount.get())
+    }
+
+    @Test
+    fun revealDeltaNeverPopulatesAnIncompleteCacheMiss() {
+        val memory = FogMemoryTileCache(maxBytes = 64)
+        val disk = FogDiskTileCache(temporaryFolder.newFolder(), maxBytes = 1_000)
+        val renderCount = AtomicInteger()
+        val pipeline = pipeline(memory, disk, renderCount, mask(1))
+        val key = key(x = 1)
+
+        assertEquals(
+            FogRevealMerge(updatedKeys = emptySet(), missingKeys = setOf(key)),
+            pipeline.mergeReveal(listOf(key), segment(id = 2)),
+        )
+        assertEquals(0, renderCount.get())
+        assertEquals(FogTileCacheStats(entryCount = 0, byteCount = 0), memory.stats())
+        assertEquals(FogDiskTileCacheStats(entryCount = 0, byteCount = 0), disk.stats())
+    }
+
+    @Test
+    fun incompatibleRevealDeltaInvalidatesStaleCopies() {
+        val memory = FogMemoryTileCache(maxBytes = 64)
+        val disk = FogDiskTileCache(temporaryFolder.newFolder(), maxBytes = 1_000)
+        val pipeline = FogTilePipeline(memory, disk) { _, segments ->
+            if (segments.single().id == 1) mask(1) else FogPixelMask(1, 1, byteArrayOf(0))
+        }
+        val key = key(x = 2)
+        pipeline.load(key, segment(id = 1))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            pipeline.mergeReveal(listOf(key), segment(id = 2))
+        }
+        assertEquals(FogTileCacheStats(entryCount = 0, byteCount = 0), memory.stats())
+        assertEquals(FogDiskTileCacheStats(entryCount = 0, byteCount = 0), disk.stats())
+    }
+
+    @Test
     fun clearDropsDerivedLayersWithoutChangingTheRendererInput() {
         val memory = FogMemoryTileCache(maxBytes = 64)
         val disk = FogDiskTileCache(temporaryFolder.newFolder(), maxBytes = 1_000)
@@ -117,6 +183,13 @@ class FogTilePipelineTest {
 
     private fun mask(alpha: Int) =
         FogPixelMask(width = 2, height = 2, alpha = ByteArray(4) { alpha.toByte() })
+
+    private fun alphaMask(vararg alpha: Int) =
+        FogPixelMask(width = 2, height = 2, alpha = ByteArray(alpha.size) { alpha[it].toByte() })
+
+    private fun segment(id: Int) = listOf(
+        TrackSegment(id = id, points = listOf(GeoPoint(latitude = 25.0, longitude = 121.0))),
+    )
 
     private fun segments() = listOf(
         TrackSegment(id = 1, points = listOf(GeoPoint(latitude = 25.0, longitude = 121.0))),
