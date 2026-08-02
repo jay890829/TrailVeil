@@ -168,6 +168,94 @@ class FogTilePipelineTest {
         assertEquals(2, renderCount.get())
     }
 
+    @Test
+    fun failedDiskClearPermanentlyDisablesStaleDiskReadsForThePipeline() {
+        val root = temporaryFolder.newFolder()
+        val key = key(x = 0)
+        val original = mask(1)
+        val seeded = pipeline(
+            FogMemoryTileCache(maxBytes = 64),
+            FogDiskTileCache(root, maxBytes = 1_000),
+            AtomicInteger(),
+            original,
+        )
+        seeded.load(key, segments())
+
+        val renderCount = AtomicInteger()
+        val rebuilt = mask(9)
+        val pipeline = pipeline(
+            FogMemoryTileCache(maxBytes = 64),
+            FogDiskTileCache(
+                rootDirectory = root,
+                maxBytes = 1_000,
+                deleteFile = { false },
+            ),
+            renderCount,
+            rebuilt,
+        )
+
+        pipeline.clear()
+
+        assertEquals(FogTileLoadSource.RENDERED, pipeline.load(key, segments()).source)
+        assertArrayEquals(rebuilt.copyAlpha(), pipeline.load(key, emptyList()).mask.copyAlpha())
+        assertEquals(1, renderCount.get())
+    }
+
+    @Test
+    fun failedDiskInvalidatePermanentlyDisablesStaleDiskReadsForThePipeline() {
+        val root = temporaryFolder.newFolder()
+        val key = key(x = 0)
+        val original = mask(1)
+        FogDiskTileCache(root, maxBytes = 1_000).put(key, original)
+        val renderCount = AtomicInteger()
+        val rebuilt = mask(9)
+        val pipeline = pipeline(
+            FogMemoryTileCache(maxBytes = 64),
+            FogDiskTileCache(
+                rootDirectory = root,
+                maxBytes = 1_000,
+                deleteFile = { false },
+            ),
+            renderCount,
+            rebuilt,
+        )
+        assertEquals(FogTileLoadSource.DISK, pipeline.load(key, segments()).source)
+
+        pipeline.invalidate(listOf(key))
+
+        assertEquals(FogTileLoadSource.RENDERED, pipeline.load(key, segments()).source)
+        assertArrayEquals(rebuilt.copyAlpha(), pipeline.load(key, emptyList()).mask.copyAlpha())
+        assertEquals(1, renderCount.get())
+    }
+
+    @Test
+    fun failedDiskVersionRetentionPermanentlyDisablesStaleDiskReadsForThePipeline() {
+        val root = temporaryFolder.newFolder()
+        val obsolete = key(x = 0, renderVersion = 1)
+        FogDiskTileCache(root, maxBytes = 1_000).put(obsolete, mask(1))
+        val renderCount = AtomicInteger()
+        val rebuilt = mask(9)
+        val pipeline = pipeline(
+            FogMemoryTileCache(maxBytes = 64),
+            FogDiskTileCache(
+                rootDirectory = root,
+                maxBytes = 1_000,
+                deleteFile = { false },
+            ),
+            renderCount,
+            rebuilt,
+        )
+
+        pipeline.retainRenderVersion(2)
+
+        assertEquals(FogTileLoadSource.RENDERED, pipeline.load(obsolete, segments()).source)
+        assertArrayEquals(
+            rebuilt.copyAlpha(),
+            pipeline.load(obsolete, emptyList()).mask.copyAlpha(),
+        )
+        assertEquals(1, renderCount.get())
+    }
+
     private fun pipeline(
         memory: FogMemoryTileCache,
         disk: FogDiskTileCache,

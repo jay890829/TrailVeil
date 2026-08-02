@@ -215,8 +215,9 @@ class FogRevealLatencyTest {
 
         override suspend fun readChangesAfter(
             cursor: PersistedPointCursor,
+            limit: Int,
         ): List<PersistedTrackPointChange> =
-            delegate.readChangesAfter(cursor).also { changes ->
+            delegate.readChangesAfter(cursor, limit).also { changes ->
                 synchronized(reads) { reads += changes }
             }
     }

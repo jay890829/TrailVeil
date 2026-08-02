@@ -4,7 +4,7 @@ TrailVeil is a privacy-first Android exploration-map app inspired by [Fog of Wor
 
 ## Project status
 
-TrailVeil now has an Android 14+ application with canonical Room track storage, a deterministic location-quality and recording state machine, a location foreground service, contextual permission/settings UX, and a production MapLibre Native + OpenFreeMap surface with a local no-network fallback and Room-backed cumulative fog. The app also provides persisted recording states, a live accepted-location marker, recentering, and local history list/detail screens with segment-safe single-session tracks. Scale validation and physical-device endurance gates remain unfinished.
+TrailVeil now has an Android 14+ application with canonical Room track storage, a deterministic location-quality and recording state machine, a location foreground service, contextual permission/settings UX, and a production MapLibre Native + OpenFreeMap surface with a local no-network fallback and Room-backed cumulative fog. The app also provides persisted recording states, a live accepted-location marker, recentering, and local history list/detail screens with segment-safe single-session tracks. Bounded live fog updates and opt-in 10k/100k scale benchmarks are implemented; the designated mid-range physical-device performance and endurance gates remain unfinished.
 
 The development requirements and current limitations are summarized below.
 
@@ -79,7 +79,18 @@ Run all debug instrumentation tests or only the recording-entry Compose tests wi
 .\gradlew.bat connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.RecordingEntryScreenTest
 ```
 
-These instrumentation commands require a compatible device/emulator. The current 52-test suite has passed on official Android Emulator AVDs for API 34, 35, and 36. The Room-to-MapLibre cumulative-fog gate also measured 20 persisted-point samples through the next fully rendered frame on API 36 at p95 411 ms and maximum 441 ms against the 2,000 ms target.
+These instrumentation commands require a compatible device/emulator. The P4-002 52-test suite passed on official Android Emulator AVDs for API 34, 35, and 36. The Room-to-MapLibre cumulative-fog gate also measured 20 persisted-point samples through the next fully rendered frame on API 36 at p95 411 ms and maximum 441 ms against the 2,000 ms target.
+
+The deterministic scale benchmarks are opt-in so ordinary connected test runs stay bounded. Use a dedicated empty test install with device networking disabled for the production UI benchmark; the test fails unless the packaged local basemap fallback is active:
+
+```powershell
+.\gradlew.bat connectedDebugAndroidTest "-Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.benchmark.ScaleBenchmarkTest" "-Pandroid.testInstrumentationRunnerArguments.trailveilScale=true"
+.\gradlew.bat connectedDebugAndroidTest "-Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.benchmark.UiScaleBenchmarkTest" "-Pandroid.testInstrumentationRunnerArguments.trailveilUiScale=true"
+```
+
+The core benchmark measures 10k/100k canonical Room bbox reads, cold fog rebuilds, warm derived-cache loads, and peak process PSS. The UI benchmark drives the production MainActivity and MapLibre surface through fixed pan/zoom operations and 20 lifecycle recoveries while checking camera and fog continuity. Emulator results are engineering evidence only; the PLAN frame-time gate still requires its designated mid-range physical device.
+
+On that designated device, append `"-Pandroid.testInstrumentationRunnerArguments.trailveilEnforceFrameGate=true"` to the UI command. This rejects emulators and enforces p95 frame time <= 32 ms plus frozen frames < 1%; omitting it records engineering evidence without claiming the physical-device gate.
 
 ## Internal signing
 

@@ -73,5 +73,16 @@ interface PersistedTrackPointChangeFeed {
 
     fun revisionsAfter(cursor: PersistedPointCursor): Flow<PersistedPointRevision>
 
-    suspend fun readChangesAfter(cursor: PersistedPointCursor): List<PersistedTrackPointChange>
+    /**
+     * Reads at most [limit] canonical changes after [cursor]. Callers must advance only to the
+     * final point actually returned and continue paging until their target revision is reached.
+     */
+    suspend fun readChangesAfter(
+        cursor: PersistedPointCursor,
+        limit: Int = DEFAULT_CHANGE_PAGE_SIZE,
+    ): List<PersistedTrackPointChange>
+
+    companion object {
+        const val DEFAULT_CHANGE_PAGE_SIZE = 256
+    }
 }

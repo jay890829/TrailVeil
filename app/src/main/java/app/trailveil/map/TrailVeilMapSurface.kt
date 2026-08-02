@@ -13,6 +13,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -35,10 +36,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.savedstate.compose.LocalSavedStateRegistryOwner
 import app.trailveil.R
-import app.trailveil.data.map.PersistedPointCursor
-import app.trailveil.data.map.PersistedTrackPointChange
 import app.trailveil.map.fog.FogPixelMask
-import app.trailveil.map.fog.FogRevealUpdate
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogTileMosaic
 import app.trailveil.map.fog.FogViewportRequest
@@ -195,6 +193,16 @@ internal fun TrailVeilMapSurface(
     var fogBaselineReady by remember(mapView, fogRuntime) {
         mutableStateOf(fogRuntime == null)
     }
+    // Read in composition, not inside the effect: a state read performed only while applying a
+    // side effect is not observed, so publication would silently stop tracking the state it
+    // reports. The status badge short-circuits on the basemap state, so `canonicalFogLoaded` has
+    // no other composition read while the local fallback is active.
+    val publishedFogGeneration = if (canonicalFogLoaded) fogViewportGeneration else null
+    val publishedLoadState = loadState.name
+    SideEffect {
+        mapView.setTag(R.id.map_fog_canonical_generation, publishedFogGeneration)
+        mapView.setTag(R.id.map_basemap_load_state, publishedLoadState)
+    }
 
     fun useLocalFallback() {
         val map = readyMap ?: return
@@ -331,46 +339,31 @@ internal fun TrailVeilMapSurface(
     LaunchedEffect(fogRuntime) {
         val runtime = fogRuntime ?: return@LaunchedEffect
         fogBaselineReady = false
-        var cursor = establishFogBaselineWithRetry(
-            retryDelayMillis = FOG_RETRY_DELAY_MILLIS,
-            latestCursor = {
-                withContext(Dispatchers.IO) { runtime.pointChanges.latestCursor() }
-            },
-            clearDerivedCache = {
-                withContext(Dispatchers.Default) {
-                    // Derived masks have no persistent data revision; a process baseline therefore
-                    // starts from canonical Room instead of a possibly stale prior-process cache.
-                    runtime.viewportCoordinator.clearDerivedCache()
-                }
-            },
-            onFailure = currentOnFogFailure,
-        )
-        fogBaselineReady = true
-        fogRevision += 1L
-
         while (true) {
             try {
-                runtime.pointChanges.revisionsAfter(cursor).collect { revision ->
-                    val changes = withContext(Dispatchers.IO) {
-                        runtime.pointChanges.readChangesAfter(cursor)
+                val baseline = withContext(Dispatchers.Default) {
+                    runtime.changeSynchronizer.synchronizeTo()
+                }
+                fogBaselineReady = true
+                fogRenderFailed = false
+                fogRevision += 1L
+                runtime.pointChanges.revisionsAfter(baseline.cursor).collect { revision ->
+                    val synchronization = withContext(Dispatchers.Default) {
+                        runtime.changeSynchronizer.synchronizeTo(revision.latestCursor)
                     }
-                    if (changes.isNotEmpty()) {
-                        withContext(Dispatchers.Default) {
-                            runtime.viewportCoordinator.mergePersistedReveals(
-                                changes.map(PersistedTrackPointChange::toFogRevealUpdate),
-                            )
-                        }
-                        cursor = changes.last().point.let { point ->
-                            app.trailveil.data.map.PersistedPointCursor(point.pointId)
-                        }
+                    if (synchronization.mergedChanges > 0) {
                         fogRevision += 1L
-                    } else {
-                        cursor = revision.latestCursor
                     }
                 }
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Exception) {
+                fogBaselineReady = false
+                fogCoverageInstalled = false
+                canonicalFogLoaded = false
+                fogRenderFailed = true
+                fogPlaceholderReadyGeneration = -1L
+                fogViewportGeneration += 1L
                 currentOnFogFailure(failure)
                 delay(1_000L)
             }
@@ -672,15 +665,6 @@ internal suspend fun renderCanonicalFogWithRetry(
     render(request).also { rendered -> installAndAwait(rendered) }
 }
 
-internal suspend fun establishFogBaselineWithRetry(
-    retryDelayMillis: Long,
-    latestCursor: suspend () -> PersistedPointCursor,
-    clearDerivedCache: suspend () -> Unit,
-    onFailure: (Exception) -> Unit,
-): PersistedPointCursor = retryFogOperation(retryDelayMillis, onFailure) {
-    latestCursor().also { clearDerivedCache() }
-}
-
 private suspend fun <T> retryFogOperation(
     retryDelayMillis: Long,
     onFailure: (Exception) -> Unit,
@@ -732,14 +716,6 @@ private suspend fun MapView.awaitFullyRenderedFrameAfter(action: () -> Unit) {
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
 private const val TRACK_CAMERA_PADDING_PX = 72
-
-private fun PersistedTrackPointChange.toFogRevealUpdate(): FogRevealUpdate =
-    FogRevealUpdate(
-        current = GeoPoint(point.latitude, point.longitude),
-        previousInSegment = previousPoint?.let { previous ->
-            GeoPoint(previous.latitude, previous.longitude)
-        },
-    )
 
 @Composable
 private fun MapStatusBadge(text: String) {

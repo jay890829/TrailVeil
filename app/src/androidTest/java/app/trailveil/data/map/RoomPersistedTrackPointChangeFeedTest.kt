@@ -92,6 +92,41 @@ class RoomPersistedTrackPointChangeFeedTest {
         assertEquals(baseline.pointId + 1, emitted.latestCursor.pointId)
     }
 
+    @Test
+    fun boundedPagingReturns128Then128ThenRemainderWithBoundaryPredecessor() = runBlocking {
+        val recording = startRecording(100)
+        repeat(257) { index ->
+            append(
+                recording = recording,
+                sequence = index.toLong(),
+                latitude = 25.0 + index * 0.000001,
+            )
+        }
+
+        var cursor = PersistedPointCursor(0L)
+        val pages = mutableListOf<List<PersistedTrackPointChange>>()
+        repeat(3) {
+            val page = feed.readChangesAfter(cursor, limit = 128)
+            pages += page
+            cursor = PersistedPointCursor(page.last().point.pointId)
+        }
+
+        assertEquals(listOf(128, 128, 1), pages.map(List<*>::size))
+        assertEquals(
+            pages[0].last().point.pointId,
+            pages[1].first().previousPoint?.pointId,
+        )
+        assertEquals(
+            pages[1].last().point.pointId,
+            pages[2].first().previousPoint?.pointId,
+        )
+        assertEquals(feed.latestCursor(), cursor)
+        assertEquals(
+            (1L..257L).toList(),
+            pages.flatten().map { it.point.pointSequence + 1L },
+        )
+    }
+
     private suspend fun startRecording(startedAt: Long): StartedRecording =
         dao.startSession(
             session = RecordingSessionEntity(

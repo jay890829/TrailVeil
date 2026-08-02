@@ -33,6 +33,8 @@ class FogTilePipeline(
     private val diskCache: FogDiskTileCache?,
     private val renderMask: (FogTileKey, List<TrackSegment>) -> FogPixelMask,
 ) {
+    private var diskCacheEnabled = diskCache != null
+
     @Synchronized
     fun load(key: FogTileKey, segments: List<TrackSegment>): FogTileLoad {
         cached(key)?.let { return it }
@@ -81,7 +83,15 @@ class FogTilePipeline(
     fun invalidate(keys: Collection<FogTileKey>): FogCacheInvalidation =
         FogCacheInvalidation(
             memoryEntries = memoryCache.invalidate(keys),
-            diskEntries = runCatching { diskCache?.invalidate(keys) ?: 0 }.getOrDefault(0),
+            diskEntries = activeDiskCache()?.let { cache ->
+                runCatching { cache.invalidate(keys) }
+                    .onFailure { diskCacheEnabled = false }
+                    .getOrNull()
+                    ?.also { result ->
+                        if (!result.complete) diskCacheEnabled = false
+                    }
+                    ?.removedEntries ?: 0
+            } ?: 0,
         )
 
     @Synchronized
@@ -89,23 +99,38 @@ class FogTilePipeline(
         require(renderVersion >= 0) { "renderVersion must be non-negative" }
         return FogCacheInvalidation(
             memoryEntries = memoryCache.retainRenderVersion(renderVersion),
-            diskEntries = runCatching {
-                diskCache?.retainRenderVersion(renderVersion) ?: 0
-            }.getOrDefault(0),
+            diskEntries = activeDiskCache()?.let { cache ->
+                runCatching { cache.retainRenderVersion(renderVersion) }
+                    .onFailure { diskCacheEnabled = false }
+                    .getOrNull()
+                    ?.also { result ->
+                        if (!result.complete) diskCacheEnabled = false
+                    }
+                    ?.removedEntries ?: 0
+            } ?: 0,
         )
     }
 
     @Synchronized
     fun clear() {
         memoryCache.clear()
-        runCatching { diskCache?.clear() }
+        val cache = activeDiskCache() ?: return
+        val cleared = runCatching { cache.clear() }
+            .onFailure { diskCacheEnabled = false }
+            .getOrDefault(false)
+        if (!cleared) diskCacheEnabled = false
     }
 
     private fun cached(key: FogTileKey): FogTileLoad? {
         memoryCache.get(key)?.let { mask ->
             return FogTileLoad(mask, FogTileLoadSource.MEMORY)
         }
-        runCatching { diskCache?.get(key) }.getOrNull()?.let { mask ->
+        val diskMask = activeDiskCache()?.let { cache ->
+            runCatching { cache.get(key) }
+                .onFailure { diskCacheEnabled = false }
+                .getOrNull()
+        }
+        diskMask?.let { mask ->
             memoryCache.put(key, mask)
             return FogTileLoad(mask, FogTileLoadSource.DISK)
         }
@@ -114,14 +139,24 @@ class FogTilePipeline(
 
     private fun store(key: FogTileKey, mask: FogPixelMask): Boolean {
         val memoryStored = memoryCache.put(key, mask)
-        val diskStored = diskCache?.let { cache ->
-            runCatching { cache.put(key, mask) }.getOrDefault(false)
+        val cache = activeDiskCache()
+        val diskStored = cache?.let {
+            runCatching { it.put(key, mask) }
+                .onFailure { diskCacheEnabled = false }
+                .getOrDefault(false)
         } ?: false
-        diskCache?.takeIf { !diskStored }?.let { cache ->
-            runCatching { cache.invalidate(listOf(key)) }
+        cache?.takeIf { !diskStored && diskCacheEnabled }?.let {
+            runCatching { it.invalidate(listOf(key)) }
+                .onFailure { diskCacheEnabled = false }
+                .getOrNull()
+                ?.takeIf { result -> !result.complete }
+                ?.let { diskCacheEnabled = false }
         }
         return memoryStored || diskStored
     }
+
+    private fun activeDiskCache(): FogDiskTileCache? =
+        diskCache.takeIf { diskCacheEnabled }
 
     private fun mergeMasks(existing: FogPixelMask, delta: FogPixelMask): FogPixelMask {
         require(existing.width == delta.width && existing.height == delta.height) {

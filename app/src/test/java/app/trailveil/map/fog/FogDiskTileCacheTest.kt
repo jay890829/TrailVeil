@@ -86,8 +86,8 @@ class FogDiskTileCacheTest {
         val v2 = key(x = 2, renderVersion = 2)
         listOf(v1a, v1b, v2).forEach { assertTrue(cache.put(it, mask(it.x))) }
 
-        assertEquals(1, cache.invalidate(listOf(v1a, v1a, key(x = 3))))
-        assertEquals(1, cache.retainRenderVersion(2))
+        assertEquals(FogDiskMutationResult(1, complete = true), cache.invalidate(listOf(v1a, v1a, key(x = 3))))
+        assertEquals(FogDiskMutationResult(1, complete = true), cache.retainRenderVersion(2))
         assertEquals(mask(2), cache.get(v2))
         assertEquals(FogDiskTileCacheStats(entryCount = 1, byteCount = 48), cache.stats())
 
@@ -134,6 +134,24 @@ class FogDiskTileCacheTest {
 
         assertNull(cache.get(key))
         assertEquals(FogDiskTileCacheStats(entryCount = 0, byteCount = 0), cache.stats())
+    }
+
+    @Test
+    fun failedDeletionIsReportedAsAnIncompleteMutation() {
+        val root = temporaryFolder.newFolder("failed-mutation")
+        val key = key(x = 0)
+        assertTrue(FogDiskTileCache(root, maxBytes = 1_000).put(key, mask(1)))
+        val cache = FogDiskTileCache(
+            rootDirectory = root,
+            maxBytes = 1_000,
+            deleteFile = { false },
+        )
+
+        assertEquals(
+            FogDiskMutationResult(removedEntries = 0, complete = false),
+            cache.invalidate(listOf(key)),
+        )
+        assertEquals(mask(1), cache.get(key))
     }
 
     private fun cache(

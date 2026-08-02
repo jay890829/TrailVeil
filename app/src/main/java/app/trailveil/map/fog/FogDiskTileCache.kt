@@ -16,6 +16,11 @@ data class FogDiskTileCacheStats(
     val byteCount: Long,
 )
 
+data class FogDiskMutationResult(
+    val removedEntries: Int,
+    val complete: Boolean,
+)
+
 /**
  * Rebuildable, byte-bounded storage for derived fog masks.
  *
@@ -26,12 +31,13 @@ class FogDiskTileCache(
     rootDirectory: File,
     private val maxBytes: Long,
     private val nowMillis: () -> Long = System::currentTimeMillis,
+    private val deleteFile: (File) -> Boolean = File::delete,
 ) {
     private val rootDirectory = rootDirectory.absoluteFile
 
     init {
         require(maxBytes > HEADER_BYTES) { "maxBytes must fit a cache header and payload" }
-        trimToSize()
+        check(trimToSize()) { "Unable to enforce fog disk-cache byte bound" }
     }
 
     @Synchronized
@@ -57,7 +63,9 @@ class FogDiskTileCache(
         val entryBytes = HEADER_BYTES + payloadBytes.toLong()
         val destination = tileFile(key)
         if (entryBytes > maxBytes) {
-            deleteEntry(destination)
+            check(!destination.exists() || deleteEntry(destination) && !destination.exists()) {
+                "Unable to remove oversized stale fog cache entry"
+            }
             return false
         }
 
@@ -76,28 +84,30 @@ class FogDiskTileCache(
             temporary.delete()
         }
 
-        trimToSize()
+        check(trimToSize()) { "Unable to enforce fog disk-cache byte bound" }
         return destination.isFile
     }
 
     @Synchronized
-    fun invalidate(keys: Collection<FogTileKey>): Int =
-        keys.distinct().count { key -> deleteEntry(tileFile(key)) }
+    fun invalidate(keys: Collection<FogTileKey>): FogDiskMutationResult =
+        removeEntries(keys.distinct().map(::tileFile))
 
     /** Drops every entry whose key uses a different renderer/style identity. */
     @Synchronized
-    fun retainRenderVersion(renderVersion: Int): Int {
+    fun retainRenderVersion(renderVersion: Int): FogDiskMutationResult {
         require(renderVersion >= 0) { "renderVersion must be non-negative" }
         val obsolete = maskFiles(rootDirectory).filter { file ->
             entryRenderVersion(file) != renderVersion
         }
-        return obsolete.count(::deleteEntry)
+        return removeEntries(obsolete)
     }
 
     @Synchronized
-    fun clear() {
-        maskFiles(rootDirectory).forEach(::deleteEntry)
+    fun clear(): Boolean {
+        val entries = maskFiles(rootDirectory)
+        val mutation = removeEntries(entries)
         cleanupTemporaryFiles(rootDirectory)
+        return mutation.complete && maskFiles(rootDirectory).isEmpty()
     }
 
     @Synchronized
@@ -172,7 +182,7 @@ class FogDiskTileCache(
         }
     }
 
-    private fun trimToSize() {
+    private fun trimToSize(): Boolean {
         cleanupTemporaryFiles(rootDirectory)
         val files = maskFiles(rootDirectory).sortedWith(
             compareBy<File>(File::lastModified).thenBy(File::getAbsolutePath),
@@ -184,6 +194,21 @@ class FogDiskTileCache(
                 if (deleteEntry(file)) byteCount -= length
             }
         }
+        return byteCount <= maxBytes
+    }
+
+    private fun removeEntries(files: Collection<File>): FogDiskMutationResult {
+        var removedEntries = 0
+        var complete = true
+        files.forEach { file ->
+            if (!file.exists()) return@forEach
+            if (deleteEntry(file) && !file.exists()) {
+                removedEntries += 1
+            } else {
+                complete = false
+            }
+        }
+        return FogDiskMutationResult(removedEntries, complete)
     }
 
     private fun validatedPayloadBytes(mask: FogPixelMask, alpha: ByteArray): Int {
@@ -208,7 +233,7 @@ class FogDiskTileCache(
     }
 
     private fun deleteEntry(file: File): Boolean {
-        val deleted = file.isFile && file.delete()
+        val deleted = file.isFile && deleteFile(file)
         if (deleted) removeEmptyParents(file.parentFile)
         return deleted
     }

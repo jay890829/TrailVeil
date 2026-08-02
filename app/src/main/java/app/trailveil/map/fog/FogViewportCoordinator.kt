@@ -26,10 +26,19 @@ data class FogViewportRender(
     val mosaic: FogTileMosaic,
 )
 
-data class FogRuntime(
+class FogRuntime(
     val viewportCoordinator: FogViewportCoordinator,
     val pointChanges: PersistedTrackPointChangeFeed,
-)
+) {
+    internal val changeSynchronizer = FogChangeSynchronizer(
+        pointChanges = pointChanges,
+        clearDerivedCache = { viewportCoordinator.clearDerivedCache() },
+        mergePersistedReveals = { updates ->
+            viewportCoordinator.mergePersistedReveals(updates)
+            Unit
+        },
+    )
+}
 
 /**
  * Serializes canonical Room reads, derived-cache access, and persisted reveal merges.

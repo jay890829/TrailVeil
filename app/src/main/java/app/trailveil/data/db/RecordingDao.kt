@@ -334,9 +334,13 @@ internal abstract class RecordingDao {
         )
         WHERE p.id > :afterPointId
         ORDER BY p.id ASC
+        LIMIT :limit
         """,
     )
-    abstract suspend fun persistedPointChangesAfter(afterPointId: Long): List<PersistedTrackPointChangeRow>
+    abstract suspend fun persistedPointChangesAfter(
+        afterPointId: Long,
+        limit: Int,
+    ): List<PersistedTrackPointChangeRow>
 
     @Query("SELECT COUNT(*) FROM recording_sessions") abstract suspend fun sessionCount(): Int
     @Query("SELECT COUNT(*) FROM track_segments") abstract suspend fun segmentCount(): Int

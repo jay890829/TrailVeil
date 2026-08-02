@@ -20,8 +20,12 @@ internal class RoomPersistedTrackPointChangeFeed(
 
     override suspend fun readChangesAfter(
         cursor: PersistedPointCursor,
+        limit: Int,
     ): List<PersistedTrackPointChange> =
-        dao.persistedPointChangesAfter(cursor.pointId).map { row -> row.toChange() }
+        dao.persistedPointChangesAfter(
+            afterPointId = cursor.pointId,
+            limit = limit.also { require(it > 0) { "limit must be positive" } },
+        ).map { row -> row.toChange() }
 
     private fun PersistedTrackPointChangeRow.toChange(): PersistedTrackPointChange {
         val point = PersistedTrackPoint(

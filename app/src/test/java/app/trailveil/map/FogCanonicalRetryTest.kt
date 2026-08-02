@@ -1,7 +1,6 @@
 package app.trailveil.map
 
 import app.trailveil.data.map.ViewportBounds
-import app.trailveil.data.map.PersistedPointCursor
 import app.trailveil.map.fog.FogPixelMask
 import app.trailveil.map.fog.FogTileBounds
 import app.trailveil.map.fog.FogTileMosaic
@@ -14,36 +13,6 @@ import org.junit.Assert.assertSame
 import org.junit.Test
 
 class FogCanonicalRetryTest {
-    @Test
-    fun transientBaselineSnapshotAndCacheClearFailuresRetryBeforeBecomingReady() = runTest {
-        val expected = PersistedPointCursor(pointId = 42L)
-        var snapshotAttempts = 0
-        var clearAttempts = 0
-        val failures = mutableListOf<String?>()
-
-        val actual = establishFogBaselineWithRetry(
-            retryDelayMillis = 1_000L,
-            latestCursor = {
-                snapshotAttempts += 1
-                if (snapshotAttempts == 1) error("transient baseline read")
-                expected
-            },
-            clearDerivedCache = {
-                clearAttempts += 1
-                if (clearAttempts == 1) error("transient cache clear")
-            },
-            onFailure = { failure -> failures += failure.message },
-        )
-
-        assertEquals(expected, actual)
-        assertEquals(3, snapshotAttempts)
-        assertEquals(2, clearAttempts)
-        assertEquals(
-            listOf("transient baseline read", "transient cache clear"),
-            failures,
-        )
-    }
-
     @Test
     fun transientRenderAndInstallFailuresRetryUntilCanonicalFrameSucceeds() = runTest {
         val request = FogViewportRequest(
