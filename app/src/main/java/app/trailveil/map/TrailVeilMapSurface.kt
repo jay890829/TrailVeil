@@ -190,6 +190,7 @@ internal fun TrailVeilMapSurface(
         mutableStateOf(!fogRequired)
     }
     var fogRenderFailed by remember(mapView, fogRuntime) { mutableStateOf(false) }
+    var fogSyncFailed by remember(mapView, fogRuntime) { mutableStateOf(false) }
     var fogBaselineReady by remember(mapView, fogRuntime) {
         mutableStateOf(fogRuntime == null)
     }
@@ -346,11 +347,13 @@ internal fun TrailVeilMapSurface(
                 }
                 fogBaselineReady = true
                 fogRenderFailed = false
+                fogSyncFailed = false
                 fogRevision += 1L
                 runtime.pointChanges.revisionsAfter(baseline.cursor).collect { revision ->
                     val synchronization = withContext(Dispatchers.Default) {
                         runtime.changeSynchronizer.synchronizeTo(revision.latestCursor)
                     }
+                    fogSyncFailed = false
                     if (synchronization.mergedChanges > 0) {
                         fogRevision += 1L
                     }
@@ -362,6 +365,7 @@ internal fun TrailVeilMapSurface(
                 fogCoverageInstalled = false
                 canonicalFogLoaded = false
                 fogRenderFailed = true
+                fogSyncFailed = true
                 fogPlaceholderReadyGeneration = -1L
                 fogViewportGeneration += 1L
                 currentOnFogFailure(failure)
@@ -521,9 +525,9 @@ internal fun TrailVeilMapSurface(
         }
         val statusText = when {
             loadState == BasemapLoadState.LOADING -> stringResource(R.string.map_loading)
+            fogRenderFailed || fogSyncFailed -> stringResource(R.string.map_fog_unavailable)
             loadState == BasemapLoadState.LOCAL_FALLBACK ->
                 stringResource(R.string.map_unavailable)
-            fogRenderFailed -> stringResource(R.string.map_fog_unavailable)
             fogRequired && !canonicalFogLoaded -> stringResource(R.string.map_fog_loading)
             else -> null
         }
