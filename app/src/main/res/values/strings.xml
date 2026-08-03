@@ -12,6 +12,9 @@
     <string name="recording_entry_stop">Stop exploration</string>
     <string name="recording_entry_starting">Starting…</string>
     <string name="recording_entry_consent_note">Permissions are requested only after you press Start exploration. No location is collected before then.</string>
+    <string name="recording_entry_privacy_acknowledge">Got it</string>
+    <string name="recording_entry_menu">Exploration menu</string>
+    <string name="recording_entry_privacy_menu">Privacy and data</string>
     <string name="map_content_description">Interactive exploration map</string>
     <string name="map_loading">Loading the online basemap…</string>
     <string name="map_unavailable">Online basemap unavailable. Trail recording still works.</string>
@@ -51,6 +54,7 @@
     <string name="recording_state_completed">The latest exploration was completed and saved.</string>
     <string name="recording_state_interrupted">The latest exploration was interrupted. Its saved points remain in history.</string>
     <string name="recording_state_failed">The latest exploration could not start; no active recording remains.</string>
+    <string name="recording_state_dismiss">Dismiss this status</string>
     <string name="map_center_latest_location">Center on latest recorded location</string>
     <string name="history_open">Exploration history</string>
 </resources>

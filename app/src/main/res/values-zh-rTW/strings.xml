@@ -12,6 +12,9 @@
     <string name="recording_entry_stop">停止探索</string>
     <string name="recording_entry_starting">正在開始…</string>
     <string name="recording_entry_consent_note">只有按下「開始探索」後才會請求權限；在此之前不會收集位置。</string>
+    <string name="recording_entry_privacy_acknowledge">我知道了</string>
+    <string name="recording_entry_menu">探索選單</string>
+    <string name="recording_entry_privacy_menu">隱私與資料</string>
     <string name="map_content_description">互動式探索地圖</string>
     <string name="map_loading">正在載入線上底圖…</string>
     <string name="map_unavailable">線上底圖目前無法使用；足跡記錄仍可正常運作。</string>
@@ -51,6 +54,7 @@
     <string name="recording_state_completed">最近一次探索已完成並保存。</string>
     <string name="recording_state_interrupted">最近一次探索曾中斷，已保存的位置仍保留在歷史中。</string>
     <string name="recording_state_failed">最近一次探索無法開始，目前沒有進行中的記錄。</string>
+    <string name="recording_state_dismiss">關閉這則狀態訊息</string>
     <string name="map_center_latest_location">移至最新記錄位置</string>
     <string name="history_open">探索歷史</string>
 </resources>
