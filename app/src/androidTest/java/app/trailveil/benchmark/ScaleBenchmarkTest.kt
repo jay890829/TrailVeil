@@ -75,6 +75,7 @@ class ScaleBenchmarkTest {
     }
 
     private suspend fun measureDataset(pointCount: Int): ScaleResult {
+        settleProcessMemory()
         val database = Room.inMemoryDatabaseBuilder(
             ApplicationProvider.getApplicationContext(),
             TrailVeilDatabase::class.java,
@@ -141,6 +142,25 @@ class ScaleBenchmarkTest {
     private fun AtomicLong.recordPss() {
         val observed = Debug.getPss().toLong()
         updateAndGet { previous -> maxOf(previous, observed) }
+    }
+
+    /**
+     * Each dataset's peak PSS must describe that dataset's own demand.
+     *
+     * The datasets share one instrumentation process, and every sampled read/render produces
+     * large short-lived allocations. ART only collects when the heap approaches
+     * `dalvik.vm.heapgrowthlimit`, so on a device with a large limit the earlier dataset can end
+     * while most of its garbage is still resident: measured here, the 10k dataset finished at
+     * 251 MiB PSS of which a single collection released 166 MiB. Starting the next dataset's
+     * sampler on that residue attributed the previous dataset's uncollected garbage to the 100k
+     * peak. Settling before the measurement window opens removes only that cross-dataset
+     * carry-over; the sampled workload, sampling interval, and 250 MiB ceiling are unchanged.
+     */
+    private suspend fun settleProcessMemory() {
+        repeat(SETTLE_PASSES) {
+            Runtime.getRuntime().gc()
+            delay(SETTLE_DELAY_MILLIS)
+        }
     }
 
     private fun validateCanonicalRead(read: ViewportTrackReadModel, pointCount: Int) {
@@ -219,5 +239,7 @@ class ScaleBenchmarkTest {
         const val MAX_PSS_KIB = 250L * 1024L
         const val NANOS_PER_MILLISECOND = 1_000_000L
         const val PSS_SAMPLE_INTERVAL_MILLIS = 25L
+        const val SETTLE_PASSES = 2
+        const val SETTLE_DELAY_MILLIS = 300L
     }
 }
