@@ -1,18 +1,25 @@
 package app.trailveil.feature.history
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performTouchInput
+import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import app.trailveil.data.history.RecordingHistoryAcceptedPoint
+import app.trailveil.data.history.RecordingHistoryAcceptedPointSegment
 import app.trailveil.data.history.RecordingHistoryDetail
 import app.trailveil.data.history.RecordingHistorySegment
 import app.trailveil.data.history.RecordingHistorySession
 import app.trailveil.data.history.RecordingHistoryStatus
 import app.trailveil.ui.theme.TrailVeilTheme
 import java.util.concurrent.atomic.AtomicLong
+import kotlin.math.abs
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -137,6 +144,95 @@ class RecordingHistoryScreensTest {
         assertEquals(1L, backCalls.get())
     }
 
+    /**
+     * The detail page scrolls, so the embedded map has to claim its own drags or panning the track
+     * scrolls the page instead. MapLibre asks the host to stop intercepting touches only once while
+     * the map initialises, and Compose view interop drops that request when a gesture ends, so the
+     * first drag can succeed on its own; the assertion needs a later drag to be meaningful.
+     */
+    @Test
+    fun draggingTheTrackMapPansItWhileTheRestOfTheDetailPageStillScrolls() {
+        composeRule.setContent {
+            TrailVeilTheme {
+                RecordingHistoryDetailScreen(
+                    detail = trackedDetail(segmentCount = 8),
+                    onBack = {},
+                    nowMillis = 600_000L,
+                )
+            }
+        }
+        composeRule.onNodeWithTag(RecordingHistoryTestTags.TrackMap).assertIsDisplayed()
+        composeRule.waitForIdle()
+
+        val beforeMapDrags = mapTop()
+        repeat(2) {
+            composeRule.onNodeWithTag(RecordingHistoryTestTags.TrackMap)
+                .performTouchInput { swipeUp() }
+            composeRule.waitForIdle()
+        }
+        val afterMapDrags = mapTop()
+
+        composeRule.onNodeWithTag(RecordingHistoryTestTags.Detail).performTouchInput {
+            // Below the map, so this drag never enters the surface that owns map gestures.
+            swipeUp(startY = bottom - 4f, endY = bottom - 304f)
+        }
+        composeRule.waitForIdle()
+        val afterPageDrag = mapTop()
+
+        assertEquals(
+            "Dragging the track map scrolled the detail page instead of panning the map",
+            beforeMapDrags,
+            afterMapDrags,
+            SCROLL_TOLERANCE_DP,
+        )
+        assertTrue(
+            "Dragging outside the track map no longer scrolls the detail page",
+            abs(afterPageDrag - afterMapDrags) > SCROLL_TOLERANCE_DP,
+        )
+    }
+
+    private fun mapTop(): Double = composeRule
+        .onNodeWithTag(RecordingHistoryTestTags.TrackMap)
+        .getUnclippedBoundsInRoot()
+        .top
+        .value
+        .toDouble()
+
+    private fun trackedDetail(segmentCount: Int) = RecordingHistoryDetail(
+        session = session(
+            id = 7,
+            startedAt = 0L,
+            endedAt = 600_000L,
+            status = RecordingHistoryStatus.COMPLETED,
+            acceptedPointCount = segmentCount.toLong() * 2L,
+        ),
+        segments = List(segmentCount) { index ->
+            segment(
+                id = index + 1L,
+                sequence = index.toLong(),
+                startedAt = index * 60_000L,
+                endedAt = (index + 1) * 60_000L,
+            )
+        },
+        latestOperationOutcome = null,
+        latestAcceptedPoint = null,
+        acceptedPointSegments = List(segmentCount) { index ->
+            RecordingHistoryAcceptedPointSegment(
+                segmentId = index + 1L,
+                segmentSequence = index.toLong(),
+                points = List(2) { offset ->
+                    RecordingHistoryAcceptedPoint(
+                        id = index * 2L + offset + 1L,
+                        timestamp = index * 60_000L + offset * 1_000L,
+                        latitude = 25.0330 + index * 0.0004 + offset * 0.0002,
+                        longitude = 121.5654 + index * 0.0006 + offset * 0.0003,
+                        sequence = index * 2L + offset,
+                    )
+                },
+            )
+        },
+    )
+
     private fun session(
         id: Long,
         startedAt: Long,
@@ -170,4 +266,8 @@ class RecordingHistoryScreensTest {
         startReason = "SESSION_START",
         endReason = "GPS_DISABLED",
     )
+
+    private companion object {
+        const val SCROLL_TOLERANCE_DP = 1.0
+    }
 }

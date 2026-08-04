@@ -4,9 +4,11 @@ import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
@@ -342,6 +344,63 @@ class MapSurfaceTest {
             }
 
             composeRule.onNodeWithText(fallbackText).assertIsDisplayed()
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * A rendered mosaic may keep covering the map only where it actually reaches. Panning far
+     * beyond it must raise the safety cover rather than expose unknown area as explored.
+     */
+    @Test
+    fun panningBeyondTheRenderedFogRaisesTheSafetyCover() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            val cameraRequest = mutableStateOf(
+                MapCameraRequest(
+                    requestId = 1L,
+                    point = GeoPoint(25.0330, 121.5654),
+                    zoom = 16.0,
+                ),
+            )
+
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-cover-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-cover",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-cover-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = cameraRequest.value,
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 15_000L) { fogRendered.get() }
+            composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertDoesNotExist()
+
+            composeRule.runOnUiThread {
+                cameraRequest.value = MapCameraRequest(
+                    requestId = 2L,
+                    point = GeoPoint(35.0330, 131.5654),
+                    zoom = 16.0,
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 15_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isNotEmpty()
+            }
         } finally {
             database.close()
         }

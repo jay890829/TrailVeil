@@ -1,9 +1,11 @@
 package app.trailveil.map
 
 import android.content.ComponentCallbacks2
+import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.view.MotionEvent
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -165,7 +167,7 @@ internal fun TrailVeilMapSurface(
     }
     val mapView = remember(context, lifecycle, savedStateRegistry, savedStateKey) {
         MapLibre.getInstance(context.applicationContext)
-        MapView(context).apply { onCreate(restoredMapState ?: Bundle()) }
+        GestureOwningMapView(context).apply { onCreate(restoredMapState ?: Bundle()) }
     }
     var loadState by remember(mapView, provider) { mutableStateOf(BasemapLoadState.LOADING) }
     var readyMap by remember(mapView) { mutableStateOf<MapLibreMap?>(null) }
@@ -395,6 +397,8 @@ internal fun TrailVeilMapSurface(
             val moveStartedListener = MapLibreMap.OnCameraMoveStartedListener {
                 // The previous mosaic has finite bounds. Hide it during camera motion so a fast
                 // pan cannot expose unknown map outside those bounds before the idle rebuild.
+                // Deciding this from the live viewport instead is a frame behind what MapLibre has
+                // already drawn, which is enough to reveal unexplored area during a fast pan.
                 fogCoverageInstalled = false
                 canonicalFogLoaded = false
                 fogRenderFailed = false
@@ -736,6 +740,20 @@ private fun MapStatusBadge(text: String) {
             modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
             style = MaterialTheme.typography.bodySmall,
         )
+    }
+}
+
+/**
+ * MapLibre asks its parent to stop intercepting touches once while the map initialises, and Compose
+ * view interop drops that request when a gesture ends, so a scrolling ancestor claims every later
+ * drag. Re-asking on each gesture keeps map pans owned by the map wherever the surface is hosted.
+ */
+private class GestureOwningMapView(context: Context) : MapView(context) {
+    override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+        if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+            parent?.requestDisallowInterceptTouchEvent(true)
+        }
+        return super.dispatchTouchEvent(event)
     }
 }
 
