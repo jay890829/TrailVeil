@@ -87,7 +87,7 @@ class FogViewportCoordinator(
             request = request,
             keys = keys,
             queryBounds = queryBounds,
-            mosaic = FogPocMosaic.compose(tiles),
+            mosaic = FogPocMosaic.compose(tiles).anchoredNear(request.center.longitude),
         )
     }
 
@@ -112,7 +112,7 @@ class FogViewportCoordinator(
             request = request,
             keys = keys,
             queryBounds = queryBounds,
-            mosaic = FogPocMosaic.compose(tiles),
+            mosaic = FogPocMosaic.compose(tiles).anchoredNear(request.center.longitude),
         )
     }
 
@@ -148,6 +148,33 @@ class FogViewportCoordinator(
         // 100 m/s * 60 s accepted continuity ceiling + 25 m reveal radius + rounding allowance.
         const val DEFAULT_QUERY_MARGIN_METERS = 6_100.0
     }
+}
+
+/**
+ * Moves a mosaic into the same copy of the world the camera is looking at.
+ *
+ * Tile longitudes are canonical, so a tile window that wraps the antimeridian is expressed starting
+ * from the far side: a camera just west of the seam gets a mosaic built a whole world to its east.
+ * The renderer draws an image at the coordinates it is given and does not repeat it across world
+ * copies, so that mosaic is drawn somewhere the camera cannot see, leaving the repeated basemap
+ * under it with no fog at all. Shifting by whole worlds preserves the geometry exactly — the same
+ * ground, named in the camera's own copy.
+ */
+internal fun FogTileMosaic.anchoredNear(centerLongitude: Double): FogTileMosaic {
+    val span = bounds.eastLongitude - bounds.westLongitude
+    if (span <= 0.0 || !centerLongitude.isFinite()) return this
+    // The centre of the mosaic is what should sit near the camera; anchoring on an edge would
+    // leave a mosaic that merely touches the camera counted as correctly placed.
+    val currentCenter = bounds.westLongitude + span / 2.0
+    val worlds = Math.round((centerLongitude - currentCenter) / 360.0)
+    if (worlds == 0L) return this
+    val shift = worlds * 360.0
+    return copy(
+        bounds = bounds.copy(
+            westLongitude = bounds.westLongitude + shift,
+            eastLongitude = bounds.eastLongitude + shift,
+        ),
+    )
 }
 
 object FogViewportTileGrid {

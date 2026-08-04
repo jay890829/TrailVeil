@@ -40,6 +40,57 @@ class FogViewportCoordinatorTest {
         assertEquals(2, bounds.longitudeIntervals().size)
     }
 
+    /**
+     * A camera just west of the antimeridian gets a tile window that wraps, and tile longitudes are
+     * canonical, so the composed mosaic names ground a whole world to its east. The renderer draws
+     * an image once, where it is told, so that mosaic lands where the camera cannot see it — 100% of
+     * the viewport rendered as unfogged basemap at every zoom, measured on device before this.
+     */
+    @Test
+    fun aWrappedMosaicIsNamedInTheCameraSOwnCopyOfTheWorld() {
+        val westOfSeam = -179.5
+        val wrapped = mosaic(west = 157.5, east = 225.0)
+
+        val anchored = wrapped.anchoredNear(westOfSeam)
+
+        assertEquals(-202.5, anchored.bounds.westLongitude, 1e-9)
+        assertEquals(-135.0, anchored.bounds.eastLongitude, 1e-9)
+        assertTrue(
+            "The camera must fall inside the mosaic it is given",
+            westOfSeam > anchored.bounds.westLongitude && westOfSeam < anchored.bounds.eastLongitude,
+        )
+        // The shift is whole worlds only, so it renames the same ground rather than moving it.
+        assertEquals(
+            wrapped.bounds.eastLongitude - wrapped.bounds.westLongitude,
+            anchored.bounds.eastLongitude - anchored.bounds.westLongitude,
+            1e-9,
+        )
+        assertEquals(wrapped.bounds.northLatitude, anchored.bounds.northLatitude, 1e-9)
+        assertEquals(wrapped.bounds.southLatitude, anchored.bounds.southLatitude, 1e-9)
+    }
+
+    @Test
+    fun aMosaicAlreadyAroundTheCameraIsLeftAlone() {
+        listOf(
+            0.0 to mosaic(west = -22.5, east = 45.0),
+            // East of the seam the window already runs past 180, which is why that side never broke.
+            179.5 to mosaic(west = 135.0, east = 202.5),
+        ).forEach { (centerLongitude, untouched) ->
+            assertEquals(untouched, untouched.anchoredNear(centerLongitude))
+        }
+    }
+
+    private fun mosaic(west: Double, east: Double) = FogTileMosaic(
+        mask = FogPixelMask(width = 2, height = 2, alpha = ByteArray(4)),
+        bounds = FogTileBounds(
+            westLongitude = west,
+            southLatitude = -10.0,
+            eastLongitude = east,
+            northLatitude = 10.0,
+        ),
+        tileCount = 1,
+    )
+
     @Test
     fun cacheLossRebuildsSameViewportFromCanonicalPoints() = runTest {
         var reads = 0

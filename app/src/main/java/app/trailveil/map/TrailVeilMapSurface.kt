@@ -308,6 +308,7 @@ internal fun TrailVeilMapSurface(
         mapView.addOnDidFailLoadingMapListener(failureListener)
         mapView.getMapAsync { map ->
             if (!compositionActive.get() || !styleGenerationActive.get()) return@getMapAsync
+            if (fogRequired) map.setMinZoomPreference(MINIMUM_TRUTHFUL_ZOOM)
             readyMap = map
             map.setStyle(Style.Builder().fromUri(provider.styleUri)) { style ->
                 if (
@@ -855,6 +856,23 @@ private suspend fun MapView.awaitFullyRenderedFrameAfter(action: () -> Unit) {
         }
     }
 }
+
+/**
+ * The lowest zoom at which fog can be drawn truthfully.
+ *
+ * MapLibre draws an image quad exactly once, at the coordinates it is given, while the basemap
+ * repeats across world copies. The fog mosaic is built from a window of tiles whose western edge is
+ * a canonical tile longitude, and at zoom 0 and 1 that window is the whole world, so its western
+ * edge is pinned to -180 and the quad cannot be moved into the copy the camera is looking at. A
+ * camera near the antimeridian then sees a repeated basemap with no fog over it: measured at 49.7%
+ * of the viewport at zoom 1. Zoom 2 and above escape this because the window is narrower than the
+ * world, so it is placed around the camera and is free to run past the antimeridian.
+ *
+ * Refusing to zoom out that far is the honest response until the mosaic can be anchored to the
+ * camera's own world copy. Showing unexplored ground as explored is the one thing this surface must
+ * never do, and a view we cannot fog is not worth offering.
+ */
+private const val MINIMUM_TRUTHFUL_ZOOM = 2.0
 
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L

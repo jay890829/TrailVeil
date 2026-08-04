@@ -424,6 +424,112 @@ class MapSurfaceTest {
     }
 
     /**
+     * The mosaic is a fixed number of tiles, so how much of the world it covers shrinks as the map
+     * zooms in and grows as it zooms out — but the tile grid stops widening at three columns, so
+     * below zoom 2 the mosaic covers less than the whole world while the viewport covers more of
+     * it. This sweeps the settled camera across zoom levels and edge cases and reads back what
+     * MapLibre actually drew, because the geometry alone does not say whether the shortfall is
+     * ever inside the viewport.
+     */
+    @Test
+    fun noSettledCameraPresentsUnexploredMapAsRevealed() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            val revealed = GeoPoint(25.0330, 121.5654)
+            revealTrack(database, revealed)
+            val cameraRequest = mutableStateOf(
+                MapCameraRequest(requestId = 1L, point = revealed, zoom = 16.0),
+            )
+
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-zoom-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-zoom",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-zoom-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = cameraRequest.value,
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 15_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+
+            val report = StringBuilder()
+            var worstFraction = 0.0
+            var worstLabel = "none"
+            var requestId = 1L
+            UNEXPLORED_VIEWPOINTS.forEach { (label, point) ->
+                ZOOM_SWEEP.forEach { zoom ->
+                    requestId += 1L
+                    composeRule.runOnUiThread {
+                        cameraRequest.value = MapCameraRequest(
+                            requestId = requestId,
+                            point = point,
+                            zoom = zoom,
+                        )
+                    }
+                    composeRule.waitUntil(timeoutMillis = 25_000L) {
+                        composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                            .fetchSemanticsNodes()
+                            .isEmpty()
+                    }
+                    Thread.sleep(ZOOM_SETTLE_MILLIS)
+                    val coverage = map.renderedFogCoverage()
+                    val settledZoom = map.cameraPosition.zoom
+                    report.append(
+                        "$label@z$zoom(actual=${"%.2f".format(java.util.Locale.US, settledZoom)})=" +
+                            "${coverage.report()} ",
+                    )
+                    // A request below the truthful floor must be clamped, not honoured. Without
+                    // this the sweep could pass simply because the camera never went where it
+                    // was told.
+                    assertTrue(
+                        "Camera reached zoom $settledZoom, below the truthful floor",
+                        settledZoom >= MINIMUM_TRUTHFUL_ZOOM - ZOOM_TOLERANCE,
+                    )
+                    if (coverage.revealedFraction > worstFraction) {
+                        worstFraction = coverage.revealedFraction
+                        worstLabel = "$label@z$zoom"
+                    }
+                }
+            }
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply {
+                    putString(
+                        "stream",
+                        "TrailVeil settled fog coverage sweep: worst=$worstLabel " +
+                            "worstFraction=${"%.4f".format(java.util.Locale.US, worstFraction * 100.0)}% " +
+                            "limit=${MAXIMUM_SETTLED_REVEALED_FRACTION * 100.0}% $report\n",
+                    )
+                },
+            )
+            assertTrue(
+                "Settled camera $worstLabel showed unexplored map as revealed " +
+                    "(${"%.4f".format(java.util.Locale.US, worstFraction * 100.0)}%)",
+                worstFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
      * The same invariant under real touch input rather than a camera call: sustained drags and
      * flings run on their own thread while this one keeps reading back what MapLibre drew.
      */
@@ -816,6 +922,28 @@ class MapSurfaceTest {
         const val SNAPSHOT_TIMEOUT_SECONDS = 10L
         const val UNFOGGED_LUMINANCE = 150
         const val MINIMUM_REVEALED_FRACTION = 0.01
+
+        /**
+         * A settled camera over unexplored ground should be entirely fogged. The allowance is for
+         * the revealed track itself, which is sub-pixel at these zooms but can still land on one,
+         * not for any part of a coverage gap — the narrowest gap the tile grid could open is a
+         * quarter of the world's width.
+         */
+        const val MAXIMUM_SETTLED_REVEALED_FRACTION = 0.001
+        const val ZOOM_SETTLE_MILLIS = 1_200L
+        const val MINIMUM_TRUTHFUL_ZOOM = 2.0
+        const val ZOOM_TOLERANCE = 0.01
+        val ZOOM_SWEEP = listOf(0.0, 1.0, 2.0, 3.0, 4.0, 6.0)
+        val UNEXPLORED_VIEWPOINTS = listOf(
+            "atlantic" to GeoPoint(0.0, 0.0),
+            // An image quad is drawn once, in one world copy, while the basemap repeats. Both
+            // sides of the seam are sampled because which side leaks depends on where the tile
+            // window's western edge lands.
+            "antimeridian-east" to GeoPoint(0.0, 179.5),
+            "antimeridian-west" to GeoPoint(0.0, -179.5),
+            // Rows are clamped at the poles, so the surround has fewer tiles to work with here.
+            "high-latitude" to GeoPoint(80.0, 0.0),
+        )
         const val SUSTAINED_DRAG_COUNT = 6
         const val FLING_COUNT = 4
         const val FLING_SETTLE_MILLIS = 400L
