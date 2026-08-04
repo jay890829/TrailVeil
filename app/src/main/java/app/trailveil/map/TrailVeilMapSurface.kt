@@ -60,6 +60,7 @@ import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.geometry.LatLngBounds
 import org.maplibre.android.geometry.LatLngQuad
 import org.maplibre.android.maps.MapLibreMap
+import org.maplibre.android.maps.MapLibreMapOptions
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.layers.CircleLayer
@@ -146,6 +147,13 @@ internal data class MapTrackOverlay(
 /**
  * Provider failure is deliberately contained inside this surface. It never owns recording,
  * location permissions, canonical points, or fog state.
+ *
+ * `rendersIntoTheWindow` decides where MapLibre draws. By default it draws into its own compositor
+ * layer, which is the faster path and the right one for a map that occupies the whole screen. A map
+ * embedded in a screen the user navigates away from should set this: a separate layer neither fades
+ * with an exit transition nor stops presenting when the composition around it does, so it keeps
+ * painting over whatever screen comes next until the view is finally detached. Drawing into the
+ * window costs a copy per frame and buys a map that disappears exactly when its screen does.
  */
 @Composable
 internal fun TrailVeilMapSurface(
@@ -155,6 +163,7 @@ internal fun TrailVeilMapSurface(
     savedStateKey: String = "trailveil.map.primary",
     fogRuntime: FogRuntime? = null,
     fogRequired: Boolean = false,
+    rendersIntoTheWindow: Boolean = false,
     cameraRequest: MapCameraRequest? = null,
     currentLocation: GeoPoint? = null,
     trackOverlay: MapTrackOverlay? = null,
@@ -185,9 +194,17 @@ internal fun TrailVeilMapSurface(
     val restoredMapState = remember(savedStateRegistry, savedStateKey) {
         savedStateRegistry.consumeRestoredStateForKey(savedStateKey)
     }
-    val mapView = remember(context, lifecycle, savedStateRegistry, savedStateKey) {
+    val mapView = remember(
+        context,
+        lifecycle,
+        savedStateRegistry,
+        savedStateKey,
+        rendersIntoTheWindow,
+    ) {
         MapLibre.getInstance(context.applicationContext)
-        GestureOwningMapView(context).apply { onCreate(restoredMapState ?: Bundle()) }
+        val options = MapLibreMapOptions.createFromAttributes(context)
+            .textureMode(rendersIntoTheWindow)
+        GestureOwningMapView(context, options).apply { onCreate(restoredMapState ?: Bundle()) }
     }
     var loadState by remember(mapView, provider) { mutableStateOf(BasemapLoadState.LOADING) }
     var readyMap by remember(mapView) { mutableStateOf<MapLibreMap?>(null) }
@@ -860,7 +877,12 @@ private fun MapStatusBadge(text: String) {
  * view interop drops that request when a gesture ends, so a scrolling ancestor claims every later
  * drag. Re-asking on each gesture keeps map pans owned by the map wherever the surface is hosted.
  */
-private class GestureOwningMapView(context: Context) : MapView(context) {
+private class GestureOwningMapView(
+    context: Context,
+    options: MapLibreMapOptions,
+) : MapView(context, options) {
+    constructor(context: Context) : this(context, MapLibreMapOptions.createFromAttributes(context))
+
     override fun dispatchTouchEvent(event: MotionEvent): Boolean {
         if (event.actionMasked == MotionEvent.ACTION_DOWN) {
             parent?.requestDisallowInterceptTouchEvent(true)

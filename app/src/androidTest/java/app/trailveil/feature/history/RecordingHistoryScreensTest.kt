@@ -1,5 +1,8 @@
 package app.trailveil.feature.history
 
+import android.view.TextureView
+import android.view.View
+import android.view.ViewGroup
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.v2.createComposeRule
@@ -9,6 +12,8 @@ import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
+import androidx.test.runner.lifecycle.Stage
 import app.trailveil.data.history.RecordingHistoryAcceptedPoint
 import app.trailveil.data.history.RecordingHistoryAcceptedPointSegment
 import app.trailveil.data.history.RecordingHistoryDetail
@@ -23,6 +28,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.maplibre.android.maps.MapView
 
 @RunWith(AndroidJUnit4::class)
 class RecordingHistoryScreensTest {
@@ -191,6 +197,56 @@ class RecordingHistoryScreensTest {
         )
     }
 
+    /**
+     * MapLibre's default drawing surface is its own compositor layer, which keeps presenting
+     * regardless of what the composition around it does — it stayed painted over the history list
+     * for as long as the popped screen's view remained attached. A windowed render view is drawn
+     * and removed with everything else on the screen it belongs to.
+     */
+    @Test
+    fun theTrackMapDrawsIntoTheWindowSoItCannotOutliveItsScreen() {
+        composeRule.setContent {
+            TrailVeilTheme {
+                RecordingHistoryDetailScreen(
+                    detail = trackedDetail(segmentCount = 2),
+                    onBack = {},
+                    nowMillis = 600_000L,
+                )
+            }
+        }
+        composeRule.onNodeWithTag(RecordingHistoryTestTags.TrackMap).assertIsDisplayed()
+
+        val renderView = awaitRenderView()
+        assertTrue(
+            "Track map render view was ${renderView.javaClass.name}, not a windowed one",
+            renderView is TextureView,
+        )
+    }
+
+    private fun awaitRenderView(): View {
+        repeat(RENDER_VIEW_POLLS) {
+            // The activity registry refuses to answer off the main thread, which is also the only
+            // thread allowed to read the view tree it hands back.
+            composeRule.runOnIdle { attachedMapView()?.renderView }?.let { return it }
+            Thread.sleep(RENDER_VIEW_POLL_MILLIS)
+        }
+        error("The track map never attached a render view")
+    }
+
+    private fun attachedMapView(): MapView? =
+        ActivityLifecycleMonitorRegistry.getInstance()
+            .getActivitiesInStage(Stage.RESUMED)
+            .firstNotNullOfOrNull { activity -> activity.window.decorView.findMapView() }
+
+    private fun View.findMapView(): MapView? {
+        if (this is MapView) return this
+        if (this !is ViewGroup) return null
+        repeat(childCount) { index ->
+            getChildAt(index).findMapView()?.let { return it }
+        }
+        return null
+    }
+
     private fun mapTop(): Double = composeRule
         .onNodeWithTag(RecordingHistoryTestTags.TrackMap)
         .getUnclippedBoundsInRoot()
@@ -269,5 +325,7 @@ class RecordingHistoryScreensTest {
 
     private companion object {
         const val SCROLL_TOLERANCE_DP = 1.0
+        const val RENDER_VIEW_POLLS = 50
+        const val RENDER_VIEW_POLL_MILLIS = 100L
     }
 }

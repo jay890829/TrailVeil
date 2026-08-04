@@ -1,5 +1,6 @@
 package app.trailveil.map
 
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import androidx.test.core.app.ActivityScenario
@@ -29,6 +30,22 @@ class MapSurfaceLifecycleTest {
     fun productionFogSourceAndLayerAreInstalled() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             assertProductionFogInstalled(scenario)
+        }
+    }
+
+    /**
+     * The history detail map deliberately draws into the window so it cannot outlive its screen.
+     * The main map is the screen, so it keeps MapLibre's faster compositor-layer surface — this
+     * pins that asymmetry, because losing it would cost a per-frame copy on the map that pans.
+     */
+    @Test
+    fun theMainMapKeepsItsOwnCompositorLayer() {
+        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+            val renderView = awaitMapView(scenario).renderView
+            assertTrue(
+                "Main map render view was ${renderView.javaClass.name}, not a surface layer",
+                renderView is SurfaceView,
+            )
         }
     }
 

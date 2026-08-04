@@ -168,6 +168,7 @@ internal fun RecordingHistoryDetailScreen(
                         .clip(MaterialTheme.shapes.large)
                         .testTag(RecordingHistoryTestTags.TrackMap),
                     savedStateKey = "trailveil.map.history." + session.id,
+                    rendersIntoTheWindow = true,
                     trackOverlay = trackOverlay,
                 )
             }
