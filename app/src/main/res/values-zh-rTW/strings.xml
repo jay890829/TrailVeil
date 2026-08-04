@@ -7,6 +7,7 @@
     <string name="recording_entry_privacy_title_first">第一次探索前</string>
     <string name="recording_entry_privacy_title">足跡只留在這台裝置</string>
     <string name="recording_entry_privacy_body">位置紀錄儲存在本機，TrailVeil 不會上傳你的路線；線上底圖請求會傳送到 OpenFreeMap，並透露目前瀏覽的大約區域。</string>
+    <string name="recording_entry_privacy_retention_body">已保存的探索只存在這個 App 內。解除安裝 TrailVeil 會永久刪除它們，而且沒有備份或雲端副本可以還原。</string>
     <string name="recording_entry_permissions_summary">精確位置用來繪製可靠足跡。通知權限可顯示持續記錄狀態，但拒絕通知不會阻止記錄。</string>
     <string name="recording_entry_start">開始探索</string>
     <string name="recording_entry_stop">停止探索</string>

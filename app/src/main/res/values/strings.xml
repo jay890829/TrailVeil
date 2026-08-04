@@ -7,6 +7,7 @@
     <string name="recording_entry_privacy_title_first">Before your first exploration</string>
     <string name="recording_entry_privacy_title">Your trail stays on this device</string>
     <string name="recording_entry_privacy_body">TrailVeil stores location history locally and does not upload your route. Online basemap requests go to OpenFreeMap and reveal the approximate area being viewed.</string>
+    <string name="recording_entry_privacy_retention_body">Stored explorations exist only inside this app. Uninstalling TrailVeil permanently deletes them, and there is no backup or cloud copy to restore.</string>
     <string name="recording_entry_permissions_summary">Precise location is required for a useful track. Notification access keeps the active recording visible, but declining it will not prevent recording.</string>
     <string name="recording_entry_start">Start exploration</string>
     <string name="recording_entry_stop">Stop exploration</string>

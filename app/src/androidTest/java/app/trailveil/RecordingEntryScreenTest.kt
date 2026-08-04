@@ -73,6 +73,12 @@ class RecordingEntryScreenTest {
             .onNodeWithText(context.getString(R.string.recording_entry_privacy_title_first))
             .assertIsDisplayed()
         composeRule
+            .onNodeWithText(context.getString(R.string.recording_entry_privacy_body))
+            .assertIsDisplayed()
+        composeRule
+            .onNodeWithText(context.getString(R.string.recording_entry_privacy_retention_body))
+            .assertIsDisplayed()
+        composeRule
             .onNodeWithText(context.getString(R.string.recording_entry_permissions_summary))
             .assertIsDisplayed()
         composeRule

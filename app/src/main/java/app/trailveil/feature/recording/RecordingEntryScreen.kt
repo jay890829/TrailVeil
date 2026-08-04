@@ -501,6 +501,10 @@ private fun PrivacySheet(
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
+                    text = stringResource(R.string.recording_entry_privacy_retention_body),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
                     text = stringResource(R.string.recording_entry_permissions_summary),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
