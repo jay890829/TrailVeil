@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import app.trailveil.R
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
@@ -75,27 +76,44 @@ class RecordingPlatformContractTest {
     }
 
     /**
-     * The confirmation has to reach a user who stopped from the shade and never opened the app, so
-     * it is a normal dismissible notification on its own channel rather than another ongoing one.
+     * An outcome has to reach a user who stopped from the shade, or who never noticed the recording
+     * die at all, so it is a normal dismissible notification on its own channel rather than another
+     * ongoing one.
      */
     @Test
-    fun theSavedConfirmationIsDismissibleAndSeparatelyMutable() {
+    fun outcomeNotificationsAreDismissibleAndSeparatelyMutable() {
         val notifier = RecordingForegroundNotifier(context)
         notifier.ensureChannel()
+        val manager = context.getSystemService(NotificationManager::class.java)
         val channel = requireNotNull(
-            context.getSystemService(NotificationManager::class.java)
-                .getNotificationChannel(RecordingForegroundNotifier.COMPLETED_CHANNEL_ID),
+            manager.getNotificationChannel(RecordingForegroundNotifier.OUTCOME_CHANNEL_ID),
         )
         assertNotEquals(RecordingForegroundNotifier.CHANNEL_ID, channel.id)
         assertEquals(NotificationManager.IMPORTANCE_DEFAULT, channel.importance)
+        assertNull(
+            manager.getNotificationChannel(
+                RecordingForegroundNotifier.RETIRED_COMPLETED_CHANNEL_ID,
+            ),
+        )
 
-        val completed = notifier.completedNotification()
-        assertEquals(0, completed.flags and Notification.FLAG_ONGOING_EVENT)
-        assertTrue(completed.flags and Notification.FLAG_AUTO_CANCEL != 0)
-        assertNull(completed.actions)
+        listOf(
+            notifier.outcomeNotification(
+                R.string.recording_completed_title,
+                R.string.recording_completed_text,
+            ),
+            notifier.outcomeNotification(
+                R.string.recording_interrupted_title,
+                R.string.recording_interrupted_text,
+            ),
+        ).forEach { outcome ->
+            assertEquals(0, outcome.flags and Notification.FLAG_ONGOING_EVENT)
+            assertTrue(outcome.flags and Notification.FLAG_AUTO_CANCEL != 0)
+            assertNull(outcome.actions)
+        }
+        // One session has one outcome, so the two share an id and the later one replaces the older.
         assertNotEquals(
             RecordingForegroundNotifier.NOTIFICATION_ID,
-            RecordingForegroundNotifier.COMPLETED_NOTIFICATION_ID,
+            RecordingForegroundNotifier.OUTCOME_NOTIFICATION_ID,
         )
     }
 }

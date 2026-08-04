@@ -343,6 +343,10 @@ class RecordingForegroundService : Service() {
         } catch (_: Exception) {
             // The process is being stopped; recovery will reconcile the durable active row later.
         }
+        // Notified either way. The claim is that recording stopped without completing and that
+        // whatever was already saved is kept, and both are true whether or not the terminal row
+        // could be written — nothing else will tell the user this happened.
+        notifier.showInterrupted()
         stopRuntime(startId)
     }
 

@@ -22,9 +22,17 @@ internal data class PermissionHistory(
     val hasRequestedNotifications: Boolean = false,
 ) {
     companion object {
-        /** A corrupt/unreadable marker store must never be interpreted as permission consent. */
+        /**
+         * A corrupt or unreadable marker store must never be interpreted as permission consent.
+         *
+         * For the four request markers that means `true`: "assume we already asked", so nothing is
+         * auto-requested on the user's behalf. `hasSeenIntroduction` reads the other way round —
+         * `true` means "do not show the disclosure" — so the safe value for it is `false`. A user
+         * whose store cannot be read gets the first-run disclosure again, which costs them one
+         * dialog; the alternative was never showing it to someone who had never seen it.
+         */
         val ConservativeFallback = PermissionHistory(
-            hasSeenIntroduction = true,
+            hasSeenIntroduction = false,
             hasRequestedLocation = true,
             hasRetriedLocation = true,
             hasRequestedPreciseUpgrade = true,

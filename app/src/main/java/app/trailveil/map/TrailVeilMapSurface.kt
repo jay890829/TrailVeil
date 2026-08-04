@@ -6,6 +6,7 @@ import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.os.Bundle
 import android.view.MotionEvent
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -575,12 +576,17 @@ internal fun TrailVeilMapSurface(
                 .testTag(MapSurfaceTestTags.Map),
         )
         if (fogRequired && !fogCoverageInstalled) {
-            Surface(
+            // A plain Box, not a Surface: the cover exists to stop unexplored area being shown as
+            // explored, which is about what is drawn, not about what the user is allowed to do.
+            // Material3's Surface swallows pointer input, and that swallowing was the whole of the
+            // dead period after returning from history — the map was ready within a frame, but
+            // every drag landed on the cover until fog finished installing.
+            Box(
                 modifier = Modifier
                     .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.72f))
                     .testTag(MapSurfaceTestTags.FogSafetyCover),
-                color = Color.Black.copy(alpha = 0.72f),
-            ) {}
+            )
         }
         val statusText = when {
             loadState == BasemapLoadState.LOADING -> stringResource(R.string.map_loading)

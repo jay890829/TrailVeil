@@ -32,20 +32,31 @@ internal class RecordingForegroundNotifier(
     }
 
     /**
-     * Tells the user their exploration was saved.
+     * Tells the user how their exploration ended.
      *
      * A recording can end while the app is not on screen — that is the whole point of stopping from
-     * the notification — so the confirmation cannot live only in the app. Posting is best-effort:
-     * the exploration is already durable by the time this runs, and nothing about it may depend on
-     * whether a notification could be shown.
+     * the notification, and it is the only way an interruption is ever noticed — so the outcome
+     * cannot live only in the app. Posting is best-effort: recording has already stopped by the
+     * time this runs, and nothing about it may depend on whether a notification could be shown.
+     * Both outcomes share one notification id because a session has exactly one of them.
      */
-    fun showCompleted() {
+    fun showCompleted() = showOutcome(outcomeNotification(
+        R.string.recording_completed_title,
+        R.string.recording_completed_text,
+    ))
+
+    fun showInterrupted() = showOutcome(outcomeNotification(
+        R.string.recording_interrupted_title,
+        R.string.recording_interrupted_text,
+    ))
+
+    private fun showOutcome(notification: Notification) {
         try {
             ensureChannel()
             requireNotNull(context.getSystemService(NotificationManager::class.java))
-                .notify(COMPLETED_NOTIFICATION_ID, completedNotification())
+                .notify(OUTCOME_NOTIFICATION_ID, notification)
         } catch (_: RuntimeException) {
-            // Notifications may be denied or disabled entirely. The exploration is saved either way.
+            // Notifications may be denied or disabled entirely. The recording ended either way.
         }
     }
 
@@ -61,25 +72,28 @@ internal class RecordingForegroundNotifier(
                 setShowBadge(false)
             },
         )
-        // Its own channel, so muting "an exploration is being recorded" does not also mute
-        // "your exploration was saved", which are opposite things to want.
+        // Its own channel, so muting "an exploration is being recorded" does not also mute how one
+        // ended, which are opposite things to want.
         manager.createNotificationChannel(
             NotificationChannel(
-                COMPLETED_CHANNEL_ID,
-                context.getString(R.string.recording_completed_channel_name),
+                OUTCOME_CHANNEL_ID,
+                context.getString(R.string.recording_outcome_channel_name),
                 NotificationManager.IMPORTANCE_DEFAULT,
             ).apply {
-                description = context.getString(R.string.recording_completed_text)
+                description = context.getString(R.string.recording_outcome_channel_description)
                 setShowBadge(false)
             },
         )
+        // A build that shipped briefly carried a completion-only channel. Remove it rather than
+        // leave an empty entry in the user's notification settings forever.
+        manager.deleteNotificationChannel(RETIRED_COMPLETED_CHANNEL_ID)
     }
 
-    internal fun completedNotification(): Notification = NotificationCompat
-        .Builder(context, COMPLETED_CHANNEL_ID)
+    internal fun outcomeNotification(titleRes: Int, textRes: Int): Notification = NotificationCompat
+        .Builder(context, OUTCOME_CHANNEL_ID)
         .setSmallIcon(R.drawable.ic_recording_notification)
-        .setContentTitle(context.getString(R.string.recording_completed_title))
-        .setContentText(context.getString(R.string.recording_completed_text))
+        .setContentTitle(context.getString(titleRes))
+        .setContentText(context.getString(textRes))
         .setCategory(NotificationCompat.CATEGORY_STATUS)
         .setAutoCancel(true)
         .setOngoing(false)
@@ -127,9 +141,10 @@ internal class RecordingForegroundNotifier(
 
     internal companion object {
         const val CHANNEL_ID = "trailveil.recording"
-        const val COMPLETED_CHANNEL_ID = "trailveil.recording.completed"
+        const val OUTCOME_CHANNEL_ID = "trailveil.recording.outcome"
+        const val RETIRED_COMPLETED_CHANNEL_ID = "trailveil.recording.completed"
         const val NOTIFICATION_ID = 1001
-        const val COMPLETED_NOTIFICATION_ID = 1002
+        const val OUTCOME_NOTIFICATION_ID = 1002
         const val NO_SESSION_ID = -1L
         private const val CONTENT_REQUEST_CODE = 1001
         private const val STOP_REQUEST_CODE = 1002
