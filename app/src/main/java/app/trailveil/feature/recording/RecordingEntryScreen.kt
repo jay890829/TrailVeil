@@ -28,7 +28,9 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -45,6 +47,7 @@ import app.trailveil.map.TrailVeilMapSurface
 import app.trailveil.map.MapCameraRequest
 import app.trailveil.map.fog.GeoPoint
 import app.trailveil.map.fog.FogRuntime
+import kotlinx.coroutines.delay
 
 internal enum class LocationNotice {
     RATIONALE,
@@ -87,6 +90,8 @@ internal data class RecordingEntryUiState(
     val recordingActive: Boolean = false,
     val starting: Boolean = false,
     val recordingState: RecordingDisplayState = RecordingDisplayState.IDLE,
+    val latestSessionId: Long? = null,
+    val latestEndedAt: Long? = null,
     val canRecenter: Boolean = false,
 )
 
@@ -109,12 +114,6 @@ internal object RecordingEntryTestTags {
     const val RecordingStateDismiss = "recording_entry_recording_state_dismiss"
 }
 
-private val TerminalRecordingStates = setOf(
-    RecordingDisplayState.COMPLETED,
-    RecordingDisplayState.INTERRUPTED,
-    RecordingDisplayState.FAILED_TO_START,
-)
-
 @Composable
 internal fun RecordingEntryScreen(
     state: RecordingEntryUiState,
@@ -134,17 +133,27 @@ internal fun RecordingEntryScreen(
     var menuExpanded by rememberSaveable { mutableStateOf(false) }
     var privacyRequested by rememberSaveable { mutableStateOf(false) }
     var privacyAcknowledged by rememberSaveable { mutableStateOf(false) }
-    val privacyVisible = privacyRequested || (state.firstVisit && !privacyAcknowledged)
-    var dismissedRecordingState by rememberSaveable {
-        mutableStateOf<RecordingDisplayState?>(null)
-    }
-    // A dismissal only silences the state instance it was made for. As soon as the derived
-    // state changes to anything else the card becomes visible again, so a later terminal
-    // outcome is never swallowed by an earlier dismissal.
-    LaunchedEffect(state.recordingState) {
-        if (dismissedRecordingState != null && dismissedRecordingState != state.recordingState) {
-            dismissedRecordingState = null
-        }
+    // Never auto-open the disclosure on `firstVisit` alone: until the stored history has been read
+    // the route cannot know whether this is a first visit, and showing it on that guess made the
+    // sheet flash on every launch and every return from history for people who had long since
+    // seen it.
+    val privacyVisible = privacyRequested ||
+        (!state.loading && state.firstVisit && !privacyAcknowledged)
+    // An acknowledgement belongs to one exploration, not to a kind of outcome. Keying it on the
+    // session means a later outcome is visible by construction rather than by a rule that has to
+    // guess when the previous one stopped applying.
+    var acknowledgedSessionId by rememberSaveable { mutableStateOf<Long?>(null) }
+    // Re-read the clock only when the outcome being timed changes, and once more when its window
+    // is due to close. Recomposition alone must not move it, or the card's lifetime would depend
+    // on unrelated redraws.
+    var noticeNowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(state.latestSessionId, state.latestEndedAt) {
+        noticeNowMillis = System.currentTimeMillis()
+        val endedAt = state.latestEndedAt ?: return@LaunchedEffect
+        val remaining = COMPLETED_NOTICE_WINDOW_MILLIS - (noticeNowMillis - endedAt)
+        if (remaining <= 0L) return@LaunchedEffect
+        delay(remaining)
+        noticeNowMillis = System.currentTimeMillis()
     }
     var dismissedStartNotice by rememberSaveable { mutableStateOf<RecordingStartNotice?>(null) }
     // Start notices are one-shot acknowledgements of a user action, so the same dismissal rule
@@ -155,8 +164,17 @@ internal fun RecordingEntryScreen(
         }
     }
     val recordingStateDismissible = state.recordingState in TerminalRecordingStates
-    val recordingStateVisible = state.recordingState != RecordingDisplayState.IDLE &&
-        dismissedRecordingState != state.recordingState
+    val recordingStateVisible = if (recordingStateDismissible) {
+        terminalNoticeVisible(
+            state = state.recordingState,
+            sessionId = state.latestSessionId,
+            endedAt = state.latestEndedAt,
+            nowMillis = noticeNowMillis,
+            acknowledgedSessionId = acknowledgedSessionId,
+        )
+    } else {
+        state.recordingState != RecordingDisplayState.IDLE
+    }
 
     Surface(
         modifier = modifier.fillMaxSize(),
@@ -222,7 +240,7 @@ internal fun RecordingEntryScreen(
                         RecordingStateCard(
                             state = state.recordingState,
                             onDismiss = if (recordingStateDismissible) {
-                                { dismissedRecordingState = state.recordingState }
+                                { acknowledgedSessionId = state.latestSessionId }
                             } else {
                                 null
                             },

@@ -71,6 +71,10 @@ internal fun RecordingEntryRoute(
     var locationNotice by rememberSaveable { mutableStateOf<LocationNotice?>(null) }
     var startNotice by rememberSaveable { mutableStateOf<RecordingStartNotice?>(null) }
     var latestHistoryDetail by remember { mutableStateOf<RecordingHistoryDetail?>(null) }
+    // A null detail means both "no exploration exists" and "the newest one has not been read yet",
+    // and the screen must not act on the second as if it were the first — that is how a live
+    // recording could be offered a Start action instead of Stop.
+    var latestHistoryLoaded by remember { mutableStateOf(false) }
     var stoppingSessionId by remember(appContainer) { mutableStateOf<Long?>(null) }
     var serviceLocation by remember(appContainer) {
         mutableStateOf<RecordingServiceLocation?>(null)
@@ -91,6 +95,7 @@ internal fun RecordingEntryRoute(
     LaunchedEffect(appContainer) {
         appContainer.recordingHistory.latestSessionDetail().collectLatest { detail ->
             latestHistoryDetail = detail
+            latestHistoryLoaded = true
         }
     }
 
@@ -320,14 +325,18 @@ internal fun RecordingEntryRoute(
         }
     RecordingEntryScreen(
         state = RecordingEntryUiState(
-            loading = currentHistory == null,
-            firstVisit = currentHistory?.hasSeenIntroduction != true,
+            loading = currentHistory == null || !latestHistoryLoaded,
+            // Not knowing yet is not the same as knowing this is a first visit. Deriving the two
+            // from the same snapshot keeps them from disagreeing for a frame.
+            firstVisit = currentHistory != null && !currentHistory.hasSeenIntroduction,
             locationNotice = locationNotice,
             notificationNotice = notificationNotice,
             startNotice = startNotice,
             recordingActive = recordingPresentation.activeSessionId != null,
             starting = starting,
             recordingState = recordingPresentation.state,
+            latestSessionId = recordingPresentation.latestSessionId,
+            latestEndedAt = recordingPresentation.latestEndedAt,
             canRecenter = currentLocation != null,
         ),
         onStart = {

@@ -10,6 +10,7 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import app.trailveil.feature.recording.COMPLETED_NOTICE_WINDOW_MILLIS
 import app.trailveil.feature.recording.LocationNotice
 import app.trailveil.feature.recording.NotificationNotice
 import app.trailveil.feature.recording.RecordingEntryScreen
@@ -319,17 +320,22 @@ class RecordingEntryScreenTest {
     }
 
     @Test
-    fun aDismissedTerminalStateStaysHiddenUntilTheStateChanges() {
+    fun aDismissedOutcomeSurvivesTheScreenBeingRebuilt() {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val completed = context.getString(R.string.recording_state_completed)
         val interrupted = context.getString(R.string.recording_state_interrupted)
-        val displayState = mutableStateOf(RecordingDisplayState.COMPLETED)
+        val endedAt = System.currentTimeMillis()
+        val published = mutableStateOf(
+            RecordingEntryUiState(
+                firstVisit = false,
+                recordingState = RecordingDisplayState.COMPLETED,
+                latestSessionId = 7L,
+                latestEndedAt = endedAt,
+            ),
+        )
         composeRule.setContent {
             RecordingEntryScreen(
-                state = RecordingEntryUiState(
-                    firstVisit = false,
-                    recordingState = displayState.value,
-                ),
+                state = published.value,
                 onStart = {},
                 onStop = {},
                 onLocationAction = {},
@@ -343,16 +349,107 @@ class RecordingEntryScreenTest {
         composeRule.onNodeWithTag(RecordingEntryTestTags.RecordingState).assertDoesNotExist()
         composeRule.onNodeWithText(completed).assertDoesNotExist()
 
-        // A different terminal outcome is new information and must not inherit the dismissal.
-        composeRule.runOnIdle { displayState.value = RecordingDisplayState.INTERRUPTED }
+        // Leaving this screen and coming back republishes an unread state before the same session
+        // arrives again. Neither frame is a new outcome, so neither may revive the dismissal.
+        composeRule.runOnIdle {
+            published.value = RecordingEntryUiState(firstVisit = false, loading = true)
+        }
+        composeRule.onNodeWithTag(RecordingEntryTestTags.RecordingState).assertDoesNotExist()
+        composeRule.runOnIdle {
+            published.value = RecordingEntryUiState(
+                firstVisit = false,
+                recordingState = RecordingDisplayState.COMPLETED,
+                latestSessionId = 7L,
+                latestEndedAt = endedAt,
+            )
+        }
+        composeRule.onNodeWithTag(RecordingEntryTestTags.RecordingState).assertDoesNotExist()
+        composeRule.onNodeWithText(completed).assertDoesNotExist()
+
+        // A different exploration's outcome is new information and must not inherit the dismissal.
+        composeRule.runOnIdle {
+            published.value = RecordingEntryUiState(
+                firstVisit = false,
+                recordingState = RecordingDisplayState.INTERRUPTED,
+                latestSessionId = 8L,
+                latestEndedAt = endedAt,
+            )
+        }
         composeRule.onNodeWithTag(RecordingEntryTestTags.RecordingState).assertIsDisplayed()
         composeRule.onNodeWithText(interrupted).assertIsDisplayed()
 
-        // Dismissing again must not permanently silence a state the user already dismissed once.
+        // Dismissing again must not permanently silence outcomes the user dismissed once before.
         composeRule.onNodeWithTag(RecordingEntryTestTags.RecordingStateDismiss).performClick()
         composeRule.onNodeWithTag(RecordingEntryTestTags.RecordingState).assertDoesNotExist()
-        composeRule.runOnIdle { displayState.value = RecordingDisplayState.COMPLETED }
+        composeRule.runOnIdle {
+            published.value = RecordingEntryUiState(
+                firstVisit = false,
+                recordingState = RecordingDisplayState.COMPLETED,
+                latestSessionId = 9L,
+                latestEndedAt = endedAt,
+            )
+        }
         composeRule.onNodeWithText(completed).assertIsDisplayed()
+    }
+
+    @Test
+    fun aCompletionStopsAnnouncingItselfOnceItsWindowHasPassed() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val completed = context.getString(R.string.recording_state_completed)
+        val interrupted = context.getString(R.string.recording_state_interrupted)
+        val longAgo = System.currentTimeMillis() - COMPLETED_NOTICE_WINDOW_MILLIS * 10L
+        val published = mutableStateOf(
+            RecordingEntryUiState(
+                firstVisit = false,
+                recordingState = RecordingDisplayState.COMPLETED,
+                latestSessionId = 7L,
+                latestEndedAt = longAgo,
+            ),
+        )
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = published.value,
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.RecordingState).assertDoesNotExist()
+        composeRule.onNodeWithText(completed).assertDoesNotExist()
+
+        // A failed exploration is not a courtesy message, so it keeps waiting to be read.
+        composeRule.runOnIdle {
+            published.value = RecordingEntryUiState(
+                firstVisit = false,
+                recordingState = RecordingDisplayState.INTERRUPTED,
+                latestSessionId = 7L,
+                latestEndedAt = longAgo,
+            )
+        }
+        composeRule.onNodeWithText(interrupted).assertIsDisplayed()
+    }
+
+    @Test
+    fun anUnloadedScreenPresentsNeitherTheDisclosureNorAnEnabledStart() {
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(loading = true, firstVisit = true),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        // `firstVisit` defaults to true before the stored history is read, so the disclosure must
+        // wait for a real answer rather than flashing on the default.
+        composeRule.onNodeWithTag(RecordingEntryTestTags.PrivacySheet).assertDoesNotExist()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Start).assertIsNotEnabled()
     }
 
     @Test

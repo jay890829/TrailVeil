@@ -6,7 +6,9 @@ import app.trailveil.data.history.RecordingHistoryOperationOutcome
 import app.trailveil.data.history.RecordingHistorySession
 import app.trailveil.data.history.RecordingHistoryStatus
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RecordingPresentationTest {
@@ -16,7 +18,21 @@ class RecordingPresentationTest {
 
         assertEquals(RecordingDisplayState.IDLE, presentation.state)
         assertNull(presentation.activeSessionId)
+        assertNull(presentation.latestSessionId)
+        assertNull(presentation.latestEndedAt)
         assertNull(presentation.latestAcceptedPoint)
+    }
+
+    @Test
+    fun terminalOutcomesStillCarryTheirSessionIdentity() {
+        val presentation = detail(RecordingHistoryStatus.COMPLETED)
+            .toRecordingPresentation(stoppingSessionId = null)
+
+        // `activeSessionId` is deliberately null once a session ends, so identity for an
+        // acknowledgement has to come from somewhere that survives the ending.
+        assertNull(presentation.activeSessionId)
+        assertEquals(7L, presentation.latestSessionId)
+        assertEquals(2_000L, presentation.latestEndedAt)
     }
 
     @Test
@@ -70,6 +86,116 @@ class RecordingPresentationTest {
                 .toRecordingPresentation(stoppingSessionId = null)
                 .state,
         )
+    }
+
+    @Test
+    fun anOutcomeWithoutIdentityIsNeverAnnounced() {
+        // The route publishes IDLE with no identity for as long as the newest session is being
+        // read, which happens on every return from the history screen. IDLE is not terminal, so
+        // that frame is already silent — but nothing may announce an outcome it cannot name, and
+        // the two states that otherwise never expire are where that would actually show.
+        listOf(
+            RecordingDisplayState.INTERRUPTED,
+            RecordingDisplayState.FAILED_TO_START,
+            RecordingDisplayState.COMPLETED,
+            RecordingDisplayState.IDLE,
+        ).forEach { state ->
+            assertFalse(
+                terminalNoticeVisible(
+                    state = state,
+                    sessionId = null,
+                    endedAt = 2_000L,
+                    nowMillis = 2_100L,
+                    acknowledgedSessionId = 7L,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun anAcknowledgementIsBoundToOneExploration() {
+        assertFalse(
+            terminalNoticeVisible(
+                state = RecordingDisplayState.COMPLETED,
+                sessionId = 7L,
+                endedAt = 2_000L,
+                nowMillis = 2_100L,
+                acknowledgedSessionId = 7L,
+            ),
+        )
+        // The same outcome for a later exploration is new information, not a repeat.
+        assertTrue(
+            terminalNoticeVisible(
+                state = RecordingDisplayState.COMPLETED,
+                sessionId = 8L,
+                endedAt = 2_000L,
+                nowMillis = 2_100L,
+                acknowledgedSessionId = 7L,
+            ),
+        )
+    }
+
+    @Test
+    fun aCompletionExpiresOnItsPersistedEndTime() {
+        val endedAt = 2_000L
+        assertTrue(
+            terminalNoticeVisible(
+                state = RecordingDisplayState.COMPLETED,
+                sessionId = 7L,
+                endedAt = endedAt,
+                nowMillis = endedAt + COMPLETED_NOTICE_WINDOW_MILLIS - 1L,
+                acknowledgedSessionId = null,
+            ),
+        )
+        assertFalse(
+            terminalNoticeVisible(
+                state = RecordingDisplayState.COMPLETED,
+                sessionId = 7L,
+                endedAt = endedAt,
+                nowMillis = endedAt + COMPLETED_NOTICE_WINDOW_MILLIS,
+                acknowledgedSessionId = null,
+            ),
+        )
+    }
+
+    @Test
+    fun failedOutcomesWaitToBeReadInsteadOfExpiring() {
+        val endedAt = 2_000L
+        val longAfter = endedAt + COMPLETED_NOTICE_WINDOW_MILLIS * 10L
+        listOf(
+            RecordingDisplayState.INTERRUPTED,
+            RecordingDisplayState.FAILED_TO_START,
+        ).forEach { state ->
+            assertTrue(
+                terminalNoticeVisible(
+                    state = state,
+                    sessionId = 7L,
+                    endedAt = endedAt,
+                    nowMillis = longAfter,
+                    acknowledgedSessionId = null,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun liveStatesAreNotGovernedByTheTerminalRule() {
+        listOf(
+            RecordingDisplayState.STARTING,
+            RecordingDisplayState.RECORDING,
+            RecordingDisplayState.POOR_SIGNAL,
+            RecordingDisplayState.STOPPING,
+        ).forEach { state ->
+            assertFalse(
+                terminalNoticeVisible(
+                    state = state,
+                    sessionId = 7L,
+                    endedAt = null,
+                    nowMillis = 2_000L,
+                    acknowledgedSessionId = null,
+                ),
+            )
+        }
     }
 
     private fun detail(
