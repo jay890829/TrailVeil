@@ -71,6 +71,9 @@ object WebMercator {
         return mercator.coerceIn(0.0, 1.0)
     }
 
+    fun latitudeAtNormalizedY(normalizedY: Double): Double =
+        Math.toDegrees(atan(sinh(PI * (1.0 - 2.0 * normalizedY))))
+
     fun worldPixel(point: GeoPoint, zoom: Int, tileSize: Int = 256): WorldPixel {
         require(zoom in 0..22) { "zoom must be in 0..22" }
         require(tileSize > 0) { "tileSize must be positive" }

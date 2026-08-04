@@ -49,7 +49,8 @@ class FogRuntime(
 class FogViewportCoordinator(
     private val trackDataSource: ViewportTrackDataSource,
     private val pipeline: FogTilePipeline,
-    private val style: FogRenderStyle = FogRenderStyle(),
+    // Exposed so the map surface can paint out-of-mosaic map with the renderer's own fog.
+    val style: FogRenderStyle = FogRenderStyle(),
     private val renderVersion: Int = FogRenderVersions.CURRENT,
     private val queryMarginMeters: Double = DEFAULT_QUERY_MARGIN_METERS,
 ) {

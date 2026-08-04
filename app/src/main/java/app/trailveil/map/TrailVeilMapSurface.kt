@@ -38,8 +38,10 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.savedstate.compose.LocalSavedStateRegistryOwner
 import app.trailveil.R
+import app.trailveil.map.fog.FogBackdropGeometry
 import app.trailveil.map.fog.FogPixelMask
 import app.trailveil.map.fog.FogRuntime
+import app.trailveil.map.fog.FogTileBounds
 import app.trailveil.map.fog.FogTileMosaic
 import app.trailveil.map.fog.FogViewportRequest
 import app.trailveil.map.fog.FogViewportRender
@@ -89,6 +91,24 @@ internal object MapSurfaceTestTags {
 internal object FogOverlayIds {
     const val Source = "trailveil-cumulative-fog-source"
     const val Layer = "trailveil-cumulative-fog-layer"
+}
+
+/**
+ * The mosaic has finite bounds, so the map outside them carries its own fog in map coordinates.
+ * MapLibre transforms these bands with the camera in the frame that draws the mosaic, which is
+ * what makes coverage immune to the dispatch lag of any camera callback.
+ */
+internal object FogBackdropIds {
+    const val NorthSource = "trailveil-fog-backdrop-north-source"
+    const val NorthLayer = "trailveil-fog-backdrop-north-layer"
+    const val SouthSource = "trailveil-fog-backdrop-south-source"
+    const val SouthLayer = "trailveil-fog-backdrop-south-layer"
+    const val WestSource = "trailveil-fog-backdrop-west-source"
+    const val WestLayer = "trailveil-fog-backdrop-west-layer"
+    const val EastSource = "trailveil-fog-backdrop-east-source"
+    const val EastLayer = "trailveil-fog-backdrop-east-layer"
+
+    val Layers: List<String> = listOf(NorthLayer, SouthLayer, WestLayer, EastLayer)
 }
 
 internal object CurrentLocationOverlayIds {
@@ -185,7 +205,9 @@ internal fun TrailVeilMapSurface(
     var fogPlaceholderReadyGeneration by remember(mapView, fogRuntime) {
         mutableLongStateOf(-1L)
     }
-    var fogCoverageInstalled by remember(mapView, fogRuntime, fogRequired) {
+    // A new style starts with no fog sources or layers at all, so installed coverage cannot
+    // survive one.
+    var fogCoverageInstalled by remember(mapView, fogRuntime, fogRequired, readyStyle) {
         mutableStateOf(!fogRequired)
     }
     var canonicalFogLoaded by remember(mapView, fogRuntime, fogRequired) {
@@ -383,9 +405,11 @@ internal fun TrailVeilMapSurface(
         if (!fogRequired || map == null || style == null || runtime == null) {
             onDispose { }
         } else {
+            // Gesture motion deliberately leaves the installed overlay alone. The mosaic is
+            // anchored to the map, so it stays truthful wherever a gesture takes the camera, and
+            // the backdrop bands keep everything around it fogged in the same rendered frame.
             fun requestViewport() {
                 val request = map.fogViewportRequest()
-                fogCoverageInstalled = false
                 canonicalFogLoaded = false
                 fogRenderFailed = false
                 fogPlaceholderReadyGeneration = -1L
@@ -394,17 +418,18 @@ internal fun TrailVeilMapSurface(
             }
 
             val idleListener = MapLibreMap.OnCameraIdleListener(::requestViewport)
-            val moveStartedListener = MapLibreMap.OnCameraMoveStartedListener {
-                // The previous mosaic has finite bounds. Hide it during camera motion so a fast
-                // pan cannot expose unknown map outside those bounds before the idle rebuild.
-                // Deciding this from the live viewport instead is a frame behind what MapLibre has
-                // already drawn, which is enough to reveal unexplored area during a fast pan.
-                fogCoverageInstalled = false
-                canonicalFogLoaded = false
-                fogRenderFailed = false
-                fogPlaceholderReadyGeneration = -1L
-                fogViewportRequest = null
-                fogViewportGeneration += 1L
+            val moveStartedListener = MapLibreMap.OnCameraMoveStartedListener { reason ->
+                // A programmed camera move can jump anywhere at once, including past the bands,
+                // so it still hides the overlay until the rebuild lands. Gestures cannot: their
+                // reach is bounded and the bands already cover it.
+                if (reason != MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) {
+                    fogCoverageInstalled = false
+                    canonicalFogLoaded = false
+                    fogRenderFailed = false
+                    fogPlaceholderReadyGeneration = -1L
+                    fogViewportRequest = null
+                    fogViewportGeneration += 1L
+                }
             }
             val moveCanceledListener = MapLibreMap.OnCameraMoveCanceledListener(::requestViewport)
             map.addOnCameraIdleListener(idleListener)
@@ -429,34 +454,43 @@ internal fun TrailVeilMapSurface(
         val style = readyStyle ?: return@LaunchedEffect
         val request = fogViewportRequest ?: return@LaunchedEffect
         val generation = fogViewportGeneration
-        retryFogOperation(
-            retryDelayMillis = FOG_RETRY_DELAY_MILLIS,
-            onFailure = { failure ->
-                if (
-                    generation == fogViewportGeneration &&
-                    request == fogViewportRequest &&
-                    style === readyStyle
-                ) {
-                    fogCoverageInstalled = false
-                    canonicalFogLoaded = false
-                    fogRenderFailed = true
-                    currentOnFogFailure(failure)
-                }
-            },
-        ) {
-            val placeholder = runtime.viewportCoordinator.placeholder(request)
-            mapView.installFogMosaicAndAwait(style, placeholder.mosaic)
+        // An already installed overlay keeps covering the new viewport truthfully: its mosaic is
+        // map-anchored and its bands fog everything else. Only a surface with no installed
+        // overlay needs the opaque placeholder before canonical fog arrives.
+        if (!fogCoverageInstalled) {
+            retryFogOperation(
+                retryDelayMillis = FOG_RETRY_DELAY_MILLIS,
+                onFailure = { failure ->
+                    if (
+                        generation == fogViewportGeneration &&
+                        request == fogViewportRequest &&
+                        style === readyStyle
+                    ) {
+                        fogCoverageInstalled = false
+                        canonicalFogLoaded = false
+                        fogRenderFailed = true
+                        currentOnFogFailure(failure)
+                    }
+                },
+            ) {
+                val placeholder = runtime.viewportCoordinator.placeholder(request)
+                mapView.installFogOverlayAndAwait(
+                    style = style,
+                    mosaic = placeholder.mosaic,
+                    fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
+                )
+            }
+            if (
+                generation != fogViewportGeneration ||
+                request != fogViewportRequest ||
+                style !== readyStyle
+            ) {
+                return@LaunchedEffect
+            }
+            fogCoverageInstalled = true
+            canonicalFogLoaded = false
+            fogRenderFailed = false
         }
-        if (
-            generation != fogViewportGeneration ||
-            request != fogViewportRequest ||
-            style !== readyStyle
-        ) {
-            return@LaunchedEffect
-        }
-        fogCoverageInstalled = true
-        canonicalFogLoaded = false
-        fogRenderFailed = false
         fogPlaceholderReadyGeneration = generation
     }
 
@@ -484,7 +518,11 @@ internal fun TrailVeilMapSurface(
                 }
             },
             installAndAwait = { viewport ->
-                mapView.installFogMosaicAndAwait(style, viewport.mosaic)
+                mapView.installFogOverlayAndAwait(
+                    style = style,
+                    mosaic = viewport.mosaic,
+                    fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
+                )
             },
             onFailure = { failure ->
                 if (
@@ -550,14 +588,17 @@ private fun MapLibreMap.fogViewportRequest(): FogViewportRequest {
     )
 }
 
+/**
+ * Installs the mosaic and the bands that close around it in one call stack, so no rendered frame
+ * can pair one of them with the other's previous geometry.
+ */
+private fun Style.installFogOverlay(mosaic: FogTileMosaic, fogAlpha: Int) {
+    installFogMosaic(mosaic)
+    installFogBackdrop(mosaic, fogAlpha)
+}
+
 private fun Style.installFogMosaic(mosaic: FogTileMosaic) {
-    val bounds = mosaic.bounds
-    val coordinates = LatLngQuad(
-        LatLng(bounds.northLatitude, bounds.westLongitude),
-        LatLng(bounds.northLatitude, bounds.eastLongitude),
-        LatLng(bounds.southLatitude, bounds.eastLongitude),
-        LatLng(bounds.southLatitude, bounds.westLongitude),
-    )
+    val coordinates = mosaic.bounds.toQuad()
     val bitmap = mosaic.mask.toBitmap()
     val source = getSourceAs<ImageSource>(FogOverlayIds.Source)
     if (source == null) {
@@ -578,6 +619,73 @@ private fun Style.installFogMosaic(mosaic: FogTileMosaic) {
         }
     }
 }
+
+private fun Style.installFogBackdrop(mosaic: FogTileMosaic, fogAlpha: Int) {
+    val bands = FogBackdropGeometry.bands(mosaic)
+    installFogBackdropBand(
+        FogBackdropIds.NorthSource,
+        FogBackdropIds.NorthLayer,
+        bands.north,
+        fogAlpha,
+    )
+    installFogBackdropBand(
+        FogBackdropIds.SouthSource,
+        FogBackdropIds.SouthLayer,
+        bands.south,
+        fogAlpha,
+    )
+    installFogBackdropBand(
+        FogBackdropIds.WestSource,
+        FogBackdropIds.WestLayer,
+        bands.west,
+        fogAlpha,
+    )
+    installFogBackdropBand(
+        FogBackdropIds.EastSource,
+        FogBackdropIds.EastLayer,
+        bands.east,
+        fogAlpha,
+    )
+}
+
+private fun Style.installFogBackdropBand(
+    sourceId: String,
+    layerId: String,
+    bounds: FogTileBounds,
+    fogAlpha: Int,
+) {
+    val coordinates = bounds.toQuad()
+    val source = getSourceAs<ImageSource>(sourceId)
+    if (source == null) {
+        addSource(ImageSource(sourceId, coordinates, fogBandBitmap(fogAlpha)))
+    } else {
+        source.setCoordinates(coordinates)
+    }
+    if (getLayer(layerId) == null) {
+        val layer = RasterLayer(layerId, sourceId).withProperties(
+            PropertyFactory.rasterFadeDuration(0f),
+            PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
+        )
+        // Above the mosaic, so the half-pixel the bands deliberately overlap it stays one flat
+        // layer of fog instead of a darker seam, and still below the location and track overlays.
+        if (getLayer(FogOverlayIds.Layer) == null) {
+            addLayer(layer)
+        } else {
+            addLayerAbove(layer, FogOverlayIds.Layer)
+        }
+    }
+}
+
+private fun FogTileBounds.toQuad(): LatLngQuad = LatLngQuad(
+    LatLng(northLatitude, westLongitude),
+    LatLng(northLatitude, eastLongitude),
+    LatLng(southLatitude, eastLongitude),
+    LatLng(southLatitude, westLongitude),
+)
+
+/** One texel of the renderer's own fog, stretched over a band by the raster layer. */
+private fun fogBandBitmap(fogAlpha: Int): Bitmap =
+    Bitmap.createBitmap(intArrayOf((fogAlpha and 0xff) shl 24), 1, 1, Bitmap.Config.ARGB_8888)
 
 private fun Style.installCurrentLocation(point: GeoPoint?) {
     val collection = point?.let {
@@ -691,9 +799,13 @@ private suspend fun <T> retryFogOperation(
     }
 }
 
-private suspend fun MapView.installFogMosaicAndAwait(style: Style, mosaic: FogTileMosaic) {
+private suspend fun MapView.installFogOverlayAndAwait(
+    style: Style,
+    mosaic: FogTileMosaic,
+    fogAlpha: Int,
+) {
     val rendered = withTimeoutOrNull(FOG_FRAME_TIMEOUT_MILLIS) {
-        awaitFullyRenderedFrameAfter { style.installFogMosaic(mosaic) }
+        awaitFullyRenderedFrameAfter { style.installFogOverlay(mosaic, fogAlpha) }
         true
     }
     if (rendered != true) error("MapLibre did not fully render the fog frame in time")

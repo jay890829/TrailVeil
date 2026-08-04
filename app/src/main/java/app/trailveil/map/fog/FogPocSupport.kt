@@ -1,10 +1,5 @@
 package app.trailveil.map.fog
 
-import kotlin.math.PI
-import kotlin.math.atan
-import kotlin.math.floor
-import kotlin.math.sinh
-
 data class FogTileBounds(
     val westLongitude: Double,
     val southLatitude: Double,
@@ -55,7 +50,7 @@ object FogPocTileGrid {
     }
 
     private fun latitudeAtTileEdge(normalizedY: Double): Double =
-        Math.toDegrees(atan(sinh(PI * (1.0 - 2.0 * normalizedY))))
+        WebMercator.latitudeAtNormalizedY(normalizedY)
 }
 
 enum class FogPocTimingStage(val logValue: String) {
