@@ -12,6 +12,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -70,6 +71,31 @@ class RecordingPlatformContractTest {
         assertNotEquals(
             first.actions.single().actionIntent,
             second.actions.single().actionIntent,
+        )
+    }
+
+    /**
+     * The confirmation has to reach a user who stopped from the shade and never opened the app, so
+     * it is a normal dismissible notification on its own channel rather than another ongoing one.
+     */
+    @Test
+    fun theSavedConfirmationIsDismissibleAndSeparatelyMutable() {
+        val notifier = RecordingForegroundNotifier(context)
+        notifier.ensureChannel()
+        val channel = requireNotNull(
+            context.getSystemService(NotificationManager::class.java)
+                .getNotificationChannel(RecordingForegroundNotifier.COMPLETED_CHANNEL_ID),
+        )
+        assertNotEquals(RecordingForegroundNotifier.CHANNEL_ID, channel.id)
+        assertEquals(NotificationManager.IMPORTANCE_DEFAULT, channel.importance)
+
+        val completed = notifier.completedNotification()
+        assertEquals(0, completed.flags and Notification.FLAG_ONGOING_EVENT)
+        assertTrue(completed.flags and Notification.FLAG_AUTO_CANCEL != 0)
+        assertNull(completed.actions)
+        assertNotEquals(
+            RecordingForegroundNotifier.NOTIFICATION_ID,
+            RecordingForegroundNotifier.COMPLETED_NOTIFICATION_ID,
         )
     }
 }

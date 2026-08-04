@@ -19,12 +19,24 @@ internal val TerminalRecordingStates = setOf(
 )
 
 /**
- * How long a completed exploration is still worth announcing, measured from the moment it actually
- * ended rather than from the moment a card appeared. The anchor matters: this screen is rebuilt
- * from scratch every time the user comes back from history, and a window measured from composition
- * would start over each time.
+ * How long a courtesy message stays on screen, measured from the moment the thing it reports
+ * actually happened rather than from the moment a card appeared. The anchor matters: this screen is
+ * rebuilt from scratch every time the user comes back from history, and a window measured from
+ * composition would start over each time.
+ *
+ * A completion is also announced by a notification, so the card is only the in-app echo of it and
+ * does not have to survive long enough to be caught.
  */
-internal const val COMPLETED_NOTICE_WINDOW_MILLIS = 60_000L
+internal const val TRANSIENT_NOTICE_WINDOW_MILLIS = 5_000L
+
+/**
+ * Acknowledgements of something the user just did. They are courtesies, so they expire; every other
+ * start notice reports a failure and waits to be read.
+ */
+internal val ExpiringStartNotices = setOf(
+    RecordingStartNotice.STARTED,
+    RecordingStartNotice.STOP_REQUESTED,
+)
 
 internal fun RecordingHistoryDetail?.toRecordingPresentation(
     stoppingSessionId: Long?,
@@ -88,11 +100,31 @@ internal fun terminalNoticeVisible(
     if (sessionId == acknowledgedSessionId) return false
     return when (state) {
         RecordingDisplayState.COMPLETED ->
-            endedAt != null && nowMillis - endedAt < COMPLETED_NOTICE_WINDOW_MILLIS
+            endedAt != null && nowMillis - endedAt < TRANSIENT_NOTICE_WINDOW_MILLIS
         // A failed or interrupted exploration is the outcome a user may still need to act on, so it
         // waits to be read instead of expiring on its own.
         else -> true
     }
+}
+
+/**
+ * Whether a start notice is still worth showing.
+ *
+ * `raisedAt` is when the user's action produced the notice, not when it was last drawn, so leaving
+ * this screen and coming back does not buy the notice another window.
+ */
+internal fun startNoticeVisible(
+    notice: RecordingStartNotice?,
+    raisedAt: Long?,
+    nowMillis: Long,
+    dismissedNotice: RecordingStartNotice?,
+): Boolean {
+    if (notice == null) return false
+    if (notice == dismissedNotice) return false
+    if (notice !in ExpiringStartNotices) return true
+    // An acknowledgement with no timestamp cannot be timed, and a courtesy that cannot expire is
+    // the thing being removed here, so it does not get shown at all.
+    return raisedAt != null && nowMillis - raisedAt < TRANSIENT_NOTICE_WINDOW_MILLIS
 }
 
 private const val LOCATION_REJECTED_PREFIX = "LOCATION_REJECTED_"

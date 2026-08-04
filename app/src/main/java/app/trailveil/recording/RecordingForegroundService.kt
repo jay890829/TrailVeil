@@ -196,6 +196,9 @@ class RecordingForegroundService : Service() {
                 dependencies.operationIds.next("notification-stop"), activeSessionId, dependencies.clock.epochMillis(),
                 TerminalReason.NOTIFICATION_STOP,
             )
+            // Only after the exploration is durable, and only on the path that completes one, so
+            // the confirmation can never outrun what it is confirming.
+            notifier.showCompleted()
             stopRuntime(command.startId)
         } catch (cancelled: CancellationException) {
             throw cancelled

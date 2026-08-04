@@ -5,12 +5,13 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.v2.createComposeRule
+import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import app.trailveil.feature.recording.COMPLETED_NOTICE_WINDOW_MILLIS
+import app.trailveil.feature.recording.TRANSIENT_NOTICE_WINDOW_MILLIS
 import app.trailveil.feature.recording.LocationNotice
 import app.trailveil.feature.recording.NotificationNotice
 import app.trailveil.feature.recording.RecordingEntryScreen
@@ -256,12 +257,14 @@ class RecordingEntryScreenTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val started = context.getString(R.string.recording_started)
         val stopRequested = context.getString(R.string.recording_stop_requested)
+        val raisedAt = System.currentTimeMillis()
         val startNotice = mutableStateOf<RecordingStartNotice?>(RecordingStartNotice.STARTED)
         composeRule.setContent {
             RecordingEntryScreen(
                 state = RecordingEntryUiState(
                     firstVisit = false,
                     startNotice = startNotice.value,
+                    startNoticeRaisedAt = raisedAt,
                 ),
                 onStart = {},
                 onStop = {},
@@ -397,7 +400,7 @@ class RecordingEntryScreenTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val completed = context.getString(R.string.recording_state_completed)
         val interrupted = context.getString(R.string.recording_state_interrupted)
-        val longAgo = System.currentTimeMillis() - COMPLETED_NOTICE_WINDOW_MILLIS * 10L
+        val longAgo = System.currentTimeMillis() - TRANSIENT_NOTICE_WINDOW_MILLIS * 10L
         val published = mutableStateOf(
             RecordingEntryUiState(
                 firstVisit = false,
@@ -430,6 +433,60 @@ class RecordingEntryScreenTest {
             )
         }
         composeRule.onNodeWithText(interrupted).assertIsDisplayed()
+    }
+
+    @Test
+    fun anAcknowledgementOfAUserActionDoesNotLingerOrRestart() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val started = context.getString(R.string.recording_started)
+        val launchFailure = context.getString(R.string.recording_launch_failure)
+        val published = mutableStateOf(
+            RecordingEntryUiState(
+                firstVisit = false,
+                startNotice = RecordingStartNotice.STARTED,
+                startNoticeRaisedAt = System.currentTimeMillis(),
+            ),
+        )
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = published.value,
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithText(started).assertIsDisplayed()
+        composeRule.waitUntil(TRANSIENT_NOTICE_WINDOW_MILLIS * 2) {
+            composeRule.onAllNodesWithText(started).fetchSemanticsNodes().isEmpty()
+        }
+
+        // Coming back to a stale acknowledgement must not buy it another window.
+        composeRule.runOnIdle {
+            published.value = RecordingEntryUiState(firstVisit = false, loading = true)
+        }
+        composeRule.runOnIdle {
+            published.value = RecordingEntryUiState(
+                firstVisit = false,
+                startNotice = RecordingStartNotice.STARTED,
+                startNoticeRaisedAt = System.currentTimeMillis() -
+                    TRANSIENT_NOTICE_WINDOW_MILLIS * 10L,
+            )
+        }
+        composeRule.onNodeWithText(started).assertDoesNotExist()
+
+        // A notice that reports a failure is not a courtesy, so it keeps waiting to be read.
+        composeRule.runOnIdle {
+            published.value = RecordingEntryUiState(
+                firstVisit = false,
+                startNotice = RecordingStartNotice.LAUNCH_FAILURE,
+                startNoticeRaisedAt = System.currentTimeMillis() -
+                    TRANSIENT_NOTICE_WINDOW_MILLIS * 10L,
+            )
+        }
+        composeRule.onNodeWithText(launchFailure).assertIsDisplayed()
     }
 
     @Test

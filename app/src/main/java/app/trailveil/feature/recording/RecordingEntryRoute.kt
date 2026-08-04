@@ -70,6 +70,9 @@ internal fun RecordingEntryRoute(
     var startAfterNotificationResult by remember { mutableStateOf(false) }
     var locationNotice by rememberSaveable { mutableStateOf<LocationNotice?>(null) }
     var startNotice by rememberSaveable { mutableStateOf<RecordingStartNotice?>(null) }
+    // When the user's action produced the notice, so an acknowledgement expires on its own age
+    // rather than on how long this screen has been drawn.
+    var startNoticeRaisedAt by rememberSaveable { mutableStateOf<Long?>(null) }
     var latestHistoryDetail by remember { mutableStateOf<RecordingHistoryDetail?>(null) }
     // A null detail means both "no exploration exists" and "the newest one has not been read yet",
     // and the screen must not act on the second as if it were the first — that is how a live
@@ -157,37 +160,44 @@ internal fun RecordingEntryRoute(
         notificationResultVersion += 1
     }
 
+    fun raiseStartNotice(notice: RecordingStartNotice?) {
+        startNotice = notice
+        startNoticeRaisedAt = notice?.let { System.currentTimeMillis() }
+    }
+
     suspend fun startRecording() {
         starting = true
         locationNotice = null
-        startNotice = null
+        raiseStartNotice(null)
         val outcome = controller.startFromVisibleActivity(
             activityVisible = activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
         )
-        startNotice = when (outcome) {
-            is RecordingStartOutcome.ServiceRequested -> {
-                RecordingStartNotice.STARTED
-            }
-            is RecordingStartOutcome.PersistenceFailure ->
-                RecordingStartNotice.PERSISTENCE_FAILURE
-            is RecordingStartOutcome.LaunchFailure -> RecordingStartNotice.LAUNCH_FAILURE
-            is RecordingStartOutcome.Blocked -> when (outcome.blocker) {
-                RecordingStartBlocker.ACTIVITY_NOT_VISIBLE ->
-                    RecordingStartNotice.ACTIVITY_NOT_VISIBLE
-                RecordingStartBlocker.MISSING_LOCATION_PERMISSION -> {
-                    locationNotice = LocationNotice.PERMISSION_SETTINGS
-                    null
+        raiseStartNotice(
+            when (outcome) {
+                is RecordingStartOutcome.ServiceRequested -> {
+                    RecordingStartNotice.STARTED
                 }
-                RecordingStartBlocker.MISSING_FINE_LOCATION -> {
-                    locationNotice = LocationNotice.PRECISE_SETTINGS
-                    null
+                is RecordingStartOutcome.PersistenceFailure ->
+                    RecordingStartNotice.PERSISTENCE_FAILURE
+                is RecordingStartOutcome.LaunchFailure -> RecordingStartNotice.LAUNCH_FAILURE
+                is RecordingStartOutcome.Blocked -> when (outcome.blocker) {
+                    RecordingStartBlocker.ACTIVITY_NOT_VISIBLE ->
+                        RecordingStartNotice.ACTIVITY_NOT_VISIBLE
+                    RecordingStartBlocker.MISSING_LOCATION_PERMISSION -> {
+                        locationNotice = LocationNotice.PERMISSION_SETTINGS
+                        null
+                    }
+                    RecordingStartBlocker.MISSING_FINE_LOCATION -> {
+                        locationNotice = LocationNotice.PRECISE_SETTINGS
+                        null
+                    }
+                    RecordingStartBlocker.LOCATION_DISABLED -> {
+                        locationNotice = LocationNotice.LOCATION_SERVICES
+                        null
+                    }
                 }
-                RecordingStartBlocker.LOCATION_DISABLED -> {
-                    locationNotice = LocationNotice.LOCATION_SERVICES
-                    null
-                }
-            }
-        }
+            },
+        )
         starting = false
     }
 
@@ -195,7 +205,7 @@ internal fun RecordingEntryRoute(
         when (action) {
             RecordingStartAction.WaitForResumedActivity -> {
                 starting = false
-                startNotice = RecordingStartNotice.ACTIVITY_NOT_VISIBLE
+                raiseStartNotice(RecordingStartNotice.ACTIVITY_NOT_VISIBLE)
             }
             RecordingStartAction.RequestPreciseLocation -> scope.launch {
                 starting = true
@@ -208,7 +218,7 @@ internal fun RecordingEntryRoute(
                     throw cancelled
                 } catch (_: Exception) {
                     starting = false
-                    startNotice = RecordingStartNotice.PERSISTENCE_FAILURE
+                    raiseStartNotice(RecordingStartNotice.PERSISTENCE_FAILURE)
                 }
             }
             RecordingStartAction.ShowLocationRationale -> {
@@ -242,7 +252,7 @@ internal fun RecordingEntryRoute(
                 } catch (_: Exception) {
                     startAfterNotificationResult = false
                     starting = false
-                    startNotice = RecordingStartNotice.PERSISTENCE_FAILURE
+                    raiseStartNotice(RecordingStartNotice.PERSISTENCE_FAILURE)
                 }
             }
             RecordingStartAction.ShowNotificationRationaleThenStart -> scope.launch {
@@ -332,6 +342,7 @@ internal fun RecordingEntryRoute(
             locationNotice = locationNotice,
             notificationNotice = notificationNotice,
             startNotice = startNotice,
+            startNoticeRaisedAt = startNoticeRaisedAt,
             recordingActive = recordingPresentation.activeSessionId != null,
             starting = starting,
             recordingState = recordingPresentation.state,
@@ -342,7 +353,7 @@ internal fun RecordingEntryRoute(
         onStart = {
             if (!starting) {
                 starting = true
-                startNotice = null
+                raiseStartNotice(null)
                 locationNotice = null
                 scope.launch {
                     try {
@@ -360,7 +371,7 @@ internal fun RecordingEntryRoute(
                         throw cancelled
                     } catch (_: Exception) {
                         starting = false
-                        startNotice = RecordingStartNotice.PERSISTENCE_FAILURE
+                        raiseStartNotice(RecordingStartNotice.PERSISTENCE_FAILURE)
                     }
                 }
             }
@@ -371,9 +382,9 @@ internal fun RecordingEntryRoute(
                 starting = true
                 try {
                     RecordingForegroundService.stopFromVisibleActivity(activity, sessionId)
-                    startNotice = RecordingStartNotice.STOP_REQUESTED
+                    raiseStartNotice(RecordingStartNotice.STOP_REQUESTED)
                 } catch (_: RuntimeException) {
-                    startNotice = RecordingStartNotice.LAUNCH_FAILURE
+                    raiseStartNotice(RecordingStartNotice.LAUNCH_FAILURE)
                 } finally {
                     starting = false
                 }
@@ -400,7 +411,7 @@ internal fun RecordingEntryRoute(
                             throw cancelled
                         } catch (_: Exception) {
                             starting = false
-                            startNotice = RecordingStartNotice.PERSISTENCE_FAILURE
+                            raiseStartNotice(RecordingStartNotice.PERSISTENCE_FAILURE)
                         }
                     }
                 }
@@ -431,7 +442,7 @@ internal fun RecordingEntryRoute(
                             throw cancelled
                         } catch (_: Exception) {
                             starting = false
-                            startNotice = RecordingStartNotice.PERSISTENCE_FAILURE
+                            raiseStartNotice(RecordingStartNotice.PERSISTENCE_FAILURE)
                         }
                     }
                 }

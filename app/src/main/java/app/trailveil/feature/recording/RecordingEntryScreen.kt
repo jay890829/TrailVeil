@@ -87,6 +87,7 @@ internal data class RecordingEntryUiState(
     val locationNotice: LocationNotice? = null,
     val notificationNotice: NotificationNotice? = null,
     val startNotice: RecordingStartNotice? = null,
+    val startNoticeRaisedAt: Long? = null,
     val recordingActive: Boolean = false,
     val starting: Boolean = false,
     val recordingState: RecordingDisplayState = RecordingDisplayState.IDLE,
@@ -143,17 +144,29 @@ internal fun RecordingEntryScreen(
     // session means a later outcome is visible by construction rather than by a rule that has to
     // guess when the previous one stopped applying.
     var acknowledgedSessionId by rememberSaveable { mutableStateOf<Long?>(null) }
-    // Re-read the clock only when the outcome being timed changes, and once more when its window
-    // is due to close. Recomposition alone must not move it, or the card's lifetime would depend
-    // on unrelated redraws.
+    // Re-read the clock only when something being timed changes, and once more when the nearest
+    // window is due to close. Recomposition alone must not move it, or a card's lifetime would
+    // depend on unrelated redraws.
     var noticeNowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    LaunchedEffect(state.latestSessionId, state.latestEndedAt) {
-        noticeNowMillis = System.currentTimeMillis()
-        val endedAt = state.latestEndedAt ?: return@LaunchedEffect
-        val remaining = COMPLETED_NOTICE_WINDOW_MILLIS - (noticeNowMillis - endedAt)
-        if (remaining <= 0L) return@LaunchedEffect
-        delay(remaining)
-        noticeNowMillis = System.currentTimeMillis()
+    LaunchedEffect(
+        state.latestSessionId,
+        state.latestEndedAt,
+        state.startNotice,
+        state.startNoticeRaisedAt,
+    ) {
+        val now = System.currentTimeMillis()
+        noticeNowMillis = now
+        val deadlines = listOfNotNull(
+            state.latestEndedAt.takeIf { state.recordingState in TerminalRecordingStates },
+            state.startNoticeRaisedAt.takeIf { state.startNotice in ExpiringStartNotices },
+        ).map { it + TRANSIENT_NOTICE_WINDOW_MILLIS }
+        var remaining = deadlines.filter { it > now }.minOrNull()?.minus(now)
+        while (remaining != null) {
+            delay(remaining)
+            val awake = System.currentTimeMillis()
+            noticeNowMillis = awake
+            remaining = deadlines.filter { it > awake }.minOrNull()?.minus(awake)
+        }
     }
     var dismissedStartNotice by rememberSaveable { mutableStateOf<RecordingStartNotice?>(null) }
     // Start notices are one-shot acknowledgements of a user action, so the same dismissal rule
@@ -228,7 +241,13 @@ internal fun RecordingEntryScreen(
                     }
 
                     state.startNotice?.let { notice ->
-                        if (dismissedStartNotice != notice) {
+                        val visible = startNoticeVisible(
+                            notice = notice,
+                            raisedAt = state.startNoticeRaisedAt,
+                            nowMillis = noticeNowMillis,
+                            dismissedNotice = dismissedStartNotice,
+                        )
+                        if (visible) {
                             StartNoticeCard(
                                 notice = notice,
                                 onDismiss = { dismissedStartNotice = notice },

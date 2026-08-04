@@ -48,6 +48,9 @@
     <string name="recording_notification_title">Recording your trail</string>
     <string name="recording_notification_text">TrailVeil is recording location in the background.</string>
     <string name="recording_notification_stop">Stop recording</string>
+    <string name="recording_completed_channel_name">Saved explorations</string>
+    <string name="recording_completed_title">Exploration saved</string>
+    <string name="recording_completed_text">Recording stopped. This exploration is saved on this device.</string>
     <string name="recording_state_starting">Preparing a durable exploration record…</string>
     <string name="recording_state_recording">Recording your exploration.</string>
     <string name="recording_state_poor_signal">Location signal is currently too weak for a reliable point. Recording remains active and will resume automatically.</string>

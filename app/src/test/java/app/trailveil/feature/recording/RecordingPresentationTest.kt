@@ -143,7 +143,7 @@ class RecordingPresentationTest {
                 state = RecordingDisplayState.COMPLETED,
                 sessionId = 7L,
                 endedAt = endedAt,
-                nowMillis = endedAt + COMPLETED_NOTICE_WINDOW_MILLIS - 1L,
+                nowMillis = endedAt + TRANSIENT_NOTICE_WINDOW_MILLIS - 1L,
                 acknowledgedSessionId = null,
             ),
         )
@@ -152,7 +152,7 @@ class RecordingPresentationTest {
                 state = RecordingDisplayState.COMPLETED,
                 sessionId = 7L,
                 endedAt = endedAt,
-                nowMillis = endedAt + COMPLETED_NOTICE_WINDOW_MILLIS,
+                nowMillis = endedAt + TRANSIENT_NOTICE_WINDOW_MILLIS,
                 acknowledgedSessionId = null,
             ),
         )
@@ -161,7 +161,7 @@ class RecordingPresentationTest {
     @Test
     fun failedOutcomesWaitToBeReadInsteadOfExpiring() {
         val endedAt = 2_000L
-        val longAfter = endedAt + COMPLETED_NOTICE_WINDOW_MILLIS * 10L
+        val longAfter = endedAt + TRANSIENT_NOTICE_WINDOW_MILLIS * 10L
         listOf(
             RecordingDisplayState.INTERRUPTED,
             RecordingDisplayState.FAILED_TO_START,
@@ -196,6 +196,73 @@ class RecordingPresentationTest {
                 ),
             )
         }
+    }
+
+    @Test
+    fun anAcknowledgementOfAUserActionExpiresOnItsOwnAge() {
+        val raisedAt = 2_000L
+        listOf(
+            RecordingStartNotice.STARTED,
+            RecordingStartNotice.STOP_REQUESTED,
+        ).forEach { notice ->
+            assertTrue(
+                startNoticeVisible(
+                    notice = notice,
+                    raisedAt = raisedAt,
+                    nowMillis = raisedAt + TRANSIENT_NOTICE_WINDOW_MILLIS - 1L,
+                    dismissedNotice = null,
+                ),
+            )
+            assertFalse(
+                startNoticeVisible(
+                    notice = notice,
+                    raisedAt = raisedAt,
+                    nowMillis = raisedAt + TRANSIENT_NOTICE_WINDOW_MILLIS,
+                    dismissedNotice = null,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun startNoticesThatReportAFailureWaitToBeRead() {
+        val raisedAt = 2_000L
+        val longAfter = raisedAt + TRANSIENT_NOTICE_WINDOW_MILLIS * 100L
+        listOf(
+            RecordingStartNotice.PERSISTENCE_FAILURE,
+            RecordingStartNotice.LAUNCH_FAILURE,
+            RecordingStartNotice.ACTIVITY_NOT_VISIBLE,
+        ).forEach { notice ->
+            assertTrue(
+                startNoticeVisible(
+                    notice = notice,
+                    raisedAt = raisedAt,
+                    nowMillis = longAfter,
+                    dismissedNotice = null,
+                ),
+            )
+            assertFalse(
+                startNoticeVisible(
+                    notice = notice,
+                    raisedAt = raisedAt,
+                    nowMillis = longAfter,
+                    dismissedNotice = notice,
+                ),
+            )
+        }
+    }
+
+    @Test
+    fun anUntimedAcknowledgementIsNotShownAtAll() {
+        // Nothing should be able to reintroduce a courtesy message that never goes away.
+        assertFalse(
+            startNoticeVisible(
+                notice = RecordingStartNotice.STARTED,
+                raisedAt = null,
+                nowMillis = 2_000L,
+                dismissedNotice = null,
+            ),
+        )
     }
 
     private fun detail(

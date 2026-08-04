@@ -31,6 +31,24 @@ internal class RecordingForegroundNotifier(
         ServiceCompat.stopForeground(service, ServiceCompat.STOP_FOREGROUND_REMOVE)
     }
 
+    /**
+     * Tells the user their exploration was saved.
+     *
+     * A recording can end while the app is not on screen — that is the whole point of stopping from
+     * the notification — so the confirmation cannot live only in the app. Posting is best-effort:
+     * the exploration is already durable by the time this runs, and nothing about it may depend on
+     * whether a notification could be shown.
+     */
+    fun showCompleted() {
+        try {
+            ensureChannel()
+            requireNotNull(context.getSystemService(NotificationManager::class.java))
+                .notify(COMPLETED_NOTIFICATION_ID, completedNotification())
+        } catch (_: RuntimeException) {
+            // Notifications may be denied or disabled entirely. The exploration is saved either way.
+        }
+    }
+
     fun ensureChannel() {
         val manager = requireNotNull(context.getSystemService(NotificationManager::class.java))
         manager.createNotificationChannel(
@@ -43,17 +61,42 @@ internal class RecordingForegroundNotifier(
                 setShowBadge(false)
             },
         )
+        // Its own channel, so muting "an exploration is being recorded" does not also mute
+        // "your exploration was saved", which are opposite things to want.
+        manager.createNotificationChannel(
+            NotificationChannel(
+                COMPLETED_CHANNEL_ID,
+                context.getString(R.string.recording_completed_channel_name),
+                NotificationManager.IMPORTANCE_DEFAULT,
+            ).apply {
+                description = context.getString(R.string.recording_completed_text)
+                setShowBadge(false)
+            },
+        )
     }
 
+    internal fun completedNotification(): Notification = NotificationCompat
+        .Builder(context, COMPLETED_CHANNEL_ID)
+        .setSmallIcon(R.drawable.ic_recording_notification)
+        .setContentTitle(context.getString(R.string.recording_completed_title))
+        .setContentText(context.getString(R.string.recording_completed_text))
+        .setCategory(NotificationCompat.CATEGORY_STATUS)
+        .setAutoCancel(true)
+        .setOngoing(false)
+        .setContentIntent(openAppIntent())
+        .build()
+
+    private fun openAppIntent(): PendingIntent = PendingIntent.getActivity(
+        context,
+        CONTENT_REQUEST_CODE,
+        Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        },
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+    )
+
     internal fun notification(sessionId: Long?): Notification {
-        val contentIntent = PendingIntent.getActivity(
-            context,
-            CONTENT_REQUEST_CODE,
-            Intent(context, MainActivity::class.java).apply {
-                flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
-            },
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
+        val contentIntent = openAppIntent()
         val stopIntent = Intent(context, RecordingForegroundService::class.java).apply {
             action = RecordingForegroundService.ACTION_STOP
             putExtra(RecordingForegroundService.EXTRA_SESSION_ID, sessionId ?: NO_SESSION_ID)
@@ -84,7 +127,9 @@ internal class RecordingForegroundNotifier(
 
     internal companion object {
         const val CHANNEL_ID = "trailveil.recording"
+        const val COMPLETED_CHANNEL_ID = "trailveil.recording.completed"
         const val NOTIFICATION_ID = 1001
+        const val COMPLETED_NOTIFICATION_ID = 1002
         const val NO_SESSION_ID = -1L
         private const val CONTENT_REQUEST_CODE = 1001
         private const val STOP_REQUEST_CODE = 1002
