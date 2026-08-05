@@ -35,7 +35,7 @@ import app.trailveil.data.history.RecordingHistorySession
 import app.trailveil.data.history.RecordingHistoryStatus
 import app.trailveil.map.TrailVeilMapSurface
 import java.time.Instant
-import java.time.ZoneOffset
+import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import kotlin.math.max
@@ -445,11 +445,19 @@ private val RecordingHistoryStatus.isProblem: Boolean
     get() = this == RecordingHistoryStatus.INTERRUPTED || this == RecordingHistoryStatus.FAILED_TO_START
 
 internal object HistoryFormatters {
-    private val utcFormatter: DateTimeFormatter = DateTimeFormatter
-        .ofPattern("yyyy-MM-dd HH:mm 'UTC'", Locale.ROOT)
-        .withZone(ZoneOffset.UTC)
+    private val pattern: DateTimeFormatter = DateTimeFormatter
+        .ofPattern("yyyy-MM-dd HH:mm", Locale.ROOT)
 
-    fun instant(epochMillis: Long): String = utcFormatter.format(Instant.ofEpochMilli(epochMillis))
+    /**
+     * Read back in the reader's own time zone. Stored timestamps stay epoch milliseconds, so this
+     * is presentation only — but an exploration is something the user did at a time of day they
+     * remember, and UTC made an evening walk read as the small hours.
+     *
+     * The zone is resolved per call rather than cached, so a device that crosses one keeps
+     * agreeing with its own clock.
+     */
+    fun instant(epochMillis: Long, zone: ZoneId = ZoneId.systemDefault()): String =
+        pattern.withZone(zone).format(Instant.ofEpochMilli(epochMillis))
 
     fun duration(durationMillis: Long): String {
         val seconds = max(0L, durationMillis) / 1_000L

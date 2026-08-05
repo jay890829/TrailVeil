@@ -495,13 +495,24 @@ class MapSurfaceTest {
                         "$label@z$zoom(actual=${"%.2f".format(java.util.Locale.US, settledZoom)})=" +
                             "${coverage.report()} ",
                     )
-                    // A request below the truthful floor must be clamped, not honoured. Without
-                    // this the sweep could pass simply because the camera never went where it
-                    // was told.
-                    assertTrue(
-                        "Camera reached zoom $settledZoom, below the truthful floor",
-                        settledZoom >= MINIMUM_TRUTHFUL_ZOOM - ZOOM_TOLERANCE,
-                    )
+                    // Every zoom must actually be reachable, or the sweep could pass because the
+                    // camera quietly refused to go where it was told. MapLibre keeps the world
+                    // covering the viewport, so the true floor is device-dependent and sits below
+                    // 1 — there, all that can be asserted is that nothing of ours adds a floor.
+                    if (zoom >= LOWEST_EXACTLY_REACHABLE_ZOOM) {
+                        assertEquals(
+                            "Camera did not reach the requested zoom",
+                            zoom,
+                            settledZoom,
+                            ZOOM_TOLERANCE,
+                        )
+                    } else {
+                        assertTrue(
+                            "Camera stopped at zoom $settledZoom, so something is refusing to " +
+                                "zoom out",
+                            settledZoom < LOWEST_EXACTLY_REACHABLE_ZOOM,
+                        )
+                    }
                     if (coverage.revealedFraction > worstFraction) {
                         worstFraction = coverage.revealedFraction
                         worstLabel = "$label@z$zoom"
@@ -931,8 +942,8 @@ class MapSurfaceTest {
          */
         const val MAXIMUM_SETTLED_REVEALED_FRACTION = 0.001
         const val ZOOM_SETTLE_MILLIS = 1_200L
-        const val MINIMUM_TRUTHFUL_ZOOM = 2.0
         const val ZOOM_TOLERANCE = 0.01
+        const val LOWEST_EXACTLY_REACHABLE_ZOOM = 1.0
         val ZOOM_SWEEP = listOf(0.0, 1.0, 2.0, 3.0, 4.0, 6.0)
         val UNEXPLORED_VIEWPOINTS = listOf(
             "atlantic" to GeoPoint(0.0, 0.0),

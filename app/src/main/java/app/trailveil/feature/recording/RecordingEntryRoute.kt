@@ -333,6 +333,18 @@ internal fun RecordingEntryRoute(
         ?: recordingPresentation.latestAcceptedPoint?.let { point ->
             GeoPoint(latitude = point.latitude, longitude = point.longitude)
         }
+    // Open where the user is, not in the middle of the ocean. This fires once per screen instance
+    // and is remembered across navigation, so it never fights a camera the user has moved
+    // themselves — and returning from history restores the map's own saved camera instead.
+    var openedAtKnownLocation by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(currentLocation, openedAtKnownLocation) {
+        if (openedAtKnownLocation) return@LaunchedEffect
+        val point = currentLocation ?: return@LaunchedEffect
+        openedAtKnownLocation = true
+        cameraRequestId += 1L
+        cameraRequest = MapCameraRequest(requestId = cameraRequestId, point = point)
+    }
+
     RecordingEntryScreen(
         state = RecordingEntryUiState(
             loading = currentHistory == null || !latestHistoryLoaded,

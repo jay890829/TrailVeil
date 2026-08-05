@@ -27,7 +27,7 @@ internal val TerminalRecordingStates = setOf(
  * A completion is also announced by a notification, so the card is only the in-app echo of it and
  * does not have to survive long enough to be caught.
  */
-internal const val TRANSIENT_NOTICE_WINDOW_MILLIS = 5_000L
+internal const val TRANSIENT_NOTICE_WINDOW_MILLIS = 3_000L
 
 /**
  * Acknowledgements of something the user just did. They are courtesies, so they expire; every other

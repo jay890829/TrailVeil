@@ -93,6 +93,18 @@ internal object MapSurfaceTestTags {
 internal object FogOverlayIds {
     const val Source = "trailveil-cumulative-fog-source"
     const val Layer = "trailveil-cumulative-fog-layer"
+
+    /**
+     * The basemap repeats across copies of the world; an image source does not. When the mosaic
+     * spans a whole world its western edge is a canonical tile boundary, so it cannot be centred on
+     * the camera by shifting it — the shift lands it back where it started. These carry the same
+     * fog one world either side, so a camera looking past the mosaic's edge finds fog there too
+     * rather than a bare repeat of the map.
+     */
+    const val WestRepeatSource = "trailveil-cumulative-fog-west-repeat-source"
+    const val WestRepeatLayer = "trailveil-cumulative-fog-west-repeat-layer"
+    const val EastRepeatSource = "trailveil-cumulative-fog-east-repeat-source"
+    const val EastRepeatLayer = "trailveil-cumulative-fog-east-repeat-layer"
 }
 
 /**
@@ -308,7 +320,6 @@ internal fun TrailVeilMapSurface(
         mapView.addOnDidFailLoadingMapListener(failureListener)
         mapView.getMapAsync { map ->
             if (!compositionActive.get() || !styleGenerationActive.get()) return@getMapAsync
-            if (fogRequired) map.setMinZoomPreference(MINIMUM_TRUTHFUL_ZOOM)
             readyMap = map
             map.setStyle(Style.Builder().fromUri(provider.styleUri)) { style ->
                 if (
@@ -622,17 +633,47 @@ private fun Style.installFogOverlay(mosaic: FogTileMosaic, fogAlpha: Int) {
 }
 
 private fun Style.installFogMosaic(mosaic: FogTileMosaic) {
-    val coordinates = mosaic.bounds.toQuad()
     val bitmap = mosaic.mask.toBitmap()
-    val source = getSourceAs<ImageSource>(FogOverlayIds.Source)
+    installFogMosaicQuad(FogOverlayIds.Source, FogOverlayIds.Layer, mosaic.bounds, bitmap)
+    val spansWorld =
+        mosaic.bounds.eastLongitude - mosaic.bounds.westLongitude >= WORLD_LONGITUDE_SPAN
+    if (spansWorld) {
+        installFogMosaicQuad(
+            FogOverlayIds.WestRepeatSource,
+            FogOverlayIds.WestRepeatLayer,
+            mosaic.bounds.shiftedByWorlds(-1),
+            bitmap,
+        )
+        installFogMosaicQuad(
+            FogOverlayIds.EastRepeatSource,
+            FogOverlayIds.EastRepeatLayer,
+            mosaic.bounds.shiftedByWorlds(1),
+            bitmap,
+        )
+    } else {
+        // A narrower mosaic is placed around the camera already, so repeats would be dead weight
+        // carrying a copy of the mask for nothing.
+        removeFogMosaicQuad(FogOverlayIds.WestRepeatSource, FogOverlayIds.WestRepeatLayer)
+        removeFogMosaicQuad(FogOverlayIds.EastRepeatSource, FogOverlayIds.EastRepeatLayer)
+    }
+}
+
+private fun Style.installFogMosaicQuad(
+    sourceId: String,
+    layerId: String,
+    bounds: FogTileBounds,
+    bitmap: Bitmap,
+) {
+    val coordinates = bounds.toQuad()
+    val source = getSourceAs<ImageSource>(sourceId)
     if (source == null) {
-        addSource(ImageSource(FogOverlayIds.Source, coordinates, bitmap))
+        addSource(ImageSource(sourceId, coordinates, bitmap))
     } else {
         source.setCoordinates(coordinates)
         source.setImage(bitmap)
     }
-    if (getLayer(FogOverlayIds.Layer) == null) {
-        val layer = RasterLayer(FogOverlayIds.Layer, FogOverlayIds.Source).withProperties(
+    if (getLayer(layerId) == null) {
+        val layer = RasterLayer(layerId, sourceId).withProperties(
             PropertyFactory.rasterFadeDuration(0f),
             PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
         )
@@ -643,6 +684,16 @@ private fun Style.installFogMosaic(mosaic: FogTileMosaic) {
         }
     }
 }
+
+private fun Style.removeFogMosaicQuad(sourceId: String, layerId: String) {
+    if (getLayer(layerId) != null) removeLayer(layerId)
+    if (getSource(sourceId) != null) removeSource(sourceId)
+}
+
+private fun FogTileBounds.shiftedByWorlds(worlds: Int): FogTileBounds = copy(
+    westLongitude = westLongitude + worlds * WORLD_LONGITUDE_SPAN,
+    eastLongitude = eastLongitude + worlds * WORLD_LONGITUDE_SPAN,
+)
 
 private fun Style.installFogBackdrop(mosaic: FogTileMosaic, fogAlpha: Int) {
     val bands = FogBackdropGeometry.bands(mosaic)
@@ -857,22 +908,7 @@ private suspend fun MapView.awaitFullyRenderedFrameAfter(action: () -> Unit) {
     }
 }
 
-/**
- * The lowest zoom at which fog can be drawn truthfully.
- *
- * MapLibre draws an image quad exactly once, at the coordinates it is given, while the basemap
- * repeats across world copies. The fog mosaic is built from a window of tiles whose western edge is
- * a canonical tile longitude, and at zoom 0 and 1 that window is the whole world, so its western
- * edge is pinned to -180 and the quad cannot be moved into the copy the camera is looking at. A
- * camera near the antimeridian then sees a repeated basemap with no fog over it: measured at 49.7%
- * of the viewport at zoom 1. Zoom 2 and above escape this because the window is narrower than the
- * world, so it is placed around the camera and is free to run past the antimeridian.
- *
- * Refusing to zoom out that far is the honest response until the mosaic can be anchored to the
- * camera's own world copy. Showing unexplored ground as explored is the one thing this surface must
- * never do, and a view we cannot fog is not worth offering.
- */
-private const val MINIMUM_TRUTHFUL_ZOOM = 2.0
+private const val WORLD_LONGITUDE_SPAN = 360.0
 
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
