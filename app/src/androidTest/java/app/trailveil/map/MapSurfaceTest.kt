@@ -53,6 +53,7 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -60,6 +61,8 @@ import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
+import org.maplibre.android.style.layers.Property
+import org.maplibre.android.style.layers.PropertyFactory
 
 @RunWith(AndroidJUnit4::class)
 class MapSurfaceTest {
@@ -432,7 +435,34 @@ class MapSurfaceTest {
      * ever inside the viewport.
      */
     @Test
-    fun noSettledCameraPresentsUnexploredMapAsRevealed() {
+    fun noSettledCameraPresentsUnexploredMapAsRevealed() = sweepSettledCameras(
+        provider = MapProviderConfiguration(
+            providerName = "fog-zoom-test-provider",
+            styleUri = "https://tiles.invalid/styles/fog-zoom",
+        ),
+        requireOnlineStyle = false,
+    )
+
+    /**
+     * The same sweep against the style that actually ships.
+     *
+     * The packaged fallback is a flat light fill, and the fixed-threshold measurement this replaced
+     * was calibrated to its brightness — production vector tiles render the same unfogged ocean at
+     * luminance 18-28, far below that threshold, so a real leak read as "fogged". Geometry can also
+     * differ: the fallback paints the whole viewport, real tiles stop at the edge of the world.
+     * Skipped rather than failed when the style cannot be fetched, so an offline run stays green
+     * without silently claiming production was checked.
+     */
+    @Test
+    fun noSettledCameraPresentsUnexploredMapAsRevealedOnTheProductionStyle() = sweepSettledCameras(
+        provider = ProductionMapProvider,
+        requireOnlineStyle = true,
+    )
+
+    private fun sweepSettledCameras(
+        provider: MapProviderConfiguration,
+        requireOnlineStyle: Boolean,
+    ) {
         val database = inMemoryDatabase()
         try {
             val fogRendered = AtomicBoolean(false)
@@ -445,11 +475,8 @@ class MapSurfaceTest {
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
-                    provider = MapProviderConfiguration(
-                        providerName = "fog-zoom-test-provider",
-                        styleUri = "https://tiles.invalid/styles/fog-zoom",
-                    ),
-                    fallbackTimeoutMillis = 100L,
+                    provider = provider,
+                    fallbackTimeoutMillis = if (requireOnlineStyle) 20_000L else 100L,
                     savedStateKey = "trailveil.map.fog-zoom-test",
                     fogRuntime = fogRuntime(
                         database,
@@ -461,15 +488,40 @@ class MapSurfaceTest {
                 )
             }
 
-            composeRule.waitUntil(timeoutMillis = 15_000L) { fogRendered.get() }
+            composeRule.waitUntil(timeoutMillis = 30_000L) { fogRendered.get() }
             val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            if (requireOnlineStyle) {
+                val loadState = composeRule.runOnIdle {
+                    attachedMapView()?.getTag(R.id.map_basemap_load_state)
+                }
+                Assume.assumeTrue(
+                    "The production style did not load (state=$loadState); skipping rather than " +
+                        "reporting a fallback-style result as production",
+                    loadState == BasemapLoadState.ONLINE.name,
+                )
+            }
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 map.uiSettings.isLogoEnabled = false
                 map.uiSettings.isAttributionEnabled = false
                 map.uiSettings.isCompassEnabled = false
             }
 
-            val report = StringBuilder()
+            // Calibrate before measuring: prove the instrument can see a leak on this device and
+            // this style, so that a clean sweep below means the fog is there rather than that the
+            // detector is blind.
+            val calibration = map.auditWithFogRemoved()
+            assertTrue(
+                "The map drew almost nothing, so the sweep would pass vacuously: " +
+                    calibration.report(),
+                calibration.drawnFraction >= MINIMUM_DRAWN_FRACTION,
+            )
+            assertTrue(
+                "With the fog layers hidden the audit still reported the map as covered, so it " +
+                    "cannot detect a leak: " + calibration.report(),
+                calibration.uncoveredFraction >= MINIMUM_CALIBRATION_UNCOVERED_FRACTION,
+            )
+
+            val report = StringBuilder("calibration=${calibration.report()} ")
             var worstFraction = 0.0
             var worstLabel = "none"
             var requestId = 1L
@@ -489,7 +541,7 @@ class MapSurfaceTest {
                             .isEmpty()
                     }
                     Thread.sleep(ZOOM_SETTLE_MILLIS)
-                    val coverage = map.renderedFogCoverage()
+                    val coverage = map.auditFogCoverage()
                     val settledZoom = map.cameraPosition.zoom
                     report.append(
                         "$label@z$zoom(actual=${"%.2f".format(java.util.Locale.US, settledZoom)})=" +
@@ -513,8 +565,8 @@ class MapSurfaceTest {
                             settledZoom < LOWEST_EXACTLY_REACHABLE_ZOOM,
                         )
                     }
-                    if (coverage.revealedFraction > worstFraction) {
-                        worstFraction = coverage.revealedFraction
+                    if (coverage.uncoveredFraction > worstFraction) {
+                        worstFraction = coverage.uncoveredFraction
                         worstLabel = "$label@z$zoom"
                     }
                 }
@@ -524,7 +576,8 @@ class MapSurfaceTest {
                 Bundle().apply {
                     putString(
                         "stream",
-                        "TrailVeil settled fog coverage sweep: worst=$worstLabel " +
+                        "TrailVeil settled fog coverage sweep [${provider.providerName}]: " +
+                            "worst=$worstLabel " +
                             "worstFraction=${"%.4f".format(java.util.Locale.US, worstFraction * 100.0)}% " +
                             "limit=${MAXIMUM_SETTLED_REVEALED_FRACTION * 100.0}% $report\n",
                     )
@@ -822,6 +875,128 @@ class MapSurfaceTest {
         )
     }
 
+    /**
+     * Whether each pixel of the rendered map actually has fog over it, measured against the same
+     * frame with the fog layers hidden.
+     *
+     * The absolute-luminance test this sits beside can only work on the packaged fallback style,
+     * which is a flat light fill: it calls a pixel revealed at luminance 150 against a fogged
+     * reference of 60. Production vector tiles are far darker — the same unfogged ocean measures
+     * 18-28 — so every real leak would read as "fogged" to a fixed threshold. Comparing a pixel to
+     * its own unfogged value instead makes the measurement independent of how bright the basemap
+     * happens to be, and catches a one-pixel seam as readily as half a screen.
+     *
+     * Only valid for a settled camera: it needs two frames of the same view.
+     */
+    private fun MapLibreMap.auditFogCoverage(): FogAudit {
+        val fogged = snapshotPixels()
+        setFogLayersVisible(false)
+        val bare = snapshotPixels()
+        setFogLayersVisible(true)
+        return compareFogCoverage(fogged, bare)
+    }
+
+    /**
+     * What the audit reports when there is definitely no fog: the same bare frame compared against
+     * itself. Everything the map actually draws must come back uncovered. A detector that stays
+     * quiet here would stay quiet on a real leak too, and every clean sweep it produced would mean
+     * nothing — which is exactly how the previous fixed-threshold measurement went wrong.
+     */
+    private fun MapLibreMap.auditWithFogRemoved(): FogAudit {
+        setFogLayersVisible(false)
+        val first = snapshotPixels()
+        val second = snapshotPixels()
+        setFogLayersVisible(true)
+        return compareFogCoverage(first, second)
+    }
+
+    private fun compareFogCoverage(fogged: IntArray, bare: IntArray): FogAudit {
+        assertEquals("Snapshot sizes differ", bare.size, fogged.size)
+        var uncovered = 0L
+        var drawn = 0L
+        var worstRatio = 0.0
+        var worstBare = 0
+        bare.indices.forEach { index ->
+            val bareLuminance = luminance(bare[index])
+            val fogLuminance = luminance(fogged[index])
+            // Nothing to reveal where the map itself draws nothing.
+            if (bareLuminance <= 0) return@forEach
+            drawn += 1L
+            if (fogLuminance > FOG_TRANSMISSION_CEILING * bareLuminance + FOG_LUMINANCE_TOLERANCE) {
+                uncovered += 1L
+                val ratio = fogLuminance.toDouble() / bareLuminance.toDouble()
+                if (ratio > worstRatio) {
+                    worstRatio = ratio
+                    worstBare = bareLuminance
+                }
+            }
+        }
+        return FogAudit(
+            uncoveredFraction = uncovered.toDouble() / bare.size.toDouble(),
+            drawnFraction = drawn.toDouble() / bare.size.toDouble(),
+            worstRatio = worstRatio,
+            worstBareLuminance = worstBare,
+            sampledPixels = bare.size.toLong(),
+        )
+    }
+
+    private fun MapLibreMap.setFogLayersVisible(visible: Boolean) {
+        val value = if (visible) Property.VISIBLE else Property.NONE
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val style = requireNotNull(style) { "The style is not ready" }
+            (
+                listOf(
+                    FogOverlayIds.Layer,
+                    FogOverlayIds.WestRepeatLayer,
+                    FogOverlayIds.EastRepeatLayer,
+                ) + FogBackdropIds.Layers
+                ).forEach { id ->
+                style.getLayer(id)?.setProperties(PropertyFactory.visibility(value))
+            }
+        }
+        Thread.sleep(FOG_VISIBILITY_SETTLE_MILLIS)
+    }
+
+    private fun MapLibreMap.snapshotPixels(): IntArray {
+        val ready = CountDownLatch(1)
+        val captured = AtomicReference<Bitmap?>(null)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            snapshot { bitmap ->
+                captured.set(bitmap)
+                ready.countDown()
+            }
+        }
+        assertTrue(
+            "MapLibre did not produce a frame snapshot",
+            ready.await(SNAPSHOT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+        val bitmap = requireNotNull(captured.get())
+        val pixels = IntArray(bitmap.width * bitmap.height)
+        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
+        bitmap.recycle()
+        return pixels
+    }
+
+    private fun luminance(pixel: Int): Int = (
+        77 * ((pixel shr 16) and 0xff) +
+            150 * ((pixel shr 8) and 0xff) +
+            29 * (pixel and 0xff)
+        ) shr 8
+
+    private data class FogAudit(
+        val uncoveredFraction: Double,
+        val drawnFraction: Double,
+        val worstRatio: Double,
+        val worstBareLuminance: Int,
+        val sampledPixels: Long,
+    ) {
+        fun report(): String = "[uncovered=" +
+            "${"%.4f".format(java.util.Locale.US, uncoveredFraction * 100.0)}% " +
+            "drawn=${"%.2f".format(java.util.Locale.US, drawnFraction * 100.0)}% " +
+            "worstRatio=${"%.2f".format(java.util.Locale.US, worstRatio)} " +
+            "bareAtWorst=$worstBareLuminance pixels=$sampledPixels]"
+    }
+
     private data class FogCoverage(
         val revealedFraction: Double,
         val maxLuminance: Int,
@@ -941,6 +1116,22 @@ class MapSurfaceTest {
          * quarter of the world's width.
          */
         const val MAXIMUM_SETTLED_REVEALED_FRACTION = 0.001
+
+        /**
+         * Fog transmits `(255 - fogAlpha) / 255` = 0.278 of what is under it, so a covered pixel
+         * lands near 0.28 of its bare value and an uncovered one at 1.0. Half-way between is a
+         * wide margin either side; the flat tolerance absorbs rounding where the map is nearly
+         * black and the ratio stops being meaningful.
+         */
+        const val FOG_TRANSMISSION_CEILING = 0.5
+        const val FOG_LUMINANCE_TOLERANCE = 4
+        const val FOG_VISIBILITY_SETTLE_MILLIS = 600L
+
+        /** The map must actually be drawing, or "no leak found" is a statement about a blank screen. */
+        const val MINIMUM_DRAWN_FRACTION = 0.5
+
+        /** With the fog hidden, nearly everything the map draws must read as uncovered. */
+        const val MINIMUM_CALIBRATION_UNCOVERED_FRACTION = 0.5
         const val ZOOM_SETTLE_MILLIS = 1_200L
         const val ZOOM_TOLERANCE = 0.01
         const val LOWEST_EXACTLY_REACHABLE_ZOOM = 1.0

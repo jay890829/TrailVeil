@@ -47,11 +47,13 @@ class MapReturnInteractivityTest {
         // returning from history rather than about how long a drag takes to register at all.
         val controlBefore = requireNotNull(cameraTarget())
         var controlAttempts = 0
+        val controlStart = SystemClock.uptimeMillis()
         while (controlAttempts < CONTROL_ATTEMPT_LIMIT) {
             controlAttempts += 1
             drag()
             if (movedFrom(controlBefore)) break
         }
+        val controlMillis = SystemClock.uptimeMillis() - controlStart
 
         composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
         composeRule.onNodeWithTag(RecordingEntryTestTags.History).performClick()
@@ -88,7 +90,8 @@ class MapReturnInteractivityTest {
                 putString(
                     "stream",
                     "TrailVeil return-from-history interactivity: deadMillis=$deadMillis " +
-                        "attempts=$attempts controlAttempts=$controlAttempts coverStillUp=$coverUp " +
+                        "attempts=$attempts controlMillis=$controlMillis " +
+                        "controlAttempts=$controlAttempts coverStillUp=$coverUp " +
                         "budget=$INTERACTIVE_BUDGET_MILLIS zoom=${map.cameraPosition.zoom}\n",
                 )
             },
@@ -97,13 +100,13 @@ class MapReturnInteractivityTest {
             "The map never accepted a drag after returning from history",
             deadMillis >= 0L,
         )
-        // `controlAttempts` is reported rather than asserted: it says how responsive this device
-        // was before navigation entered the picture, which is context for reading the number
-        // below, not a property of the code under test.
+        // Measured against the same device's own responsiveness a moment earlier, not against a
+        // fixed number: one drag costs ~100 ms of injected events, and a loaded emulator can need
+        // several before MapLibre's detector takes one. Only the difference is about navigation.
         assertTrue(
-            "Drags after returning were ignored for ${deadMillis}ms ($attempts attempts, " +
-                "control took $controlAttempts)",
-            deadMillis <= INTERACTIVE_BUDGET_MILLIS,
+            "Drags after returning were ignored for ${deadMillis}ms ($attempts attempts) against " +
+                "a control of ${controlMillis}ms ($controlAttempts attempts) on the same device",
+            deadMillis <= controlMillis + INTERACTIVE_BUDGET_MILLIS,
         )
     }
 
@@ -217,11 +220,12 @@ class MapReturnInteractivityTest {
         const val INTERACTIVE_TIMEOUT_MILLIS = 20_000L
 
         /**
-         * Measured 3,234 ms before the safety cover stopped consuming touches, and 628–1,033 ms
-         * after it across three consecutive runs. The remainder is a genuinely new `MapView`:
-         * navigation discards the destination, so its GL surface has to be created again before
-         * MapLibre's gesture detector exists at all. Closing that gap means keeping the map alive
-         * across navigation, which is still open work — this budget guards the part already won.
+         * Headroom over the control, not an absolute deadline. Measured 3,234 ms before the safety
+         * cover stopped consuming touches, and 628–1,033 ms after it across three consecutive
+         * runs. The remainder is a genuinely new `MapView`: navigation discards the destination,
+         * so its GL surface has to be created again before MapLibre's gesture detector exists at
+         * all. Closing that gap means keeping the map alive across navigation, which is still open
+         * work — this budget guards the part already won.
          */
         const val INTERACTIVE_BUDGET_MILLIS = 1_500L
         const val MAP_READY_TIMEOUT_SECONDS = 20L
