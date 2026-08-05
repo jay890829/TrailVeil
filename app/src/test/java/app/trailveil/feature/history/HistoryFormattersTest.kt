@@ -6,11 +6,12 @@ import org.junit.Test
 
 class HistoryFormattersTest {
     @Test
-    fun readsPersistedInstantsBackInTheGivenZone() {
-        // The stored value never moves; only the reading of it does.
-        assertEquals("1970-01-01 08:00", HistoryFormatters.instant(0L, TAIPEI))
-        assertEquals("1970-01-01 00:00", HistoryFormatters.instant(0L, ZoneId.of("UTC")))
-        assertEquals("1969-12-31 19:00", HistoryFormatters.instant(0L, ZoneId.of("-05:00")))
+    fun readsPersistedInstantsBackInTheGivenZoneAndSaysWhichZone() {
+        // The stored value never moves; only the reading of it does — so the reading has to say
+        // which zone it is, or the same instant renders as three unrelated unlabelled times.
+        assertEquals("1970-01-01 08:00 +08:00", HistoryFormatters.instant(0L, TAIPEI))
+        assertEquals("1970-01-01 00:00 Z", HistoryFormatters.instant(0L, ZoneId.of("UTC")))
+        assertEquals("1969-12-31 19:00 -05:00", HistoryFormatters.instant(0L, ZoneId.of("-05:00")))
     }
 
     @Test

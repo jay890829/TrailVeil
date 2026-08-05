@@ -445,8 +445,13 @@ private val RecordingHistoryStatus.isProblem: Boolean
     get() = this == RecordingHistoryStatus.INTERRUPTED || this == RecordingHistoryStatus.FAILED_TO_START
 
 internal object HistoryFormatters {
+    /**
+     * The offset is part of the reading, not decoration. Without it a walk recorded at 19:30 in
+     * Taipei and reviewed in London renders as a bare "12:30" that matches neither the clock the
+     * user remembers nor the one in their pocket, and nothing on screen says which it is.
+     */
     private val pattern: DateTimeFormatter = DateTimeFormatter
-        .ofPattern("yyyy-MM-dd HH:mm", Locale.ROOT)
+        .ofPattern("yyyy-MM-dd HH:mm XXX", Locale.ROOT)
 
     /**
      * Read back in the reader's own time zone. Stored timestamps stay epoch milliseconds, so this
