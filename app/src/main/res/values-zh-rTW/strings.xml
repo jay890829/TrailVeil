@@ -62,6 +62,7 @@
     <string name="recording_state_interrupted">最近一次探索曾中斷，已保存的位置仍保留在歷史中。</string>
     <string name="recording_state_failed">最近一次探索無法開始，目前沒有進行中的記錄。</string>
     <string name="recording_state_dismiss">關閉這則狀態訊息</string>
-    <string name="map_center_latest_location">移至最新記錄位置</string>
+    <string name="map_center_latest_location">移至最新記錄位置並持續跟隨</string>
+    <string name="map_following_latest_location">移至最新記錄位置（跟隨中）</string>
     <string name="history_open">探索歷史</string>
 </resources>

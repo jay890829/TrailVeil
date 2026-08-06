@@ -342,8 +342,17 @@ internal fun RecordingEntryRoute(
         val point = currentLocation ?: return@LaunchedEffect
         openedAtKnownLocation = true
         cameraRequestId += 1L
-        cameraRequest = MapCameraRequest(requestId = cameraRequestId, point = point)
+        cameraRequest = MapCameraRequest(
+            requestId = cameraRequestId,
+            point = point,
+            zoom = EXPLORATION_ZOOM,
+        )
     }
+    // Centring once and then standing still is what the button used to do, and it left a walking
+    // user drifting off their own map. Following is a mode: the button turns it on, the user's own
+    // hand on the map turns it off, and nothing else does either.
+    var requestedFollowing by rememberSaveable { mutableStateOf(false) }
+    val following = requestedFollowing && currentLocation != null
 
     RecordingEntryScreen(
         state = RecordingEntryUiState(
@@ -361,6 +370,7 @@ internal fun RecordingEntryRoute(
             latestSessionId = recordingPresentation.latestSessionId,
             latestEndedAt = recordingPresentation.latestEndedAt,
             canRecenter = currentLocation != null,
+            followingLocation = following,
         ),
         onStart = {
             if (!starting) {
@@ -462,20 +472,33 @@ internal fun RecordingEntryRoute(
                 null -> Unit
             }
         },
+        // One press, one thing: back to where I am, at the zoom I explore at, and stay with me.
+        // It used to double as a switch that turned following off, which meant a press did
+        // different things depending on a state the user could not see, and the way back in took
+        // two presses. Following still ends the moment a hand touches the map, which is the only
+        // place anyone looked for it.
         onRecenter = {
             currentLocation?.let { point ->
+                requestedFollowing = true
                 cameraRequestId += 1L
                 cameraRequest = MapCameraRequest(
                     requestId = cameraRequestId,
                     point = point,
+                    // Back to the zoom exploration happens at. Keeping whatever zoom the user
+                    // had was tried and was wrong: after zooming out to look around, the whole
+                    // point of pressing this is to be taken back in, and a button that only
+                    // slides a distant view sideways reads as broken.
+                    zoom = EXPLORATION_ZOOM,
                 )
             }
         },
+        onUserMovedCamera = { requestedFollowing = false },
         onOpenHistory = onOpenHistory,
         fogRuntime = fogRuntime,
         fogRequired = true,
         cameraRequest = cameraRequest,
         currentLocation = currentLocation,
+        followLocation = currentLocation.takeIf { following },
     )
 }
 
@@ -539,3 +562,12 @@ private fun Activity.openSafely(intent: Intent) {
         startActivity(Intent(Settings.ACTION_SETTINGS))
     }
 }
+
+/**
+ * The zoom the recentre button returns to, and the one the map opens at.
+ *
+ * Same value both times on purpose: "take me back to where I am" should land somewhere a walk is
+ * legible, whether it is the first thing the screen does or the thing the user asks for after
+ * looking around.
+ */
+private const val EXPLORATION_ZOOM = 16.0

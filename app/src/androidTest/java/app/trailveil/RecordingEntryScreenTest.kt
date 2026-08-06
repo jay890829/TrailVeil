@@ -1,16 +1,23 @@
 package app.trailveil
 
+import android.graphics.Rect
+import android.view.View
+import android.view.ViewGroup
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
+import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.performClick
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
+import androidx.test.runner.lifecycle.Stage
 import app.trailveil.feature.recording.TRANSIENT_NOTICE_WINDOW_MILLIS
 import app.trailveil.feature.recording.LocationNotice
 import app.trailveil.feature.recording.NotificationNotice
@@ -21,9 +28,11 @@ import app.trailveil.feature.recording.RecordingDisplayState
 import app.trailveil.feature.recording.RecordingStartNotice
 import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.maplibre.android.maps.widgets.CompassView
 
 @RunWith(AndroidJUnit4::class)
 class RecordingEntryScreenTest {
@@ -535,6 +544,121 @@ class RecordingEntryScreenTest {
             .performClick()
         assertEquals(1, recenterCalls.get())
         assertEquals(1, historyCalls.get())
+    }
+
+    /**
+     * Following is a mode the map stays in, not an action that happened once, so the button has to
+     * keep saying which one it is — otherwise the only way to find out is to walk somewhere. The
+     * press itself does the same thing in both states; only what it announces changes.
+     */
+    @Test
+    fun theRecenterButtonSaysWhetherTheMapIsFollowing() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val following = mutableStateOf(false)
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    firstVisit = false,
+                    canRecenter = true,
+                    followingLocation = following.value,
+                ),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+                onRecenter = { following.value = true },
+            )
+        }
+
+        composeRule.onNodeWithContentDescription(
+            context.getString(R.string.map_center_latest_location),
+        ).assertIsDisplayed()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Recenter).performClick()
+        composeRule.onNodeWithContentDescription(
+            context.getString(R.string.map_following_latest_location),
+        ).assertIsDisplayed()
+    }
+
+    /**
+     * The compass belongs to the map view, not to this screen's column of controls, so nothing
+     * lays it out for us — it went wherever MapLibre put it, which was on top of the menu button.
+     * Placing it takes arithmetic, and arithmetic is what silently drifts, so both halves of the
+     * result are measured here: where it ended up, and that a notice cannot reach it.
+     */
+    @Test
+    fun theCompassSitsBelowTheMenuAndNoNoticeReachesIt() {
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    firstVisit = false,
+                    // The longest notice this screen has, so a card that wraps is the one measured.
+                    locationNotice = LocationNotice.PRECISE_SETTINGS,
+                    canRecenter = true,
+                ),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.LocationNotice).assertIsDisplayed()
+        val compass = composeRule.waitForCompassBounds()
+        val menu = composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).getUnclippedBoundsInRoot()
+        val notice = composeRule.onNodeWithTag(RecordingEntryTestTags.LocationNotice)
+            .getUnclippedBoundsInRoot()
+        val density = composeRule.density
+
+        with(density) {
+            assertTrue(
+                "The compass (top=${compass.top}px) is not below the menu button " +
+                    "(bottom=${menu.bottom.roundToPx()}px)",
+                compass.top >= menu.bottom.roundToPx(),
+            )
+            assertTrue(
+                "A notice reaches ${notice.right.roundToPx()}px, past the compass's left edge " +
+                    "at ${compass.left}px",
+                notice.right.roundToPx() <= compass.left,
+            )
+        }
+    }
+
+    /**
+     * The compass is only laid out once the map view has attached and MapLibre has applied the
+     * margins the screen asked for, which happens after the first composition.
+     */
+    private fun androidx.compose.ui.test.junit4.ComposeContentTestRule.waitForCompassBounds(): Rect {
+        lateinit var bounds: Rect
+        waitUntil(timeoutMillis = 15_000L) {
+            val compass = runOnIdle { attachedCompassView() } ?: return@waitUntil false
+            if (compass.width <= 0 || compass.height <= 0) return@waitUntil false
+            val location = IntArray(2)
+            compass.getLocationInWindow(location)
+            bounds = Rect(
+                location[0],
+                location[1],
+                location[0] + compass.width,
+                location[1] + compass.height,
+            )
+            true
+        }
+        return bounds
+    }
+
+    private fun attachedCompassView(): View? =
+        ActivityLifecycleMonitorRegistry.getInstance()
+            .getActivitiesInStage(Stage.RESUMED)
+            .firstNotNullOfOrNull { activity -> activity.window.decorView.findCompassView() }
+
+    private fun View.findCompassView(): View? {
+        if (this is CompassView) return this
+        if (this !is ViewGroup) return null
+        repeat(childCount) { index ->
+            getChildAt(index).findCompassView()?.let { return it }
+        }
+        return null
     }
 
     @Test

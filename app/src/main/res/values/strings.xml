@@ -62,6 +62,7 @@
     <string name="recording_state_interrupted">The latest exploration was interrupted. Its saved points remain in history.</string>
     <string name="recording_state_failed">The latest exploration could not start; no active recording remains.</string>
     <string name="recording_state_dismiss">Dismiss this status</string>
-    <string name="map_center_latest_location">Center on latest recorded location</string>
+    <string name="map_center_latest_location">Center on latest recorded location and keep following it</string>
+    <string name="map_following_latest_location">Center on latest recorded location, already following it</string>
     <string name="history_open">Exploration history</string>
 </resources>

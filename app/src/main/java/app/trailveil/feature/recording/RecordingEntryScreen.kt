@@ -1,12 +1,15 @@
 package app.trailveil.feature.recording
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -94,6 +97,7 @@ internal data class RecordingEntryUiState(
     val latestSessionId: Long? = null,
     val latestEndedAt: Long? = null,
     val canRecenter: Boolean = false,
+    val followingLocation: Boolean = false,
 )
 
 internal object RecordingEntryTestTags {
@@ -126,10 +130,12 @@ internal fun RecordingEntryScreen(
     modifier: Modifier = Modifier,
     onRecenter: () -> Unit = {},
     onOpenHistory: () -> Unit = {},
+    onUserMovedCamera: () -> Unit = {},
     fogRuntime: FogRuntime? = null,
     fogRequired: Boolean = false,
     cameraRequest: MapCameraRequest? = null,
     currentLocation: GeoPoint? = null,
+    followLocation: GeoPoint? = null,
 ) {
     var menuExpanded by rememberSaveable { mutableStateOf(false) }
     var privacyRequested by rememberSaveable { mutableStateOf(false) }
@@ -200,13 +206,20 @@ internal fun RecordingEntryScreen(
                 fogRequired = fogRequired,
                 cameraRequest = cameraRequest,
                 currentLocation = currentLocation,
+                followLocation = followLocation,
+                onUserMovedCamera = onUserMovedCamera,
+                // The map draws its compass inside itself and edge to edge, so left alone it lands
+                // under the menu button. Stack it below instead, in the same column of controls.
+                compassTopInset = WindowInsets.safeDrawing.asPaddingValues().calculateTopPadding() +
+                    ControlEdgeInset + MenuButtonSize + ControlSpacing,
+                compassEndInset = ControlEdgeInset,
             )
             Column(
                 modifier = Modifier
                     .fillMaxSize()
                     .safeDrawingPadding()
-                    .padding(horizontal = 12.dp, vertical = 12.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                    .padding(horizontal = ControlEdgeInset, vertical = ControlEdgeInset),
+                verticalArrangement = Arrangement.spacedBy(ControlSpacing),
                 horizontalAlignment = Alignment.End,
             ) {
                 RecordingEntryMenu(
@@ -221,9 +234,14 @@ internal fun RecordingEntryScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
+                        // The compass sits directly above this column's leading edge, so notices
+                        // keep clear of it rather than growing underneath it. Reserved whether or
+                        // not the compass is currently showing, so a card's width never depends on
+                        // which way the map happens to be facing.
+                        .padding(end = CompassReserve)
                         .weight(1f, fill = false)
                         .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(ControlSpacing),
                 ) {
                     state.locationNotice?.let { notice ->
                         LocationNoticeCard(
@@ -269,6 +287,7 @@ internal fun RecordingEntryScreen(
             }
             RecenterButton(
                 enabled = state.canRecenter,
+                following = state.followingLocation,
                 onClick = onRecenter,
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
@@ -374,6 +393,7 @@ private fun RecordingEntryMenu(
 @Composable
 private fun RecenterButton(
     enabled: Boolean,
+    following: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -382,20 +402,30 @@ private fun RecenterButton(
         modifier = modifier
             .semantics { if (!enabled) disabled() }
             .testTag(RecordingEntryTestTags.Recenter),
-        containerColor = if (enabled) {
-            MaterialTheme.colorScheme.primaryContainer
-        } else {
-            MaterialTheme.colorScheme.surfaceContainerHighest
+        containerColor = when {
+            !enabled -> MaterialTheme.colorScheme.surfaceContainerHighest
+            // Following is a mode the map is in, not an action that just happened, so the button
+            // has to keep saying so until it stops.
+            following -> MaterialTheme.colorScheme.primary
+            else -> MaterialTheme.colorScheme.primaryContainer
         },
-        contentColor = if (enabled) {
-            MaterialTheme.colorScheme.onPrimaryContainer
-        } else {
-            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+        contentColor = when {
+            !enabled -> MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+            following -> MaterialTheme.colorScheme.onPrimary
+            else -> MaterialTheme.colorScheme.onPrimaryContainer
         },
     ) {
         Icon(
             painter = painterResource(R.drawable.ic_map_recenter),
-            contentDescription = stringResource(R.string.map_center_latest_location),
+            contentDescription = stringResource(
+                // The press does the same thing either way; this says which state it is in, so a
+                // screen reader is not left announcing an action as though it were a switch.
+                if (following) {
+                    R.string.map_following_latest_location
+                } else {
+                    R.string.map_center_latest_location
+                },
+            ),
         )
     }
 }
@@ -687,3 +717,19 @@ private fun StartNoticeCard(
         )
     }
 }
+
+/**
+ * The one column of controls this screen stacks over the map, from the top edge down: the menu
+ * button, then the map's own compass, then any notices.
+ *
+ * The compass belongs to the map view rather than to this layout, so it cannot take part in the
+ * column and has to be placed by arithmetic instead. Keeping every number that arithmetic depends
+ * on here is what stops the two drifting apart.
+ */
+private val ControlEdgeInset = 12.dp
+private val ControlSpacing = 10.dp
+private val MenuButtonSize = 48.dp
+private val CompassSize = 48.dp
+
+/** Width a notice gives up so it can never grow underneath the compass. */
+private val CompassReserve = CompassSize + 8.dp

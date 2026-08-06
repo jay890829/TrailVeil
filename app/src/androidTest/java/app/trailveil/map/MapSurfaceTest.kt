@@ -3,10 +3,12 @@ package app.trailveil.map
 import android.graphics.Bitmap
 import android.os.Bundle
 import android.os.SystemClock
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.assertIsDisplayed
@@ -34,6 +36,7 @@ import app.trailveil.data.map.PersistedTrackPointChangeFeed
 import app.trailveil.data.map.RoomPersistedTrackPointChangeFeed
 import app.trailveil.data.map.RoomViewportTrackPointReader
 import app.trailveil.data.map.ViewportTrackDataSource
+import app.trailveil.map.fog.FogBackdropGeometry
 import app.trailveil.map.fog.FogMemoryTileCache
 import app.trailveil.map.fog.FogRenderStyle
 import app.trailveil.map.fog.FogRuntime
@@ -44,7 +47,9 @@ import app.trailveil.map.fog.GeoPoint
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.ln
 import kotlin.math.max
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
@@ -488,7 +493,12 @@ class MapSurfaceTest {
                 )
             }
 
-            composeRule.waitUntil(timeoutMillis = 30_000L) { fogRendered.get() }
+            // Fetching a real style, rendering its tiles and building fog from them takes longer
+            // under a full suite than it does alone, and this is a wait for setup rather than a
+            // budget anything is measured against.
+            composeRule.waitUntil(
+                timeoutMillis = if (requireOnlineStyle) ONLINE_STYLE_SETUP_MILLIS else 30_000L,
+            ) { fogRendered.get() }
             val map = checkNotNull(awaitMap()) { "The map never became ready" }
             if (requireOnlineStyle) {
                 val loadState = composeRule.runOnIdle {
@@ -521,10 +531,27 @@ class MapSurfaceTest {
                 calibration.uncoveredFraction >= MINIMUM_CALIBRATION_UNCOVERED_FRACTION,
             )
 
-            val report = StringBuilder("calibration=${calibration.report()} ")
+            // How far out this display itself allows, measured once rather than assumed, and
+            // checked against what MapLibre's own rule predicts so that a floor added anywhere in
+            // this app would show up as the measurement exceeding the prediction.
+            val zoomFloor = measureZoomFloor(map, cameraRequest)
+            val predictedFloor = predictedZoomFloor()
+            assertTrue(
+                "The camera stopped at zoom $zoomFloor when this display allows $predictedFloor, " +
+                    "so something is refusing to zoom out",
+                zoomFloor <= predictedFloor + ZOOM_FLOOR_PREDICTION_TOLERANCE,
+            )
+
+            val report = StringBuilder(
+                "calibration=${calibration.report()} " +
+                    "zoomFloor=${"%.2f".format(java.util.Locale.US, zoomFloor)} " +
+                    "predictedFloor=${"%.2f".format(java.util.Locale.US, predictedFloor)} ",
+            )
             var worstFraction = 0.0
             var worstLabel = "none"
-            var requestId = 1L
+            var worstOverFogged = 0.0
+            var worstOverFoggedLabel = "none"
+            var requestId = 100L
             UNEXPLORED_VIEWPOINTS.forEach { (label, point) ->
                 ZOOM_SWEEP.forEach { zoom ->
                     requestId += 1L
@@ -535,7 +562,7 @@ class MapSurfaceTest {
                             zoom = zoom,
                         )
                     }
-                    composeRule.waitUntil(timeoutMillis = 25_000L) {
+                    composeRule.waitUntil(timeoutMillis = 45_000L) {
                         composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                             .fetchSemanticsNodes()
                             .isEmpty()
@@ -549,25 +576,26 @@ class MapSurfaceTest {
                     )
                     // Every zoom must actually be reachable, or the sweep could pass because the
                     // camera quietly refused to go where it was told. MapLibre keeps the world
-                    // covering the viewport, so the true floor is device-dependent and sits below
-                    // 1 — there, all that can be asserted is that nothing of ours adds a floor.
-                    if (zoom >= LOWEST_EXACTLY_REACHABLE_ZOOM) {
-                        assertEquals(
-                            "Camera did not reach the requested zoom",
-                            zoom,
-                            settledZoom,
-                            ZOOM_TOLERANCE,
-                        )
-                    } else {
-                        assertTrue(
-                            "Camera stopped at zoom $settledZoom, so something is refusing to " +
-                                "zoom out",
-                            settledZoom < LOWEST_EXACTLY_REACHABLE_ZOOM,
-                        )
-                    }
+                    // covering the viewport, so the floor belongs to the display rather than to
+                    // this app — and comparing against that, rather than against a hard-coded 1.0,
+                    // both survives a taller screen and still fails if anything of ours adds a
+                    // floor of its own.
+                    assertEquals(
+                        "Camera settled at zoom $settledZoom, not at the zoom this display allows",
+                        max(zoom, zoomFloor),
+                        settledZoom,
+                        ZOOM_TOLERANCE,
+                    )
                     if (coverage.uncoveredFraction > worstFraction) {
                         worstFraction = coverage.uncoveredFraction
-                        worstLabel = "$label@z$zoom"
+                        // With the bounds, not just the size. A strip along one edge, a seam
+                        // through the middle and a corner are three different defects, and a bare
+                        // percentage cannot tell them apart — localising one costs a run each time.
+                        worstLabel = "$label@z$zoom ${coverage.report()}"
+                    }
+                    if (coverage.overFoggedFraction > worstOverFogged) {
+                        worstOverFogged = coverage.overFoggedFraction
+                        worstOverFoggedLabel = "$label@z$zoom ${coverage.report()}"
                     }
                 }
             }
@@ -579,6 +607,7 @@ class MapSurfaceTest {
                         "TrailVeil settled fog coverage sweep [${provider.providerName}]: " +
                             "worst=$worstLabel " +
                             "worstFraction=${"%.4f".format(java.util.Locale.US, worstFraction * 100.0)}% " +
+                            "worstOverFogged=$worstOverFoggedLabel " +
                             "limit=${MAXIMUM_SETTLED_REVEALED_FRACTION * 100.0}% $report\n",
                     )
                 },
@@ -588,6 +617,1483 @@ class MapSurfaceTest {
                     "(${"%.4f".format(java.util.Locale.US, worstFraction * 100.0)}%)",
                 worstFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
             )
+            // Coverage can be wrong in the other direction too, and until now nothing here could
+            // see it: two coats of fog over the same ground read as covered while looking like a
+            // black stripe down the map.
+            assertTrue(
+                "Settled camera $worstOverFoggedLabel drew " +
+                    "${"%.4f".format(java.util.Locale.US, worstOverFogged * 100.0)}% of the map " +
+                    "under more than one coat of fog",
+                worstOverFogged <= MAXIMUM_OVER_FOGGED_FRACTION,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * Zooming out with two fingers, which is the case the pan invariant below cannot see.
+     *
+     * A gesture deliberately never rebuilds the overlay — that is what keeps a pan smooth — so
+     * whatever fog was installed when the fingers landed is all the coverage there is until they
+     * lift. A pan cannot outrun that, because it moves the camera by a bounded amount. A zoom-out
+     * can: it grows the viewport without moving the camera at all, and when the surround was
+     * measured in fractions of the world rather than in screens, one pinch from zoom 4 presented
+     * 46% of the screen as bare basemap.
+     */
+    @Test
+    fun aPinchZoomOutNeverExposesUnexploredMap() = sweepGesture(
+        provider = MapProviderConfiguration(
+            providerName = "fog-pinch-test-provider",
+            styleUri = "https://tiles.invalid/styles/fog-pinch",
+        ),
+        requireOnlineStyle = false,
+        savedStateKey = "trailveil.map.fog-pinch-test",
+        gesture = ::pinchOutInSteps,
+    )
+
+    /** The same pinch against the style that actually ships. */
+    @Test
+    fun aPinchZoomOutNeverExposesUnexploredMapOnTheProductionStyle() = sweepGesture(
+        provider = ProductionMapProvider,
+        requireOnlineStyle = true,
+        savedStateKey = "trailveil.map.fog-pinch-production-test",
+        gesture = ::pinchOutInSteps,
+    )
+
+    /**
+     * The other way out. MapLibre zooms on a double tap held and dragged, with one finger, through
+     * a different detector than the pinch — and one finger is the gesture a person makes without
+     * meaning to.
+     */
+    @Test
+    fun aQuickZoomOutNeverExposesUnexploredMap() = sweepGesture(
+        provider = MapProviderConfiguration(
+            providerName = "fog-quick-zoom-test-provider",
+            styleUri = "https://tiles.invalid/styles/fog-quick-zoom",
+        ),
+        requireOnlineStyle = false,
+        savedStateKey = "trailveil.map.fog-quick-zoom-test",
+        gesture = ::quickZoomOutInSteps,
+    )
+
+    /**
+     * The pinch the three tests above cannot make: from the zoom people actually explore at.
+     *
+     * Those start at zoom 4, where the surround is the whole world and the pixel budget never
+     * binds. The clamp only applies from render zoom 13 up, so until this test the entire clamped
+     * regime — the one the budget was invented for — had no gesture evidence at all. It starts
+     * over unexplored ground rather than over the track, because at this zoom a revealed track
+     * fills more of the screen than the leak allowance.
+     */
+    @Test
+    fun aPinchZoomOutFromExplorationZoomNeverExposesUnexploredMap() = sweepGesture(
+        provider = MapProviderConfiguration(
+            providerName = "fog-pinch-close-test-provider",
+            styleUri = "https://tiles.invalid/styles/fog-pinch-close",
+        ),
+        requireOnlineStyle = false,
+        savedStateKey = "trailveil.map.fog-pinch-close-test",
+        gesture = ::pinchOutInSteps,
+        startPoint = UNEXPLORED_NEAR_REVEALED,
+        startZoom = 16.0,
+        // Here the surround is clamped to what the renderer will draw, and where it lands drifts
+        // as the camera zooms away from the zoom it was built for. Past a measured margin the map
+        // is covered instead of trusted — so what this asserts is that no frame is ever bare, not
+        // that no frame is ever hidden.
+        expectCover = true,
+    )
+
+    /**
+     * Zooming out across the point where the renderer starts repeating an image source by itself.
+     *
+     * The world's own copies have to be drawn when it does not and hidden when it does, and neither
+     * belongs to the zoom the overlay was built at — a gesture changes the camera and rebuilds
+     * nothing. Getting that from the build zoom put a second coat of fog over half the screen past
+     * the antimeridian, reported from a device as one side of the map going completely black.
+     * Only the production style can show it: the packaged fallback is a flat fill with no world
+     * edge and no repetition.
+     */
+    @Test
+    fun zoomingOutPastTheAntimeridianNeverDoubleFogsTheMap() = sweepGesture(
+        provider = ProductionMapProvider,
+        requireOnlineStyle = true,
+        savedStateKey = "trailveil.map.fog-antimeridian-out-test",
+        gesture = ::pinchOutInSteps,
+        startPoint = ANTIMERIDIAN,
+        startZoom = 1.6,
+        minimumZoomChange = ANTIMERIDIAN_ZOOM_CHANGE,
+    )
+
+    /**
+     * The same crossing in the other direction, which fails the other way and is the dangerous one.
+     *
+     * Built at a zoom where the renderer repeats by itself, the copies are hidden; zoom in past
+     * that point and the renderer stops, so without them the neighbouring copy of the world is
+     * drawn with no fog on it at all. Reported from a device as bare, readable basemap filling a
+     * third of the screen — unexplored ground presented as explored.
+     */
+    @Test
+    fun zoomingInPastTheAntimeridianNeverExposesUnexploredMap() = sweepGesture(
+        provider = ProductionMapProvider,
+        requireOnlineStyle = true,
+        savedStateKey = "trailveil.map.fog-antimeridian-in-test",
+        gesture = ::pinchInInSteps,
+        startPoint = ANTIMERIDIAN,
+        startZoom = 0.0,
+        expectZoomOut = false,
+        expectZoomIn = true,
+        minimumZoomChange = ANTIMERIDIAN_ZOOM_CHANGE,
+    )
+
+    /**
+     * The same crossing again, started from a zoom where it is the *bands* that carry the world
+     * copies rather than the mosaic.
+     *
+     * Below render zoom 2 the mosaic spans a world and is copied itself; above it, it does not, and
+     * a pair of flat band quads carry the fog into the neighbouring copies instead. The test above
+     * starts at 1.6 and therefore never installs that pair at all — which is how half of this
+     * defect survived a fix that measured clean, and was reported from a device a second time.
+     */
+    @Test
+    fun zoomingOutFromAnExplorationZoomPastTheAntimeridianNeverDoubleFogsTheMap() = sweepGesture(
+        provider = ProductionMapProvider,
+        requireOnlineStyle = true,
+        savedStateKey = "trailveil.map.fog-antimeridian-bands-test",
+        gesture = ::pinchOutInSteps,
+        startPoint = ANTIMERIDIAN,
+        startZoom = 3.0,
+        minimumZoomChange = ANTIMERIDIAN_ZOOM_CHANGE,
+    )
+
+    /**
+     * The same zoom-out with no world edge anywhere near it.
+     *
+     * Every test above that could see a second coat of fog was placed at the antimeridian, so the
+     * defect read as an antimeridian defect for two rounds of fixes. It was not: the far side band
+     * lies past the world's edge whenever the mosaic sits far enough east or west, and Taipei is
+     * far enough. Measured at 5.38% of the screen here before the fix.
+     */
+    @Test
+    fun zoomingOutFromAnExplorationZoomNeverDoubleFogsTheMap() = sweepGesture(
+        provider = ProductionMapProvider,
+        requireOnlineStyle = true,
+        savedStateKey = "trailveil.map.fog-ordinary-bands-test",
+        gesture = ::pinchOutInSteps,
+        startPoint = REVEALED_CENTER,
+        startZoom = 3.0,
+        minimumZoomChange = ANTIMERIDIAN_ZOOM_CHANGE,
+    )
+
+    /**
+     * The side bands come back after the band that replaced them is removed.
+     *
+     * The wrapped band exists only where the surround spans a world, and replaces the two side
+     * bands only where the renderer repeats by itself. Crossing camera zoom 1 hides the side bands;
+     * the rebuild that follows removes the wrapped band, because at that zoom the mosaic spans the
+     * world and there is nothing beside it to cover. If nothing turns the side bands back on, every
+     * later zoom draws the map with no cover beside the mosaic at all — measured by an independent
+     * verifier at 89.3519% of the screen bare with the safety cover down, at every zoom afterwards
+     * and until the style is reloaded.
+     *
+     * Asserted on the layers rather than on pixels because it is a state that persists: a pixel
+     * test would have to fling several screen-widths without ever letting the camera idle, while
+     * the state itself is wrong the moment the rebuild lands.
+     *
+     * What this pins is that *an* arrangement is drawn, never *which* — a verifier defeated it by
+     * making the wrapped band never chosen, which is internally consistent and is exactly the
+     * behaviour P4-024 was opened for. Which arrangement is right is pinned by
+     * [noSingleFogQuadIsDrawnMoreThanOnce], which reports 8.2455% against that same change, and by
+     * `exactlyOneArrangementOfTheGroundBesideTheMosaicIsEverDrawn` in the JVM suite. Read the three
+     * together; none of them is sufficient alone.
+     */
+    @Test
+    fun theSideBandsComeBackWhenTheWrappedBandIsRemoved() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            revealTrack(database, REVEALED_CENTER)
+            val cameraRequest = mutableStateOf(
+                MapCameraRequest(requestId = 1L, point = REVEALED_CENTER, zoom = 3.0),
+            )
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-side-band-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-side-band",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-side-band-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = cameraRequest.value,
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = 30_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+
+            val trace = StringBuilder()
+            fun settleAt(zoom: Double, requestId: Long) {
+                composeRule.runOnUiThread {
+                    cameraRequest.value = MapCameraRequest(
+                        requestId = requestId,
+                        point = REVEALED_CENTER,
+                        zoom = zoom,
+                    )
+                }
+                composeRule.waitUntil(timeoutMillis = 30_000L) {
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                        .fetchSemanticsNodes()
+                        .isEmpty()
+                }
+                Thread.sleep(ZOOM_SETTLE_MILLIS)
+            }
+
+            fun assertGroundBesideTheMosaicIsCoveredOnce(label: String) {
+                val west = map.fogLayerVisibility(FogBackdropIds.WestLayer)
+                val east = map.fogLayerVisibility(FogBackdropIds.EastLayer)
+                val wrapped = map.fogLayerVisibility(FogBackdropIds.WrappedSideLayer)
+                trace.append("\n $label west=$west east=$east wrapped=$wrapped")
+                val wrappedDrawn = wrapped == Property.VISIBLE
+                val sidesDrawn = west == Property.VISIBLE
+                assertEquals("$label: the side bands disagree with each other", west, east)
+                assertTrue(
+                    "$label: the ground beside the mosaic is covered " +
+                        (if (wrappedDrawn) "twice" else "not at all") +
+                        " (west=$west east=$east wrapped=$wrapped)",
+                    sidesDrawn != wrappedDrawn,
+                )
+            }
+
+            settleAt(3.0, 2L)
+            assertGroundBesideTheMosaicIsCoveredOnce("at zoom 3, before crossing")
+            // Below the zoom where the renderer repeats by itself: the wrapped band takes over, and
+            // the rebuild that follows removes it again.
+            settleAt(0.8, 3L)
+            assertGroundBesideTheMosaicIsCoveredOnce("at zoom 0.8, past the repetition edge")
+            settleAt(8.0, 4L)
+            assertGroundBesideTheMosaicIsCoveredOnce("back at zoom 8")
+
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply { putString("stream", "TrailVeil side bands:$trace\n") },
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * A settled camera at every zoom a user passes through on the way out, with nothing moving.
+     *
+     * The defect this exists for needed no gesture at all: at render zooms 12 and 14 the south band
+     * was drawn 50 and 73 screen pixels away from where its coordinates put it, over the mosaic,
+     * as a full-width black band along the bottom of the map. It is a property of how large the
+     * surround quad is, so it appeared at the two zooms where the surround is at its size limit and
+     * nowhere else — which is why zoom had to be swept rather than sampled, and why the frames are
+     * settled: every gesture test in this file stops measuring at 0.75 levels out, where the safety
+     * cover goes up, and the band lives past that.
+     */
+    @Test
+    fun noSettledZoomDrawsASeamOverTheMap() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            revealTrack(database, REVEALED_CENTER)
+            val cameraRequest = mutableStateOf(
+                MapCameraRequest(requestId = 1L, point = REVEALED_CENTER, zoom = 16.0),
+            )
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = ProductionMapProvider,
+                    fallbackTimeoutMillis = 20_000L,
+                    savedStateKey = "trailveil.map.fog-seam-probe",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = cameraRequest.value,
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = ONLINE_STYLE_SETUP_MILLIS) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            val loadState = composeRule.runOnIdle {
+                attachedMapView()?.getTag(R.id.map_basemap_load_state)
+            }
+            Assume.assumeTrue("style=$loadState", loadState == BasemapLoadState.ONLINE.name)
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+            val report = StringBuilder()
+            var requestId = 1L
+            var worst = 0.0
+            var worstReport = "none"
+            SETTLED_SEAM_ZOOMS.forEach { zoom ->
+                requestId += 1L
+                composeRule.runOnUiThread {
+                    cameraRequest.value = MapCameraRequest(
+                        requestId = requestId,
+                        point = REVEALED_CENTER,
+                        zoom = zoom,
+                    )
+                }
+                composeRule.waitUntil(timeoutMillis = 45_000L) {
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                        .fetchSemanticsNodes()
+                        .isEmpty()
+                }
+                Thread.sleep(ZOOM_SETTLE_MILLIS)
+                val visibility = ALL_FOG_LAYERS.associateWith { map.fogLayerVisibility(it) }
+                val audit = map.auditFogCoverage()
+                report.append(
+                    "\n z=${"%.2f".format(java.util.Locale.US, map.cameraPosition.zoom)} " +
+                        audit.report(),
+                )
+                if (audit.overFoggedFraction > worst) {
+                    worst = audit.overFoggedFraction
+                    worstReport = "at zoom $zoom: ${audit.report()}"
+                }
+                // Only when something is wrong, and only to say what: which quad is the second
+                // coat, and where each one really is. Localising this by hand cost a run apiece.
+                if (audit.overFoggedFraction > MAXIMUM_SETTLED_SEAM_FRACTION) {
+                    map.setFogLayersVisible(false)
+                    val bare = map.snapshotPixels()
+                    ALL_FOG_LAYERS.filter { visibility[it] == Property.VISIBLE }.forEach { id ->
+                        map.setSingleFogLayerVisible(id, true)
+                        val only = compareFogCoverage(map.snapshotPixels(), bare, snapshotWidth())
+                        map.setSingleFogLayerVisible(id, false)
+                        report.append("\n  only ${id.removePrefix("trailveil-")} -> ")
+                            .append(only.report())
+                    }
+                    map.restoreFogLayerVisibility(visibility)
+                    ALL_FOG_LAYERS.filter { visibility[it] == Property.VISIBLE }.forEach { id ->
+                        map.setSingleFogLayerVisible(id, false)
+                        val without =
+                            compareFogCoverage(map.snapshotPixels(), bare, snapshotWidth())
+                        map.setSingleFogLayerVisible(id, true)
+                        report.append("\n  without ${id.removePrefix("trailveil-")} -> ")
+                            .append(without.report())
+                    }
+                    map.restoreFogLayerVisibility(visibility)
+                }
+            }
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply { putString("stream", "TrailVeil settled seam sweep:$report\n") },
+            )
+            assertTrue(
+                "A settled camera drew part of the map under more than one coat of fog $worstReport",
+                worst <= MAXIMUM_SETTLED_SEAM_FRACTION,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * No single fog quad may be drawn more than once.
+     *
+     * This is the cause behind the black block a user saw while zooming out, stated as the rule it
+     * broke rather than as the symptom. Below the zoom where the renderer repeats an image source
+     * across world copies by itself, a quad lying *entirely* past the world's edge is drawn twice —
+     * at its own coordinates and again where the repetition puts it, on the same pixels. Two coats
+     * of fog transmit 0.077 of the basemap instead of 0.278, which reads as black.
+     *
+     * Measured by drawing each quad with every other fog layer hidden, so nothing else can be the
+     * second coat. Before the fix the east band alone reported 5.31% of the screen over-fogged at
+     * an ordinary place and 8.25% past the antimeridian, while every other quad reported none: the
+     * east band was the only one whose centre lay outside the world. A coverage test cannot see
+     * this at all — over-fogged map still counts as covered — which is why it survived two rounds
+     * of fixes that measured clean.
+     */
+    @Test
+    fun noSingleFogQuadIsDrawnMoreThanOnce() =
+        assertNoFogQuadIsDoubled(ANTIMERIDIAN, "antimeridian")
+
+    @Test
+    fun noSingleFogQuadIsDrawnMoreThanOnceAtAnOrdinaryPlace() =
+        assertNoFogQuadIsDoubled(REVEALED_CENTER, "ordinary")
+
+    private fun assertNoFogQuadIsDoubled(startPoint: GeoPoint, label: String) {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            revealTrack(database, REVEALED_CENTER)
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = ProductionMapProvider,
+                    fallbackTimeoutMillis = 20_000L,
+                    savedStateKey = "trailveil.map.fog-single-quad-$label",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = startPoint,
+                        zoom = 3.0,
+                    ),
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = ONLINE_STYLE_SETUP_MILLIS) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            val loadState = composeRule.runOnIdle {
+                attachedMapView()?.getTag(R.id.map_basemap_load_state)
+            }
+            Assume.assumeTrue(
+                "The production style did not load (state=$loadState)",
+                loadState == BasemapLoadState.ONLINE.name,
+            )
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+            composeRule.waitUntil(timeoutMillis = 25_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+            composeRule.waitUntil(timeoutMillis = 25_000L) { fogGeneration() != null }
+
+            val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            val report = StringBuilder("viewport=${view.width}x${view.height}")
+            var doubled: String? = null
+            var isolations = 0
+            pinchOutInSteps(map) {
+                if (doubled != null) return@pinchOutInSteps
+                val covered = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isNotEmpty()
+                val zoom = map.cameraPosition.zoom
+                if (covered) {
+                    report.append("\n z=${"%.2f".format(java.util.Locale.US, zoom)} covered")
+                    return@pinchOutInSteps
+                }
+                // Read before anything is hidden: which quads are drawn depends on the camera, so
+                // a reading taken afterwards would describe the harness rather than the app.
+                val visibility = ALL_FOG_LAYERS.associateWith { map.fogLayerVisibility(it) }
+                report.append("\n z=${"%.2f".format(java.util.Locale.US, zoom)}")
+                map.setFogLayersVisible(false)
+                ALL_FOG_LAYERS.filter { visibility[it] == Property.VISIBLE }.forEach { id ->
+                    val only = map.measureQuadAlone(id)
+                    isolations += 1
+                    report.append("\n  only ${id.removePrefix("trailveil-")} -> ")
+                        .append(only.report())
+                    if (only.overFoggedFraction <= MAXIMUM_SINGLE_QUAD_OVER_FOGGED_FRACTION) {
+                        return@forEach
+                    }
+                    // Looked at twice before it is believed. A production basemap is still
+                    // streaming at these zooms, and a tile or label that lands between the two
+                    // frames of a pair reads as a change in coverage that no quad caused: the same
+                    // dark box at (939,943)-(1054,1037) was attributed to the wrapped side band in
+                    // one run and to the south band in another, at the same camera zoom, which is
+                    // not something a quad drawn twice can do. A quad really drawn twice is
+                    // deterministic and survives a second look; this does not.
+                    val again = map.measureQuadAlone(id)
+                    report.append(" | again ").append(again.report())
+                    if (
+                        doubled == null &&
+                        again.overFoggedFraction > MAXIMUM_SINGLE_QUAD_OVER_FOGGED_FRACTION
+                    ) {
+                        doubled = "$id at zoom $zoom: ${only.report()} then ${again.report()}"
+                    }
+                }
+                map.restoreFogLayerVisibility(visibility)
+            }
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply {
+                    putString("stream", "TrailVeil single-quad coats [$label]:$report\n")
+                },
+            )
+            assertTrue(
+                "No quad was ever drawn on its own, so this measured nothing",
+                isolations > 0,
+            )
+            assertTrue(
+                "A single fog quad was drawn more than once: $doubled",
+                doubled == null,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * One quad drawn with every other fog layer hidden, against a bare frame taken next to it.
+     *
+     * Called with every fog layer already hidden, and leaves them that way. The bare reference is
+     * re-taken for each quad rather than once for the sweep: a single reference goes stale by ten
+     * seconds over seven layers, and a basemap that is still loading changes underneath it.
+     */
+    private fun MapLibreMap.measureQuadAlone(id: String): FogAudit {
+        val bare = snapshotPixels()
+        setSingleFogLayerVisible(id, true)
+        val only = snapshotPixels()
+        setSingleFogLayerVisible(id, false)
+        return compareFogCoverage(only, bare, snapshotWidth())
+    }
+
+    private fun MapLibreMap.fogLayerVisibility(id: String): String? {
+        val captured = AtomicReference<String?>(null)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            captured.set(style?.getLayer(id)?.visibility?.value)
+        }
+        return captured.get()
+    }
+
+    private fun MapLibreMap.restoreFogLayerVisibility(visibility: Map<String, String?>) {
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val style = requireNotNull(style) { "The style is not ready" }
+            visibility.forEach { (id, value) ->
+                if (value != null) {
+                    style.getLayer(id)?.setProperties(PropertyFactory.visibility(value))
+                }
+            }
+        }
+        Thread.sleep(FOG_VISIBILITY_SETTLE_MILLIS)
+    }
+
+    private fun MapLibreMap.setSingleFogLayerVisible(id: String, visible: Boolean) {
+        val value = if (visible) Property.VISIBLE else Property.NONE
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            style?.getLayer(id)?.setProperties(PropertyFactory.visibility(value))
+        }
+        Thread.sleep(FOG_VISIBILITY_SETTLE_MILLIS)
+    }
+
+    /**
+     * The two settled cameras either side of the zoom where the renderer starts repeating an image
+     * source by itself, which is the edge the world copies are switched on at.
+     *
+     * Both sides fail totally when the switch is in the wrong place, in opposite directions, so
+     * both sides are asserted. Swept in steps of 0.02 to find it: 0.98 with the copies on is
+     * 50.000% black, 1.00 with them off leaks 49.722%, and the edge is exactly the integer. A user
+     * saw the black band twice, once for each of two values that were inferred rather than
+     * measured.
+     */
+    @Test
+    fun theWorldCopyEdgeIsCorrectOnBothSides() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            revealTrack(database, REVEALED_CENTER)
+            val cameraRequest = mutableStateOf(
+                MapCameraRequest(requestId = 1L, point = ANTIMERIDIAN, zoom = 2.0),
+            )
+
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = ProductionMapProvider,
+                    fallbackTimeoutMillis = 20_000L,
+                    savedStateKey = "trailveil.map.fog-world-copy-edge",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = cameraRequest.value,
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = ONLINE_STYLE_SETUP_MILLIS) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            val loadState = composeRule.runOnIdle {
+                attachedMapView()?.getTag(R.id.map_basemap_load_state)
+            }
+            Assume.assumeTrue(
+                "The production style did not load (state=$loadState); skipping rather than " +
+                    "reporting a fallback-style result as production",
+                loadState == BasemapLoadState.ONLINE.name,
+            )
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+
+            val report = StringBuilder()
+            var requestId = 100L
+            WORLD_COPY_EDGE_ZOOMS.forEach { zoom ->
+                requestId += 1L
+                composeRule.runOnUiThread {
+                    cameraRequest.value = MapCameraRequest(
+                        requestId = requestId,
+                        point = ANTIMERIDIAN,
+                        zoom = zoom,
+                    )
+                }
+                composeRule.waitUntil(timeoutMillis = 45_000L) {
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                        .fetchSemanticsNodes()
+                        .isEmpty()
+                }
+                Thread.sleep(ZOOM_SETTLE_MILLIS)
+                val settled = map.cameraPosition.zoom
+                val audit = map.auditFogCoverage()
+                report.append(
+                    " z=${"%.2f".format(java.util.Locale.US, settled)}=${audit.report()}",
+                )
+                assertTrue(
+                    "At zoom $settled the map was left bare past the world edge: ${audit.report()}",
+                    audit.uncoveredFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
+                )
+                assertTrue(
+                    "At zoom $settled part of the map was under more than one coat of fog: " +
+                        audit.report(),
+                    audit.overFoggedFraction <= MAXIMUM_OVER_FOGGED_FRACTION,
+                )
+            }
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply {
+                    putString("stream", "TrailVeil world-copy edge:$report\n")
+                },
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * A pan at the zoom where the whole world is nearly on screen, which is where an adversarial
+     * verifier found the defect every test here had missed.
+     *
+     * The surround was a square centred on the mosaic and *trimmed* by the world edge, so a mosaic
+     * off the equator lost a quarter of its height with nothing over that strip. Reproduced here
+     * before the fix at 22.04% of the screen shown as bare basemap, growing 0 → 2.71 → 12.42 →
+     * 22.04% across one drag, with the camera zoom never changing — a pan, not a zoom.
+     */
+    @Test
+    fun aPanAtWorldZoomNeverExposesUnexploredMap() = sweepGesture(
+        provider = MapProviderConfiguration(
+            providerName = "fog-world-pan-test-provider",
+            styleUri = "https://tiles.invalid/styles/fog-world-pan",
+        ),
+        requireOnlineStyle = false,
+        savedStateKey = "trailveil.map.fog-world-pan-test",
+        gesture = ::panInSteps,
+        startPoint = GeoPoint(0.0, 121.5654),
+        startZoom = 2.0,
+        expectZoomOut = false,
+    )
+
+    /**
+     * The other defect from the same verification, which fails in the opposite direction: the live
+     * camera check measured the viewport against one world when the installed coverage is three
+     * worlds wide, so an ordinary drag at zoom 1 from anywhere far from the prime meridian raised
+     * the safety cover over a map that was correctly and completely fogged. Taipei is 121° out,
+     * which was enough.
+     */
+    @Test
+    fun aPanAtWorldZoomNeverHidesAFullyFoggedMap() = sweepGesture(
+        provider = MapProviderConfiguration(
+            providerName = "fog-world-pan-far-test-provider",
+            styleUri = "https://tiles.invalid/styles/fog-world-pan-far",
+        ),
+        requireOnlineStyle = false,
+        savedStateKey = "trailveil.map.fog-world-pan-far-test",
+        gesture = ::panInSteps,
+        startPoint = GeoPoint(25.0330, 121.5654),
+        startZoom = 1.0,
+        expectZoomOut = false,
+    )
+
+    /**
+     * Measures coverage *during* a zoom-out, with the fingers still down.
+     *
+     * The settled sweep compares each pixel with the same pixel unfogged, which needs two frames of
+     * one view and so cannot be taken from a moving camera. A gesture does not have to be moving to
+     * be a gesture, though: the zoom is driven in steps and the fingers are held between them, so
+     * the same comparison works while the overlay is still exactly the one installed before the
+     * gesture began. That the overlay really is that one is asserted rather than assumed — the
+     * published fog generation must not change from the first touch to the last.
+     */
+    private fun sweepGesture(
+        provider: MapProviderConfiguration,
+        requireOnlineStyle: Boolean,
+        savedStateKey: String,
+        gesture: (map: MapLibreMap, onHold: () -> Unit) -> Unit,
+        startPoint: GeoPoint = REVEALED_CENTER,
+        startZoom: Double = GESTURE_START_ZOOM,
+        expectZoomOut: Boolean = true,
+        expectCover: Boolean = false,
+        expectZoomIn: Boolean = false,
+        minimumZoomChange: Double = MINIMUM_GESTURE_ZOOM_CHANGE,
+    ) {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            revealTrack(database, REVEALED_CENTER)
+
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = provider,
+                    fallbackTimeoutMillis = if (requireOnlineStyle) 20_000L else 100L,
+                    savedStateKey = savedStateKey,
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = startPoint,
+                        zoom = startZoom,
+                    ),
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            // Fetching a real style, rendering its tiles and building fog from them takes longer
+            // under a full suite than it does alone, and this is a wait for setup rather than a
+            // budget anything is measured against.
+            composeRule.waitUntil(
+                timeoutMillis = if (requireOnlineStyle) ONLINE_STYLE_SETUP_MILLIS else 30_000L,
+            ) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            if (requireOnlineStyle) {
+                val loadState = composeRule.runOnIdle {
+                    attachedMapView()?.getTag(R.id.map_basemap_load_state)
+                }
+                Assume.assumeTrue(
+                    "The production style did not load (state=$loadState); skipping rather than " +
+                        "reporting a fallback-style result as production",
+                    loadState == BasemapLoadState.ONLINE.name,
+                )
+            }
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+            composeRule.waitUntil(timeoutMillis = 25_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            // Same calibration the settled sweep runs, for the same reason: a detector that cannot
+            // see a leak here would report every frame of the gesture as covered.
+            val calibration = map.auditWithFogRemoved()
+            assertTrue(
+                "The map drew almost nothing, so this would pass vacuously: " +
+                    calibration.report(),
+                calibration.drawnFraction >= MINIMUM_DRAWN_FRACTION,
+            )
+            assertTrue(
+                "With the fog layers hidden the audit still reported the map as covered: " +
+                    calibration.report(),
+                calibration.uncoveredFraction >= MINIMUM_CALIBRATION_UNCOVERED_FRACTION,
+            )
+
+            // Canonical fog has to be installed before the fingers land, or the gesture would be
+            // measured against a placeholder and the generation check would compare with nothing.
+            composeRule.waitUntil(timeoutMillis = 25_000L) { fogGeneration() != null }
+            val startCameraZoom = map.cameraPosition.zoom
+            val startTarget = map.cameraPosition.target
+            val generationAtTouchDown = fogGeneration()
+            // What MapLibre made of the injected touches. Without this the test could report a
+            // clean gesture that the map never actually received as one.
+            val moveReasons = java.util.Collections.synchronizedList(mutableListOf<Int>())
+            val reasonListener = MapLibreMap.OnCameraMoveStartedListener { reason ->
+                moveReasons += reason
+            }
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.addOnCameraMoveStartedListener(reasonListener)
+            }
+            var coveredFrames = 0
+            var worstFraction = -1.0
+            var worstReport = "none"
+            var worstOverFogged = 0.0
+            var worstOverFoggedReport = "none"
+            var worstZoom = startCameraZoom
+            var holds = 0
+            val generations = mutableListOf<Any?>()
+            val trace = StringBuilder()
+
+            gesture(map) {
+                holds += 1
+                generations += fogGeneration()
+                val covered = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isNotEmpty()
+                if (covered) coveredFrames += 1
+                val zoom = map.cameraPosition.zoom
+                // A covered frame shows the user nothing, and the snapshot is of the map surface
+                // underneath the cover, so auditing it would measure something nobody can see.
+                if (covered) {
+                    trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:covered ")
+                    return@gesture
+                }
+                val audit = map.auditFogCoverage()
+                trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:")
+                    .append("${"%.4f".format(java.util.Locale.US, audit.uncoveredFraction * 100.0)}%")
+                    .append("/${"%.4f".format(java.util.Locale.US, audit.overFoggedFraction * 100.0)}% ")
+                if (audit.overFoggedFraction > worstOverFogged) {
+                    worstOverFogged = audit.overFoggedFraction
+                    worstOverFoggedReport = audit.report()
+                }
+                if (audit.uncoveredFraction > worstFraction) {
+                    worstFraction = audit.uncoveredFraction
+                    worstReport = audit.report()
+                    worstZoom = zoom
+                }
+            }
+            val endZoom = map.cameraPosition.zoom
+            val endTarget = map.cameraPosition.target
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.removeOnCameraMoveStartedListener(reasonListener)
+            }
+            assertTrue("The gesture never reported a held frame", holds > 0)
+            assertTrue(
+                "Every held frame was covered, so no coverage was measured at all",
+                expectCover || worstFraction >= 0.0,
+            )
+
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply {
+                    putString(
+                        "stream",
+                        "TrailVeil zoom-out gesture invariant [${provider.providerName}]: " +
+                            "startZoom=${"%.2f".format(java.util.Locale.US, startCameraZoom)} " +
+                            "endZoom=${"%.2f".format(java.util.Locale.US, endZoom)} holds=$holds " +
+                            "worst=$worstReport worstOverFogged=$worstOverFoggedReport " +
+                            "atZoom=${"%.2f".format(java.util.Locale.US, worstZoom)} " +
+                            "calibration=${calibration.report()} " +
+                            "generation=$generationAtTouchDown held=$generations " +
+                            "moveReasons=$moveReasons " +
+                            "coveredFrames=$coveredFrames trace=[$trace]\n",
+                    )
+                },
+            )
+            assertTrue(
+                "MapLibre never saw the injected touches as a gesture (reasons=$moveReasons)",
+                moveReasons.contains(
+                    MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE,
+                ),
+            )
+            if (expectZoomIn) {
+                assertTrue(
+                    "The gesture did not zoom in, so this measured nothing " +
+                        "(start=$startCameraZoom end=$endZoom)",
+                    endZoom - startCameraZoom >= minimumZoomChange,
+                )
+            } else if (expectZoomOut) {
+                assertTrue(
+                    "The gesture did not zoom out, so this measured nothing " +
+                        "(start=$startCameraZoom end=$endZoom)",
+                    startCameraZoom - endZoom >= minimumZoomChange,
+                )
+            } else {
+                val moved = endTarget != null && startTarget != null &&
+                    (
+                        kotlin.math.abs(endTarget.latitude - startTarget.latitude) +
+                            kotlin.math.abs(endTarget.longitude - startTarget.longitude)
+                        ) > MINIMUM_PAN_DEGREES
+                assertTrue(
+                    "The gesture did not move the camera, so this measured nothing " +
+                        "($startTarget -> $endTarget)",
+                    moved,
+                )
+            }
+            // Without this the measurement could be of an overlay rebuilt mid-gesture, which is
+            // not the thing under test — the whole point is that a gesture gets no rebuild.
+            // Compared against the first *held* frame rather than against touch-down: a pinch that
+            // fails to engage is lifted and made again, and the abandoned attempt ends in a camera
+            // idle that legitimately rebuilds the fog before the measured attempt starts.
+            assertNotNull(
+                "Fog was not loaded when the measured frames were taken",
+                generations.firstOrNull(),
+            )
+            assertTrue(
+                "The fog was rebuilt during the gesture, so nothing measured here is about what a " +
+                    "gesture is given: $generations (touch-down was $generationAtTouchDown)",
+                generations.all { it == generations.first() },
+            )
+            assertTrue(
+                "A zoom-out gesture presented unexplored map as revealed at zoom $worstZoom: " +
+                    worstReport,
+                worstFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
+            )
+            // A gesture can get coverage wrong in the other direction too, and until this was
+            // measured it did: crossing the zoom where the renderer starts repeating an image
+            // source by itself put a second coat of fog over half the screen.
+            assertTrue(
+                "A gesture drew part of the map under more than one coat of fog: " +
+                    worstOverFoggedReport,
+                worstOverFogged <= MAXIMUM_OVER_FOGGED_FRACTION,
+            )
+            if (expectCover) {
+                // The other half of the contract in the regime where the surround is clamped: the
+                // map is hidden rather than allowed to leak, and the guard really does fire.
+                assertTrue(
+                    "The gesture left the surround behind and nothing covered the map",
+                    coveredFrames > 0,
+                )
+            } else {
+                assertEquals(
+                    "The safety cover was raised during a gesture",
+                    0,
+                    coveredFrames,
+                )
+            }
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * Two fingers drawn together at the centre of the screen, held still after every step so the
+     * camera can be read against itself without ever letting go of the map.
+     */
+    private fun pinchOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
+        pinchInSteps(map, onHold, zoomIn = false)
+
+    private fun pinchInInSteps(map: MapLibreMap, onHold: () -> Unit) =
+        pinchInSteps(map, onHold, zoomIn = true)
+
+    private fun pinchInSteps(map: MapLibreMap, onHold: () -> Unit, zoomIn: Boolean) {
+        repeat(PINCH_ATTEMPTS) { attempt ->
+            if (pinchOnce(map, onHold, zoomIn)) return
+        }
+        // Every assertion downstream would still be sound, but reporting nothing measured is more
+        // useful than reporting a clean gesture that never happened.
+        throw AssertionError("The pinch never engaged MapLibre's scale detector in $PINCH_ATTEMPTS attempts")
+    }
+
+    /** One pinch. Returns whether it actually zoomed, having run [onHold] at each held step. */
+    private fun pinchOnce(map: MapLibreMap, onHold: () -> Unit, zoomIn: Boolean): Boolean {
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        val centerX = view.width / 2f
+        val centerY = view.height / 2f
+        val downTime = SystemClock.uptimeMillis()
+        val shorterEdge = minOf(view.width, view.height)
+        // Fingers apart then together zooms out; together then apart zooms in.
+        val startSpan = shorterEdge *
+            if (zoomIn) PINCH_END_SPAN_FRACTION else PINCH_START_SPAN_FRACTION
+        val endSpan = shorterEdge *
+            if (zoomIn) PINCH_START_SPAN_FRACTION else PINCH_END_SPAN_FRACTION
+        val zoomAtTouchDown = map.cameraPosition.zoom
+
+        // Every event in the stream is built the same way, including the first and the last. A
+        // pointer whose tool type or precision changes part way through is a different pointer as
+        // far as the input pipeline is concerned, and the gesture never begins.
+        fun send(action: Int, pointerCount: Int, span: Float, eventTime: Long) {
+            val properties = Array(pointerCount) { index ->
+                MotionEvent.PointerProperties().apply {
+                    id = index
+                    toolType = MotionEvent.TOOL_TYPE_FINGER
+                }
+            }
+            val coordinates = Array(pointerCount) { index ->
+                MotionEvent.PointerCoords().apply {
+                    x = centerX
+                    y = if (index == 0) centerY - span / 2f else centerY + span / 2f
+                    pressure = 1f
+                    size = 1f
+                }
+            }
+            injectTouch(
+                MotionEvent.obtain(
+                    downTime,
+                    eventTime,
+                    action,
+                    pointerCount,
+                    properties,
+                    coordinates,
+                    0,
+                    0,
+                    1f,
+                    1f,
+                    0,
+                    0,
+                    InputDevice.SOURCE_TOUCHSCREEN,
+                    0,
+                ),
+            )
+        }
+
+        send(MotionEvent.ACTION_DOWN, 1, startSpan, downTime)
+        send(
+            MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2,
+            startSpan,
+            SystemClock.uptimeMillis(),
+        )
+        fun lift(span: Float) {
+            send(
+                MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                2,
+                span,
+                SystemClock.uptimeMillis(),
+            )
+            send(MotionEvent.ACTION_UP, 1, span, SystemClock.uptimeMillis())
+        }
+
+        // Engagement first, with nothing measured. An attempt that never reaches MapLibre's scale
+        // detector is abandoned here, so a restarted pinch cannot contribute a frame — and the
+        // frames that are measured all belong to one gesture over one installed overlay.
+        val engageSpan = startSpan + (endSpan - startSpan) * PINCH_ENGAGE_TRAVEL
+        repeat(PINCH_ENGAGE_MOVES) { move ->
+            val span = startSpan + (engageSpan - startSpan) * (move + 1) / PINCH_ENGAGE_MOVES
+            send(MotionEvent.ACTION_MOVE, 2, span, SystemClock.uptimeMillis())
+            SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+        }
+        val engagement = if (zoomIn) {
+            map.cameraPosition.zoom - zoomAtTouchDown
+        } else {
+            zoomAtTouchDown - map.cameraPosition.zoom
+        }
+        if (engagement < MINIMUM_PINCH_ENGAGEMENT) {
+            lift(engageSpan)
+            // Lifting ends in a camera idle, which rebuilds the fog. Let that finish, so the next
+            // attempt starts from a settled overlay rather than racing one.
+            Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+            return false
+        }
+
+        val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
+        repeat(moves) { move ->
+            val span = engageSpan + (endSpan - engageSpan) * (move + 1) / moves
+            send(MotionEvent.ACTION_MOVE, 2, span, SystemClock.uptimeMillis())
+            SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+            if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
+                Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
+                onHold()
+            }
+        }
+        lift(endSpan)
+        return true
+    }
+
+    /**
+     * One finger dragged diagonally, held between steps. Diagonal so that a single gesture crosses
+     * both the edge a trimmed surround loses and the edge a wrongly-measured one thinks it has.
+     */
+    private fun panInSteps(@Suppress("UNUSED_PARAMETER") map: MapLibreMap, onHold: () -> Unit) {
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        val fromX = view.width * 0.72f
+        val toX = view.width * 0.22f
+        val fromY = view.height * 0.24f
+        val toY = view.height * 0.82f
+        val downTime = SystemClock.uptimeMillis()
+
+        fun send(action: Int, x: Float, y: Float) {
+            injectTouch(
+                MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action, x, y, 0)
+                    .apply { source = InputDevice.SOURCE_TOUCHSCREEN },
+            )
+        }
+
+        send(MotionEvent.ACTION_DOWN, fromX, fromY)
+        val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
+        repeat(moves) { move ->
+            val progress = (move + 1).toFloat() / moves
+            send(
+                MotionEvent.ACTION_MOVE,
+                fromX + (toX - fromX) * progress,
+                fromY + (toY - fromY) * progress,
+            )
+            SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+            if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
+                Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
+                onHold()
+            }
+        }
+        send(MotionEvent.ACTION_UP, toX, toY)
+    }
+
+    /**
+     * `sendPointerSync` refuses nothing and reports nothing, so a malformed multi-touch stream is
+     * indistinguishable from a map that ignored it. Injecting through the automation interface
+     * instead returns whether the event was actually dispatched.
+     */
+    private fun injectTouch(event: MotionEvent) {
+        val injected = InstrumentationRegistry.getInstrumentation()
+            .uiAutomation
+            .injectInputEvent(event, true)
+        event.recycle()
+        assertTrue("The input event was rejected: $event", injected)
+    }
+
+    /**
+     * One finger: tap, then press and drag. MapLibre reads that as a zoom through a detector the
+     * pinch never touches, and dragging up is the direction that zooms out.
+     */
+    private fun quickZoomOutInSteps(@Suppress("UNUSED_PARAMETER") map: MapLibreMap, onHold: () -> Unit) {
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        val centerX = view.width / 2f
+        val centerY = view.height / 2f
+
+        fun send(downTime: Long, action: Int, y: Float) {
+            injectTouch(
+                MotionEvent.obtain(
+                    downTime,
+                    SystemClock.uptimeMillis(),
+                    action,
+                    centerX,
+                    y,
+                    0,
+                ).apply { source = InputDevice.SOURCE_TOUCHSCREEN },
+            )
+        }
+
+        // A tap that lifts instantly, or a second tap that lands instantly, is not a double tap:
+        // the platform requires a minimum time on each side of the gap before it will call it one,
+        // and without that this degenerates into an ordinary drag that pans instead of zooming.
+        val tapDown = SystemClock.uptimeMillis()
+        send(tapDown, MotionEvent.ACTION_DOWN, centerY)
+        SystemClock.sleep(TAP_DURATION_MILLIS)
+        send(tapDown, MotionEvent.ACTION_UP, centerY)
+        SystemClock.sleep(DOUBLE_TAP_GAP_MILLIS)
+        val holdDown = SystemClock.uptimeMillis()
+        send(holdDown, MotionEvent.ACTION_DOWN, centerY)
+        SystemClock.sleep(TAP_DURATION_MILLIS)
+        val travel = view.height * QUICK_ZOOM_TRAVEL_FRACTION
+        val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
+        repeat(moves) { move ->
+            send(holdDown, MotionEvent.ACTION_MOVE, centerY - travel * (move + 1) / moves)
+            SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+            if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
+                Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
+                onHold()
+            }
+        }
+        send(holdDown, MotionEvent.ACTION_UP, centerY - travel)
+    }
+
+    private fun fogGeneration(): Any? = composeRule.runOnIdle {
+        attachedMapView()?.getTag(R.id.map_fog_canonical_generation)
+    }
+
+    /**
+     * Where this display's own zoom floor is, taken from the camera rather than from a constant.
+     */
+    private fun measureZoomFloor(
+        map: MapLibreMap,
+        cameraRequest: MutableState<MapCameraRequest>,
+    ): Double {
+        composeRule.runOnUiThread {
+            cameraRequest.value = MapCameraRequest(
+                requestId = 2L,
+                point = UNEXPLORED_VIEWPOINTS.first().second,
+                zoom = 0.0,
+            )
+        }
+        composeRule.waitUntil(timeoutMillis = 25_000L) {
+            composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                .fetchSemanticsNodes()
+                .isEmpty()
+        }
+        Thread.sleep(ZOOM_SETTLE_MILLIS)
+        return map.cameraPosition.zoom
+    }
+
+    /**
+     * MapLibre keeps the world covering the viewport, and its world is 512 logical pixels across at
+     * zoom 0, so how far out a device can go is a property of how tall its map view is.
+     */
+    private fun predictedZoomFloor(): Double {
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        val density = InstrumentationRegistry.getInstrumentation()
+            .targetContext
+            .resources
+            .displayMetrics
+            .density
+        val logicalHeight = view.height / density
+        return max(0.0, ln(logicalHeight / MAPLIBRE_WORLD_SIZE_DP) / ln(2.0))
+    }
+
+    /**
+     * Following a walking user has to move the map without blanking it.
+     *
+     * Every programmed camera move used to hide the overlay until its rebuild landed, which is the
+     * right answer for a jump across the world and the wrong one for a person walking: they would
+     * have watched the map go black every time they crossed the dead zone. A follow step is bounded
+     * by the ground crossed between two fixes, and the surround is now the whole world, so there is
+     * nothing left for such a step to outrun.
+     */
+    @Test
+    fun followingALocationMovesTheMapWithoutBlankingIt() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            val revealed = GeoPoint(25.0330, 121.5654)
+            revealTrack(database, revealed)
+            val followLocation = mutableStateOf<GeoPoint?>(null)
+
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-follow-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-follow",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-follow-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = revealed,
+                        zoom = 16.0,
+                    ),
+                    followLocation = followLocation.value,
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 20_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            composeRule.waitUntil(timeoutMillis = 20_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            // A step that stays inside the viewport but well outside the dead zone, which is what
+            // a few minutes of walking looks like at this zoom.
+            val walked = GeoPoint(revealed.latitude + FOLLOW_STEP_DEGREES, revealed.longitude)
+            composeRule.runOnUiThread { followLocation.value = walked }
+
+            var coveredFrames = 0
+            var arrived = false
+            val deadline = SystemClock.uptimeMillis() + FOLLOW_ARRIVAL_TIMEOUT_MILLIS
+            while (SystemClock.uptimeMillis() < deadline) {
+                if (
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                        .fetchSemanticsNodes()
+                        .isNotEmpty()
+                ) {
+                    coveredFrames += 1
+                }
+                val target = map.cameraPosition.target
+                if (
+                    target != null &&
+                    kotlin.math.abs(target.latitude - walked.latitude) < FOLLOW_ARRIVAL_DEGREES
+                ) {
+                    arrived = true
+                    break
+                }
+            }
+            val settled = map.cameraPosition.target
+
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply {
+                    putString(
+                        "stream",
+                        "TrailVeil follow step: from=${revealed.latitude} to=${walked.latitude} " +
+                            "settled=${settled?.latitude} arrived=$arrived " +
+                            "coveredFrames=$coveredFrames\n",
+                    )
+                },
+            )
+            assertTrue(
+                "The map never followed the location it was given (settled at $settled)",
+                arrived,
+            )
+            assertEquals(
+                "The safety cover was raised while following a walking user",
+                0,
+                coveredFrames,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * Turning following on and moving the camera happen together, and the move carries the zoom.
+     *
+     * A follow step is a latitude and longitude with no zoom in it, so one made in the same frame
+     * as a programmed move replaces that move and the zoom goes with it. From the user's side the
+     * recentre button centred the map but never took them back in, and it took a second press to
+     * get the zoom — which is how this was reported.
+     */
+    @Test
+    fun turningFollowingOnDoesNotSwallowTheZoomItWasAskedFor() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            val revealed = GeoPoint(25.0330, 121.5654)
+            revealTrack(database, revealed)
+            val followLocation = mutableStateOf<GeoPoint?>(null)
+            // Started somewhere else, which is the whole point: the user looked around, so the
+            // location is well off centre when the button is pressed and the follow step is a real
+            // one. Starting centred makes `followCameraMove` return HOLD, no competing animation is
+            // ever issued, and the test passes whether the fix is present or not.
+            val lookedAround = GeoPoint(
+                revealed.latitude + RECENTRE_LOOK_AWAY_DEGREES,
+                revealed.longitude + RECENTRE_LOOK_AWAY_DEGREES,
+            )
+            val cameraRequest = mutableStateOf(
+                MapCameraRequest(requestId = 1L, point = lookedAround, zoom = RECENTRE_FROM_ZOOM),
+            )
+
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-recentre-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-recentre",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-recentre-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = cameraRequest.value,
+                    followLocation = followLocation.value,
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 20_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            composeRule.waitUntil(timeoutMillis = 20_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            // One press of the recentre button: following turns on and a zoom is asked for, in the
+            // same recomposition, with the map somewhere else entirely.
+            composeRule.runOnUiThread {
+                followLocation.value = revealed
+                cameraRequest.value = MapCameraRequest(
+                    requestId = 2L,
+                    point = revealed,
+                    zoom = RECENTRE_TO_ZOOM,
+                )
+            }
+            // Waited *for* rather than waited out, because `waitUntil` is also what pumps the
+            // compose test clock: a plain sleep here leaves the state change unrecomposed, so the
+            // camera never receives the request and the test fails for a reason of its own making.
+            // The timeout is swallowed so the assertion below can say where the camera actually is,
+            // which a bare timeout cannot.
+            runCatching {
+                composeRule.waitUntil(timeoutMillis = FOLLOW_ARRIVAL_TIMEOUT_MILLIS) {
+                    kotlin.math.abs(map.cameraPosition.zoom - RECENTRE_TO_ZOOM) < ZOOM_TOLERANCE
+                }
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            assertEquals(
+                "The zoom the recentre asked for was replaced by a follow step",
+                RECENTRE_TO_ZOOM,
+                map.cameraPosition.zoom,
+                ZOOM_TOLERANCE,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * The only thing that stops the map following is the user's own hand. The follow step itself is
+     * a programmed move, so it must not be mistaken for one and switch itself off after one step.
+     */
+    @Test
+    fun onlyAGestureReportsThatTheUserMovedTheCamera() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            val revealed = GeoPoint(25.0330, 121.5654)
+            revealTrack(database, revealed)
+            val followLocation = mutableStateOf<GeoPoint?>(null)
+            val userMoves = AtomicInteger()
+
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-follow-cancel-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-follow-cancel",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-follow-cancel-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = revealed,
+                        zoom = 16.0,
+                    ),
+                    followLocation = followLocation.value,
+                    onUserMovedCamera = { userMoves.incrementAndGet() },
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 20_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            composeRule.waitUntil(timeoutMillis = 20_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            composeRule.runOnUiThread {
+                followLocation.value =
+                    GeoPoint(revealed.latitude + FOLLOW_STEP_DEGREES, revealed.longitude)
+            }
+            Thread.sleep(FOLLOW_ARRIVAL_TIMEOUT_MILLIS)
+            assertEquals(
+                "A follow step reported itself as the user moving the camera, so following " +
+                    "would switch itself off after one step",
+                0,
+                userMoves.get(),
+            )
+
+            val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            dragVertically(
+                x = view.width / 2f,
+                fromY = view.height * 0.7f,
+                toY = view.height * 0.3f,
+                steps = 12,
+                stepMillis = 12L,
+                lift = true,
+            )
+            composeRule.waitUntil(timeoutMillis = 10_000L) { userMoves.get() > 0 }
+
+            assertTrue(
+                "A drag on the map never reported that the user moved the camera",
+                userMoves.get() > 0,
+            )
+            assertNotNull("The map lost its camera", map.cameraPosition.target)
         } finally {
             database.close()
         }
@@ -890,10 +2396,14 @@ class MapSurfaceTest {
      */
     private fun MapLibreMap.auditFogCoverage(): FogAudit {
         val fogged = snapshotPixels()
+        // Put back what the app chose, not everything. Which fog quads are drawn depends on the
+        // camera, and leaving them all visible would hand the next measurement an arrangement the
+        // app never produces — two coats where it draws one.
+        val visibility = ALL_FOG_LAYERS.associateWith { fogLayerVisibility(it) }
         setFogLayersVisible(false)
         val bare = snapshotPixels()
-        setFogLayersVisible(true)
-        return compareFogCoverage(fogged, bare)
+        restoreFogLayerVisibility(visibility)
+        return compareFogCoverage(fogged, bare, snapshotWidth())
     }
 
     /**
@@ -903,27 +2413,61 @@ class MapSurfaceTest {
      * nothing — which is exactly how the previous fixed-threshold measurement went wrong.
      */
     private fun MapLibreMap.auditWithFogRemoved(): FogAudit {
+        val visibility = ALL_FOG_LAYERS.associateWith { fogLayerVisibility(it) }
         setFogLayersVisible(false)
         val first = snapshotPixels()
         val second = snapshotPixels()
-        setFogLayersVisible(true)
-        return compareFogCoverage(first, second)
+        restoreFogLayerVisibility(visibility)
+        return compareFogCoverage(first, second, snapshotWidth())
     }
 
-    private fun compareFogCoverage(fogged: IntArray, bare: IntArray): FogAudit {
+    private fun compareFogCoverage(fogged: IntArray, bare: IntArray, width: Int): FogAudit {
         assertEquals("Snapshot sizes differ", bare.size, fogged.size)
         var uncovered = 0L
         var drawn = 0L
         var worstRatio = 0.0
         var worstBare = 0
+        var minX = Int.MAX_VALUE
+        var minY = Int.MAX_VALUE
+        var maxX = Int.MIN_VALUE
+        var maxY = Int.MIN_VALUE
+        var overFogged = 0L
+        var judgeable = 0L
+        var darkMinX = Int.MAX_VALUE
+        var darkMinY = Int.MAX_VALUE
+        var darkMaxX = Int.MIN_VALUE
+        var darkMaxY = Int.MIN_VALUE
         bare.indices.forEach { index ->
             val bareLuminance = luminance(bare[index])
             val fogLuminance = luminance(fogged[index])
             // Nothing to reveal where the map itself draws nothing.
             if (bareLuminance <= 0) return@forEach
             drawn += 1L
+            // The other way coverage goes wrong. One coat of fog transmits 0.278 of what is under
+            // it; two coats transmit 0.077 and read as black on a dark basemap. That is not a leak,
+            // so nothing here could see it — and a map with a black stripe down it is still a
+            // broken map. Judged only where the basemap is bright enough for the ratio to mean
+            // something.
+            if (bareLuminance >= MINIMUM_BARE_FOR_OVER_FOG) {
+                judgeable += 1L
+                if (fogLuminance < FOG_TRANSMISSION * bareLuminance * OVER_FOG_RATIO) {
+                    overFogged += 1L
+                    val x = index % width
+                    val y = index / width
+                    if (x < darkMinX) darkMinX = x
+                    if (x > darkMaxX) darkMaxX = x
+                    if (y < darkMinY) darkMinY = y
+                    if (y > darkMaxY) darkMaxY = y
+                }
+            }
             if (fogLuminance > FOG_TRANSMISSION_CEILING * bareLuminance + FOG_LUMINANCE_TOLERANCE) {
                 uncovered += 1L
+                val x = index % width
+                val y = index / width
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
                 val ratio = fogLuminance.toDouble() / bareLuminance.toDouble()
                 if (ratio > worstRatio) {
                     worstRatio = ratio
@@ -937,6 +2481,26 @@ class MapSurfaceTest {
             worstRatio = worstRatio,
             worstBareLuminance = worstBare,
             sampledPixels = bare.size.toLong(),
+            overFoggedFraction = if (judgeable == 0L) {
+                0.0
+            } else {
+                overFogged.toDouble() / judgeable.toDouble()
+            },
+            overFoggedBounds = if (overFogged == 0L) null else IntArray(4).also {
+                it[0] = darkMinX
+                it[1] = darkMinY
+                it[2] = darkMaxX
+                it[3] = darkMaxY
+            },
+            // Where the leak is, not just how big it is. A strip along one edge, a seam through the
+            // middle and a corner are three different bugs that the fraction alone cannot tell
+            // apart, and localising one by bisecting the geometry costs a run each time.
+            uncoveredBounds = if (uncovered == 0L) null else IntArray(4).also {
+                it[0] = minX
+                it[1] = minY
+                it[2] = maxX
+                it[3] = maxY
+            },
         )
     }
 
@@ -956,6 +2520,9 @@ class MapSurfaceTest {
         }
         Thread.sleep(FOG_VISIBILITY_SETTLE_MILLIS)
     }
+
+    private fun snapshotWidth(): Int =
+        requireNotNull(composeRule.runOnIdle { attachedMapView() }).width
 
     private fun MapLibreMap.snapshotPixels(): IntArray {
         val ready = CountDownLatch(1)
@@ -989,12 +2556,25 @@ class MapSurfaceTest {
         val worstRatio: Double,
         val worstBareLuminance: Int,
         val sampledPixels: Long,
+        val uncoveredBounds: IntArray? = null,
+        val overFoggedFraction: Double = 0.0,
+        val overFoggedBounds: IntArray? = null,
     ) {
         fun report(): String = "[uncovered=" +
             "${"%.4f".format(java.util.Locale.US, uncoveredFraction * 100.0)}% " +
             "drawn=${"%.2f".format(java.util.Locale.US, drawnFraction * 100.0)}% " +
             "worstRatio=${"%.2f".format(java.util.Locale.US, worstRatio)} " +
-            "bareAtWorst=$worstBareLuminance pixels=$sampledPixels]"
+            "bareAtWorst=$worstBareLuminance pixels=$sampledPixels" +
+            (uncoveredBounds?.let { " at=(${it[0]},${it[1]})-(${it[2]},${it[3]})" } ?: "") +
+            " overFogged=${"%.4f".format(java.util.Locale.US, overFoggedFraction * 100.0)}%" +
+            (overFoggedBounds?.let { " dark=(${it[0]},${it[1]})-(${it[2]},${it[3]})" } ?: "") +
+            "]"
+
+        // The array field makes the generated equals/hashCode wrong by identity; nothing here
+        // compares audits, so they are simply not offered.
+        override fun equals(other: Any?): Boolean = this === other
+
+        override fun hashCode(): Int = System.identityHashCode(this)
     }
 
     private data class FogCoverage(
@@ -1125,16 +2705,116 @@ class MapSurfaceTest {
          */
         const val FOG_TRANSMISSION_CEILING = 0.5
         const val FOG_LUMINANCE_TOLERANCE = 4
+
+        /**
+         * What one coat of fog leaves: `(255 - fogAlpha) / 255`. A second coat squares it, to
+         * 0.077, which is black on anything but a bright basemap. Half of one coat is comfortably
+         * between the two and well clear of rounding.
+         */
+        const val FOG_TRANSMISSION = 0.278
+        const val OVER_FOG_RATIO = 0.5
+
+        /**
+         * Below this the basemap is so dark that one coat and two are not separable. At bare 30 one
+         * coat lands at 8 and two at 2, six levels apart; at bare 12 they are 3 and 1, and a single
+         * step of rounding decides the answer. Ocean in the production style sits at 18-28, which
+         * is exactly the range that produced scattered false positives before this bound.
+         */
+        const val MINIMUM_BARE_FOR_OVER_FOG = 30
+
+        /**
+         * What the seams between fog quads are allowed to cost, and no more.
+         *
+         * The bands deliberately overlap the mosaic by half of one *mosaic mask* pixel, which is
+         * sub-pixel at exploration zooms and about five screen pixels at render zoom 0, where one
+         * mask pixel is a two-hundred-and-fifty-sixth of the world. That is the whole of the
+         * residue this tolerates: measured 0.4167% at a camera with the world's top and bottom
+         * edges on screen — two five-pixel strips across 1080 — and 1.2465% at the antimeridian,
+         * where the mosaic's east and west edges are on screen as well. `P4-023` is the task to
+         * make that overlap a screen-pixel quantity instead.
+         *
+         * A gesture adds to that. Where two fog quads abut — the mosaic and its own world copy —
+         * the seam between them widens as the camera zooms away from the zoom the overlay was
+         * built for, the same drift `P4-017` measured in the opposite direction. Measured crossing
+         * the antimeridian: a 24-pixel dark line at 2.3148% of the screen, still a line and not a
+         * region. `P4-024` is the task to shrink those seams.
+         *
+         * What this must never stop catching is the defect it was built for: a user reported half
+         * the map going black past the antimeridian, which measures 50.39% settled and 50.08%
+         * during a gesture. This bound sits twenty times under that.
+         */
+        const val MAXIMUM_OVER_FOGGED_FRACTION = 0.05
         const val FOG_VISIBILITY_SETTLE_MILLIS = 600L
+
+        /** Every quad the fog installs, in the order they are drawn. */
+        val ALL_FOG_LAYERS: List<String> = listOf(
+            FogOverlayIds.Layer,
+            FogOverlayIds.WestRepeatLayer,
+            FogOverlayIds.EastRepeatLayer,
+        ) + FogBackdropIds.Layers
+
+        /**
+         * One quad drawn on its own is one coat of fog, everywhere it reaches, or it is being
+         * drawn twice. This is not a seam budget — there is no second quad to seam against — so it
+         * allows only what antialiasing at the quad's own edge can account for. The defect it
+         * bounds measured 5.31% and 8.25%, two orders of magnitude above it.
+         */
+        const val MAXIMUM_SINGLE_QUAD_OVER_FOGGED_FRACTION = 0.001
 
         /** The map must actually be drawing, or "no leak found" is a statement about a blank screen. */
         const val MINIMUM_DRAWN_FRACTION = 0.5
 
         /** With the fog hidden, nearly everything the map draws must read as uncovered. */
         const val MINIMUM_CALIBRATION_UNCOVERED_FRACTION = 0.5
+        /**
+         * How long a production-style test may take to fetch a style, its tiles and a first fog
+         * frame before it is called a failure.
+         *
+         * A setup budget, not something a result is measured against — every measurement here is
+         * taken afterwards. It was 90 seconds, which is ample alone and occasionally not enough
+         * under a full suite where every production-style test fetches again: three of four full
+         * runs lost one or two tests to it, each on this wait, each passing in isolation
+         * immediately afterwards, on an emulator with 505 ms round-trip to the tile host. A gate
+         * that fails a test per run cannot tell anyone whether the tree is green.
+         */
+        const val ONLINE_STYLE_SETUP_MILLIS = 180_000L
+
         const val ZOOM_SETTLE_MILLIS = 1_200L
-        const val ZOOM_TOLERANCE = 0.01
-        const val LOWEST_EXACTLY_REACHABLE_ZOOM = 1.0
+        const val ZOOM_TOLERANCE = 0.05
+
+        /**
+         * Every zoom the surround changes character at, and the ordinary ones between them: it is
+         * the whole world below render zoom six and clamped above, and the band appeared only where
+         * the clamp binds.
+         */
+        val SETTLED_SEAM_ZOOMS = listOf(16.0, 14.0, 12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0)
+
+        /**
+         * A settled camera has no gesture to blame, so the seams between quads are the designed
+         * half a mosaic pixel and nothing else — a few screen pixels at most. The band this bounds
+         * measured 2.08% and 3.04%; every zoom now measures 0.0000%.
+         */
+        const val MAXIMUM_SETTLED_SEAM_FRACTION = 0.002
+
+        /** Looking around from far out, then pressing the button that takes you back in. */
+        const val RECENTRE_FROM_ZOOM = 8.0
+        const val RECENTRE_TO_ZOOM = 16.0
+
+        /**
+         * Far enough at zoom 8 to put the user's own location off screen, so the follow step the
+         * guard has to stand aside for is the off-screen one rather than no step at all.
+         */
+        const val RECENTRE_LOOK_AWAY_DEGREES = 0.35
+
+        /**
+         * MapLibre's world is 512 logical pixels across at zoom 0 and it keeps that world covering
+         * the viewport, so the lowest reachable zoom belongs to the display, not to this app. The
+         * sweep predicts it from the map view's own height and then checks the camera against the
+         * prediction, which is what makes "nothing here refuses to zoom out" a real assertion on
+         * any screen rather than a constant that happens to hold on one.
+         */
+        const val MAPLIBRE_WORLD_SIZE_DP = 512.0
+        const val ZOOM_FLOOR_PREDICTION_TOLERANCE = 0.3
         val ZOOM_SWEEP = listOf(0.0, 1.0, 2.0, 3.0, 4.0, 6.0)
         val UNEXPLORED_VIEWPOINTS = listOf(
             "atlantic" to GeoPoint(0.0, 0.0),
@@ -1150,5 +2830,62 @@ class MapSurfaceTest {
         const val FLING_COUNT = 4
         const val FLING_SETTLE_MILLIS = 400L
         const val MINIMUM_POST_EXIT_FRAMES = 20
+
+        /**
+         * The zoom the reported leak started from, and enough steps out of it to cross the range
+         * where the old surround ran out. The fingers stay down throughout; each step is held long
+         * enough for the camera to settle so the frame can be compared with its own unfogged twin.
+         */
+        const val GESTURE_START_ZOOM = 4.0
+        const val GESTURE_STEPS = 6
+        const val GESTURE_MICRO_STEPS = 5
+        const val GESTURE_MICRO_STEP_MILLIS = 16L
+        const val GESTURE_HOLD_SETTLE_MILLIS = 500L
+        const val MINIMUM_GESTURE_ZOOM_CHANGE = 1.5
+        const val PINCH_START_SPAN_FRACTION = 0.75f
+        const val PINCH_END_SPAN_FRACTION = 0.06f
+
+        /**
+         * How many times a pinch may be started over before the test gives up. Injected two-finger
+         * streams do not always reach MapLibre's scale detector — about one attempt in three ends
+         * with the move detector holding the gesture and the camera never zooming — and neither a
+         * coarser first step nor finer steps made that reliable. So engagement is checked instead
+         * of assumed: an attempt that has not moved the camera is lifted and made again, which
+         * costs a second and makes the suite deterministic.
+         */
+        const val PINCH_ATTEMPTS = 4
+        const val PINCH_ENGAGE_MOVES = 8
+        const val PINCH_ENGAGE_TRAVEL = 0.30f
+        const val MINIMUM_PINCH_ENGAGEMENT = 0.03
+        const val PINCH_RETRY_SETTLE_MILLIS = 2_500L
+        const val QUICK_ZOOM_TRAVEL_FRACTION = 0.45f
+        const val TAP_DURATION_MILLIS = 60L
+        const val DOUBLE_TAP_GAP_MILLIS = 80L
+
+        /**
+         * About 450 m north — inside the viewport at zoom 16, so it is a follow step rather than a
+         * move, and far outside the dead zone, so it is a step the map has to take.
+         */
+        const val FOLLOW_STEP_DEGREES = 0.004
+        const val FOLLOW_ARRIVAL_DEGREES = 0.0005
+        const val FOLLOW_ARRIVAL_TIMEOUT_MILLIS = 4_000L
+
+        val REVEALED_CENTER = GeoPoint(25.0330, 121.5654)
+
+        /** Where the world's edge is at the middle of the screen, so both copies are in view. */
+        val ANTIMERIDIAN = GeoPoint(0.0, 179.5)
+
+        /**
+         * Less than a pinch usually travels, because these two start at 1.6 and at MapLibre's own
+         * floor and only have to cross 0.95 between them.
+         */
+        const val ANTIMERIDIAN_ZOOM_CHANGE = 0.4
+
+        /** Either side of the measured edge, and one well clear of it. */
+        val WORLD_COPY_EDGE_ZOOMS = listOf(0.98, 1.0, 1.6)
+
+        /** Far enough east that the revealed track stays off screen all the way out of zoom 16. */
+        val UNEXPLORED_NEAR_REVEALED = GeoPoint(25.0330, 121.9000)
+        const val MINIMUM_PAN_DEGREES = 0.5
     }
 }

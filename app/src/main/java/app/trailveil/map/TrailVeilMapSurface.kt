@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.view.Gravity
 import android.view.MotionEvent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -26,12 +27,14 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.platform.LocalResources
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
@@ -41,7 +44,9 @@ import androidx.savedstate.compose.LocalSavedStateRegistryOwner
 import app.trailveil.R
 import app.trailveil.map.fog.FogBackdropGeometry
 import app.trailveil.map.fog.FogPixelMask
+import app.trailveil.map.fog.FogSideBands
 import app.trailveil.map.fog.FogRuntime
+import app.trailveil.map.fog.FogSurroundExtent
 import app.trailveil.map.fog.FogTileBounds
 import app.trailveil.map.fog.FogTileMosaic
 import app.trailveil.map.fog.FogViewportRequest
@@ -122,7 +127,28 @@ internal object FogBackdropIds {
     const val EastSource = "trailveil-fog-backdrop-east-source"
     const val EastLayer = "trailveil-fog-backdrop-east-layer"
 
-    val Layers: List<String> = listOf(NorthLayer, SouthLayer, WestLayer, EastLayer)
+    /** Flat fog over the world copies beside the surround, for a viewport wider than one world. */
+    const val WestWorldSource = "trailveil-fog-backdrop-west-world-source"
+    const val WestWorldLayer = "trailveil-fog-backdrop-west-world-layer"
+    const val EastWorldSource = "trailveil-fog-backdrop-east-world-source"
+    const val EastWorldLayer = "trailveil-fog-backdrop-east-world-layer"
+
+    /**
+     * What [WestLayer] and [EastLayer] become where the renderer repeats an image source by itself:
+     * one quad from the mosaic's east edge round to its west, kept inside the canonical world.
+     */
+    const val WrappedSideSource = "trailveil-fog-backdrop-wrapped-side-source"
+    const val WrappedSideLayer = "trailveil-fog-backdrop-wrapped-side-layer"
+
+    val Layers: List<String> = listOf(
+        NorthLayer,
+        SouthLayer,
+        WestLayer,
+        EastLayer,
+        WestWorldLayer,
+        EastWorldLayer,
+        WrappedSideLayer,
+    )
 }
 
 internal object CurrentLocationOverlayIds {
@@ -140,12 +166,55 @@ internal object TrackOverlayIds {
 internal data class MapCameraRequest(
     val requestId: Long,
     val point: GeoPoint,
-    val zoom: Double = 16.0,
+    /** `null` moves the camera without touching the zoom the user chose. */
+    val zoom: Double? = 16.0,
 ) {
     init {
         require(requestId >= 0L) { "requestId must be non-negative" }
-        require(zoom.isFinite() && zoom in 0.0..22.0) { "zoom must be in 0..22" }
+        require(zoom == null || (zoom.isFinite() && zoom in 0.0..22.0)) {
+            "zoom must be in 0..22"
+        }
     }
+}
+
+/**
+ * What a new location should do to a camera that is following it.
+ *
+ * Following is not the same kind of camera move as being sent somewhere. A follow step is bounded
+ * by how far a person walked between two fixes, which is why it can be made without hiding the map
+ * first; a jump to somewhere off screen is not, and goes through the ordinary programmed path with
+ * everything that protects.
+ */
+internal enum class FollowCameraMove {
+    /** Close enough to centred already; moving would only jitter the map under the user. */
+    HOLD,
+    EASE,
+    JUMP,
+}
+
+/**
+ * The dead zone is a fraction of the shorter viewport edge, so it means the same thing in portrait
+ * and landscape: about a finger's width of drift before the map re-centres. Without one, a 5 m
+ * location update would nudge the camera every few seconds and rebuild the fog with it.
+ */
+internal const val FOLLOW_DEAD_ZONE_FRACTION: Double = 0.12
+
+internal fun followCameraMove(
+    offsetX: Double,
+    offsetY: Double,
+    viewportWidth: Int,
+    viewportHeight: Int,
+): FollowCameraMove {
+    if (viewportWidth <= 0 || viewportHeight <= 0) return FollowCameraMove.HOLD
+    if (!offsetX.isFinite() || !offsetY.isFinite()) return FollowCameraMove.JUMP
+    val halfWidth = viewportWidth / 2.0
+    val halfHeight = viewportHeight / 2.0
+    if (kotlin.math.abs(offsetX) > halfWidth || kotlin.math.abs(offsetY) > halfHeight) {
+        return FollowCameraMove.JUMP
+    }
+    val deadZone = minOf(viewportWidth, viewportHeight) * FOLLOW_DEAD_ZONE_FRACTION
+    val distance = kotlin.math.hypot(offsetX, offsetY)
+    return if (distance <= deadZone) FollowCameraMove.HOLD else FollowCameraMove.EASE
 }
 
 internal data class MapTrackOverlay(
@@ -179,7 +248,14 @@ internal fun TrailVeilMapSurface(
     rendersIntoTheWindow: Boolean = false,
     cameraRequest: MapCameraRequest? = null,
     currentLocation: GeoPoint? = null,
+    followLocation: GeoPoint? = null,
+    // MapLibre draws the compass inside the map view, which is full-bleed, so it knows nothing
+    // about the controls a host stacks on top of it. The host that puts them there says where the
+    // compass may sit.
+    compassTopInset: Dp = MAP_CONTROL_INSET,
+    compassEndInset: Dp = MAP_CONTROL_INSET,
     trackOverlay: MapTrackOverlay? = null,
+    onUserMovedCamera: () -> Unit = {},
     onFogRendered: ((FogViewportRender) -> Unit)? = null,
     onFogFailure: (Throwable) -> Unit = {},
 ) {
@@ -197,6 +273,7 @@ internal fun TrailVeilMapSurface(
 
     val context = LocalContext.current
     val resources = LocalResources.current
+    val density = LocalDensity.current
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     val savedStateRegistry = LocalSavedStateRegistryOwner.current.savedStateRegistry
     val fallbackStyleJson = remember(resources) {
@@ -227,6 +304,10 @@ internal fun TrailVeilMapSurface(
     val styleGenerationActive = remember(mapView, provider) { AtomicBoolean(true) }
     val currentOnFogRendered by rememberUpdatedState(onFogRendered)
     val currentOnFogFailure by rememberUpdatedState(onFogFailure)
+    val currentOnUserMovedCamera by rememberUpdatedState(onUserMovedCamera)
+    // Set only around a follow step, whose reach is bounded by how far a person walked since the
+    // last fix. Every other programmed move keeps hiding the overlay until its rebuild lands.
+    val followingCameraMove = remember(mapView) { AtomicBoolean(false) }
     var fogViewportRequest by remember(mapView, fogRuntime) {
         mutableStateOf<FogViewportRequest?>(null)
     }
@@ -239,6 +320,11 @@ internal fun TrailVeilMapSurface(
     // survive one.
     var fogCoverageInstalled by remember(mapView, fogRuntime, fogRequired, readyStyle) {
         mutableStateOf(!fogRequired)
+    }
+    // What the last completed install actually covers, so a live camera can be checked against it
+    // rather than against an argument about how far a gesture can travel.
+    var installedSurround by remember(mapView, fogRuntime, readyStyle) {
+        mutableStateOf<FogSurroundExtent?>(null)
     }
     var canonicalFogLoaded by remember(mapView, fogRuntime, fogRequired) {
         mutableStateOf(!fogRequired)
@@ -355,12 +441,121 @@ internal fun TrailVeilMapSurface(
     LaunchedEffect(readyMap, cameraRequest) {
         val map = readyMap ?: return@LaunchedEffect
         val request = cameraRequest ?: return@LaunchedEffect
+        val target = LatLng(request.point.latitude, request.point.longitude)
         map.animateCamera(
-            CameraUpdateFactory.newLatLngZoom(
-                LatLng(request.point.latitude, request.point.longitude),
-                request.zoom,
-            ),
+            if (request.zoom == null) {
+                CameraUpdateFactory.newLatLng(target)
+            } else {
+                CameraUpdateFactory.newLatLngZoom(target, request.zoom)
+            },
         )
+    }
+
+    // Keeping the camera on a walking user, once they have asked for it. The map is not hidden
+    // for this: a follow step crosses at most one viewport and does not change the zoom, which is
+    // the axis a clamped surround is sensitive to — and the move listener covers the map anyway if
+    // the step ever does carry the camera past what is installed.
+    LaunchedEffect(readyMap, followLocation, cameraRequest) {
+        val map = readyMap ?: return@LaunchedEffect
+        val target = followLocation ?: return@LaunchedEffect
+        // A programmed move to this very point is already under way, and it carries a zoom. A
+        // follow step does not — it is a latitude and longitude only — so making one here would
+        // replace the zoom with nothing and land the camera centred but no closer. That is what
+        // made the recentre button take two presses to get back in.
+        if (cameraRequest?.point == target) return@LaunchedEffect
+        val destination = LatLng(target.latitude, target.longitude)
+        val screen = map.projection.toScreenLocation(destination)
+        when (
+            followCameraMove(
+                offsetX = screen.x - mapView.width / 2.0,
+                offsetY = screen.y - mapView.height / 2.0,
+                viewportWidth = mapView.width,
+                viewportHeight = mapView.height,
+            )
+        ) {
+            FollowCameraMove.HOLD -> Unit
+            FollowCameraMove.EASE -> {
+                followingCameraMove.set(true)
+                map.easeCamera(CameraUpdateFactory.newLatLng(destination), FOLLOW_EASE_MILLIS)
+            }
+            // Off screen is not a step, it is a move — so it is made like any other one, with the
+            // cover raised until fog has been rebuilt around wherever the user turned out to be.
+            FollowCameraMove.JUMP ->
+                map.animateCamera(CameraUpdateFactory.newLatLng(destination))
+        }
+    }
+
+    // Asked both by the camera-move listener and by the two install paths. Coverage becoming
+    // installed is not the same as coverage being enough: a re-render can land while a gesture has
+    // already carried the camera past what the installed surround holds, and lowering the cover on
+    // the strength of a successful install alone would uncover a map that is leaking.
+    fun requestViewport() {
+        val map = readyMap ?: return
+        followingCameraMove.set(false)
+        val request = map.fogViewportRequest()
+        canonicalFogLoaded = false
+        fogRenderFailed = false
+        fogPlaceholderReadyGeneration = -1L
+        fogViewportRequest = request
+        fogViewportGeneration += 1L
+    }
+
+    // Kept in step with the camera on every move, and applied once after each install so a fresh
+    // overlay does not wait for the first movement to be right.
+    fun applyWorldCopyVisibility() {
+        val style = readyStyle ?: return
+        val map = readyMap ?: return
+        style.setFogWorldCopiesVisible(map.cameraPosition.zoom >= LIVE_WORLD_COPY_ZOOM)
+    }
+
+    fun surroundHoldsForCamera(): Boolean {
+        val extent = installedSurround ?: return true
+        val map = readyMap ?: return true
+        val width = mapView.width
+        val height = mapView.height
+        // Nothing is laid out yet, so there is no viewport to be outside of; the next camera move
+        // asks again.
+        if (width <= 0 || height <= 0) return true
+        val position = map.cameraPosition
+        val target = position.target ?: return true
+        val worldPixels = FogBackdropGeometry.RENDER_TILE_SIZE_PIXELS *
+            Math.pow(2.0, position.zoom) * resources.displayMetrics.density
+        return extent.covers(
+            cameraLongitude = target.longitude,
+            cameraLatitude = target.latitude,
+            viewportHalfWorldsX = width / 2.0 / worldPixels,
+            viewportHalfWorldsY = height / 2.0 / worldPixels,
+        ) && !extent.outrunByZoom(position.zoom)
+    }
+
+    LaunchedEffect(readyMap, compassTopInset, compassEndInset, density) {
+        val map = readyMap ?: return@LaunchedEffect
+        val top = with(density) { compassTopInset.roundToPx() }
+        val side = with(density) { compassEndInset.roundToPx() }
+        map.uiSettings.compassGravity = Gravity.TOP or Gravity.END
+        // Both horizontal margins, so the same call places it correctly when the layout is
+        // mirrored and `END` resolves to the left.
+        map.uiSettings.setCompassMargins(side, top, side, 0)
+    }
+
+    // Reporting the user's own hand is not fog's business, and keeping it here rather than in the
+    // fog listeners means a map without fog — or one whose runtime has not loaded yet — still stops
+    // following when its owner takes hold of it.
+    DisposableEffect(readyMap) {
+        val map = readyMap
+        if (map == null) {
+            onDispose { }
+        } else {
+            val listener = MapLibreMap.OnCameraMoveStartedListener { reason ->
+                // Only a gesture. A follow step is a programmed move, so it can never switch
+                // itself off after one step.
+                if (reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) {
+                    currentOnUserMovedCamera()
+                }
+            }
+            map.addOnCameraMoveStartedListener(listener)
+            onDispose { map.removeOnCameraMoveStartedListener(listener) }
+        }
     }
 
     LaunchedEffect(readyStyle, currentLocation) {
@@ -438,22 +633,17 @@ internal fun TrailVeilMapSurface(
             // Gesture motion deliberately leaves the installed overlay alone. The mosaic is
             // anchored to the map, so it stays truthful wherever a gesture takes the camera, and
             // the backdrop bands keep everything around it fogged in the same rendered frame.
-            fun requestViewport() {
-                val request = map.fogViewportRequest()
-                canonicalFogLoaded = false
-                fogRenderFailed = false
-                fogPlaceholderReadyGeneration = -1L
-                fogViewportRequest = request
-                fogViewportGeneration += 1L
-            }
-
             val idleListener = MapLibreMap.OnCameraIdleListener(::requestViewport)
             val moveStartedListener = MapLibreMap.OnCameraMoveStartedListener { reason ->
-                // A programmed camera move can jump anywhere at once, including past the bands,
-                // so it still hides the overlay until the rebuild lands. Gestures cannot: their
-                // reach is bounded and the bands already cover it.
-                if (reason != MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE) {
+                val gesture = reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE
+                // A programmed camera move can jump anywhere at once, so it still hides the
+                // overlay until its rebuild lands. Gestures and follow steps do not: both are
+                // bounded, and both would black the map out under a user who is only walking or
+                // panning. What keeps that safe is the surround, and what keeps the surround
+                // honest is the move listener below.
+                if (!gesture && !followingCameraMove.get()) {
                     fogCoverageInstalled = false
+                    installedSurround = null
                     canonicalFogLoaded = false
                     fogRenderFailed = false
                     fogPlaceholderReadyGeneration = -1L
@@ -461,14 +651,27 @@ internal fun TrailVeilMapSurface(
                     fogViewportGeneration += 1L
                 }
             }
+            // The surround is large but finite, because a quad past the renderer's precision is
+            // drawn over the whole map instead of being clipped, and where a clamped one lands
+            // drifts as the camera zooms away from the zoom it was built for. Everything else here
+            // argues that no gesture travels far enough to matter; this measures rather than
+            // argues, and covers the map when the camera does.
+            val moveListener = MapLibreMap.OnCameraMoveListener {
+                applyWorldCopyVisibility()
+                if (fogCoverageInstalled && !surroundHoldsForCamera()) {
+                    fogCoverageInstalled = false
+                }
+            }
             val moveCanceledListener = MapLibreMap.OnCameraMoveCanceledListener(::requestViewport)
             map.addOnCameraIdleListener(idleListener)
             map.addOnCameraMoveStartedListener(moveStartedListener)
+            map.addOnCameraMoveListener(moveListener)
             map.addOnCameraMoveCancelListener(moveCanceledListener)
             requestViewport()
             onDispose {
                 map.removeOnCameraIdleListener(idleListener)
                 map.removeOnCameraMoveStartedListener(moveStartedListener)
+                map.removeOnCameraMoveListener(moveListener)
                 map.removeOnCameraMoveCancelListener(moveCanceledListener)
             }
         }
@@ -497,6 +700,7 @@ internal fun TrailVeilMapSurface(
                         style === readyStyle
                     ) {
                         fogCoverageInstalled = false
+                        installedSurround = null
                         canonicalFogLoaded = false
                         fogRenderFailed = true
                         currentOnFogFailure(failure)
@@ -509,15 +713,28 @@ internal fun TrailVeilMapSurface(
                     mosaic = placeholder.mosaic,
                     fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
                 )
+                placeholder.mosaic
+            }.let { installed ->
+                if (
+                    generation != fogViewportGeneration ||
+                    request != fogViewportRequest ||
+                    style !== readyStyle
+                ) {
+                    return@LaunchedEffect
+                }
+                installedSurround = FogBackdropGeometry.extent(installed, request.mapZoom)
             }
-            if (
-                generation != fogViewportGeneration ||
-                request != fogViewportRequest ||
-                style !== readyStyle
-            ) {
+            applyWorldCopyVisibility()
+            // Installing coverage is not the same as coverage being enough: the camera may have
+            // moved on while this was being built. Asking for another rebuild — rather than only
+            // declining to lower the cover — is what stops the map staying black with nothing
+            // scheduled to lift it.
+            if (surroundHoldsForCamera()) {
+                fogCoverageInstalled = true
+            } else {
+                requestViewport()
                 return@LaunchedEffect
             }
-            fogCoverageInstalled = true
             canonicalFogLoaded = false
             fogRenderFailed = false
         }
@@ -560,6 +777,12 @@ internal fun TrailVeilMapSurface(
                     request == fogViewportRequest &&
                     style === readyStyle
                 ) {
+                    // The install writes a mosaic, its repeats and six bands in one call stack,
+                    // so a throw part way through leaves a shape nobody can name. Treat installed
+                    // coverage as lost until a whole install has succeeded again, or that
+                    // half-applied state is presented as fog.
+                    fogCoverageInstalled = false
+                    installedSurround = null
                     canonicalFogLoaded = false
                     fogRenderFailed = true
                     currentOnFogFailure(failure)
@@ -571,6 +794,12 @@ internal fun TrailVeilMapSurface(
             request != fogViewportRequest ||
             style !== readyStyle
         ) {
+            return@LaunchedEffect
+        }
+        installedSurround = FogBackdropGeometry.extent(rendered.mosaic, request.mapZoom)
+        applyWorldCopyVisibility()
+        if (!surroundHoldsForCamera()) {
+            requestViewport()
             return@LaunchedEffect
         }
         fogCoverageInstalled = true
@@ -628,15 +857,24 @@ private fun MapLibreMap.fogViewportRequest(): FogViewportRequest {
  * can pair one of them with the other's previous geometry.
  */
 private fun Style.installFogOverlay(mosaic: FogTileMosaic, fogAlpha: Int) {
-    installFogMosaic(mosaic)
-    installFogBackdrop(mosaic, fogAlpha)
+    val spansWorld = FogBackdropGeometry.spansWorld(mosaic)
+    // The copies are always installed when there is a world to copy. Whether they are *drawn* is
+    // decided per frame from the live camera, because that is what the renderer's own repetition
+    // depends on — see [setFogMosaicRepeatsVisible].
+    installFogMosaic(mosaic, spansWorld)
+    installFogBackdrop(
+        mosaic,
+        fogAlpha,
+        // Only when the surround reaches all the way round is there a neighbouring world copy the
+        // camera can see, and only then is a world-wide quad small enough to be drawn rather than
+        // smeared over the map.
+        repeatWorlds = FogBackdropGeometry.surroundSpansWorld(mosaic) && !spansWorld,
+    )
 }
 
-private fun Style.installFogMosaic(mosaic: FogTileMosaic) {
+private fun Style.installFogMosaic(mosaic: FogTileMosaic, spansWorld: Boolean) {
     val bitmap = mosaic.mask.toBitmap()
     installFogMosaicQuad(FogOverlayIds.Source, FogOverlayIds.Layer, mosaic.bounds, bitmap)
-    val spansWorld =
-        mosaic.bounds.eastLongitude - mosaic.bounds.westLongitude >= WORLD_LONGITUDE_SPAN
     if (spansWorld) {
         installFogMosaicQuad(
             FogOverlayIds.WestRepeatSource,
@@ -685,6 +923,56 @@ private fun Style.installFogMosaicQuad(
     }
 }
 
+/**
+ * Whether the mosaic's own world copies are drawn, decided from the camera rather than from the
+ * zoom the overlay was built for.
+ *
+ * Below about zoom one the renderer repeats an image source across world copies by itself and these
+ * are a second coat of fog — one coat leaves 0.278 of a basemap whose ocean sits at luminance 18-28,
+ * two leave 1-2, which is black. At and above it the renderer does not, and without these the
+ * neighbouring copy of the map is drawn with no fog on it at all.
+ *
+ * Neither belongs to the overlay's build zoom, which is what made this wrong in both directions at
+ * once: a gesture changes the camera without rebuilding anything, so zooming in from far out leaked
+ * and zooming further out went black. Visibility costs nothing to change and can follow the camera
+ * frame by frame.
+ */
+private fun Style.setFogWorldCopiesVisible(visible: Boolean) {
+    val value = if (visible) Property.VISIBLE else Property.NONE
+    // Every copy, not only the mosaic's. The bands have their own pair for the case where the
+    // mosaic is too small to span a world, and they double up in exactly the same way — which is
+    // the half of this defect that survived the first fix, because the test that covered it
+    // started at a zoom where the band copies are not installed at all.
+    (
+        listOf(FogOverlayIds.WestRepeatLayer, FogOverlayIds.EastRepeatLayer) +
+            listOf(FogBackdropIds.WestWorldLayer, FogBackdropIds.EastWorldLayer)
+        ).forEach { id ->
+        getLayer(id)?.setProperties(PropertyFactory.visibility(value))
+    }
+    // The same switch, for the pair of quads that has to change shape rather than merely appear.
+    // The decision is [FogSideBands], which is a rule rather than a branch here: an earlier version
+    // returned early when there was no wrapped band to show, and returning early also skipped
+    // turning the side bands back *on*. They had been hidden while a wrapped band existed, the next
+    // rebuild removed that band, and nothing ever set them visible again — 89% of the screen bare
+    // with the safety cover down, at every zoom afterwards.
+    val arrangement = FogSideBands.forCamera(
+        rendererRepeatsWorldCopies = !visible,
+        hasWrappedBand = getLayer(FogBackdropIds.WrappedSideLayer) != null,
+    )
+    getLayer(FogBackdropIds.WrappedSideLayer)?.setProperties(
+        PropertyFactory.visibility(arrangement.wrappedBandProperty()),
+    )
+    listOf(FogBackdropIds.WestLayer, FogBackdropIds.EastLayer).forEach { id ->
+        getLayer(id)?.setProperties(PropertyFactory.visibility(arrangement.sideBandsProperty()))
+    }
+}
+
+private fun FogSideBands.sideBandsProperty(): String =
+    if (sideBandsVisible) Property.VISIBLE else Property.NONE
+
+private fun FogSideBands.wrappedBandProperty(): String =
+    if (wrappedBandVisible) Property.VISIBLE else Property.NONE
+
 private fun Style.removeFogMosaicQuad(sourceId: String, layerId: String) {
     if (getLayer(layerId) != null) removeLayer(layerId)
     if (getSource(sourceId) != null) removeSource(sourceId)
@@ -695,7 +983,11 @@ private fun FogTileBounds.shiftedByWorlds(worlds: Int): FogTileBounds = copy(
     eastLongitude = eastLongitude + worlds * WORLD_LONGITUDE_SPAN,
 )
 
-private fun Style.installFogBackdrop(mosaic: FogTileMosaic, fogAlpha: Int) {
+private fun Style.installFogBackdrop(
+    mosaic: FogTileMosaic,
+    fogAlpha: Int,
+    repeatWorlds: Boolean,
+) {
     val bands = FogBackdropGeometry.bands(mosaic)
     installFogBackdropBand(
         FogBackdropIds.NorthSource,
@@ -721,6 +1013,37 @@ private fun Style.installFogBackdrop(mosaic: FogTileMosaic, fogAlpha: Int) {
         bands.east,
         fogAlpha,
     )
+    val wrappedSide = FogBackdropGeometry.wrappedSideBand(mosaic)
+    if (wrappedSide == null) {
+        removeFogMosaicQuad(FogBackdropIds.WrappedSideSource, FogBackdropIds.WrappedSideLayer)
+    } else {
+        installFogBackdropBand(
+            FogBackdropIds.WrappedSideSource,
+            FogBackdropIds.WrappedSideLayer,
+            wrappedSide,
+            fogAlpha,
+        )
+    }
+    if (repeatWorlds) {
+        val (west, east) = FogBackdropGeometry.worldRepeats(mosaic)
+        installFogBackdropBand(
+            FogBackdropIds.WestWorldSource,
+            FogBackdropIds.WestWorldLayer,
+            west,
+            fogAlpha,
+        )
+        installFogBackdropBand(
+            FogBackdropIds.EastWorldSource,
+            FogBackdropIds.EastWorldLayer,
+            east,
+            fogAlpha,
+        )
+    } else {
+        // A mosaic that spans the world is repeated itself, and flat fog over those copies would
+        // bury the explored area they are there to show.
+        removeFogMosaicQuad(FogBackdropIds.WestWorldSource, FogBackdropIds.WestWorldLayer)
+        removeFogMosaicQuad(FogBackdropIds.EastWorldSource, FogBackdropIds.EastWorldLayer)
+    }
 }
 
 private fun Style.installFogBackdropBand(
@@ -913,6 +1236,32 @@ private const val WORLD_LONGITUDE_SPAN = 360.0
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
 private const val TRACK_CAMERA_PADDING_PX = 72
+
+/**
+ * Short enough that the user stays with the map rather than watching it catch up, long enough that
+ * the step reads as the map following them rather than as the map jumping.
+ */
+private const val FOLLOW_EASE_MILLIS = 450
+
+/**
+ * The camera zoom at and above which the fog's world copies are drawn — the mosaic's and the
+ * bands' alike.
+ *
+ * Below this the renderer repeats an image source across world copies itself and ours are a second
+ * coat of fog; at and above it it does not, and without ours the neighbouring copy of the map is
+ * drawn with no fog on it at all. Both failures are total, not marginal.
+ *
+ * The value is measured, not chosen. Swept at the antimeridian on the production style in steps of
+ * 0.02 with the copies forced each way: at 0.98 having them on blacks out 50.000% of the screen and
+ * having them off costs nothing; at 1.00 having them on costs nothing and having them off leaks
+ * 49.722%. The edge is exactly the integer, which is what the renderer's own tile zoom is counted
+ * in — so it is a property of the renderer rather than of any one display. Two earlier values were
+ * inferred from a couple of readings instead, and both were wrong on a real device.
+ */
+private const val LIVE_WORLD_COPY_ZOOM = 1.0
+
+/** Where the map's own controls sit when the host does not stack anything of its own on top. */
+internal val MAP_CONTROL_INSET: Dp = 12.dp
 
 @Composable
 private fun MapStatusBadge(text: String) {
