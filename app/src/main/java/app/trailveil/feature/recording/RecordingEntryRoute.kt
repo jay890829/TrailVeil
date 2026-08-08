@@ -86,6 +86,7 @@ internal fun RecordingEntryRoute(
     var cameraRequest by remember { mutableStateOf<MapCameraRequest?>(null) }
     var starting by remember { mutableStateOf(false) }
     var fogRuntime by remember { mutableStateOf<FogRuntime?>(null) }
+    var startupReconciled by remember(appContainer) { mutableStateOf(false) }
 
     LaunchedEffect(historyStore) {
         historyStore.history.collectLatest { history = it }
@@ -93,6 +94,11 @@ internal fun RecordingEntryRoute(
 
     LaunchedEffect(appContainer) {
         fogRuntime = withContext(Dispatchers.IO) { appContainer.fogRuntime() }
+    }
+
+    LaunchedEffect(appContainer) {
+        withContext(Dispatchers.IO) { appContainer.reconcileRecordingStartup() }
+        startupReconciled = true
     }
 
     LaunchedEffect(appContainer) {
@@ -356,7 +362,7 @@ internal fun RecordingEntryRoute(
 
     RecordingEntryScreen(
         state = RecordingEntryUiState(
-            loading = currentHistory == null || !latestHistoryLoaded,
+            loading = currentHistory == null || !latestHistoryLoaded || !startupReconciled,
             // Not knowing yet is not the same as knowing this is a first visit. Deriving the two
             // from the same snapshot keeps them from disagreeing for a frame.
             firstVisit = currentHistory != null && !currentHistory.hasSeenIntroduction,

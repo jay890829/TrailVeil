@@ -199,6 +199,68 @@ class RecordingRepositoryTest {
         assertEquals(1, store.segmentStarts.size)
     }
 
+    @Test fun startupReconciliationIsIdempotentAndAllowsAFutureStart() = runBlocking {
+        val store = FakeTransactionalRecordingStore()
+        val repository = RecordingRepository(store)
+        val stranded = repository.begin(id("stranded"), 0).sessionId
+
+        val reconciled = repository.reconcileStarting(id("reconcile"), 10)
+
+        assertEquals(ReconcileStartingDisposition.STARTING_FAILED, reconciled.disposition)
+        assertEquals(stranded, reconciled.state.sessionId)
+        assertEquals(RecordingLifecycle.FAILED_TO_START, reconciled.state.lifecycle)
+        assertEquals(reconciled, repository.reconcileStarting(id("reconcile"), 999))
+        val future = repository.begin(id("future"), 11)
+        assertEquals(StartDisposition.PREPARED, future.disposition)
+        assertTrue(future.sessionId != stranded)
+    }
+
+    @Test fun replayingStartupReconciliationCannotRevokeAFutureActiveOwner() = runBlocking {
+        val store = FakeTransactionalRecordingStore()
+        val repository = RecordingRepository(store)
+        repository.begin(id("stranded"), 0)
+        val reconciliation = repository.reconcileStarting(id("reconcile"), 10)
+        val currentSession = repository.begin(id("current"), 11).sessionId
+        assertTrue(repository.completeStart(id("activate-current"), currentSession, 12).activated)
+
+        assertEquals(reconciliation, repository.reconcileStarting(id("reconcile"), 999))
+
+        assertEquals(
+            LocationDisposition.ACCEPTED,
+            repository.deliver(id("current-first"), currentSession, raw(0, 45.0), 0).disposition,
+        )
+        assertEquals(RecordingLifecycle.ACTIVE, repository.state().lifecycle)
+    }
+
+    @Test fun startupReconciliationLeavesAnActivatedOwnerUntouched() = runBlocking {
+        val store = FakeTransactionalRecordingStore()
+        val repository = RecordingRepository(store)
+        val session = repository.begin(id("begin"), 0).sessionId
+        assertTrue(repository.completeStart(id("activate"), session, 1).activated)
+
+        val result = repository.reconcileStarting(id("reconcile-active"), 2)
+
+        assertEquals(ReconcileStartingDisposition.NOTHING_TO_RECONCILE, result.disposition)
+        assertEquals(RecordingLifecycle.ACTIVE, repository.state().lifecycle)
+        assertEquals(
+            LocationDisposition.ACCEPTED,
+            repository.deliver(id("still-owned"), session, raw(0, 0.0), 2).disposition,
+        )
+    }
+
+    @Test fun startupReconciliationGivesPendingStopPriority() = runBlocking {
+        val store = FakeTransactionalRecordingStore()
+        val repository = RecordingRepository(store)
+        val session = repository.begin(id("begin"), 0).sessionId
+        assertTrue(repository.requestStop(id("request-stop"), session, 1, "USER").requested)
+
+        val result = repository.reconcileStarting(id("reconcile-stop"), 10)
+
+        assertEquals(ReconcileStartingDisposition.PENDING_STOP_COMPLETED, result.disposition)
+        assertEquals(RecordingLifecycle.STOPPED, repository.state().lifecycle)
+        assertEquals(listOf(RecordingTerminalStatus.INTERRUPTED), store.terminalStatuses)
+    }
+
     @Test fun aNewSessionStartsWithAFreshZeroDistanceFilterAnchor() = runBlocking {
         val store = FakeTransactionalRecordingStore()
         val repository = RecordingRepository(store)
@@ -486,6 +548,31 @@ private class FakeTransactionalRecordingStore : RecordingStore {
             current.locationOwnerToken = null
             StoreOutcome.StartFailed(current.id)
         } else StoreOutcome.StartFailureIgnored(transaction.sessionId, current?.lifecycle ?: RecordingLifecycle.STOPPED)
+    }
+    override suspend fun reconcileStarting(
+        transaction: ReconcileStartingTransaction,
+    ): StoreReceipt = once(transaction.operationId, RecordingOperationKind.RECONCILE_STARTING) {
+        val current = session
+        if (
+            current?.pendingStopReason != null &&
+            current.lifecycle == RecordingLifecycle.STARTING
+        ) {
+            terminalStatuses += RecordingTerminalStatus.INTERRUPTED
+            current.openSegment?.let { closedReasons += "STOP" }
+            current.openSegment = null
+            current.openSegmentReason = null
+            current.locationOwnerToken = null
+            current.lifecycle = RecordingLifecycle.STOPPED
+            StoreOutcome.ReconciledPendingStop(current.id)
+        } else if (current?.lifecycle == RecordingLifecycle.STARTING) {
+            current.openSegment = null
+            current.openSegmentReason = null
+            current.locationOwnerToken = null
+            current.lifecycle = RecordingLifecycle.FAILED_TO_START
+            StoreOutcome.ReconciledStartingAsFailed(current.id)
+        } else {
+            StoreOutcome.NothingToReconcile
+        }
     }
     override suspend fun recordLocation(transaction: RecordLocationTransaction): StoreReceipt = once(transaction.operationId, RecordingOperationKind.LOCATION) {
         val current = session

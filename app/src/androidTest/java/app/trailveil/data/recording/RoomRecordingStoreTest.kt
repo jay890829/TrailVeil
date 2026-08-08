@@ -531,6 +531,133 @@ class RoomRecordingStoreTest {
         assertFalse(dao.reservedSession() != null)
     }
 
+    @Test
+    fun startupReconciliationFailsOnlyStartingAndAllowsFutureStart() = runBlocking {
+        val repository = repository()
+        assertEquals(
+            ReconcileStartingDisposition.NOTHING_TO_RECONCILE,
+            repository.reconcileStarting(id("empty-reconcile"), 900).disposition,
+        )
+        val stranded = repository.begin("stranded", 1_000).sessionId
+
+        val reconciled = repository.reconcileStarting(id("reconcile"), 1_100)
+
+        assertEquals(ReconcileStartingDisposition.STARTING_FAILED, reconciled.disposition)
+        assertEquals(RecordingLifecycle.FAILED_TO_START, reconciled.state.lifecycle)
+        val failed = requireNotNull(dao.sessionById(stranded))
+        assertEquals(RecordingStatus.FAILED_TO_START, failed.status)
+        assertEquals(1_100L, failed.endedAt)
+        assertEquals("APP_STARTUP_RECONCILIATION", failed.stopReason)
+        assertEquals(reconciled, repository.reconcileStarting(id("reconcile"), 9_999))
+
+        val future = repository.begin("future", 1_101)
+        assertEquals(StartDisposition.PREPARED, future.disposition)
+        assertTrue(future.sessionId != stranded)
+        assertTrue(repository.completeStart(id("future-active"), future.sessionId, 1_102).activated)
+
+        // A later replay returns the historical reconciliation outcome without revoking the
+        // replacement session's process-local delivery ownership.
+        assertEquals(reconciled, repository.reconcileStarting(id("reconcile"), 9_999))
+        assertEquals(
+            LocationDisposition.ACCEPTED,
+            repository.deliver("future-first", future.sessionId, 0, 1_103, 45.0, 1_103).disposition,
+        )
+    }
+
+    @Test
+    fun activationAndStartupReconciliationSerializeToOneHonestWinner() = runBlocking {
+        repeat(12) { iteration ->
+            val starter = repository(RecordingRuntimeId("starter-$iteration"))
+            val reconciler = repository(RecordingRuntimeId("reconciler-$iteration"))
+            val sessionId = starter.begin("race-begin-$iteration", 2_000L + iteration * 10).sessionId
+            val (activation, reconciliation) = coroutineScope {
+                val activated = async(Dispatchers.Default) {
+                    starter.completeStart(
+                        id("race-activate-$iteration"),
+                        sessionId,
+                        2_001L + iteration * 10,
+                    )
+                }
+                val repaired = async(Dispatchers.Default) {
+                    reconciler.reconcileStarting(
+                        id("race-reconcile-$iteration"),
+                        2_002L + iteration * 10,
+                    )
+                }
+                activated.await() to repaired.await()
+            }
+            val stored = requireNotNull(dao.sessionById(sessionId))
+            if (activation.activated) {
+                assertEquals(ReconcileStartingDisposition.NOTHING_TO_RECONCILE, reconciliation.disposition)
+                assertEquals(RecordingStatus.ACTIVE, stored.status)
+                assertTrue(
+                    starter.stop(
+                        id("race-cleanup-$iteration"),
+                        sessionId,
+                        2_003L + iteration * 10,
+                        "TEST_CLEANUP",
+                    ).stopped,
+                )
+            } else {
+                assertEquals(ReconcileStartingDisposition.STARTING_FAILED, reconciliation.disposition)
+                assertEquals(RecordingStatus.FAILED_TO_START, stored.status)
+            }
+        }
+    }
+
+    @Test
+    fun startupReconciliationCompletesPendingStopInsteadOfFailingStart() = runBlocking {
+        val repository = repository()
+        val sessionId = repository.begin("pending-reconcile-begin", 3_000).sessionId
+        assertTrue(
+            repository.requestStop(
+                id("pending-reconcile-request"),
+                sessionId,
+                3_001,
+                "USER",
+            ).requested,
+        )
+
+        val result = repository.reconcileStarting(id("pending-reconcile"), 3_999)
+
+        assertEquals(ReconcileStartingDisposition.PENDING_STOP_COMPLETED, result.disposition)
+        val stored = requireNotNull(dao.sessionById(sessionId))
+        assertEquals(RecordingStatus.INTERRUPTED, stored.status)
+        assertEquals(3_001L, stored.endedAt)
+        assertEquals("STOP_DURING_START:USER", stored.stopReason)
+        assertEquals("RECONCILED_PENDING_STOP", dao.receiptByOperationId("pending-reconcile")?.outcome)
+    }
+
+    @Test
+    fun startupReconciliationRollsBackIfItsReceiptCannotCommit() = runBlocking {
+        val repository = repository()
+        val sessionId = repository.begin("rollback-begin", 4_000).sessionId
+        database.openHelper.writableDatabase.execSQL(
+            """
+            CREATE TRIGGER fail_reconcile_receipt
+            BEFORE INSERT ON recording_operation_receipts
+            WHEN NEW.command_kind = 'RECONCILE_STARTING'
+            BEGIN SELECT RAISE(ABORT, 'injected reconcile receipt failure'); END
+            """.trimIndent(),
+        )
+
+        try {
+            repository.reconcileStarting(id("rollback-reconcile"), 4_100)
+            throw AssertionError("expected receipt failure")
+        } catch (_: Exception) {
+            // The transaction must restore STARTING when its durable acknowledgement cannot land.
+        }
+        assertEquals(RecordingStatus.STARTING, dao.sessionById(sessionId)?.status)
+        assertEquals(null, dao.receiptByOperationId("rollback-reconcile"))
+
+        database.openHelper.writableDatabase.execSQL("DROP TRIGGER fail_reconcile_receipt")
+        assertEquals(
+            ReconcileStartingDisposition.STARTING_FAILED,
+            repository.reconcileStarting(id("rollback-reconcile"), 4_100).disposition,
+        )
+        assertEquals(RecordingStatus.FAILED_TO_START, dao.sessionById(sessionId)?.status)
+    }
+
     private fun repository(
         runtimeId: RecordingRuntimeId = RecordingRuntimeId("room-instrumentation-runtime"),
     ) = RecordingRepository(RoomRecordingStore(dao), runtimeId = runtimeId)

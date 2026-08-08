@@ -25,7 +25,8 @@ private object RecordingProcessIdentity {
 }
 
 internal enum class RecordingOperationKind {
-    BEGIN_START, COMPLETE_START, FAIL_START, LOCATION, REQUEST_STOP, STOP, INTERRUPT, RECOVERY,
+    BEGIN_START, COMPLETE_START, FAIL_START, RECONCILE_STARTING, LOCATION, REQUEST_STOP, STOP,
+    INTERRUPT, RECOVERY,
 }
 
 internal enum class RecordingLifecycle { STARTING, ACTIVE, FAILED_TO_START, STOPPED }
@@ -82,6 +83,10 @@ internal data class FailStartTransaction(
     val failedAtEpochMillis: Long,
     val message: String? = null,
 ) { init { require(sessionId > 0L && failedAtEpochMillis >= 0L) } }
+internal data class ReconcileStartingTransaction(
+    val operationId: RecordingOperationId,
+    val reconciledAtEpochMillis: Long,
+) { init { require(reconciledAtEpochMillis >= 0L) } }
 internal data class RecordLocationTransaction(
     val operationId: RecordingOperationId,
     val sessionId: Long,
@@ -158,6 +163,9 @@ internal sealed interface StoreOutcome {
     data class StartNotPending(val sessionId: Long, val lifecycle: RecordingLifecycle) : StoreOutcome
     data class StartFailed(val sessionId: Long) : StoreOutcome
     data class StartFailureIgnored(val sessionId: Long, val lifecycle: RecordingLifecycle) : StoreOutcome
+    data class ReconciledPendingStop(val sessionId: Long) : StoreOutcome
+    data class ReconciledStartingAsFailed(val sessionId: Long) : StoreOutcome
+    data object NothingToReconcile : StoreOutcome
     data class LocationAccepted(val kind: app.trailveil.data.location.AcceptedLocationKind, val breakReason: LocationBreakReason?) : StoreOutcome
     data class LocationRejected(val breakReason: LocationBreakReason?) : StoreOutcome
     data class SessionGuardRejected(val requestedSessionId: Long) : StoreOutcome
@@ -187,6 +195,7 @@ internal interface RecordingStore {
     suspend fun prepareStart(transaction: PrepareStartTransaction): StoreReceipt
     suspend fun activateStart(transaction: ActivateStartTransaction): StoreReceipt
     suspend fun failStart(transaction: FailStartTransaction): StoreReceipt
+    suspend fun reconcileStarting(transaction: ReconcileStartingTransaction): StoreReceipt
     suspend fun recordLocation(transaction: RecordLocationTransaction): StoreReceipt
     suspend fun rejectStaleLocation(transaction: RejectLocationTransaction): StoreReceipt
     suspend fun requestStop(transaction: RequestStopTransaction): StoreReceipt
@@ -204,6 +213,12 @@ internal data class BeginStartResult(override val operationId: RecordingOperatio
 internal enum class StartDisposition { PREPARED, ALREADY_STARTING, ALREADY_ACTIVE }
 internal data class CompleteStartResult(override val operationId: RecordingOperationId, val sessionId: Long, val activated: Boolean, override val state: RecordingRepositoryState) : RecordingCommandResult
 internal data class FailStartResult(override val operationId: RecordingOperationId, val sessionId: Long, val failed: Boolean, override val state: RecordingRepositoryState) : RecordingCommandResult
+internal data class ReconcileStartingResult(override val operationId: RecordingOperationId, val disposition: ReconcileStartingDisposition, override val state: RecordingRepositoryState) : RecordingCommandResult
+internal enum class ReconcileStartingDisposition {
+    PENDING_STOP_COMPLETED,
+    STARTING_FAILED,
+    NOTHING_TO_RECONCILE,
+}
 internal data class LocationDeliveryResult(override val operationId: RecordingOperationId, val disposition: LocationDisposition, override val state: RecordingRepositoryState) : RecordingCommandResult
 internal enum class LocationDisposition { ACCEPTED, REJECTED, STALE_SESSION }
 internal data class StopRequestResult(override val operationId: RecordingOperationId, val sessionId: Long, val requested: Boolean, override val state: RecordingRepositoryState) : RecordingCommandResult
@@ -424,6 +439,34 @@ internal class RecordingRepository(
         result
     }
 
+    /**
+     * Process-visible startup repair. Unlike service recovery this command never rotates or takes
+     * ownership of ACTIVE work; its Room transaction can only terminalize a still-STARTING row.
+     */
+    suspend fun reconcileStarting(
+        operationId: RecordingOperationId,
+        reconciledAtEpochMillis: Long,
+    ): ReconcileStartingResult = mutex.withLock {
+        val receipt = receiptOrNull(operationId, RecordingOperationKind.RECONCILE_STARTING)
+            ?: commit(
+                store.reconcileStarting(
+                    ReconcileStartingTransaction(operationId, reconciledAtEpochMillis),
+                ),
+            )
+        val result = reconcileStartingResult(receipt)
+        // A historical receipt returns its original result, but must not revoke ownership that a
+        // newer activation granted to this repository after the reconciliation first completed.
+        if (
+            !receipt.replayed &&
+            result.disposition != ReconcileStartingDisposition.NOTHING_TO_RECONCILE
+        ) {
+            resetFilter()
+            locationDeliveryEnabled = false
+            locationOwnerToken = null
+        }
+        result
+    }
+
     suspend fun interrupt(
         operationId: RecordingOperationId,
         sessionId: Long,
@@ -512,6 +555,24 @@ internal class RecordingRepository(
         is StoreOutcome.StartFailed -> FailStartResult(receipt.operationId, outcome.sessionId, true, receipt.projection.state)
         is StoreOutcome.StartFailureIgnored -> FailStartResult(receipt.operationId, outcome.sessionId, false, receipt.projection.state)
         else -> error("Unexpected fail receipt: $outcome")
+    }
+    private fun reconcileStartingResult(receipt: StoreReceipt): ReconcileStartingResult = when (val outcome = receipt.outcome) {
+        is StoreOutcome.ReconciledPendingStop -> ReconcileStartingResult(
+            receipt.operationId,
+            ReconcileStartingDisposition.PENDING_STOP_COMPLETED,
+            receipt.projection.state,
+        )
+        is StoreOutcome.ReconciledStartingAsFailed -> ReconcileStartingResult(
+            receipt.operationId,
+            ReconcileStartingDisposition.STARTING_FAILED,
+            receipt.projection.state,
+        )
+        StoreOutcome.NothingToReconcile -> ReconcileStartingResult(
+            receipt.operationId,
+            ReconcileStartingDisposition.NOTHING_TO_RECONCILE,
+            receipt.projection.state,
+        )
+        else -> error("Unexpected reconcile-starting receipt: $outcome")
     }
     private fun locationResult(receipt: StoreReceipt): LocationDeliveryResult = when (receipt.outcome) {
         is StoreOutcome.LocationAccepted -> LocationDeliveryResult(receipt.operationId, LocationDisposition.ACCEPTED, receipt.projection.state)

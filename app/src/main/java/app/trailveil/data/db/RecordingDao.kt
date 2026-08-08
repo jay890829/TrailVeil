@@ -70,6 +70,9 @@ internal object RecordingReceiptOutcome {
     const val START_ALREADY_ACTIVE = "START_ALREADY_ACTIVE"
     const val START_ACTIVATED = "START_ACTIVATED"
     const val START_FAILED = "START_FAILED"
+    const val RECONCILED_STARTING = "RECONCILED_STARTING"
+    const val RECONCILED_PENDING_STOP = "RECONCILED_PENDING_STOP"
+    const val NOTHING_TO_RECONCILE = "NOTHING_TO_RECONCILE"
     const val LOCATION_SESSION_GUARD = "LOCATION_SESSION_GUARD"
     const val STOP_REQUESTED_PREFIX = "STOP_REQUESTED:"
     const val STOP_REQUEST_IGNORED = "STOP_REQUEST_IGNORED"
@@ -483,6 +486,68 @@ internal abstract class RecordingDao {
         val reason = message?.trim()?.takeIf { it.isNotEmpty() }?.let { "START_FAILED:".plus(it) } ?: "START_FAILED"
         check(closeSessionRow(sessionId, RecordingStatus.STARTING, RecordingStatus.FAILED_TO_START, maxOf(failedAt, session.startedAt), reason) == 1)
         return record(RecordingOperationReceiptEntity(operationId, commandKind, RecordingReceiptOutcome.START_FAILED, sessionId, createdAt = createdAt))
+    }
+
+    /**
+     * App-process startup repair. This deliberately considers only the still-reserved STARTING
+     * row. Room serializes this transaction with service activation, so an activation that wins
+     * remains ACTIVE and a reconciliation that wins leaves nothing for activation to acquire.
+     */
+    @Transaction
+    open suspend fun executeReconcileStarting(
+        reconciledAt: Long,
+        operationId: String,
+        commandKind: String,
+        createdAt: Long,
+    ): RecordingOperationResult {
+        replay(operationId, commandKind)?.let { return it }
+        val pending = reservedSession()
+            ?: return record(
+                RecordingOperationReceiptEntity(
+                    operationId,
+                    commandKind,
+                    RecordingReceiptOutcome.NOTHING_TO_RECONCILE,
+                    createdAt = createdAt,
+                ),
+            )
+        finishPendingStop(
+            pending,
+            operationId,
+            commandKind,
+            RecordingReceiptOutcome.RECONCILED_PENDING_STOP,
+            createdAt,
+        )?.let { return it }
+        val open = openSegmentForSession(pending.id)
+        val terminalAt = maxOf(reconciledAt, pending.startedAt, open?.startedAt ?: pending.startedAt)
+        if (open != null) {
+            check(
+                closeSegmentRow(
+                    pending.id,
+                    open.id,
+                    terminalAt,
+                    "APP_STARTUP_RECONCILIATION",
+                ) == 1,
+            )
+        }
+        check(
+            closeSessionRow(
+                pending.id,
+                RecordingStatus.STARTING,
+                RecordingStatus.FAILED_TO_START,
+                terminalAt,
+                "APP_STARTUP_RECONCILIATION",
+            ) == 1,
+        )
+        return record(
+            RecordingOperationReceiptEntity(
+                operationId,
+                commandKind,
+                RecordingReceiptOutcome.RECONCILED_STARTING,
+                pending.id,
+                open?.id,
+                createdAt = createdAt,
+            ),
+        )
     }
 
     /** Persists a local stale-delivery acknowledgement without evaluating coordinates or counters. */

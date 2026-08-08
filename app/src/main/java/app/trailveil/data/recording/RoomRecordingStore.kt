@@ -75,6 +75,17 @@ internal class RoomRecordingStore(
             RecordingOperationKind.FAIL_START,
         )
 
+    override suspend fun reconcileStarting(transaction: ReconcileStartingTransaction): StoreReceipt =
+        decodeResult(
+            dao.executeReconcileStarting(
+                reconciledAt = transaction.reconciledAtEpochMillis,
+                operationId = transaction.operationId.value,
+                commandKind = RecordingOperationKind.RECONCILE_STARTING.name,
+                createdAt = transaction.reconciledAtEpochMillis,
+            ),
+            RecordingOperationKind.RECONCILE_STARTING,
+        )
+
     override suspend fun recordLocation(transaction: RecordLocationTransaction): StoreReceipt {
         val decision = transaction.decision
         val accepted = decision as? LocationQualityDecision.Accepted
@@ -219,6 +230,7 @@ internal class RoomRecordingStore(
 
     private fun String.toStoreOutcome(sessionId: Long?): StoreOutcome {
         if (this == RecordingReceiptOutcome.NOTHING_TO_RECOVER) return StoreOutcome.NothingToRecover
+        if (this == RecordingReceiptOutcome.NOTHING_TO_RECONCILE) return StoreOutcome.NothingToReconcile
         val id = requireNotNull(sessionId) { "receipt ".plus(this).plus(" requires a session id") }
         return when {
             this == RecordingReceiptOutcome.START_PREPARED -> StoreOutcome.StartPrepared(id)
@@ -226,6 +238,8 @@ internal class RoomRecordingStore(
             this == RecordingReceiptOutcome.START_ALREADY_ACTIVE -> StoreOutcome.StartAlreadyActive(id)
             this == RecordingReceiptOutcome.START_ACTIVATED -> StoreOutcome.StartActivated(id)
             this == RecordingReceiptOutcome.START_FAILED -> StoreOutcome.StartFailed(id)
+            this == RecordingReceiptOutcome.RECONCILED_STARTING -> StoreOutcome.ReconciledStartingAsFailed(id)
+            this == RecordingReceiptOutcome.RECONCILED_PENDING_STOP -> StoreOutcome.ReconciledPendingStop(id)
             this == RecordingReceiptOutcome.LOCATION_SESSION_GUARD -> StoreOutcome.SessionGuardRejected(id)
             startsWith(RecordingReceiptOutcome.STOP_REQUESTED_PREFIX) -> StoreOutcome.StopRequested(id)
             this == RecordingReceiptOutcome.STOP_REQUEST_IGNORED -> StoreOutcome.StopRequestIgnored(id)

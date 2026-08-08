@@ -11,6 +11,7 @@ import app.trailveil.data.map.RoomPersistedTrackPointChangeFeed
 import app.trailveil.data.map.RoomViewportTrackPointReader
 import app.trailveil.data.map.ViewportTrackDataSource
 import app.trailveil.data.recording.RecordingOperationId
+import app.trailveil.data.recording.ReconcileStartingResult
 import app.trailveil.data.recording.RecordingRepository
 import app.trailveil.data.recording.RoomRecordingStore
 import app.trailveil.map.fog.FogDiskTileCache
@@ -22,6 +23,7 @@ import app.trailveil.map.fog.FogTileRenderer
 import app.trailveil.map.fog.FogViewportCoordinator
 import java.io.File
 import java.util.UUID
+import kotlinx.coroutines.delay
 
 /** Process-scoped production wiring. Constructing it performs no recording action. */
 internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
@@ -44,6 +46,17 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     override val operationIds: RecordingOperationIdFactory = UuidRecordingOperationIdFactory
     override val recordingServiceState = RecordingServiceState()
 
+    private val recordingStartupReconciler = RecordingStartupReconciler {
+        val operationId = operationIds.next("app-startup-reconcile")
+        val reconciledAt = clock.epochMillis()
+        RecordingPersistenceRetrier(
+            attempt = {
+                recordingRepository.reconcileStarting(operationId, reconciledAt)
+            },
+            retryDelay = { delay(STARTUP_RECONCILIATION_RETRY_MILLIS) },
+        ).runUntilResolved()
+    }
+
     @Volatile
     private var createdFogRuntime: FogRuntime? = null
 
@@ -53,6 +66,10 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
         launcher = AndroidRecordingServiceLauncher(activityContext),
         createdAppVersion = createdAppVersion,
     )
+
+    /** Must resolve before an app-visible Start can be issued in this process. */
+    suspend fun reconcileRecordingStartup(): ReconcileStartingResult =
+        recordingStartupReconciler.reconcileOnce()
 
     /**
      * Call from a background dispatcher: disk-cache discovery and trimming perform file I/O.
@@ -91,6 +108,7 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     private companion object {
         const val FOG_MEMORY_CACHE_BYTES = 16L * 1024L * 1024L
         const val FOG_DISK_CACHE_BYTES = 64L * 1024L * 1024L
+        const val STARTUP_RECONCILIATION_RETRY_MILLIS = 1_000L
     }
 }
 
