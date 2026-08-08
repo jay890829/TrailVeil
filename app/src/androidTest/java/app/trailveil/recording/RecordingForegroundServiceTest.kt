@@ -4,7 +4,9 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.SystemClock
 import androidx.core.content.ContextCompat
+import androidx.room.withTransaction
 import androidx.test.core.app.ActivityScenario
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -13,13 +15,31 @@ import app.trailveil.MainActivity
 import app.trailveil.TrailVeilApplication
 import app.trailveil.data.db.RecordingStatus
 import app.trailveil.data.db.TrailVeilDatabase
+import app.trailveil.data.location.LocationBackpressureException
+import app.trailveil.data.location.LocationEngine
+import app.trailveil.data.location.LocationFixOfferResult
+import app.trailveil.data.location.LocationUpdateRequest
+import app.trailveil.data.location.RawLocationFix
+import app.trailveil.data.location.offerLocationFix
+import app.trailveil.data.location.withLocationFixBuffer
 import app.trailveil.data.recording.RecordingLifecycle
 import app.trailveil.data.recording.RecordingOperationId
 import java.util.UUID
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -262,6 +282,110 @@ class RecordingForegroundServiceTest {
             activity.close()
         }
     }
+
+    @Test
+    fun locationBackpressureInterruptsAndClosesTheOpenSegment() = runBlocking {
+        enableSystemLocation()
+        grant(Manifest.permission.ACCESS_COARSE_LOCATION)
+        grant(Manifest.permission.ACCESS_FINE_LOCATION)
+        val application = context.applicationContext as TrailVeilApplication
+        val container = application.appContainer
+        val repository = container.recordingRepository
+        // Match the production entry gate: app-startup reconciliation must finish before a new
+        // STARTING reservation can be created, otherwise the reconciler may honestly claim it.
+        container.reconcileRecordingStartup()
+        val engine = StoragePressureLocationEngine(totalFixes = 100_000)
+        container.setLocationEngineOverrideForTesting(engine)
+        val sessionId = repository.beginStart(
+            operationId("backpressure-begin"),
+            System.currentTimeMillis(),
+            "instrumentation",
+        ).sessionId
+        val activity = ActivityScenario.launch(MainActivity::class.java)
+        val releaseRoomWriter = CompletableDeferred<Unit>()
+        val roomWriterLocked = CompletableDeferred<Unit>()
+        val blockingDatabase = TrailVeilDatabase.open(context)
+        var blockingTransaction: Job? = null
+        try {
+            activity.onActivity {
+                RecordingForegroundService.startFromVisibleActivity(it, sessionId)
+            }
+            assertTrue("the injected session never became ACTIVE", withTimeoutOrNull(10_000) {
+                while (repository.state().lifecycle != RecordingLifecycle.ACTIVE) delay(50)
+                true
+            } == true)
+
+            blockingTransaction = async(Dispatchers.IO) {
+                blockingDatabase.withTransaction {
+                    blockingDatabase.openHelper.writableDatabase.execSQL(
+                        "UPDATE recording_sessions " +
+                            "SET created_app_version = created_app_version WHERE id = ?",
+                        arrayOf(sessionId),
+                    )
+                    roomWriterLocked.complete(Unit)
+                    releaseRoomWriter.await()
+                }
+            }
+            roomWriterLocked.await()
+            engine.startProducing.complete(Unit)
+            assertTrue("the 100k callback producer did not finish", withTimeoutOrNull(30_000) {
+                engine.productionFinished.await()
+                true
+            } == true)
+            assertTrue(engine.failed > 0)
+
+            releaseRoomWriter.complete(Unit)
+            blockingTransaction.join()
+            // The emulator must drain every fix that was accepted into the bounded queue through
+            // individual durable Room transactions before surfacing the terminal close cause.
+            assertTrue("the drained overflow did not terminalize the session", withTimeoutOrNull(30_000) {
+                while (repository.state().lifecycle != RecordingLifecycle.STOPPED) delay(50)
+                true
+            } == true)
+
+            val database = TrailVeilDatabase.open(context)
+            try {
+                val session = requireNotNull(database.recordingDao().sessionById(sessionId))
+                assertEquals(RecordingStatus.INTERRUPTED, session.status)
+                assertEquals("INTERRUPT:location_backpressure", session.stopReason)
+                assertTrue(session.acceptedPointCount > 0L)
+                assertTrue(session.rejectedPointCount > 0L)
+                assertEquals(engine.delivered.toLong(), session.acceptedPointCount + session.rejectedPointCount)
+                assertEquals(0, engine.coalesced)
+                assertEquals(
+                    engine.totalFixes.toLong(),
+                    session.acceptedPointCount + session.rejectedPointCount +
+                        engine.coalesced.toLong() + engine.failed.toLong(),
+                )
+                val segment = requireNotNull(
+                    database.recordingDao().sessionWithSegments(sessionId),
+                ).segments.single()
+                assertNotNull(segment.endedAt)
+                assertEquals("INTERRUPT:location_backpressure", segment.endReason)
+                assertNull(segment.openSlot)
+            } finally {
+                database.close()
+            }
+        } finally {
+            releaseRoomWriter.complete(Unit)
+            blockingTransaction?.cancelAndJoin()
+            blockingDatabase.close()
+            runCatching {
+                if (repository.state().lifecycle == RecordingLifecycle.ACTIVE) {
+                    repository.interrupt(
+                        operationId("backpressure-test-cleanup"),
+                        sessionId,
+                        System.currentTimeMillis(),
+                        "test_cleanup",
+                    )
+                }
+            }
+            container.setLocationEngineOverrideForTesting(null)
+            context.stopService(Intent(context, RecordingForegroundService::class.java))
+            activity.close()
+        }
+    }
+
     @Test
     fun staleNotificationStopCannotStopTheReplacementRuntime() = runBlocking {
         enableSystemLocation()
@@ -365,4 +489,40 @@ class RecordingForegroundServiceTest {
 
     private fun operationId(prefix: String) =
         RecordingOperationId("$prefix:${UUID.randomUUID()}")
+
+    private class StoragePressureLocationEngine(
+        val totalFixes: Int,
+    ) : LocationEngine {
+        val startProducing = CompletableDeferred<Unit>()
+        val productionFinished = CompletableDeferred<Unit>()
+        var delivered = 0
+            private set
+        var failed = 0
+            private set
+        val coalesced = 0
+
+        override fun fixes(request: LocationUpdateRequest): Flow<RawLocationFix> = callbackFlow {
+            startProducing.await()
+            val elapsedBase = SystemClock.elapsedRealtimeNanos()
+            val epochBase = System.currentTimeMillis()
+            repeat(totalFixes) { index ->
+                val result = offerLocationFix(
+                    RawLocationFix(
+                        latitude = if (index % 2 == 0) 25.0 else 91.0,
+                        longitude = 121.0,
+                        horizontalAccuracyMeters = 5.0,
+                        capturedAtElapsedRealtimeNanos = elapsedBase + index,
+                        epochMillis = epochBase,
+                    ),
+                )
+                when (result) {
+                    LocationFixOfferResult.DELIVERED -> delivered += 1
+                    LocationFixOfferResult.ALREADY_CLOSED,
+                    LocationFixOfferResult.OVERFLOW_TERMINATED -> failed += 1
+                }
+            }
+            productionFinished.complete(Unit)
+            awaitClose()
+        }.withLocationFixBuffer()
+    }
 }

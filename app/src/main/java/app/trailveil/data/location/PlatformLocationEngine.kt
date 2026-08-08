@@ -56,7 +56,14 @@ class PlatformLocationEngine(
 
         val listener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
-                trySend(location.toPlatformLocationSample().toRawLocationFix())
+                // The result is deliberately exhausted: full is a terminal continuity break,
+                // while closed means ordinary collector cancellation already owns teardown.
+                when (offerLocationFix(location.toPlatformLocationSample().toRawLocationFix())) {
+                    LocationFixOfferResult.DELIVERED,
+                    LocationFixOfferResult.ALREADY_CLOSED,
+                    LocationFixOfferResult.OVERFLOW_TERMINATED,
+                    -> Unit
+                }
             }
 
             override fun onProviderDisabled(provider: String) {
@@ -96,7 +103,7 @@ class PlatformLocationEngine(
                 // Permission revocation can race cancellation; the system has already detached us.
             }
         }
-    }
+    }.withLocationFixBuffer()
 
     private fun providerState(provider: String): LocationProviderState {
         val exists = locationManager.hasProvider(provider)

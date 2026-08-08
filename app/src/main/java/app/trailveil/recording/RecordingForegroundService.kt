@@ -454,14 +454,15 @@ class RecordingForegroundService : Service() {
         const val FOREGROUND_RESTART_FAILURE = "foreground_restart_failure"
     }
 
-    private fun Exception.toLocationTerminalReason(): String = when (this) {
-        is LocationPersistenceFailure -> TerminalReason.STORAGE_FAILURE
-        is LocationProviderDisabledException -> TerminalReason.LOCATION_DISABLED
-        is LocationPermissionException, is SecurityException ->
-            TerminalReason.LOCATION_PERMISSION_REVOKED
-        is LocationProviderUnavailableException -> TerminalReason.LOCATION_PROVIDER_UNAVAILABLE
-        else -> TerminalReason.LOCATION_STREAM_FAILURE
-    }
+    private fun Exception.toLocationTerminalReason(): String =
+        RecordingServicePolicy.locationBackpressureTerminalReason(this) ?: when (this) {
+            is LocationPersistenceFailure -> TerminalReason.STORAGE_FAILURE
+            is LocationProviderDisabledException -> TerminalReason.LOCATION_DISABLED
+            is LocationPermissionException, is SecurityException ->
+                TerminalReason.LOCATION_PERMISSION_REVOKED
+            is LocationProviderUnavailableException -> TerminalReason.LOCATION_PROVIDER_UNAVAILABLE
+            else -> TerminalReason.LOCATION_STREAM_FAILURE
+        }
 
     private class LocationPersistenceFailure(cause: Exception) : Exception(cause)
     companion object {

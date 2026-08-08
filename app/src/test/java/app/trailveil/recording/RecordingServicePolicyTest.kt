@@ -1,10 +1,24 @@
 package app.trailveil.recording
 
+import app.trailveil.data.location.LocationBackpressureException
 import app.trailveil.data.recording.RecordingLifecycle
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
 class RecordingServicePolicyTest {
+    @Test fun `location queue overflow has a distinct durable terminal reason`() {
+        assertEquals(
+            LOCATION_BACKPRESSURE_TERMINAL_REASON,
+            RecordingServicePolicy.locationBackpressureTerminalReason(
+                LocationBackpressureException("full"),
+            ),
+        )
+        assertEquals(
+            null,
+            RecordingServicePolicy.locationBackpressureTerminalReason(IllegalStateException()),
+        )
+    }
+
     @Test fun `matching notification stop may finish active session`() {
         assertEquals(NotificationStopDecision.STOP_CURRENT_SESSION, RecordingServicePolicy.notificationStopDecision(42L, 42L, RecordingLifecycle.ACTIVE))
     }

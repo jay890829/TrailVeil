@@ -39,9 +39,13 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     )
     val recordingHistory: RecordingHistoryDataSource =
         RoomRecordingHistoryDataSource(database.recordingDao())
-    override val locationEngine: LocationEngine = PlatformLocationEngine(
+    private val platformLocationEngine: LocationEngine = PlatformLocationEngine(
         requireNotNull(context.applicationContext.getSystemService(LocationManager::class.java)),
     )
+    @Volatile
+    private var locationEngineOverrideForTesting: LocationEngine? = null
+    override val locationEngine: LocationEngine
+        get() = locationEngineOverrideForTesting ?: platformLocationEngine
     override val clock: RecordingServiceClock = SystemRecordingServiceClock
     override val operationIds: RecordingOperationIdFactory = UuidRecordingOperationIdFactory
     override val recordingServiceState = RecordingServiceState()
@@ -70,6 +74,11 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     /** Must resolve before an app-visible Start can be issued in this process. */
     suspend fun reconcileRecordingStartup(): ReconcileStartingResult =
         recordingStartupReconciler.reconcileOnce()
+
+    /** Process-local service seam; production never installs an override. */
+    internal fun setLocationEngineOverrideForTesting(engine: LocationEngine?) {
+        locationEngineOverrideForTesting = engine
+    }
 
     /**
      * Call from a background dispatcher: disk-cache discovery and trimming perform file I/O.
