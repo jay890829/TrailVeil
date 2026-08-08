@@ -73,6 +73,56 @@ class RecordingRepositoryTest {
             store.terminalStatuses,
         )
     }
+
+    @Test fun durableStopRequestDisablesDeliveryAndIsIdempotent() = runBlocking {
+        val store = FakeTransactionalRecordingStore()
+        val repository = RecordingRepository(store)
+        val session = repository.begin(id("begin"), 0).sessionId
+        repository.completeStart(id("activate"), session, 1)
+
+        val requested = repository.requestStop(id("request-stop"), session, 2, "user")
+        assertTrue(requested.requested)
+        assertEquals(requested, repository.requestStop(id("request-stop"), session, 999, "other"))
+        assertEquals(
+            LocationDisposition.STALE_SESSION,
+            repository.deliver(id("after-request"), session, raw(0, 0.0), 3).disposition,
+        )
+        assertTrue(repository.stop(id("stop"), session, 2, "user").stopped)
+        assertEquals(RecordingLifecycle.STOPPED, repository.state().lifecycle)
+    }
+
+    @Test fun failedStopRequestKeepsDeliveryButPendingIntentWinsFreshRecovery() = runBlocking {
+        val store = FakeTransactionalRecordingStore()
+        val owner = RecordingRepository(store)
+        val session = owner.begin(id("begin"), 0).sessionId
+        owner.completeStart(id("activate"), session, 1)
+
+        store.failNext = RecordingOperationKind.REQUEST_STOP
+        try {
+            owner.requestStop(id("request-fails"), session, 2, "user")
+            throw AssertionError("expected request failure")
+        } catch (_: IOException) { }
+        assertEquals(
+            LocationDisposition.ACCEPTED,
+            owner.deliver(id("still-owned"), session, raw(0, 0.0), 2).disposition,
+        )
+
+        assertTrue(owner.requestStop(id("request"), session, 3, "user").requested)
+        store.failNext = RecordingOperationKind.STOP
+        try {
+            owner.stop(id("stop-fails"), session, 3, "user")
+            throw AssertionError("expected stop failure")
+        } catch (_: IOException) { }
+
+        val fresh = RecordingRepository(store)
+        assertEquals(
+            RecoveryDisposition.PENDING_STOP_COMPLETED,
+            fresh.recover(id("recover"), 10).disposition,
+        )
+        assertEquals(RecordingLifecycle.STOPPED, fresh.state().lifecycle)
+        assertEquals(0, store.recoveryRotations)
+    }
+
     @Test fun storeFailuresRestoreFilterAndDoNotAcknowledgeOrAdvanceState() = runBlocking {
         val store = FakeTransactionalRecordingStore()
         val repository = RecordingRepository(store)
@@ -343,6 +393,7 @@ private class FakeTransactionalRecordingStore : RecordingStore {
         var openSegment: Long? = null,
         var openSegmentReason: String? = null,
         var locationOwnerToken: RecordingRuntimeId? = null,
+        var pendingStopReason: String? = null,
     )
     private val receipts = linkedMapOf<RecordingOperationId, StoreReceipt>()
     private var missNextReceiptLookupFor: RecordingOperationId? = null
@@ -413,7 +464,11 @@ private class FakeTransactionalRecordingStore : RecordingStore {
     }
     override suspend fun activateStart(transaction: ActivateStartTransaction): StoreReceipt = once(transaction.operationId, RecordingOperationKind.COMPLETE_START) {
         val current = session
-        if (current?.id == transaction.sessionId && current.lifecycle == RecordingLifecycle.STARTING) {
+        if (
+            current?.id == transaction.sessionId &&
+            current.lifecycle == RecordingLifecycle.STARTING &&
+            current.pendingStopReason == null
+        ) {
             current.lifecycle = RecordingLifecycle.ACTIVE
             current.openSegment = nextSegment++
             current.openSegmentReason = "INITIAL"
@@ -476,6 +531,20 @@ private class FakeTransactionalRecordingStore : RecordingStore {
     ): StoreReceipt = once(transaction.operationId, RecordingOperationKind.LOCATION) {
         StoreOutcome.SessionGuardRejected(transaction.requestedSessionId)
     }
+    override suspend fun requestStop(
+        transaction: RequestStopTransaction,
+    ): StoreReceipt = once(transaction.operationId, RecordingOperationKind.REQUEST_STOP) {
+        val current = session
+        if (
+            current?.id == transaction.sessionId &&
+            current.lifecycle in setOf(RecordingLifecycle.STARTING, RecordingLifecycle.ACTIVE)
+        ) {
+            if (current.pendingStopReason == null) current.pendingStopReason = transaction.reason
+            StoreOutcome.StopRequested(current.id)
+        } else {
+            StoreOutcome.StopRequestIgnored(transaction.sessionId)
+        }
+    }
     override suspend fun stop(transaction: StopRecordingTransaction): StoreReceipt = once(transaction.operationId, transaction.operationKind) {
         val current = session
         when {
@@ -494,6 +563,22 @@ private class FakeTransactionalRecordingStore : RecordingStore {
     }
     override suspend fun recover(transaction: RecoverRecordingTransaction): StoreReceipt = once(transaction.operationId, RecordingOperationKind.RECOVERY) {
         val current = session
+        if (
+            current?.pendingStopReason != null &&
+            current.lifecycle in setOf(RecordingLifecycle.STARTING, RecordingLifecycle.ACTIVE)
+        ) {
+            terminalStatuses += if (current.lifecycle == RecordingLifecycle.ACTIVE) {
+                RecordingTerminalStatus.COMPLETED
+            } else {
+                RecordingTerminalStatus.INTERRUPTED
+            }
+            current.openSegment?.let { closedReasons += "STOP" }
+            current.openSegment = null
+            current.openSegmentReason = null
+            current.locationOwnerToken = null
+            current.lifecycle = RecordingLifecycle.STOPPED
+            return@once StoreOutcome.RecoveredPendingStop(current.id)
+        }
         when (current?.lifecycle) {
             RecordingLifecycle.STARTING -> {
                 current.lifecycle = RecordingLifecycle.FAILED_TO_START

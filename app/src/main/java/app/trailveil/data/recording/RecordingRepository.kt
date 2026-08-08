@@ -25,7 +25,7 @@ private object RecordingProcessIdentity {
 }
 
 internal enum class RecordingOperationKind {
-    BEGIN_START, COMPLETE_START, FAIL_START, LOCATION, STOP, INTERRUPT, RECOVERY,
+    BEGIN_START, COMPLETE_START, FAIL_START, LOCATION, REQUEST_STOP, STOP, INTERRUPT, RECOVERY,
 }
 
 internal enum class RecordingLifecycle { STARTING, ACTIVE, FAILED_TO_START, STOPPED }
@@ -110,6 +110,16 @@ internal data class RejectLocationTransaction(
         require(requestedSessionId > 0L && recordedAtEpochMillis >= 0L)
     }
 }
+internal data class RequestStopTransaction(
+    val operationId: RecordingOperationId,
+    val sessionId: Long,
+    val requestedAtEpochMillis: Long,
+    val reason: String,
+) {
+    init {
+        require(sessionId > 0L && requestedAtEpochMillis >= 0L && reason.isNotBlank())
+    }
+}
 internal data class StopRecordingTransaction(
     val operationId: RecordingOperationId,
     val sessionId: Long,
@@ -151,8 +161,11 @@ internal sealed interface StoreOutcome {
     data class LocationAccepted(val kind: app.trailveil.data.location.AcceptedLocationKind, val breakReason: LocationBreakReason?) : StoreOutcome
     data class LocationRejected(val breakReason: LocationBreakReason?) : StoreOutcome
     data class SessionGuardRejected(val requestedSessionId: Long) : StoreOutcome
+    data class StopRequested(val sessionId: Long) : StoreOutcome
+    data class StopRequestIgnored(val sessionId: Long) : StoreOutcome
     data class Stopped(val sessionId: Long) : StoreOutcome
     data class AlreadyStopped(val sessionId: Long) : StoreOutcome
+    data class RecoveredPendingStop(val sessionId: Long) : StoreOutcome
     data class RecoveredStartingAsFailed(val sessionId: Long) : StoreOutcome
     data class RecoveredActive(val sessionId: Long, val openedRecoverySegment: Boolean) : StoreOutcome
     data object NothingToRecover : StoreOutcome
@@ -163,7 +176,9 @@ internal sealed interface StoreOutcome {
  * `recordLocation(AFTER_BREAK)` must close the old segment, open its replacement, append the
  * zero-distance point, and update session totals together. `recordLocation(Rejected)` increments
  * rejection count and closes an open segment only when the decision carries a break; it must never
- * receive a raw coordinate. `recover` fails STARTING rows and rotates ACTIVE rows exactly once.
+ * receive a raw coordinate. A durable Stop request blocks activation and location writes and wins
+ * over later technical terminal commands; `recover` consumes it before otherwise failing STARTING
+ * rows or rotating ACTIVE rows exactly once.
  */
 internal interface RecordingStore {
     /** Returns a previously committed receipt, or throws [OperationIdCollisionException] for a different kind. */
@@ -174,6 +189,7 @@ internal interface RecordingStore {
     suspend fun failStart(transaction: FailStartTransaction): StoreReceipt
     suspend fun recordLocation(transaction: RecordLocationTransaction): StoreReceipt
     suspend fun rejectStaleLocation(transaction: RejectLocationTransaction): StoreReceipt
+    suspend fun requestStop(transaction: RequestStopTransaction): StoreReceipt
     suspend fun stop(transaction: StopRecordingTransaction): StoreReceipt
     suspend fun recover(transaction: RecoverRecordingTransaction): StoreReceipt
 }
@@ -190,9 +206,11 @@ internal data class CompleteStartResult(override val operationId: RecordingOpera
 internal data class FailStartResult(override val operationId: RecordingOperationId, val sessionId: Long, val failed: Boolean, override val state: RecordingRepositoryState) : RecordingCommandResult
 internal data class LocationDeliveryResult(override val operationId: RecordingOperationId, val disposition: LocationDisposition, override val state: RecordingRepositoryState) : RecordingCommandResult
 internal enum class LocationDisposition { ACCEPTED, REJECTED, STALE_SESSION }
+internal data class StopRequestResult(override val operationId: RecordingOperationId, val sessionId: Long, val requested: Boolean, override val state: RecordingRepositoryState) : RecordingCommandResult
 internal data class StopResult(override val operationId: RecordingOperationId, val sessionId: Long, val stopped: Boolean, override val state: RecordingRepositoryState) : RecordingCommandResult
 internal data class RecoveryResult(override val operationId: RecordingOperationId, val disposition: RecoveryDisposition, override val state: RecordingRepositoryState) : RecordingCommandResult
 internal enum class RecoveryDisposition {
+    PENDING_STOP_COMPLETED,
     STARTING_FAILED,
     ACTIVE_ROTATED,
     ACTIVE_ALREADY_RECOVERED,
@@ -376,6 +394,36 @@ internal class RecordingRepository(
         )
     }
 
+    /**
+     * Persists user intent before the service stops location delivery. Once acknowledged, even a
+     * replay disables this repository instance so no fix can race ahead of terminal recovery.
+     */
+    suspend fun requestStop(
+        operationId: RecordingOperationId,
+        sessionId: Long,
+        requestedAtEpochMillis: Long,
+        reason: String,
+    ): StopRequestResult = mutex.withLock {
+        val receipt = receiptOrNull(operationId, RecordingOperationKind.REQUEST_STOP)
+            ?: commit(
+                store.requestStop(
+                    RequestStopTransaction(
+                        operationId,
+                        sessionId,
+                        requestedAtEpochMillis,
+                        reason,
+                    ),
+                ),
+            )
+        val result = stopRequestResult(receipt)
+        if (result.requested) {
+            resetFilter()
+            locationDeliveryEnabled = false
+            locationOwnerToken = null
+        }
+        result
+    }
+
     suspend fun interrupt(
         operationId: RecordingOperationId,
         sessionId: Long,
@@ -404,6 +452,11 @@ internal class RecordingRepository(
                 ),
             )
         when (val outcome = receipt.outcome) {
+            is StoreOutcome.RecoveredPendingStop -> {
+                resetFilter()
+                locationDeliveryEnabled = false
+                locationOwnerToken = null
+            }
             is StoreOutcome.RecoveredStartingAsFailed -> if (!receipt.replayed) {
                 resetFilter()
                 locationDeliveryEnabled = false
@@ -466,12 +519,18 @@ internal class RecordingRepository(
         is StoreOutcome.SessionGuardRejected -> LocationDeliveryResult(receipt.operationId, LocationDisposition.STALE_SESSION, receipt.projection.state)
         else -> error("Unexpected location receipt: ${receipt.outcome}")
     }
+    private fun stopRequestResult(receipt: StoreReceipt): StopRequestResult = when (val outcome = receipt.outcome) {
+        is StoreOutcome.StopRequested -> StopRequestResult(receipt.operationId, outcome.sessionId, true, receipt.projection.state)
+        is StoreOutcome.StopRequestIgnored -> StopRequestResult(receipt.operationId, outcome.sessionId, false, receipt.projection.state)
+        else -> error("Unexpected stop-request receipt: $outcome")
+    }
     private fun stopResult(receipt: StoreReceipt): StopResult = when (val outcome = receipt.outcome) {
         is StoreOutcome.Stopped -> StopResult(receipt.operationId, outcome.sessionId, true, receipt.projection.state)
         is StoreOutcome.AlreadyStopped -> StopResult(receipt.operationId, outcome.sessionId, false, receipt.projection.state)
         else -> error("Unexpected stop receipt: $outcome")
     }
     private fun recoveryResult(receipt: StoreReceipt): RecoveryResult = when (val outcome = receipt.outcome) {
+        is StoreOutcome.RecoveredPendingStop -> RecoveryResult(receipt.operationId, RecoveryDisposition.PENDING_STOP_COMPLETED, receipt.projection.state)
         is StoreOutcome.RecoveredStartingAsFailed -> RecoveryResult(receipt.operationId, RecoveryDisposition.STARTING_FAILED, receipt.projection.state)
         is StoreOutcome.RecoveredActive -> RecoveryResult(
             receipt.operationId,

@@ -127,6 +127,20 @@ internal class RoomRecordingStore(
             ),
             RecordingOperationKind.LOCATION,
         )
+
+    override suspend fun requestStop(transaction: RequestStopTransaction): StoreReceipt =
+        decodeResult(
+            dao.executeRequestStop(
+                sessionId = transaction.sessionId,
+                requestedAt = transaction.requestedAtEpochMillis,
+                reason = transaction.reason,
+                operationId = transaction.operationId.value,
+                commandKind = RecordingOperationKind.REQUEST_STOP.name,
+                createdAt = transaction.requestedAtEpochMillis,
+            ),
+            RecordingOperationKind.REQUEST_STOP,
+        )
+
     override suspend fun stop(transaction: StopRecordingTransaction): StoreReceipt =
         decodeResult(
             dao.executeStop(
@@ -213,9 +227,12 @@ internal class RoomRecordingStore(
             this == RecordingReceiptOutcome.START_ACTIVATED -> StoreOutcome.StartActivated(id)
             this == RecordingReceiptOutcome.START_FAILED -> StoreOutcome.StartFailed(id)
             this == RecordingReceiptOutcome.LOCATION_SESSION_GUARD -> StoreOutcome.SessionGuardRejected(id)
+            startsWith(RecordingReceiptOutcome.STOP_REQUESTED_PREFIX) -> StoreOutcome.StopRequested(id)
+            this == RecordingReceiptOutcome.STOP_REQUEST_IGNORED -> StoreOutcome.StopRequestIgnored(id)
             this == RecordingReceiptOutcome.STOPPED -> StoreOutcome.Stopped(id)
             this == RecordingReceiptOutcome.ALREADY_STOPPED -> StoreOutcome.AlreadyStopped(id)
             this == RecordingReceiptOutcome.RECOVERED_STARTING -> StoreOutcome.RecoveredStartingAsFailed(id)
+            this == RecordingReceiptOutcome.RECOVERED_PENDING_STOP -> StoreOutcome.RecoveredPendingStop(id)
             this == RecordingReceiptOutcome.RECOVERED_ACTIVE -> StoreOutcome.RecoveredActive(id, openedRecoverySegment = true)
             this == RecordingReceiptOutcome.RECOVERED_ACTIVE_ALREADY -> StoreOutcome.RecoveredActive(id, openedRecoverySegment = false)
             startsWith("START_NOT_PENDING_") -> StoreOutcome.StartNotPending(id, suffixLifecycle("START_NOT_PENDING_"))

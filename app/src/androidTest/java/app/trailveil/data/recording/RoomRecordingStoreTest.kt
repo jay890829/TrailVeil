@@ -5,6 +5,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import app.trailveil.data.db.RecordingDao
 import app.trailveil.data.db.RecordingStatus
+import app.trailveil.data.db.TrackPointEntity
 import app.trailveil.data.db.TrailVeilDatabase
 import app.trailveil.data.location.RawLocationFix
 import kotlinx.coroutines.Dispatchers
@@ -146,6 +147,210 @@ class RoomRecordingStoreTest {
         assertTrue(repository.stop(id("user-stop"), nextId, 1_300, "USER").stopped)
         assertEquals(RecordingStatus.COMPLETED, dao.sessionById(nextId)?.status)
     }
+
+    @Test
+    fun pendingUserStopIsDurableAndRecoveryCompletesItWithoutResuming() = runBlocking {
+        val owner = repository(RecordingRuntimeId("stop-owner"))
+        val sessionId = owner.begin("pending-stop-begin", 1_000).sessionId
+        assertTrue(owner.completeStart(id("pending-stop-activate"), sessionId, 1_001).activated)
+
+        val request = owner.requestStop(
+            id("pending-stop-request"),
+            sessionId,
+            1_100,
+            "USER",
+        )
+        assertTrue(request.requested)
+        assertEquals(
+            "REQUEST_STOP",
+            dao.receiptByOperationId("pending-stop-request")?.commandKind,
+        )
+        assertEquals(
+            "STOP_REQUESTED:USER",
+            dao.receiptByOperationId("pending-stop-request")?.outcome,
+        )
+        assertTrue(
+            repository(RecordingRuntimeId("second-stop-requester")).requestStop(
+                id("pending-stop-request-later"),
+                sessionId,
+                1_200,
+                "LATER_DUPLICATE",
+            ).requested,
+        )
+        assertEquals(RecordingStatus.ACTIVE, dao.sessionById(sessionId)?.status)
+
+        val openSegment = requireNotNull(dao.sessionWithSegments(sessionId)).segments.single()
+        val guarded = dao.executeLocation(
+            sessionId = sessionId,
+            expectedOpenSegmentId = openSegment.id,
+            expectedLocationOwnerToken = "stop-owner",
+            point = TrackPointEntity(
+                sessionId = sessionId,
+                segmentId = 0L,
+                sequence = 0L,
+                timestamp = 1_101L,
+                latitude = 25.0,
+                longitude = 121.0,
+                horizontalAccuracy = 5.0,
+            ),
+            acceptedKind = "FIRST",
+            breakReason = null,
+            distanceDeltaMeters = 0.0,
+            recordedAt = 1_101L,
+            operationId = "pending-stop-late-location",
+            commandKind = "LOCATION",
+            createdAt = 1_101L,
+        )
+        assertEquals("LOCATION_SESSION_GUARD", guarded.receipt.outcome)
+        assertEquals(0, dao.pointCount())
+
+        val recovered = repository(RecordingRuntimeId("stop-recovery"))
+        val result = recovered.recover(id("recover-pending-stop"), 9_999)
+        assertEquals(RecoveryDisposition.PENDING_STOP_COMPLETED, result.disposition)
+        assertEquals(RecordingLifecycle.STOPPED, result.state.lifecycle)
+        val session = requireNotNull(dao.sessionById(sessionId))
+        assertEquals(RecordingStatus.COMPLETED, session.status)
+        assertEquals(1_100L, session.endedAt)
+        assertEquals("STOP:USER", session.stopReason)
+        val segment = requireNotNull(dao.sessionWithSegments(sessionId)).segments.single()
+        assertEquals("STOP:USER", segment.endReason)
+        assertEquals(1, dao.segmentCount())
+
+        assertEquals(
+            result,
+            recovered.recover(id("recover-pending-stop"), 20_000),
+        )
+        assertEquals(
+            RecoveryDisposition.NOTHING_TO_RECOVER,
+            repository(RecordingRuntimeId("later-runtime"))
+                .recover(id("recover-after-stop"), 20_001)
+                .disposition,
+        )
+        assertEquals(1, dao.segmentCount())
+    }
+
+    @Test
+    fun pendingUserStopOutranksALaterTechnicalInterruptTransaction() = runBlocking {
+        val owner = repository(RecordingRuntimeId("stop-before-interrupt-owner"))
+        val sessionId = owner.begin("stop-before-interrupt-begin", 1_000).sessionId
+        assertTrue(
+            owner.completeStart(
+                id("stop-before-interrupt-activate"),
+                sessionId,
+                1_001,
+            ).activated,
+        )
+        assertTrue(
+            owner.requestStop(
+                id("stop-before-interrupt-request"),
+                sessionId,
+                1_100,
+                "USER",
+            ).requested,
+        )
+
+        val fallback = repository(RecordingRuntimeId("technical-fallback"))
+        val interrupted = fallback.interrupt(
+            id("technical-interrupt-after-stop"),
+            sessionId,
+            9_999,
+            "RECOVERY_FAILURE",
+        )
+        assertTrue(interrupted.stopped)
+        assertEquals(
+            interrupted,
+            fallback.interrupt(
+                id("technical-interrupt-after-stop"),
+                sessionId,
+                20_000,
+                "DIFFERENT_REPLAY_INPUT",
+            ),
+        )
+
+        val session = requireNotNull(dao.sessionById(sessionId))
+        assertEquals(RecordingStatus.COMPLETED, session.status)
+        assertEquals(1_100L, session.endedAt)
+        assertEquals("STOP:USER", session.stopReason)
+        assertEquals(
+            "STOP:USER",
+            requireNotNull(dao.sessionWithSegments(sessionId)).segments.single().endReason,
+        )
+        assertEquals(
+            "INTERRUPT",
+            dao.receiptByOperationId("technical-interrupt-after-stop")?.commandKind,
+        )
+        assertEquals(
+            RecoveryDisposition.NOTHING_TO_RECOVER,
+            repository(RecordingRuntimeId("after-technical-fallback"))
+                .recover(id("after-technical-fallback-recovery"), 20_001)
+                .disposition,
+        )
+    }
+
+    @Test
+    fun pendingStopDuringStartPreventsActivationAndRecoversAsInterrupted() = runBlocking {
+        val owner = repository(RecordingRuntimeId("starting-stop-owner"))
+        val sessionId = owner.begin("starting-stop-begin", 2_000).sessionId
+        assertTrue(
+            owner.requestStop(
+                id("starting-stop-request"),
+                sessionId,
+                2_100,
+                "USER_CANCELLED",
+            ).requested,
+        )
+
+        assertFalse(
+            owner.completeStart(id("activation-after-stop"), sessionId, 2_101).activated,
+        )
+        assertEquals(RecordingStatus.STARTING, dao.sessionById(sessionId)?.status)
+        assertEquals(0, dao.segmentCount())
+
+        val recovered = repository(RecordingRuntimeId("starting-stop-recovery"))
+        assertEquals(
+            RecoveryDisposition.PENDING_STOP_COMPLETED,
+            recovered.recover(id("recover-starting-stop"), 9_999).disposition,
+        )
+        val session = requireNotNull(dao.sessionById(sessionId))
+        assertEquals(RecordingStatus.INTERRUPTED, session.status)
+        assertEquals(2_100L, session.endedAt)
+        assertEquals("STOP_DURING_START:USER_CANCELLED", session.stopReason)
+        assertEquals(0, dao.segmentCount())
+    }
+
+    @Test
+    fun pendingStopDuringStartOutranksALaterStartFailureTransaction() = runBlocking {
+        val owner = repository(RecordingRuntimeId("starting-stop-failure-owner"))
+        val sessionId = owner.begin("starting-stop-failure-begin", 3_000).sessionId
+        assertTrue(
+            owner.requestStop(
+                id("starting-stop-failure-request"),
+                sessionId,
+                3_100,
+                "USER_CANCELLED",
+            ).requested,
+        )
+
+        assertTrue(
+            owner.failStart(
+                id("technical-start-failure-after-stop"),
+                sessionId,
+                9_999,
+                "foreground unavailable",
+            ).failed,
+        )
+
+        val session = requireNotNull(dao.sessionById(sessionId))
+        assertEquals(RecordingStatus.INTERRUPTED, session.status)
+        assertEquals(3_100L, session.endedAt)
+        assertEquals("STOP_DURING_START:USER_CANCELLED", session.stopReason)
+        assertEquals(0, dao.segmentCount())
+        assertEquals(
+            "FAIL_START",
+            dao.receiptByOperationId("technical-start-failure-after-stop")?.commandKind,
+        )
+    }
+
     @Test
     fun processRecoveryRotatesOnceAndStartsANewZeroDistanceAnchor() = runBlocking {
         val original = repository()

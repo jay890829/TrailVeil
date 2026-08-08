@@ -71,9 +71,12 @@ internal object RecordingReceiptOutcome {
     const val START_ACTIVATED = "START_ACTIVATED"
     const val START_FAILED = "START_FAILED"
     const val LOCATION_SESSION_GUARD = "LOCATION_SESSION_GUARD"
+    const val STOP_REQUESTED_PREFIX = "STOP_REQUESTED:"
+    const val STOP_REQUEST_IGNORED = "STOP_REQUEST_IGNORED"
     const val STOPPED = "STOPPED"
     const val ALREADY_STOPPED = "ALREADY_STOPPED"
     const val RECOVERED_STARTING = "RECOVERED_STARTING"
+    const val RECOVERED_PENDING_STOP = "RECOVERED_PENDING_STOP"
     const val RECOVERED_ACTIVE = "RECOVERED_ACTIVE"
     const val RECOVERED_ACTIVE_ALREADY = "RECOVERED_ACTIVE_ALREADY"
     const val NOTHING_TO_RECOVER = "NOTHING_TO_RECOVER"
@@ -84,6 +87,7 @@ internal object RecordingReceiptOutcome {
     fun startFailureIgnored(status: RecordingStatus?): String = "START_FAILURE_IGNORED_${status?.name ?: "MISSING"}"
     fun locationAccepted(kind: String, breakReason: String?): String = "LOCATION_ACCEPTED_${kind}_${breakReason ?: "NONE"}"
     fun locationRejected(breakReason: String?): String = "LOCATION_REJECTED_${breakReason ?: "NONE"}"
+    fun stopRequested(reason: String): String = STOP_REQUESTED_PREFIX + reason
 }
 @Dao
 internal abstract class RecordingDao {
@@ -94,6 +98,15 @@ internal abstract class RecordingDao {
 
     @Query("SELECT * FROM recording_operation_receipts WHERE operation_id = :operationId")
     abstract suspend fun receiptByOperationId(operationId: String): RecordingOperationReceiptEntity?
+
+    @Query(
+        "SELECT * FROM recording_operation_receipts " +
+            "WHERE session_id = :sessionId AND command_kind = 'REQUEST_STOP' " +
+            "AND outcome LIKE 'STOP_REQUESTED:%' ORDER BY created_at ASC, rowid ASC LIMIT 1",
+    )
+    protected abstract suspend fun pendingStopRequestForSession(
+        sessionId: Long,
+    ): RecordingOperationReceiptEntity?
 
     @Query("UPDATE recording_sessions SET accepted_point_count = accepted_point_count + 1, distance_meters = distance_meters + :distanceDeltaMeters WHERE id = :sessionId AND status = 'ACTIVE' AND active_slot = 1")
     protected abstract suspend fun incrementAcceptedSummary(sessionId: Long, distanceDeltaMeters: Double): Int
@@ -138,6 +151,59 @@ internal abstract class RecordingDao {
         )
         insertReceiptRow(stored)
         return RecordingOperationResult(stored, replayed = false)
+    }
+
+    /**
+     * A committed user Stop outranks every later technical terminal command. Keeping this inside
+     * the same Room transaction closes races from service recovery, start failure, and another
+     * repository/process without relying on an earlier state read.
+     */
+    private suspend fun finishPendingStop(
+        session: RecordingSessionEntity,
+        operationId: String,
+        commandKind: String,
+        receiptOutcome: String,
+        createdAt: Long,
+    ): RecordingOperationResult? {
+        if (session.status !in setOf(RecordingStatus.STARTING, RecordingStatus.ACTIVE)) return null
+        val pendingStop = pendingStopRequestForSession(session.id) ?: return null
+        val reason = pendingStop.outcome
+            .removePrefix(RecordingReceiptOutcome.STOP_REQUESTED_PREFIX)
+        check(reason.isNotBlank()) { "pending Stop reason is missing" }
+        val open = openSegmentForSession(session.id)
+        val terminalAt = maxOf(
+            pendingStop.createdAt,
+            session.startedAt,
+            open?.startedAt ?: session.startedAt,
+        )
+        val duringStart = session.status == RecordingStatus.STARTING
+        val endReason = if (duringStart) {
+            "STOP_DURING_START:$reason"
+        } else {
+            "STOP:$reason"
+        }
+        if (open != null) {
+            check(closeSegmentRow(session.id, open.id, terminalAt, endReason) == 1)
+        }
+        check(
+            closeSessionRow(
+                sessionId = session.id,
+                expectedStatus = session.status,
+                status = if (duringStart) RecordingStatus.INTERRUPTED else RecordingStatus.COMPLETED,
+                endedAt = terminalAt,
+                stopReason = endReason,
+            ) == 1,
+        )
+        return record(
+            RecordingOperationReceiptEntity(
+                operationId,
+                commandKind,
+                receiptOutcome,
+                session.id,
+                open?.id,
+                createdAt = createdAt,
+            ),
+        )
     }
 
     @Transaction
@@ -378,7 +444,10 @@ internal abstract class RecordingDao {
     ): RecordingOperationResult {
         replay(operationId, commandKind)?.let { return it }
         val session = sessionById(sessionId)
-        if (session?.status != RecordingStatus.STARTING) {
+        if (
+            session?.status != RecordingStatus.STARTING ||
+            pendingStopRequestForSession(sessionId) != null
+        ) {
             return record(RecordingOperationReceiptEntity(operationId, commandKind, RecordingReceiptOutcome.startNotPending(session?.status), sessionId = sessionId, createdAt = createdAt))
         }
         check(activateStartingRow(sessionId, locationOwnerToken) == 1)
@@ -399,6 +468,15 @@ internal abstract class RecordingDao {
     ): RecordingOperationResult {
         replay(operationId, commandKind)?.let { return it }
         val session = sessionById(sessionId)
+        if (session != null) {
+            finishPendingStop(
+                session,
+                operationId,
+                commandKind,
+                RecordingReceiptOutcome.START_FAILED,
+                createdAt,
+            )?.let { return it }
+        }
         if (session?.status != RecordingStatus.STARTING) {
             return record(RecordingOperationReceiptEntity(operationId, commandKind, RecordingReceiptOutcome.startFailureIgnored(session?.status), sessionId = sessionId, createdAt = createdAt))
         }
@@ -446,7 +524,8 @@ internal abstract class RecordingDao {
         val active = sessionById(sessionId)?.takeIf {
             it.status == RecordingStatus.ACTIVE &&
                 it.activeSlot == ACTIVE_SESSION_SLOT &&
-                it.locationOwnerToken == expectedLocationOwnerToken
+                it.locationOwnerToken == expectedLocationOwnerToken &&
+                pendingStopRequestForSession(sessionId) == null
         } ?: return record(
             RecordingOperationReceiptEntity(operationId, commandKind, RecordingReceiptOutcome.LOCATION_SESSION_GUARD, sessionId, createdAt = createdAt),
         )
@@ -491,6 +570,40 @@ internal abstract class RecordingDao {
         return record(RecordingOperationReceiptEntity(operationId, commandKind, RecordingReceiptOutcome.locationAccepted(kind, breakReason), sessionId, destination.id, pointId, createdAt))
     }
 
+    /** Writes user Stop intent without ending the session; recovery consumes it before restart. */
+    @Transaction
+    open suspend fun executeRequestStop(
+        sessionId: Long,
+        requestedAt: Long,
+        reason: String,
+        operationId: String,
+        commandKind: String,
+        createdAt: Long,
+    ): RecordingOperationResult {
+        replay(operationId, commandKind)?.let { return it }
+        require(commandKind == "REQUEST_STOP")
+        require(requestedAt >= 0L && requestedAt == createdAt && reason.isNotBlank()) {
+            "Stop request receipt time must equal the requested time"
+        }
+        val open = sessionById(sessionId)?.status in setOf(
+            RecordingStatus.STARTING,
+            RecordingStatus.ACTIVE,
+        )
+        return record(
+            RecordingOperationReceiptEntity(
+                operationId = operationId,
+                commandKind = commandKind,
+                outcome = if (open) {
+                    RecordingReceiptOutcome.stopRequested(reason)
+                } else {
+                    RecordingReceiptOutcome.STOP_REQUEST_IGNORED
+                },
+                sessionId = sessionId,
+                createdAt = createdAt,
+            ),
+        )
+    }
+
     @Transaction
     open suspend fun executeStop(
         sessionId: Long,
@@ -520,6 +633,13 @@ internal abstract class RecordingDao {
                     createdAt = createdAt,
                 ),
             )
+        finishPendingStop(
+            session,
+            operationId,
+            commandKind,
+            RecordingReceiptOutcome.STOPPED,
+            createdAt,
+        )?.let { return it }
         when (session.status) {
             RecordingStatus.STARTING -> {
                 val open = openSegmentForSession(sessionId)
@@ -597,6 +717,16 @@ internal abstract class RecordingDao {
         createdAt: Long,
     ): RecordingOperationResult {
         replay(operationId, commandKind)?.let { return it }
+        val openSession = reservedSession() ?: activeSession()
+        if (openSession != null) {
+            finishPendingStop(
+                openSession,
+                operationId,
+                commandKind,
+                RecordingReceiptOutcome.RECOVERED_PENDING_STOP,
+                createdAt,
+            )?.let { return it }
+        }
         reservedSession()?.let { pending ->
             val open = openSegmentForSession(pending.id)
             val terminalAt = maxOf(recoveredAt, pending.startedAt, open?.startedAt ?: pending.startedAt)

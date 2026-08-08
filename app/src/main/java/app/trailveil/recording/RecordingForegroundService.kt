@@ -18,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicInteger
@@ -47,6 +48,13 @@ class RecordingForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         latestStartId.updateAndGet { maxOf(it, startId) }
+        // An explicit Stop is already targeting an existing runtime (or is the visible in-app
+        // fallback). Persist that command before doing notification work which could fail and
+        // otherwise divert the service into a technical-interrupt path.
+        if (intent?.action == ACTION_STOP) {
+            commands.trySend(Command.Stop(intent.sessionIdOrNull(), startId))
+            return START_STICKY
+        }
         // This transition deliberately precedes all DB work and LocationManager registration.
         try {
             notifier.show(this, intent?.sessionIdOrNull())
@@ -56,7 +64,6 @@ class RecordingForegroundService : Service() {
         }
 
         when (intent?.action) {
-            ACTION_STOP -> commands.trySend(Command.Stop(intent.sessionIdOrNull(), startId))
             ACTION_START -> commands.trySend(Command.Start(intent.sessionIdOrNull(), startId))
             null -> commands.trySend(Command.StickyRestart(startId))
             else -> {
@@ -114,97 +121,157 @@ class RecordingForegroundService : Service() {
 
     private suspend fun handleStickyRestart(command: Command.StickyRestart) {
         if (collectorJob?.isActive == true) return
-        try {
-            when (dependencies.recordingRepository.recover(
-                dependencies.operationIds.next("service-recovery"), dependencies.clock.epochMillis(),
-            ).disposition) {
-                app.trailveil.data.recording.RecoveryDisposition.ACTIVE_ROTATED -> {
-                    val sessionId = requireNotNull(dependencies.recordingRepository.state().sessionId)
-                    notifier.show(this, sessionId)
-                    startCollector(sessionId)
+        val recovery = RecordingPersistenceRetrier(
+            attempt = {
+                dependencies.recordingRepository.recover(
+                    dependencies.operationIds.next("service-recovery"),
+                    dependencies.clock.epochMillis(),
+                )
+            },
+            retryDelay = { delay(PERSISTENCE_RETRY_MILLIS) },
+        ).runUntilResolved()
+        when (recovery.disposition) {
+            app.trailveil.data.recording.RecoveryDisposition.PENDING_STOP_COMPLETED -> {
+                try {
+                    notifier.showCompleted()
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    // The terminal state is already durable; a confirmation failure cannot
+                    // resurrect the session or justify keeping a location service alive.
                 }
-                app.trailveil.data.recording.RecoveryDisposition.ACTIVE_ALREADY_RECOVERED -> {
-                    // The repository did not grant this service a location-owner token.
-                    stopRuntime(command.startId)
-                }
-                app.trailveil.data.recording.RecoveryDisposition.STARTING_FAILED,
-                app.trailveil.data.recording.RecoveryDisposition.NOTHING_TO_RECOVER ->
-                    stopRuntime(command.startId)
-            }
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            val active = try {
-                dependencies.recordingRepository.state()
-            } catch (cancelled: CancellationException) {
-                throw cancelled
-            } catch (_: Exception) {
-                null
-            }
-            if (active?.sessionId != null && active.lifecycle == RecordingLifecycle.ACTIVE) {
-                interruptThenStop(active.sessionId, TerminalReason.RECOVERY_FAILURE, command.startId)
-            } else {
                 stopRuntime(command.startId)
             }
-        }
-    }
-
-    private suspend fun handleStop(command: Command.Stop) {
-        val current = try {
-            dependencies.recordingRepository.state()
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (_: Exception) {
-            // Stop collection, but do not claim a durable terminal state.
-            stopRuntime(command.startId)
-            return
-        }
-        val sessionId = current.sessionId
-        when (
-            RecordingServicePolicy.notificationStopDecision(
-                command.sessionId,
-                sessionId,
-                current.lifecycle,
-            )
-        ) {
-            NotificationStopDecision.IGNORE_STALE_ACTION -> {
-                val activeSessionId = requireNotNull(sessionId)
+            app.trailveil.data.recording.RecoveryDisposition.ACTIVE_ROTATED -> {
+                val sessionId = requireNotNull(recovery.state.sessionId)
                 try {
-                    notifier.show(this, activeSessionId)
+                    notifier.show(this, sessionId)
+                    startCollector(sessionId)
                 } catch (cancelled: CancellationException) {
                     throw cancelled
                 } catch (_: Exception) {
                     interruptThenStop(
-                        activeSessionId,
+                        sessionId,
                         TerminalReason.FOREGROUND_RESTART_FAILURE,
                         command.startId,
                     )
                 }
-                return
             }
-            NotificationStopDecision.NO_ACTIVE_SESSION -> {
+            app.trailveil.data.recording.RecoveryDisposition.ACTIVE_ALREADY_RECOVERED -> {
+                // The repository did not grant this service a location-owner token.
                 stopRuntime(command.startId)
-                return
             }
-            NotificationStopDecision.STOP_CURRENT_SESSION -> Unit
+            app.trailveil.data.recording.RecoveryDisposition.STARTING_FAILED,
+            app.trailveil.data.recording.RecoveryDisposition.NOTHING_TO_RECOVER ->
+                stopRuntime(command.startId)
         }
-        val activeSessionId = requireNotNull(sessionId)
-        dependencies.recordingServiceState.markStopping(activeSessionId)
-        try {
-            // User intent is the only service path that records COMPLETED.
-            dependencies.recordingRepository.stop(
-                dependencies.operationIds.next("notification-stop"), activeSessionId, dependencies.clock.epochMillis(),
-                TerminalReason.NOTIFICATION_STOP,
-            )
-            // Only after the exploration is durable, and only on the path that completes one, so
-            // the confirmation can never outrun what it is confirming.
-            notifier.showCompleted()
-            stopRuntime(command.startId)
+    }
+
+    private suspend fun handleStop(command: Command.Stop) {
+        // Every production Stop action carries a session id. A generic action must first resolve
+        // one, but a read failure is not permission to stop collection without durable intent.
+        val requestedSessionId = command.sessionId ?: try {
+            dependencies.recordingRepository.state().sessionId
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
-            interruptThenStop(activeSessionId, TerminalReason.NOTIFICATION_STOP_PERSISTENCE_FAILURE, command.startId)
+            return
         }
+        if (requestedSessionId == null) {
+            stopRuntime(command.startId)
+            return
+        }
+        val requestedAt = dependencies.clock.epochMillis()
+        val request = RecordingPersistenceRetrier(
+            attempt = {
+                dependencies.recordingRepository.requestStop(
+                    dependencies.operationIds.next("notification-stop-request"),
+                    requestedSessionId,
+                    requestedAt,
+                    TerminalReason.NOTIFICATION_STOP,
+                )
+            },
+            // Collection remains active until an attempt commits. If this process dies first,
+            // there is intentionally no claim that an uncommitted intent survived.
+            retryDelay = { delay(PERSISTENCE_RETRY_MILLIS) },
+        ).runUntilResolved()
+        if (!request.requested) {
+            val current = try {
+                dependencies.recordingRepository.state()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                return
+            }
+            when (
+                RecordingServicePolicy.notificationStopDecision(
+                    requestedSessionId,
+                    current.sessionId,
+                    current.lifecycle,
+                )
+            ) {
+                NotificationStopDecision.IGNORE_STALE_ACTION -> {
+                    val activeSessionId = requireNotNull(current.sessionId)
+                    try {
+                        notifier.show(this, activeSessionId)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (_: Exception) {
+                        interruptThenStop(
+                            activeSessionId,
+                            TerminalReason.FOREGROUND_RESTART_FAILURE,
+                            command.startId,
+                        )
+                    }
+                    return
+                }
+                NotificationStopDecision.NO_ACTIVE_SESSION -> {
+                    stopRuntime(command.startId)
+                    return
+                }
+                NotificationStopDecision.STOP_CURRENT_SESSION ->
+                    error("an active current session rejected its durable Stop request")
+            }
+        }
+
+        dependencies.recordingServiceState.markStopping(requestedSessionId)
+        // Only now may collection end. The receipt above is what a fresh process will consume if
+        // terminal persistence or this process dies after this line.
+        collectorJob?.cancel()
+        collectorJob = null
+        collectorSessionId = null
+        completePendingUserStop(requestedSessionId, requestedAt, command.startId)
+    }
+
+    private suspend fun completePendingUserStop(
+        sessionId: Long,
+        requestedAt: Long,
+        startId: Int,
+    ) {
+        RecordingPersistenceRetrier(
+            attempt = {
+                dependencies.recordingRepository.stop(
+                    dependencies.operationIds.next("notification-stop"),
+                    sessionId,
+                    requestedAt,
+                    TerminalReason.NOTIFICATION_STOP,
+                )
+            },
+            // Keep the foreground runtime alive but with location collection disabled. Process
+            // death transfers the durable receipt to sticky recovery before collection can resume.
+            retryDelay = { delay(PERSISTENCE_RETRY_MILLIS) },
+        ).runUntilResolved()
+        // Only after the exploration is durable, and only on the path that completes one, so the
+        // confirmation can never outrun what it is confirming. Notification failure does not retry
+        // an already terminal database command or keep the foreground runtime alive.
+        try {
+            notifier.showCompleted()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // The durable completion remains authoritative.
+        }
+        stopRuntime(startId)
     }
 
     private suspend fun handleLocationFailure(command: Command.LocationFailure) {
@@ -377,9 +444,7 @@ class RecordingForegroundService : Service() {
 
     private object TerminalReason {
         const val NOTIFICATION_STOP = "user_notification_stop"
-        const val NOTIFICATION_STOP_PERSISTENCE_FAILURE = "notification_stop_persistence_failure"
         const val START_COMPLETION_FAILURE = "start_completion_failure"
-        const val RECOVERY_FAILURE = "recovery_failure"
         const val LOCATION_STREAM_FAILURE = "location_stream_failure"
         const val LOCATION_DISABLED = "location_disabled"
         const val LOCATION_PERMISSION_REVOKED = "location_permission_revoked"
@@ -400,6 +465,7 @@ class RecordingForegroundService : Service() {
 
     private class LocationPersistenceFailure(cause: Exception) : Exception(cause)
     companion object {
+        private const val PERSISTENCE_RETRY_MILLIS = 1_000L
         const val ACTION_START = "app.trailveil.action.START_RECORDING"
         const val ACTION_STOP = "app.trailveil.action.STOP_RECORDING"
         const val EXTRA_SESSION_ID = "app.trailveil.extra.SESSION_ID"
@@ -425,6 +491,27 @@ class RecordingForegroundService : Service() {
                     putExtra(EXTRA_SESSION_ID, sessionId)
                 },
             )
+        }
+    }
+}
+
+/**
+ * Fail-closed persistence loop. A transient store error cannot authorize the service to advance;
+ * the operation is retried until one transaction returns a committed or idempotent result.
+ */
+internal class RecordingPersistenceRetrier<T>(
+    private val attempt: suspend () -> T,
+    private val retryDelay: suspend () -> Unit,
+) {
+    suspend fun runUntilResolved(): T {
+        while (true) {
+            try {
+                return attempt()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                retryDelay()
+            }
         }
     }
 }

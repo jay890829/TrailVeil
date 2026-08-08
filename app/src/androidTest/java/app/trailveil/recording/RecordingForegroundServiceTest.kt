@@ -152,6 +152,74 @@ class RecordingForegroundServiceTest {
             activity.close()
         }
     }
+
+    @Test
+    fun stickyRecoveryCompletesAPendingUserStopBeforeLocationCanResume() = runBlocking {
+        enableSystemLocation()
+        grant(Manifest.permission.ACCESS_COARSE_LOCATION)
+        grant(Manifest.permission.ACCESS_FINE_LOCATION)
+        val application = context.applicationContext as TrailVeilApplication
+        val repository = application.appContainer.recordingRepository
+        val sessionId = repository.beginStart(
+            operationId("pending-stop-begin"),
+            System.currentTimeMillis(),
+            "instrumentation",
+        ).sessionId
+        val activity = ActivityScenario.launch(MainActivity::class.java)
+        try {
+            activity.onActivity {
+                RecordingForegroundService.startFromVisibleActivity(it, sessionId)
+            }
+            withTimeout(10_000) {
+                while (repository.state().lifecycle != RecordingLifecycle.ACTIVE) delay(50)
+            }
+
+            val requestedAt = System.currentTimeMillis()
+            assertTrue(
+                repository.requestStop(
+                    operationId("pending-stop-request"),
+                    sessionId,
+                    requestedAt,
+                    "user_notification_stop",
+                ).requested,
+            )
+            assertTrue(
+                context.stopService(
+                    Intent(context, RecordingForegroundService::class.java),
+                ),
+            )
+            delay(250)
+            assertEquals(RecordingLifecycle.ACTIVE, repository.state().lifecycle)
+
+            activity.onActivity {
+                ContextCompat.startForegroundService(
+                    it,
+                    Intent(it, RecordingForegroundService::class.java),
+                )
+            }
+            withTimeout(10_000) {
+                while (repository.state().lifecycle != RecordingLifecycle.STOPPED) delay(50)
+            }
+
+            val database = TrailVeilDatabase.open(context)
+            try {
+                val session = requireNotNull(database.recordingDao().sessionById(sessionId))
+                assertEquals(RecordingStatus.COMPLETED, session.status)
+                assertEquals(requestedAt, session.endedAt)
+                assertEquals("STOP:user_notification_stop", session.stopReason)
+                assertTrue(
+                    requireNotNull(database.recordingDao().sessionWithSegments(sessionId))
+                        .segments
+                        .none { it.startReason == "PROCESS_RECOVERY" },
+                )
+            } finally {
+                database.close()
+            }
+        } finally {
+            activity.close()
+        }
+    }
+
     @Test
     fun disablingSystemLocationInterruptsInsteadOfLeavingAnActiveSession() = runBlocking {
         enableSystemLocation()
