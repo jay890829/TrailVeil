@@ -18,9 +18,10 @@ import app.trailveil.feature.history.RecordingHistoryTestTags
 import app.trailveil.feature.recording.RecordingEntryTestTags
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertTrue
-import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -39,78 +40,98 @@ class MapReturnInteractivityTest {
     val composeRule = createAndroidComposeRule<MainActivity>()
 
     @Test
-    @Ignore(
-        "P4-009: committed behavior still rebuilds MapView after history; this timing gate is flaky",
-    )
     fun theMapPansOnTheFirstDragAfterReturningFromHistory() {
         dismissDisclosureIfShown()
         val map = requireNotNull(awaitMap()) { "The map never became ready" }
         composeRule.waitForIdle()
 
-        // Control: the same loop before navigating anywhere, so the measurement below is about
-        // returning from history rather than about how long a drag takes to register at all.
-        val controlBefore = requireNotNull(cameraTarget())
+        // Prime the cold MapLibre surface and the input injector before navigation. Cold-start
+        // readiness is not this task's subject, so the control may retry; the return path below may
+        // not. That preserves the distinction between harness setup and the lost-first-drag defect.
+        var controlBefore = awaitStableCameraTarget(map)
         var controlAttempts = 0
+        var controlMoved = false
         val controlStart = SystemClock.uptimeMillis()
-        while (controlAttempts < CONTROL_ATTEMPT_LIMIT) {
+        while (controlAttempts < CONTROL_ATTEMPT_LIMIT && !controlMoved) {
             controlAttempts += 1
             drag()
-            if (movedFrom(controlBefore)) break
+            controlMoved = runCatching {
+                composeRule.waitUntil(CONTROL_DRAG_RESULT_TIMEOUT_MILLIS) {
+                    movedFrom(map, controlBefore)
+                }
+            }.isSuccess
+            if (!controlMoved) controlBefore = awaitStableCameraTarget(map)
         }
         val controlMillis = SystemClock.uptimeMillis() - controlStart
+        assertTrue("The control drag did not move the map", controlMoved)
 
         composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
         composeRule.onNodeWithTag(RecordingEntryTestTags.History).performClick()
         composeRule.waitUntil(NAVIGATION_TIMEOUT_MILLIS) { historyIsShowing() }
 
+        val popStartedAt = SystemClock.uptimeMillis()
         Espresso.pressBack()
+
+        val mapCallbackRegistered = AtomicBoolean(false)
+        val returnedMap = AtomicReference<MapLibreMap?>(null)
+        val mapReadyAt = AtomicLong(-1L)
+        val historyGoneAt = AtomicLong(-1L)
         composeRule.waitUntil(NAVIGATION_TIMEOUT_MILLIS) {
-            composeRule.onAllNodesWithTag(RecordingEntryTestTags.Menu)
-                .fetchSemanticsNodes()
-                .isNotEmpty()
+            val view = composeRule.runOnIdle { attachedMapView() }
+            if (view != null && mapCallbackRegistered.compareAndSet(false, true)) {
+                composeRule.runOnIdle {
+                    view.getMapAsync { readyMap ->
+                        returnedMap.set(readyMap)
+                        mapReadyAt.compareAndSet(-1L, SystemClock.uptimeMillis())
+                    }
+                }
+            }
+            if (!historyIsShowing()) {
+                historyGoneAt.compareAndSet(-1L, SystemClock.uptimeMillis())
+            }
+            mapReadyAt.get() >= 0L && historyGoneAt.get() >= 0L
         }
 
-        val before = requireNotNull(cameraTarget()) { "No camera position after returning" }
+        val readyMap = requireNotNull(returnedMap.get()) { "No map after returning" }
+        val readyAfterHistoryMillis = (mapReadyAt.get() - historyGoneAt.get()).coerceAtLeast(0L)
+        assertTrue(
+            "The history transition ended ${readyAfterHistoryMillis}ms before the map became ready",
+            readyAfterHistoryMillis <= MAP_READY_AFTER_HISTORY_BUDGET_MILLIS,
+        )
+
+        val before = awaitStableCameraTarget(readyMap)
         // The cover is deliberately still up here: fog has not been rebuilt for this viewport yet,
         // and hiding it early is what P4-008 forbids. What must not happen is the cover eating the
-        // gesture, so the measurement starts while it is still on screen.
+        // first gesture, so exactly one drag is sent after the history transition is gone.
         val coverUp = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
             .fetchSemanticsNodes()
             .isNotEmpty()
         val start = SystemClock.uptimeMillis()
-        var attempts = 0
-        var deadMillis = -1L
-        while (SystemClock.uptimeMillis() - start < INTERACTIVE_TIMEOUT_MILLIS) {
-            attempts += 1
-            drag()
-            if (movedFrom(before)) {
-                deadMillis = SystemClock.uptimeMillis() - start
-                break
+        drag()
+        val firstDragMoved = runCatching {
+            composeRule.waitUntil(DRAG_RESULT_TIMEOUT_MILLIS) {
+                movedFrom(readyMap, before)
             }
-        }
+        }.isSuccess
+        val firstDragMillis = SystemClock.uptimeMillis() - start
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0,
             android.os.Bundle().apply {
                 putString(
                     "stream",
-                    "TrailVeil return-from-history interactivity: deadMillis=$deadMillis " +
-                        "attempts=$attempts controlMillis=$controlMillis " +
-                        "controlAttempts=$controlAttempts coverStillUp=$coverUp " +
-                        "budget=$INTERACTIVE_BUDGET_MILLIS zoom=${map.cameraPosition.zoom}\n",
+                        "TrailVeil return-from-history interactivity: firstDragMoved=$firstDragMoved " +
+                        "firstDragMillis=$firstDragMillis controlMillis=$controlMillis " +
+                        "controlAttempts=$controlAttempts " +
+                        "popMillis=${historyGoneAt.get() - popStartedAt} " +
+                        "mapReadyAfterHistoryMillis=$readyAfterHistoryMillis " +
+                        "coverStillUp=$coverUp zoom=${readyMap.cameraPosition.zoom}\n",
                 )
             },
         )
         assertTrue(
-            "The map never accepted a drag after returning from history",
-            deadMillis >= 0L,
-        )
-        // Measured against the same device's own responsiveness a moment earlier, not against a
-        // fixed number: one drag costs ~100 ms of injected events, and a loaded emulator can need
-        // several before MapLibre's detector takes one. Only the difference is about navigation.
-        assertTrue(
-            "Drags after returning were ignored for ${deadMillis}ms ($attempts attempts) against " +
-                "a control of ${controlMillis}ms ($controlAttempts attempts) on the same device",
-            deadMillis <= controlMillis + INTERACTIVE_BUDGET_MILLIS,
+            "The first drag after the history transition did not move the map; " +
+                "control moved in ${controlMillis}ms",
+            firstDragMoved,
         )
     }
 
@@ -136,35 +157,60 @@ class MapReturnInteractivityTest {
         composeRule.onAllNodesWithTag(tag).fetchSemanticsNodes().isNotEmpty()
     }
 
-    private fun movedFrom(before: LatLng): Boolean {
-        val now = cameraTarget() ?: return false
+    private fun movedFrom(map: MapLibreMap, before: LatLng): Boolean {
+        val now = cameraTarget(map)
         return Math.abs(now.latitude - before.latitude) > MOVEMENT_TOLERANCE_DEGREES ||
             Math.abs(now.longitude - before.longitude) > MOVEMENT_TOLERANCE_DEGREES
     }
 
-    private fun cameraTarget(): LatLng? = composeRule.runOnIdle {
-        attachedMapView()?.let { view ->
-            val found = AtomicReference<LatLng?>(null)
-            view.getMapAsync { map -> found.set(map.cameraPosition.target) }
-            found.get()
+    private fun cameraTarget(map: MapLibreMap): LatLng =
+        composeRule.runOnIdle {
+            requireNotNull(map.cameraPosition.target) { "Map camera has no target" }
         }
+
+    private fun awaitStableCameraTarget(map: MapLibreMap): LatLng {
+        var previous: LatLng? = null
+        var latest: LatLng? = null
+        var stablePolls = 0
+        composeRule.waitUntil(CAMERA_STABILITY_TIMEOUT_MILLIS) {
+            val current = cameraTarget(map)
+            latest = current
+            val last = previous
+            stablePolls = if (
+                last != null &&
+                Math.abs(current.latitude - last.latitude) <= MOVEMENT_TOLERANCE_DEGREES &&
+                Math.abs(current.longitude - last.longitude) <= MOVEMENT_TOLERANCE_DEGREES
+            ) {
+                stablePolls + 1
+            } else {
+                0
+            }
+            previous = current
+            stablePolls >= CAMERA_STABLE_POLL_COUNT
+        }
+        return requireNotNull(latest) { "Map camera never produced a stable target" }
     }
 
     private fun drag() {
-        val view = composeRule.runOnIdle { attachedMapView() } ?: return
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() }) {
+            "No attached MapView for drag"
+        }
         val location = IntArray(2)
         composeRule.runOnIdle { view.getLocationOnScreen(location) }
-        val x = (location[0] + view.width / 2).toFloat()
-        val fromY = (location[1] + view.height * 2 / 3).toFloat()
-        val toY = (location[1] + view.height / 3).toFloat()
+        // The initial camera may be at MapLibre's device-specific minimum zoom, where the world
+        // height is constrained to the viewport and a vertical drag can be correctly clamped.
+        // Longitude wraps, so a horizontal drag remains a valid input-acceptance signal there.
+        val fromX = (location[0] + view.width * 2 / 3).toFloat()
+        val toX = (location[0] + view.width / 3).toFloat()
+        val y = (location[1] + view.height / 2).toFloat()
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val downTime = SystemClock.uptimeMillis()
         instrumentation.sendPointerSync(
-            MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, fromY, 0),
+            MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, fromX, y, 0),
         )
         repeat(DRAG_STEPS) { step ->
             SystemClock.sleep(DRAG_STEP_MILLIS)
-            val y = fromY + (toY - fromY) * (step + 1) / DRAG_STEPS
+            val x = fromX + (toX - fromX) * (step + 1) / DRAG_STEPS
             instrumentation.sendPointerSync(
                 MotionEvent.obtain(
                     downTime,
@@ -181,8 +227,8 @@ class MapReturnInteractivityTest {
                 downTime,
                 SystemClock.uptimeMillis(),
                 MotionEvent.ACTION_UP,
-                x,
-                toY,
+                toX,
+                y,
                 0,
             ),
         )
@@ -221,22 +267,22 @@ class MapReturnInteractivityTest {
 
     private companion object {
         const val NAVIGATION_TIMEOUT_MILLIS = 20_000L
-        const val INTERACTIVE_TIMEOUT_MILLIS = 20_000L
 
         /**
-         * Headroom over the control, not an absolute deadline. Measured 3,234 ms before the safety
-         * cover stopped consuming touches, and 628–1,033 ms after it across three consecutive
-         * runs. The remainder is a genuinely new `MapView`: navigation discards the destination,
-         * so its GL surface has to be created again before MapLibre's gesture detector exists at
-         * all. Closing that gap means keeping the map alive across navigation, which is still open
-         * work — this budget guards the part already won.
+         * Engineering headroom after the visible 180 ms navigation transition, not a universal
+         * human-perception threshold. The accepted transition is meant to cover MapView startup;
+         * a longer hidden tail would recreate the user's original ambiguity.
          */
-        const val INTERACTIVE_BUDGET_MILLIS = 1_500L
+        const val MAP_READY_AFTER_HISTORY_BUDGET_MILLIS = 250L
+        const val DRAG_RESULT_TIMEOUT_MILLIS = 1_000L
+        const val CONTROL_DRAG_RESULT_TIMEOUT_MILLIS = 500L
+        const val CAMERA_STABILITY_TIMEOUT_MILLIS = 2_000L
         const val MAP_READY_TIMEOUT_SECONDS = 20L
         const val MOVEMENT_TOLERANCE_DEGREES = 1e-6
         const val DRAG_STEPS = 6
         const val DRAG_STEP_MILLIS = 16L
         const val CONTROL_ATTEMPT_LIMIT = 10
+        const val CAMERA_STABLE_POLL_COUNT = 2
         const val DISCLOSURE_POLLS = 40
         const val POLL_MILLIS = 100L
     }

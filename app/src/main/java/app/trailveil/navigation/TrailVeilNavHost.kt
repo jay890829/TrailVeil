@@ -1,6 +1,8 @@
 package app.trailveil.navigation
 
 import androidx.activity.ComponentActivity
+import androidx.compose.animation.AnimatedContentTransitionScope
+import androidx.compose.animation.core.tween
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -47,13 +49,29 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
         navController = navController,
         startDestination = RecordingRoute,
     ) {
-        composable(RecordingRoute) {
+        composable(
+            route = RecordingRoute,
+            popEnterTransition = {
+                slideIntoContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Right,
+                    animationSpec = tween(HistoryPopDurationMillis),
+                )
+            },
+        ) {
             RecordingEntryRoute(
                 activity = activity,
                 onOpenHistory = { navController.navigate(HistoryRoute) },
             )
         }
-        composable(HistoryRoute) {
+        composable(
+            route = HistoryRoute,
+            popExitTransition = {
+                slideOutOfContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Right,
+                    animationSpec = tween(HistoryPopDurationMillis),
+                )
+            },
+        ) {
             RecordingHistoryListRoute(
                 history = history,
                 onOpenSession = { sessionId ->
@@ -76,6 +94,8 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
         }
     }
 }
+
+private const val HistoryPopDurationMillis = 180
 
 @Composable
 private fun RecordingHistoryListRoute(
