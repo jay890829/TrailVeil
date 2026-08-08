@@ -935,7 +935,7 @@ class MapSurfaceTest {
         provider = ProductionMapProvider,
         requireOnlineStyle = true,
         savedStateKey = "trailveil.map.fog-antimeridian-out-test",
-        gesture = ::pinchOutInSteps,
+        gesture = ::frameAuditedPinchOutInSteps,
         startPoint = ANTIMERIDIAN,
         startZoom = 1.6,
         minimumZoomChange = ANTIMERIDIAN_ZOOM_CHANGE,
@@ -954,7 +954,7 @@ class MapSurfaceTest {
         provider = ProductionMapProvider,
         requireOnlineStyle = true,
         savedStateKey = "trailveil.map.fog-antimeridian-in-test",
-        gesture = ::pinchInInSteps,
+        gesture = ::frameAuditedQuickZoomInInSteps,
         startPoint = ANTIMERIDIAN,
         startZoom = 0.0,
         expectZoomOut = false,
@@ -1028,6 +1028,7 @@ class MapSurfaceTest {
         val database = inMemoryDatabase()
         try {
             val fogRendered = AtomicBoolean(false)
+            val fogFailure = AtomicReference<Throwable?>(null)
             revealTrack(database, REVEALED_CENTER)
             val cameraRequest = mutableStateOf(
                 MapCameraRequest(requestId = 1L, point = REVEALED_CENTER, zoom = 3.0),
@@ -1048,9 +1049,15 @@ class MapSurfaceTest {
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
                     onFogRendered = { fogRendered.set(true) },
+                    onFogFailure = { failure -> fogFailure.set(failure) },
                 )
             }
-            composeRule.waitUntil(timeoutMillis = 30_000L) { fogRendered.get() }
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                fogRendered.get() || fogFailure.get() != null
+            }
+            fogFailure.get()?.let { failure ->
+                throw AssertionError("The initial side-band fog install failed", failure)
+            }
             val map = checkNotNull(awaitMap()) { "The map never became ready" }
 
             val trace = StringBuilder()
@@ -1071,17 +1078,22 @@ class MapSurfaceTest {
             }
 
             fun assertGroundBesideTheMosaicIsCoveredOnce(label: String) {
-                val west = map.fogLayerVisibility(FogBackdropIds.WestLayer)
-                val east = map.fogLayerVisibility(FogBackdropIds.EastLayer)
-                val wrapped = map.fogLayerVisibility(FogBackdropIds.WrappedSideLayer)
-                trace.append("\n $label west=$west east=$east wrapped=$wrapped")
-                val wrappedDrawn = wrapped == Property.VISIBLE
-                val sidesDrawn = west == Property.VISIBLE
-                assertEquals("$label: the side bands disagree with each other", west, east)
+                val westDrawn = map.fogLayerIsRendered(FogBackdropIds.WestLayer)
+                val eastDrawn = map.fogLayerIsRendered(FogBackdropIds.EastLayer)
+                val wrappedDrawn = map.fogLayerIsRendered(FogBackdropIds.WrappedSideLayer)
+                trace.append(
+                    "\n $label west=$westDrawn east=$eastDrawn wrapped=$wrappedDrawn",
+                )
+                val sidesDrawn = westDrawn
+                assertEquals(
+                    "$label: the side bands disagree with each other",
+                    westDrawn,
+                    eastDrawn,
+                )
                 assertTrue(
                     "$label: the ground beside the mosaic is covered " +
                         (if (wrappedDrawn) "twice" else "not at all") +
-                        " (west=$west east=$east wrapped=$wrapped)",
+                        " (west=$westDrawn east=$eastDrawn wrapped=$wrappedDrawn)",
                     sidesDrawn != wrappedDrawn,
                 )
             }
@@ -1170,6 +1182,7 @@ class MapSurfaceTest {
                 }
                 Thread.sleep(ZOOM_SETTLE_MILLIS)
                 val visibility = ALL_FOG_LAYERS.associateWith { map.fogLayerVisibility(it) }
+                val renderedLayers = ALL_FOG_LAYERS.filter { map.fogLayerIsRendered(it) }
                 val audit = map.auditFogCoverage()
                 report.append(
                     "\n z=${"%.2f".format(java.util.Locale.US, map.cameraPosition.zoom)} " +
@@ -1183,8 +1196,8 @@ class MapSurfaceTest {
                 // coat, and where each one really is. Localising this by hand cost a run apiece.
                 if (audit.overFoggedFraction > MAXIMUM_SETTLED_SEAM_FRACTION) {
                     map.setFogLayersVisible(false)
-                    val bare = map.snapshotPixels()
-                    ALL_FOG_LAYERS.filter { visibility[it] == Property.VISIBLE }.forEach { id ->
+                    val bare = map.snapshotStableBarePixels("settled seam diagnostic")
+                    renderedLayers.forEach { id ->
                         map.setSingleFogLayerVisible(id, true)
                         val only = compareFogCoverage(map.snapshotPixels(), bare, snapshotWidth())
                         map.setSingleFogLayerVisible(id, false)
@@ -1192,7 +1205,7 @@ class MapSurfaceTest {
                             .append(only.report())
                     }
                     map.restoreFogLayerVisibility(visibility)
-                    ALL_FOG_LAYERS.filter { visibility[it] == Property.VISIBLE }.forEach { id ->
+                    renderedLayers.forEach { id ->
                         map.setSingleFogLayerVisible(id, false)
                         val without =
                             compareFogCoverage(map.snapshotPixels(), bare, snapshotWidth())
@@ -1303,9 +1316,10 @@ class MapSurfaceTest {
                 // Read before anything is hidden: which quads are drawn depends on the camera, so
                 // a reading taken afterwards would describe the harness rather than the app.
                 val visibility = ALL_FOG_LAYERS.associateWith { map.fogLayerVisibility(it) }
+                val renderedLayers = ALL_FOG_LAYERS.filter { map.fogLayerIsRendered(it) }
                 report.append("\n z=${"%.2f".format(java.util.Locale.US, zoom)}")
                 map.setFogLayersVisible(false)
-                ALL_FOG_LAYERS.filter { visibility[it] == Property.VISIBLE }.forEach { id ->
+                renderedLayers.forEach { id ->
                     val only = map.measureQuadAlone(id)
                     isolations += 1
                     report.append("\n  only ${id.removePrefix("trailveil-")} -> ")
@@ -1358,7 +1372,7 @@ class MapSurfaceTest {
      * seconds over seven layers, and a basemap that is still loading changes underneath it.
      */
     private fun MapLibreMap.measureQuadAlone(id: String): FogAudit {
-        val bare = snapshotPixels()
+        val bare = snapshotStableBarePixels("single-quad reference for $id")
         setSingleFogLayerVisible(id, true)
         val only = snapshotPixels()
         setSingleFogLayerVisible(id, false)
@@ -1369,6 +1383,36 @@ class MapSurfaceTest {
         val captured = AtomicReference<String?>(null)
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
             captured.set(style?.getLayer(id)?.visibility?.value)
+        }
+        return captured.get()
+    }
+
+    /** What the renderer selects after visibility and the installed camera-zoom opacity step. */
+    private fun MapLibreMap.fogLayerIsRendered(id: String): Boolean {
+        val captured = AtomicBoolean(false)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val layer = style?.getLayer(id)
+            val zoom = cameraPosition.zoom
+            val hasWrappedBand = style?.getLayer(FogBackdropIds.WrappedSideLayer) != null
+            val zoomOpacityIsVisible = when (id) {
+                FogOverlayIds.WestRepeatLayer,
+                FogOverlayIds.EastRepeatLayer,
+                FogBackdropIds.WestWorldLayer,
+                FogBackdropIds.EastWorldLayer,
+                -> zoom >= WORLD_COPY_RENDER_EDGE_ZOOM
+
+                FogBackdropIds.WrappedSideLayer -> zoom < WORLD_COPY_RENDER_EDGE_ZOOM
+                FogBackdropIds.WestLayer,
+                FogBackdropIds.EastLayer,
+                -> !hasWrappedBand || zoom >= WORLD_COPY_RENDER_EDGE_ZOOM
+
+                else -> true
+            }
+            captured.set(
+                layer != null &&
+                    layer.visibility.value != Property.NONE &&
+                    zoomOpacityIsVisible,
+            )
         }
         return captured.get()
     }
@@ -1787,6 +1831,10 @@ class MapSurfaceTest {
     private fun pinchOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
         pinchInSteps(map, onHold, zoomIn = false)
 
+    /** Zoom-1 transition gate: one fully rendered coverage audit after every pointer move. */
+    private fun frameAuditedPinchOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
+        pinchInSteps(map, onHold, zoomIn = false, auditEveryMove = true)
+
     /**
      * A pinch that uses the whole screen rather than its shorter edge.
      *
@@ -1807,9 +1855,6 @@ class MapSurfaceTest {
             spanEdge = PinchSpanEdge.TALLEST,
             auditEveryMove = true,
         )
-
-    private fun pinchInInSteps(map: MapLibreMap, onHold: () -> Unit) =
-        pinchInSteps(map, onHold, zoomIn = true)
 
     private enum class PinchSpanEdge { SHORTEST, TALLEST }
 
@@ -1919,21 +1964,20 @@ class MapSurfaceTest {
         // Engagement first, with nothing measured. An attempt that never reaches MapLibre's scale
         // detector is abandoned here, so a restarted pinch cannot contribute a frame — and the
         // frames that are measured all belong to one gesture over one installed overlay.
-        // A long pinch first opens slightly so MapLibre's scale detector owns the stream before the
-        // inward travel begins. Otherwise its touch slop consumes roughly half a zoom level and a
-        // geometrically four-level stream only moves the camera about 3.7 levels. This remains one
-        // uninterrupted two-pointer gesture; the ordinary shorter driver keeps its established
-        // inward engagement path.
-        val engageSpan = when (spanEdge) {
-            PinchSpanEdge.SHORTEST ->
-                startSpan + (endSpan - startSpan) * PINCH_ENGAGE_TRAVEL
-            PinchSpanEdge.TALLEST -> startSpan * LONG_PINCH_ENGAGE_EXPANSION
-        }
+        // Engage with the inward travel already proven by the ordinary pinch. Expanding the tall
+        // stream first let the move detector own all four attempts on API 36, while a five-percent
+        // inward probe remained below its effective touch slop. The >=4.0 zoom assertion remains
+        // the authority on whether the tall stream leaves enough measured travel afterwards.
+        val engageSpan = startSpan + (endSpan - startSpan) * PINCH_ENGAGE_TRAVEL
         repeat(PINCH_ENGAGE_MOVES) { move ->
             val span = startSpan + (engageSpan - startSpan) * (move + 1) / PINCH_ENGAGE_MOVES
             send(MotionEvent.ACTION_MOVE, 2, span, SystemClock.uptimeMillis())
             SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
         }
+        // Input injection is synchronous, but the camera value is published with the renderer's
+        // work. Reading it immediately can call an engaged zoom-in attempt a miss under full-suite
+        // load. This is setup only; the acceptance path below still audits each of its own moves.
+        map.awaitFullyRenderedFrame(view)
         val engagement = if (spanEdge == PinchSpanEdge.TALLEST) {
             kotlin.math.abs(map.cameraPosition.zoom - zoomAtTouchDown)
         } else if (zoomIn) {
@@ -1949,24 +1993,61 @@ class MapSurfaceTest {
             return false
         }
 
-        val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
-        repeat(moves) { move ->
-            val span = engageSpan + (endSpan - engageSpan) * (move + 1) / moves
-            send(MotionEvent.ACTION_MOVE, 2, span, SystemClock.uptimeMillis())
-            SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
-            if (auditEveryMove) {
-                map.awaitFullyRenderedFrame(view)
-                onHold()
-            } else if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
-                Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
-                onHold()
+        // The tall stream spends enough inward travel to engage reliably that only about 3.7
+        // levels remain. Once the scale detector owns the uninterrupted stream, reopen to the
+        // original span and use the whole inward path for the per-move audit. These setup moves
+        // stay near zoom 16, inside the already-proven surround; every move of the acceptance path
+        // from the reopened span to [endSpan] is still audited below.
+        var currentSpan = engageSpan
+        var streamEnded = false
+        try {
+            val measuredStartSpan = if (spanEdge == PinchSpanEdge.TALLEST) {
+                repeat(PINCH_REOPEN_MOVES) { move ->
+                    currentSpan = engageSpan +
+                        (startSpan - engageSpan) * (move + 1) / PINCH_REOPEN_MOVES
+                    send(MotionEvent.ACTION_MOVE, 2, currentSpan, SystemClock.uptimeMillis())
+                    SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+                }
+                startSpan
+            } else {
+                engageSpan
+            }
+
+            val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
+            repeat(moves) { move ->
+                currentSpan = measuredStartSpan +
+                    (endSpan - measuredStartSpan) * (move + 1) / moves
+                send(MotionEvent.ACTION_MOVE, 2, currentSpan, SystemClock.uptimeMillis())
+                SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+                if (auditEveryMove) {
+                    map.awaitFullyRenderedFrame(view)
+                    onHold()
+                } else if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
+                    Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
+                    onHold()
+                }
+            }
+            lift(endSpan)
+            streamEnded = true
+            return true
+        } finally {
+            if (!streamEnded) {
+                // An assertion in a per-move audit must not leave two pointers down and poison
+                // every test that follows it. Preserve the original failure if the window itself
+                // has already gone away and the best-effort cancellation is rejected.
+                runCatching {
+                    send(
+                        MotionEvent.ACTION_CANCEL,
+                        2,
+                        currentSpan,
+                        SystemClock.uptimeMillis(),
+                    )
+                }
             }
         }
-        lift(endSpan)
-        return true
     }
 
-    /** Requests and waits for a fully rendered frame at the camera state produced by the last move. */
+    /** Requests and waits for a fully rendered frame at the current camera and style state. */
     private fun MapLibreMap.awaitFullyRenderedFrame(view: MapView) {
         val ready = CountDownLatch(1)
         lateinit var listener: MapView.OnDidFinishRenderingFrameListener
@@ -1982,7 +2063,7 @@ class MapSurfaceTest {
         }
         try {
             assertTrue(
-                "MapLibre did not fully render the camera state produced by a pinch move",
+                "MapLibre did not fully render the requested camera and style state",
                 ready.await(SNAPSHOT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
             )
         } finally {
@@ -2044,9 +2125,21 @@ class MapSurfaceTest {
 
     /**
      * One finger: tap, then press and drag. MapLibre reads that as a zoom through a detector the
-     * pinch never touches, and dragging up is the direction that zooms out.
+     * pinch never touches; dragging up zooms out and dragging down zooms in.
      */
-    private fun quickZoomOutInSteps(@Suppress("UNUSED_PARAMETER") map: MapLibreMap, onHold: () -> Unit) {
+    private fun quickZoomOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
+        quickZoomInSteps(map, onHold, zoomIn = false, auditEveryMove = false)
+
+    /** The reverse zoom-1 transition, audited after every move without lifting the held tap. */
+    private fun frameAuditedQuickZoomInInSteps(map: MapLibreMap, onHold: () -> Unit) =
+        quickZoomInSteps(map, onHold, zoomIn = true, auditEveryMove = true)
+
+    private fun quickZoomInSteps(
+        map: MapLibreMap,
+        onHold: () -> Unit,
+        zoomIn: Boolean,
+        auditEveryMove: Boolean,
+    ) {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         val centerX = view.width / 2f
         val centerY = view.height / 2f
@@ -2077,15 +2170,29 @@ class MapSurfaceTest {
         SystemClock.sleep(TAP_DURATION_MILLIS)
         val travel = view.height * QUICK_ZOOM_TRAVEL_FRACTION
         val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
-        repeat(moves) { move ->
-            send(holdDown, MotionEvent.ACTION_MOVE, centerY - travel * (move + 1) / moves)
-            SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
-            if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
-                Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
-                onHold()
+        val direction = if (zoomIn) 1f else -1f
+        var currentY = centerY
+        var streamEnded = false
+        try {
+            repeat(moves) { move ->
+                currentY = centerY + direction * travel * (move + 1) / moves
+                send(holdDown, MotionEvent.ACTION_MOVE, currentY)
+                SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+                if (auditEveryMove) {
+                    map.awaitFullyRenderedFrame(view)
+                    onHold()
+                } else if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
+                    Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
+                    onHold()
+                }
+            }
+            send(holdDown, MotionEvent.ACTION_UP, currentY)
+            streamEnded = true
+        } finally {
+            if (!streamEnded) {
+                runCatching { send(holdDown, MotionEvent.ACTION_CANCEL, currentY) }
             }
         }
-        send(holdDown, MotionEvent.ACTION_UP, centerY - travel)
     }
 
     private fun fogGeneration(): Any? = composeRule.runOnIdle {
@@ -2457,27 +2564,34 @@ class MapSurfaceTest {
                 .resources
                 .displayMetrics
             val centerX = metrics.widthPixels / 2f
+            val gestureFailure = AtomicReference<Throwable?>(null)
             val gestures = Thread {
-                repeat(SUSTAINED_DRAG_COUNT) {
-                    dragVertically(
-                        x = centerX,
-                        fromY = metrics.heightPixels * 0.78f,
-                        toY = metrics.heightPixels * 0.22f,
-                        steps = 24,
-                        stepMillis = 12L,
-                        lift = false,
-                    )
-                }
-                repeat(FLING_COUNT) {
-                    dragVertically(
-                        x = centerX,
-                        fromY = metrics.heightPixels * 0.80f,
-                        toY = metrics.heightPixels * 0.20f,
-                        steps = 6,
-                        stepMillis = 3L,
-                        lift = true,
-                    )
-                    Thread.sleep(FLING_SETTLE_MILLIS)
+                try {
+                    repeat(SUSTAINED_DRAG_COUNT) {
+                        dragVertically(
+                            x = centerX,
+                            fromY = metrics.heightPixels * 0.78f,
+                            toY = metrics.heightPixels * 0.22f,
+                            steps = 24,
+                            stepMillis = 12L,
+                            lift = false,
+                        )
+                    }
+                    repeat(FLING_COUNT) {
+                        dragVertically(
+                            x = centerX,
+                            fromY = metrics.heightPixels * 0.80f,
+                            toY = metrics.heightPixels * 0.20f,
+                            steps = 6,
+                            stepMillis = 3L,
+                            lift = true,
+                        )
+                        Thread.sleep(FLING_SETTLE_MILLIS)
+                    }
+                } catch (failure: Throwable) {
+                    // An uncaught exception on this target-process thread kills instrumentation
+                    // before the manifest gate can report which cases were lost.
+                    gestureFailure.set(failure)
                 }
             }
             gestures.start()
@@ -2510,6 +2624,9 @@ class MapSurfaceTest {
                 }
             }
             gestures.join()
+            gestureFailure.get()?.let { failure ->
+                throw AssertionError("The sustained input stream failed", failure)
+            }
             val settled = map.renderedFogCoverage()
             val diagnostics = AtomicReference("")
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
@@ -2687,6 +2804,35 @@ class MapSurfaceTest {
     }
 
     /**
+     * The production comparator must reject a reference that changes underneath it without adding
+     * a brightness floor that would hide a real leak over dark ocean tiles.
+     */
+    @Test
+    fun bareReferenceMustBeStableAndTheComparatorStillDetectsADarkLeak() {
+        val incomplete = intArrayOf(gray(1), gray(1), gray(1), gray(1))
+        val painted = intArrayOf(gray(18), gray(22), gray(26), gray(28))
+
+        assertTrue(
+            "An incomplete reference was accepted after the basemap changed",
+            !referenceFramesAreStable(incomplete, painted),
+        )
+        assertTrue(
+            "Two identical dark-ocean references were rejected",
+            referenceFramesAreStable(painted, painted.copyOf()),
+        )
+
+        val fogged = intArrayOf(gray(5), gray(6), painted[2], gray(8))
+        val audit = compareFogCoverage(fogged, painted, width = 2)
+        assertEquals(
+            "The stable-reference rule blinded the detector to an actual missing-fog pixel",
+            0.25,
+            audit.uncoveredFraction,
+            0.0,
+        )
+        assertEquals(1.0, audit.drawnFraction, 0.0)
+    }
+
+    /**
      * Whether each pixel of the rendered map actually has fog over it, measured against the same
      * frame with the fog layers hidden.
      *
@@ -2706,7 +2852,7 @@ class MapSurfaceTest {
         // app never produces — two coats where it draws one.
         val visibility = ALL_FOG_LAYERS.associateWith { fogLayerVisibility(it) }
         setFogLayersVisible(false)
-        val bare = snapshotPixels()
+        val bare = snapshotStableBarePixels("fog coverage reference")
         restoreFogLayerVisibility(visibility)
         return compareFogCoverage(fogged, bare, snapshotWidth())
     }
@@ -2720,8 +2866,8 @@ class MapSurfaceTest {
     private fun MapLibreMap.auditWithFogRemoved(): FogAudit {
         val visibility = ALL_FOG_LAYERS.associateWith { fogLayerVisibility(it) }
         setFogLayersVisible(false)
-        val first = snapshotPixels()
-        val second = snapshotPixels()
+        val first = snapshotStableBarePixels("fog-removed calibration first reference")
+        val second = snapshotStableBarePixels("fog-removed calibration second reference")
         restoreFogLayerVisibility(visibility)
         return compareFogCoverage(first, second, snapshotWidth())
     }
@@ -2829,6 +2975,48 @@ class MapSurfaceTest {
     private fun snapshotWidth(): Int =
         requireNotNull(composeRule.runOnIdle { attachedMapView() }).width
 
+    /**
+     * A fog comparison is meaningful only after the no-fog reference has stopped changing. A
+     * `fullyRendered` callback prevents accepting an in-progress renderer frame; requiring two
+     * bit-identical snapshots then prevents a tile that lands between the paired captures from
+     * being reported as missing fog. This deliberately has no luminance floor: OpenFreeMap ocean
+     * tiles are dark, and a real leak there must remain judgeable.
+     */
+    private fun MapLibreMap.snapshotStableBarePixels(label: String): IntArray {
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        var previous: IntArray? = null
+        var changedPixels = -1L
+        repeat(BARE_REFERENCE_STABILITY_ATTEMPTS) { attempt ->
+            if (attempt > 0) SystemClock.sleep(BARE_REFERENCE_STABILITY_RETRY_MILLIS)
+            awaitFullyRenderedFrame(view)
+            val current = snapshotPixels()
+            val prior = previous
+            if (prior != null) {
+                changedPixels = changedPixelCount(prior, current)
+                if (changedPixels == 0L) return current
+            }
+            previous = current
+        }
+        assertTrue(
+            "$label never produced two identical fully rendered snapshots; " +
+                "lastChangedPixels=$changedPixels",
+            false,
+        )
+        return requireNotNull(previous)
+    }
+
+    private fun referenceFramesAreStable(first: IntArray, second: IntArray): Boolean =
+        changedPixelCount(first, second) == 0L
+
+    private fun changedPixelCount(first: IntArray, second: IntArray): Long {
+        assertEquals("Snapshot sizes differ", first.size, second.size)
+        var changed = 0L
+        first.indices.forEach { index ->
+            if (first[index] != second[index]) changed += 1L
+        }
+        return changed
+    }
+
     private fun MapLibreMap.snapshotPixels(): IntArray {
         val ready = CountDownLatch(1)
         val captured = AtomicReference<Bitmap?>(null)
@@ -2854,6 +3042,9 @@ class MapSurfaceTest {
             150 * ((pixel shr 8) and 0xff) +
             29 * (pixel and 0xff)
         ) shr 8
+
+    private fun gray(value: Int): Int =
+        (0xff shl 24) or (value shl 16) or (value shl 8) or value
 
     private data class FogAudit(
         val uncoveredFraction: Double,
@@ -2991,6 +3182,8 @@ class MapSurfaceTest {
         const val FOG_STATUS_SETTLE_MILLIS = 2_000L
         const val REVEALED_POINT_COUNT = 40
         const val SNAPSHOT_TIMEOUT_SECONDS = 10L
+        const val BARE_REFERENCE_STABILITY_ATTEMPTS = 12
+        const val BARE_REFERENCE_STABILITY_RETRY_MILLIS = 50L
         const val UNFOGGED_LUMINANCE = 150
         const val MINIMUM_REVEALED_FRACTION = 0.01
 
@@ -3164,9 +3357,7 @@ class MapSurfaceTest {
         const val PINCH_START_SPAN_FRACTION = 0.75f
         const val PINCH_END_SPAN_FRACTION = 0.06f
         const val LONG_PINCH_START_SPAN_FRACTION = 0.82f
-        const val LONG_PINCH_END_SPAN_FRACTION = 0.021f
-        const val LONG_PINCH_ENGAGE_EXPANSION = 1.10f
-
+        const val LONG_PINCH_END_SPAN_FRACTION = 0.019f
         /**
          * How many times a pinch may be started over before the test gives up. Injected two-finger
          * streams do not always reach MapLibre's scale detector — about one attempt in three ends
@@ -3177,6 +3368,7 @@ class MapSurfaceTest {
          */
         const val PINCH_ATTEMPTS = 4
         const val PINCH_ENGAGE_MOVES = 8
+        const val PINCH_REOPEN_MOVES = 8
         const val PINCH_ENGAGE_TRAVEL = 0.30f
         const val MINIMUM_PINCH_ENGAGEMENT = 0.03
         const val PINCH_RETRY_SETTLE_MILLIS = 2_500L
@@ -3205,6 +3397,7 @@ class MapSurfaceTest {
 
         /** Either side of the measured edge, and one well clear of it. */
         val WORLD_COPY_EDGE_ZOOMS = listOf(0.98, 1.0, 1.6)
+        const val WORLD_COPY_RENDER_EDGE_ZOOM = 1.0
 
         /** Far enough east that the revealed track stays off screen all the way out of zoom 16. */
         val UNEXPLORED_NEAR_REVEALED = GeoPoint(25.0330, 121.9000)

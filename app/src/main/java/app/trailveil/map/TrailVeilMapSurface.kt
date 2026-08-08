@@ -44,7 +44,6 @@ import androidx.savedstate.compose.LocalSavedStateRegistryOwner
 import app.trailveil.R
 import app.trailveil.map.fog.FogBackdropGeometry
 import app.trailveil.map.fog.FogPixelMask
-import app.trailveil.map.fog.FogSideBands
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogSurroundExtent
 import app.trailveil.map.fog.FogTileBounds
@@ -69,6 +68,7 @@ import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapLibreMapOptions
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
+import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.CircleLayer
 import org.maplibre.android.style.layers.LineLayer
 import org.maplibre.android.style.layers.Property
@@ -501,15 +501,6 @@ internal fun TrailVeilMapSurface(
         fogViewportGeneration += 1L
     }
 
-    // Updated on every dispatched camera-move callback, and applied once after each install so a
-    // fresh overlay does not wait for the first callback to be right. MapLibre dispatches these
-    // callbacks through a Handler, so this is not a renderer-atomic switch.
-    fun applyWorldCopyVisibility() {
-        val style = readyStyle ?: return
-        val map = readyMap ?: return
-        style.setFogWorldCopiesVisible(map.cameraPosition.zoom >= LIVE_WORLD_COPY_ZOOM)
-    }
-
     fun surroundHoldsForCamera(): Boolean {
         val extent = installedSurround ?: return true
         val map = readyMap ?: return true
@@ -665,7 +656,6 @@ internal fun TrailVeilMapSurface(
             // therefore does not depend on this reaction; long tilted gestures can request the cover
             // at their final audited state.
             val moveListener = MapLibreMap.OnCameraMoveListener {
-                applyWorldCopyVisibility()
                 if (fogCoverageInstalled && !surroundHoldsForCamera()) {
                     fogCoverageInstalled = false
                 }
@@ -732,7 +722,6 @@ internal fun TrailVeilMapSurface(
                 }
                 installedSurround = FogBackdropGeometry.extent(installed)
             }
-            applyWorldCopyVisibility()
             // Installing coverage is not the same as coverage being enough: the camera may have
             // moved on while this was being built. Asking for another rebuild — rather than only
             // declining to lower the cover — is what stops the map staying black with nothing
@@ -805,7 +794,6 @@ internal fun TrailVeilMapSurface(
             return@LaunchedEffect
         }
         installedSurround = FogBackdropGeometry.extent(rendered.mosaic)
-        applyWorldCopyVisibility()
         if (!surroundHoldsForCamera()) {
             requestViewport()
             return@LaunchedEffect
@@ -861,14 +849,15 @@ private fun MapLibreMap.fogViewportRequest(): FogViewportRequest {
 }
 
 /**
- * Installs the mosaic and the bands that close around it in one call stack, so no rendered frame
- * can pair one of them with the other's previous geometry.
+ * Installs the mosaic and the bands that close around it in one main-thread call stack, without an
+ * explicit renderer wait between their mutations. A thrown partial install is still treated as
+ * lost coverage by the caller; renderer-side mutation atomicity is not assumed here.
  */
 private fun Style.installFogOverlay(mosaic: FogTileMosaic, fogAlpha: Int) {
     val spansWorld = FogBackdropGeometry.spansWorld(mosaic)
-    // The copies are always installed when there is a world to copy. Whether they are *drawn* is
-    // initialised after install and then updated from Handler-dispatched camera callbacks by
-    // [setFogWorldCopiesVisible]; it follows live camera zoom, but is not renderer-atomic.
+    // The copies are always installed when there is a world to copy. A camera-zoom opacity step is
+    // attached before each layer enters the style, so the renderer — not a Handler-dispatched
+    // camera callback — decides which mutually exclusive arrangement is drawn for the frame.
     installFogMosaic(mosaic, spansWorld)
     installFogBackdrop(
         mosaic,
@@ -889,12 +878,14 @@ private fun Style.installFogMosaic(mosaic: FogTileMosaic, spansWorld: Boolean) {
             FogOverlayIds.WestRepeatLayer,
             mosaic.bounds.shiftedByWorlds(-1),
             bitmap,
+            zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
         )
         installFogMosaicQuad(
             FogOverlayIds.EastRepeatSource,
             FogOverlayIds.EastRepeatLayer,
             mosaic.bounds.shiftedByWorlds(1),
             bitmap,
+            zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
         )
     } else {
         // A narrower mosaic is placed around the camera already, so repeats would be dead weight
@@ -909,6 +900,7 @@ private fun Style.installFogMosaicQuad(
     layerId: String,
     bounds: FogTileBounds,
     bitmap: Bitmap,
+    zoomOpacity: Expression? = null,
 ) {
     val coordinates = bounds.toQuad()
     val source = getSourceAs<ImageSource>(sourceId)
@@ -918,11 +910,24 @@ private fun Style.installFogMosaicQuad(
         source.setCoordinates(coordinates)
         source.setImage(bitmap)
     }
-    if (getLayer(layerId) == null) {
-        val layer = RasterLayer(layerId, sourceId).withProperties(
+    val existingLayer = getLayer(layerId)
+    val layer = if (existingLayer == null) {
+        RasterLayer(layerId, sourceId).withProperties(
             PropertyFactory.rasterFadeDuration(0f),
             PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
         )
+    } else {
+        require(existingLayer is RasterLayer) { "$layerId is not a raster layer" }
+        existingLayer
+    }
+    layer.setProperties(
+        if (zoomOpacity == null) {
+            PropertyFactory.rasterOpacity(1.0f)
+        } else {
+            PropertyFactory.rasterOpacity(zoomOpacity)
+        },
+    )
+    if (existingLayer == null) {
         if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
             addLayer(layer)
         } else {
@@ -930,56 +935,6 @@ private fun Style.installFogMosaicQuad(
         }
     }
 }
-
-/**
- * Whether the mosaic's own world copies are drawn, decided from the camera rather than from the
- * zoom the overlay was built for.
- *
- * Below about zoom one the renderer repeats an image source across world copies by itself and these
- * are a second coat of fog — one coat leaves 0.278 of a basemap whose ocean sits at luminance 18-28,
- * two leave 1-2, which is black. At and above it the renderer does not, and without these the
- * neighbouring copy of the map is drawn with no fog on it at all.
- *
- * Neither belongs to the overlay's build zoom, which is what made this wrong in both directions at
- * once: a gesture changes the camera without rebuilding anything, so zooming in from far out leaked
- * and zooming further out went black. Visibility is updated from dispatched camera callbacks, not
- * atomically by the renderer; the transition-frame risk is tracked separately.
- */
-private fun Style.setFogWorldCopiesVisible(visible: Boolean) {
-    val value = if (visible) Property.VISIBLE else Property.NONE
-    // Every copy, not only the mosaic's. The bands have their own pair for the case where the
-    // mosaic is too small to span a world, and they double up in exactly the same way — which is
-    // the half of this defect that survived the first fix, because the test that covered it
-    // started at a zoom where the band copies are not installed at all.
-    (
-        listOf(FogOverlayIds.WestRepeatLayer, FogOverlayIds.EastRepeatLayer) +
-            listOf(FogBackdropIds.WestWorldLayer, FogBackdropIds.EastWorldLayer)
-        ).forEach { id ->
-        getLayer(id)?.setProperties(PropertyFactory.visibility(value))
-    }
-    // The same switch, for the pair of quads that has to change shape rather than merely appear.
-    // The decision is [FogSideBands], which is a rule rather than a branch here: an earlier version
-    // returned early when there was no wrapped band to show, and returning early also skipped
-    // turning the side bands back *on*. They had been hidden while a wrapped band existed, the next
-    // rebuild removed that band, and nothing ever set them visible again — 89% of the screen bare
-    // with the safety cover down, at every zoom afterwards.
-    val arrangement = FogSideBands.forCamera(
-        rendererRepeatsWorldCopies = !visible,
-        hasWrappedBand = getLayer(FogBackdropIds.WrappedSideLayer) != null,
-    )
-    getLayer(FogBackdropIds.WrappedSideLayer)?.setProperties(
-        PropertyFactory.visibility(arrangement.wrappedBandProperty()),
-    )
-    listOf(FogBackdropIds.WestLayer, FogBackdropIds.EastLayer).forEach { id ->
-        getLayer(id)?.setProperties(PropertyFactory.visibility(arrangement.sideBandsProperty()))
-    }
-}
-
-private fun FogSideBands.sideBandsProperty(): String =
-    if (sideBandsVisible) Property.VISIBLE else Property.NONE
-
-private fun FogSideBands.wrappedBandProperty(): String =
-    if (wrappedBandVisible) Property.VISIBLE else Property.NONE
 
 private fun Style.removeFogMosaicQuad(sourceId: String, layerId: String) {
     if (getLayer(layerId) != null) removeLayer(layerId)
@@ -997,6 +952,7 @@ private fun Style.installFogBackdrop(
     repeatWorlds: Boolean,
 ) {
     val bands = FogBackdropGeometry.bands(mosaic)
+    val wrappedSide = FogBackdropGeometry.wrappedSideBand(mosaic)
     installFogBackdropBand(
         FogBackdropIds.NorthSource,
         FogBackdropIds.NorthLayer,
@@ -1014,14 +970,15 @@ private fun Style.installFogBackdrop(
         FogBackdropIds.WestLayer,
         bands.west,
         fogAlpha,
+        zoomOpacity = if (wrappedSide == null) null else visibleAtAndAboveWorldCopyZoom(),
     )
     installFogBackdropBand(
         FogBackdropIds.EastSource,
         FogBackdropIds.EastLayer,
         bands.east,
         fogAlpha,
+        zoomOpacity = if (wrappedSide == null) null else visibleAtAndAboveWorldCopyZoom(),
     )
-    val wrappedSide = FogBackdropGeometry.wrappedSideBand(mosaic)
     if (wrappedSide == null) {
         removeFogMosaicQuad(FogBackdropIds.WrappedSideSource, FogBackdropIds.WrappedSideLayer)
     } else {
@@ -1030,6 +987,7 @@ private fun Style.installFogBackdrop(
             FogBackdropIds.WrappedSideLayer,
             wrappedSide,
             fogAlpha,
+            zoomOpacity = visibleBelowWorldCopyZoom(),
         )
     }
     if (repeatWorlds) {
@@ -1039,12 +997,14 @@ private fun Style.installFogBackdrop(
             FogBackdropIds.WestWorldLayer,
             west,
             fogAlpha,
+            zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
         )
         installFogBackdropBand(
             FogBackdropIds.EastWorldSource,
             FogBackdropIds.EastWorldLayer,
             east,
             fogAlpha,
+            zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
         )
     } else {
         // A mosaic that spans the world is repeated itself, and flat fog over those copies would
@@ -1059,6 +1019,7 @@ private fun Style.installFogBackdropBand(
     layerId: String,
     bounds: FogTileBounds,
     fogAlpha: Int,
+    zoomOpacity: Expression? = null,
 ) {
     val coordinates = bounds.toQuad()
     val source = getSourceAs<ImageSource>(sourceId)
@@ -1067,11 +1028,24 @@ private fun Style.installFogBackdropBand(
     } else {
         source.setCoordinates(coordinates)
     }
-    if (getLayer(layerId) == null) {
-        val layer = RasterLayer(layerId, sourceId).withProperties(
+    val existingLayer = getLayer(layerId)
+    val layer = if (existingLayer == null) {
+        RasterLayer(layerId, sourceId).withProperties(
             PropertyFactory.rasterFadeDuration(0f),
             PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
         )
+    } else {
+        require(existingLayer is RasterLayer) { "$layerId is not a raster layer" }
+        existingLayer
+    }
+    layer.setProperties(
+        if (zoomOpacity == null) {
+            PropertyFactory.rasterOpacity(1.0f)
+        } else {
+            PropertyFactory.rasterOpacity(zoomOpacity)
+        },
+    )
+    if (existingLayer == null) {
         // Above the mosaic, so the half-pixel the bands deliberately overlap it stays one flat
         // layer of fog instead of a darker seam, and still below the location and track overlays.
         if (getLayer(FogOverlayIds.Layer) == null) {
@@ -1255,8 +1229,7 @@ private const val TRACK_CAMERA_PADDING_PX = 72
 private const val FOLLOW_EASE_MILLIS = 450
 
 /**
- * The camera zoom at and above which the fog's world copies are drawn — the mosaic's and the
- * bands' alike.
+ * Renderer-owned zoom boundary for the two mutually exclusive world-copy arrangements.
  *
  * Below this the renderer repeats an image source across world copies itself and ours are a second
  * coat of fog; at and above it it does not, and without ours the neighbouring copy of the map is
@@ -1267,9 +1240,24 @@ private const val FOLLOW_EASE_MILLIS = 450
  * having them off costs nothing; at 1.00 having them on costs nothing and having them off leaks
  * 49.722%. The edge is exactly the integer, which is what the renderer's own tile zoom is counted
  * in — so it is a property of the renderer rather than of any one display. Two earlier values were
- * inferred from a couple of readings instead, and both were wrong on a real device.
+ * inferred from a couple of readings instead, and both were wrong on a real device. An Android
+ * `Handler` callback previously changed `visibility` at this edge; a full-suite run reproduced a
+ * settled half-screen leak at exactly zoom 1. A camera-zoom opacity expression makes the renderer
+ * choose the arrangement in the same frame as its own repetition rule.
  */
-private const val LIVE_WORLD_COPY_ZOOM = 1.0
+private const val WORLD_COPY_ZOOM = 1.0
+
+private fun visibleAtAndAboveWorldCopyZoom(): Expression = Expression.step(
+    Expression.zoom(),
+    0.0,
+    Expression.stop(WORLD_COPY_ZOOM, 1.0),
+)
+
+private fun visibleBelowWorldCopyZoom(): Expression = Expression.step(
+    Expression.zoom(),
+    1.0,
+    Expression.stop(WORLD_COPY_ZOOM, 0.0),
+)
 
 /** Where the map's own controls sit when the host does not stack anything of its own on top. */
 internal val MAP_CONTROL_INSET: Dp = 12.dp

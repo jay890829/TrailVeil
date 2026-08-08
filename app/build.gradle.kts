@@ -1,6 +1,7 @@
 import java.io.File
 import java.nio.file.Files
 import java.util.Properties
+import javax.xml.parsers.DocumentBuilderFactory
 
 plugins {
     alias(libs.plugins.android.application)
@@ -170,6 +171,142 @@ android {
 
 ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+val instrumentationTestManifest = layout.projectDirectory.file(
+    "src/androidTest/instrumentation-test-manifest.txt",
+)
+val connectedDebugAndroidTestResults = layout.buildDirectory.dir(
+    "outputs/androidTest-results/connected/debug",
+)
+val instrumentationRunnerArgumentPrefix = "android.testInstrumentationRunnerArguments."
+val instrumentationSelectionArgumentNames = setOf(
+    "annotation",
+    "class",
+    "notAnnotation",
+    "notClass",
+    "notPackage",
+    "notTestFile",
+    "numShards",
+    "package",
+    "shardIndex",
+    "size",
+    "testFile",
+    "tests_regex",
+)
+val activeInstrumentationSelectionArguments = gradle.startParameter.projectProperties.keys
+    .mapNotNull { key -> key.takeIf { it.startsWith(instrumentationRunnerArgumentPrefix) } }
+    .map { key -> key.removePrefix(instrumentationRunnerArgumentPrefix) }
+    .filter { name -> name in instrumentationSelectionArgumentNames }
+    .toSet()
+var connectedDebugRunStartedAtMillis: Long? = null
+val verifyDebugAndroidTestManifest = tasks.register("verifyDebugAndroidTestManifest") {
+    group = "verification"
+    description = "Fails when the unfiltered debug instrumentation run omits or adds a declared test"
+    inputs.file(instrumentationTestManifest)
+    outputs.upToDateWhen { false }
+    onlyIf {
+        if (activeInstrumentationSelectionArguments.isNotEmpty()) {
+            logger.lifecycle(
+                "Skipping the full instrumentation manifest check because these runner arguments " +
+                    "select a subset: ${activeInstrumentationSelectionArguments.sorted()}.",
+            )
+        }
+        activeInstrumentationSelectionArguments.isEmpty()
+    }
+    doLast {
+        val runStartedAtMillis = checkNotNull(connectedDebugRunStartedAtMillis) {
+            "The instrumentation manifest must verify results from connectedDebugAndroidTest " +
+                "in the same Gradle invocation; standalone or stale XML is not accepted"
+        }
+        val expectedEntries = instrumentationTestManifest.asFile.readLines()
+            .map(String::trim)
+            .filter { line -> line.isNotEmpty() && !line.startsWith('#') }
+        val expected = expectedEntries.toSet()
+        check(expected.isNotEmpty()) { "The instrumentation test manifest is empty" }
+        check(expected.size == expectedEntries.size) {
+            "The instrumentation test manifest contains duplicate case entries"
+        }
+
+        val resultRoot = connectedDebugAndroidTestResults.get().asFile
+        val resultFiles = resultRoot.walkTopDown()
+            .filter { file -> file.isFile && file.extension.equals("xml", ignoreCase = true) }
+            .toList()
+        check(resultFiles.isNotEmpty()) {
+            "No connected debug instrumentation XML results were found under ${resultRoot.absolutePath}"
+        }
+        val staleResultFiles = resultFiles.filter { resultFile ->
+            resultFile.lastModified() < runStartedAtMillis
+        }
+        check(staleResultFiles.isEmpty()) {
+            "Connected instrumentation XML predates this run: " +
+                staleResultFiles.joinToString { file -> file.name }
+        }
+
+        val parserFactory = DocumentBuilderFactory.newInstance().apply {
+            setFeature("http://apache.org/xml/features/disallow-doctype-decl", true)
+            setFeature("http://xml.org/sax/features/external-general-entities", false)
+            setFeature("http://xml.org/sax/features/external-parameter-entities", false)
+            isXIncludeAware = false
+            isExpandEntityReferences = false
+        }
+        resultFiles.forEach { resultFile ->
+            val document = parserFactory.newDocumentBuilder().parse(resultFile)
+            val cases = document.getElementsByTagName("testcase")
+            val actual = linkedSetOf<String>()
+            var resultCaseCount = 0
+            repeat(cases.length) { index ->
+                val case = cases.item(index)
+                val attributes = case.attributes
+                val className = attributes.getNamedItem("classname")?.nodeValue.orEmpty()
+                val methodName = attributes.getNamedItem("name")?.nodeValue.orEmpty()
+                if (className.isNotBlank() && methodName.isNotBlank()) {
+                    resultCaseCount += 1
+                    actual += "$className#$methodName"
+                }
+            }
+
+            val missing = (expected - actual).sorted()
+            val unexpected = (actual - expected).sorted()
+            check(
+                missing.isEmpty() &&
+                    unexpected.isEmpty() &&
+                    resultCaseCount == expected.size &&
+                    actual.size == resultCaseCount,
+            ) {
+                buildString {
+                    append(
+                        "Connected instrumentation results in ${resultFile.name} do not match " +
+                            "the declared manifest.",
+                    )
+                    append(
+                        "\nExpected ${expected.size} unique cases; XML contained $resultCaseCount " +
+                            "cases and ${actual.size} unique cases.",
+                    )
+                    if (missing.isNotEmpty()) {
+                        append("\nMissing (${missing.size}):\n${missing.joinToString("\n")}")
+                    }
+                    if (unexpected.isNotEmpty()) {
+                        append("\nUnexpected (${unexpected.size}):\n${unexpected.joinToString("\n")}")
+                    }
+                }
+            }
+        }
+        logger.lifecycle(
+            "Verified ${expected.size} connected debug instrumentation cases across " +
+                "${expected.map { entry -> entry.substringBefore('#') }.toSet().size} classes " +
+                "in ${resultFiles.size} device result file(s).",
+        )
+    }
+}
+
+tasks.configureEach {
+    if (name == "connectedDebugAndroidTest") {
+        doFirst {
+            connectedDebugRunStartedAtMillis = System.currentTimeMillis()
+        }
+        finalizedBy(verifyDebugAndroidTestManifest)
+    }
 }
 
 kotlin {
