@@ -277,6 +277,117 @@ class MapSurfaceTest {
     }
 
     /**
+     * A synchronous exception after the first fog mutation must not expose that partial style.
+     * This deliberately snapshots MapLibre itself rather than the Compose tree: the opaque frame
+     * must come from the renderer-owned install guard, before any separately scheduled Compose
+     * safety cover could help. The same retry then has to publish the complete fog and hide the
+     * guard again, or a guard that only fails closed by staying black would satisfy half the test.
+     */
+    @Test
+    fun partialFogInstallFailureKeepsTheRendererOpaqueUntilRetrySucceeds() {
+        val database = inMemoryDatabase()
+        try {
+            revealTrack(database, REVEALED_CENTER)
+            val allowInstallSuccess = AtomicBoolean(false)
+            val installFailed = AtomicBoolean(false)
+            val fogRendered = AtomicBoolean(false)
+
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "partial-fog-install-test-provider",
+                        styleUri = "https://tiles.invalid/styles/partial-fog-install",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.partial-fog-install-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = REVEALED_CENTER,
+                        zoom = 16.0,
+                    ),
+                    onFogRendered = { fogRendered.set(true) },
+                    onFogFailure = { installFailed.set(true) },
+                    fogInstallFaultForTesting = {
+                        if (!allowInstallSuccess.get()) {
+                            error("Injected failure after the first fog geometry mutation")
+                        }
+                    },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 30_000L) { installFailed.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+            map.awaitFullyRenderedFrame(view)
+
+            assertEquals(
+                "The renderer guard was not visible after a partial install",
+                Property.VISIBLE,
+                map.fogLayerVisibility(FogOverlayIds.InstallGuardLayer),
+            )
+            val failedFrame = map.snapshotPixels()
+            val width = snapshotWidth()
+            var minX = Int.MAX_VALUE
+            var minY = Int.MAX_VALUE
+            var maxX = Int.MIN_VALUE
+            var maxY = Int.MIN_VALUE
+            var maximumLuminance = 0
+            var nonBlackPixels = 0
+            failedFrame.forEachIndexed { index, pixel ->
+                val nonBlack = (pixel ushr 24) != 0xff || (pixel and 0x00ffffff) != 0
+                if (nonBlack) {
+                    nonBlackPixels += 1
+                    val x = index % width
+                    val y = index / width
+                    if (x < minX) minX = x
+                    if (x > maxX) maxX = x
+                    if (y < minY) minY = y
+                    if (y > maxY) maxY = y
+                    maximumLuminance = max(maximumLuminance, luminance(pixel))
+                }
+            }
+            assertEquals(
+                "The partial MapLibre style escaped the renderer-owned opaque guard: " +
+                    "bounds=($minX,$minY)-($maxX,$maxY) maxLuminance=$maximumLuminance",
+                0,
+                nonBlackPixels,
+            )
+
+            allowInstallSuccess.set(true)
+            composeRule.waitUntil(timeoutMillis = 30_000L) { fogRendered.get() }
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            map.awaitFullyRenderedFrame(view)
+
+            assertEquals(
+                "The renderer guard stayed visible after the complete retry",
+                Property.NONE,
+                map.fogLayerVisibility(FogOverlayIds.InstallGuardLayer),
+            )
+            assertTrue(
+                "The successful retry left the renderer entirely black",
+                map.snapshotPixels().any { pixel -> (pixel and 0x00ffffff) != 0 },
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
      * A canonical change feed failure stops fog from tracking new points at all. The placeholder
      * reinstall that follows each failure clears the per-viewport render flag, so the feed failure
      * needs its own latched state or the offline surface reports nothing but a basemap fallback.

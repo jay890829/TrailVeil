@@ -69,6 +69,7 @@ import org.maplibre.android.maps.MapLibreMapOptions
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.maps.Style
 import org.maplibre.android.style.expressions.Expression
+import org.maplibre.android.style.layers.BackgroundLayer
 import org.maplibre.android.style.layers.CircleLayer
 import org.maplibre.android.style.layers.LineLayer
 import org.maplibre.android.style.layers.Property
@@ -98,6 +99,7 @@ internal object MapSurfaceTestTags {
 internal object FogOverlayIds {
     const val Source = "trailveil-cumulative-fog-source"
     const val Layer = "trailveil-cumulative-fog-layer"
+    const val InstallGuardLayer = "trailveil-fog-install-guard-layer"
 
     /**
      * The basemap repeats across copies of the world; an image source does not. When the mosaic
@@ -258,6 +260,7 @@ internal fun TrailVeilMapSurface(
     onUserMovedCamera: () -> Unit = {},
     onFogRendered: ((FogViewportRender) -> Unit)? = null,
     onFogFailure: (Throwable) -> Unit = {},
+    fogInstallFaultForTesting: (() -> Unit)? = null,
 ) {
     require(fallbackTimeoutMillis > 0L) { "fallbackTimeoutMillis must be positive" }
     require(savedStateKey.isNotBlank()) { "savedStateKey must not be blank" }
@@ -746,6 +749,7 @@ internal fun TrailVeilMapSurface(
         fogPlaceholderReadyGeneration,
         fogRevision,
         fogBaselineReady,
+        fogInstallFaultForTesting,
     ) {
         val runtime = fogRuntime ?: return@LaunchedEffect
         val style = readyStyle ?: return@LaunchedEffect
@@ -766,6 +770,7 @@ internal fun TrailVeilMapSurface(
                     style = style,
                     mosaic = viewport.mosaic,
                     fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
+                    installFaultForTesting = fogInstallFaultForTesting,
                 )
             },
             onFailure = { failure ->
@@ -850,15 +855,25 @@ private fun MapLibreMap.fogViewportRequest(): FogViewportRequest {
 
 /**
  * Installs the mosaic and the bands that close around it in one main-thread call stack, without an
- * explicit renderer wait between their mutations. A thrown partial install is still treated as
- * lost coverage by the caller; renderer-side mutation atomicity is not assumed here.
+ * explicit renderer wait between their mutations. The renderer-owned guard is made visible first
+ * and hidden last in this same call stack. MapLibre 13.4.1 coalesces those updates before forwarding
+ * one immutable snapshot: success forwards complete geometry with the guard hidden, while a throw
+ * forwards partial geometry with the guard still visible. The Compose cover remains a second line
+ * of defence but is not part of this frame-ordering argument.
  */
-private fun Style.installFogOverlay(mosaic: FogTileMosaic, fogAlpha: Int) {
+private fun Style.installFogOverlay(
+    mosaic: FogTileMosaic,
+    fogAlpha: Int,
+    installFaultForTesting: (() -> Unit)? = null,
+) {
+    val installGuard = ensureFogInstallGuard()
+    installGuard.setProperties(PropertyFactory.visibility(Property.VISIBLE))
     val spansWorld = FogBackdropGeometry.spansWorld(mosaic)
     // The copies are always installed when there is a world to copy. A camera-zoom opacity step is
     // attached before each layer enters the style, so the renderer — not a Handler-dispatched
     // camera callback — decides which mutually exclusive arrangement is drawn for the frame.
     installFogMosaic(mosaic, spansWorld)
+    installFaultForTesting?.invoke()
     installFogBackdrop(
         mosaic,
         fogAlpha,
@@ -867,6 +882,22 @@ private fun Style.installFogOverlay(mosaic: FogTileMosaic, fogAlpha: Int) {
         // smeared over the map.
         repeatWorlds = FogBackdropGeometry.surroundSpansWorld(mosaic) && !spansWorld,
     )
+    installGuard.setProperties(PropertyFactory.visibility(Property.NONE))
+}
+
+private fun Style.ensureFogInstallGuard(): BackgroundLayer {
+    val existing = getLayer(FogOverlayIds.InstallGuardLayer)
+    if (existing != null) {
+        require(existing is BackgroundLayer) {
+            "${FogOverlayIds.InstallGuardLayer} is not a background layer"
+        }
+        return existing
+    }
+    return BackgroundLayer(FogOverlayIds.InstallGuardLayer).withProperties(
+        PropertyFactory.backgroundColor("#000000"),
+        PropertyFactory.backgroundOpacity(1.0f),
+        PropertyFactory.visibility(Property.NONE),
+    ).also(::addLayer)
 }
 
 private fun Style.installFogMosaic(mosaic: FogTileMosaic, spansWorld: Boolean) {
@@ -929,7 +960,7 @@ private fun Style.installFogMosaicQuad(
     )
     if (existingLayer == null) {
         if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
-            addLayer(layer)
+            addLayerBelow(layer, FogOverlayIds.InstallGuardLayer)
         } else {
             addLayerBelow(layer, CurrentLocationOverlayIds.Layer)
         }
@@ -1080,17 +1111,20 @@ private fun Style.installCurrentLocation(point: GeoPoint?) {
         source.setGeoJson(collection)
     }
     if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
-        addLayer(
-            CircleLayer(
-                CurrentLocationOverlayIds.Layer,
-                CurrentLocationOverlayIds.Source,
-            ).withProperties(
-                PropertyFactory.circleRadius(7f),
-                PropertyFactory.circleColor("#1565C0"),
-                PropertyFactory.circleStrokeWidth(3f),
-                PropertyFactory.circleStrokeColor("#FFFFFF"),
-            ),
+        val layer = CircleLayer(
+            CurrentLocationOverlayIds.Layer,
+            CurrentLocationOverlayIds.Source,
+        ).withProperties(
+            PropertyFactory.circleRadius(7f),
+            PropertyFactory.circleColor("#1565C0"),
+            PropertyFactory.circleStrokeWidth(3f),
+            PropertyFactory.circleStrokeColor("#FFFFFF"),
         )
+        if (getLayer(FogOverlayIds.InstallGuardLayer) == null) {
+            addLayer(layer)
+        } else {
+            addLayerBelow(layer, FogOverlayIds.InstallGuardLayer)
+        }
     }
 }
 
@@ -1114,23 +1148,29 @@ private fun Style.installTrackOverlay(overlay: MapTrackOverlay?) {
     installGeoJsonSource(TrackOverlayIds.LineSource, FeatureCollection.fromFeatures(lineFeatures))
     installGeoJsonSource(TrackOverlayIds.PointSource, FeatureCollection.fromFeatures(isolatedPointFeatures))
     if (getLayer(TrackOverlayIds.LineLayer) == null) {
-        addLayer(
-            LineLayer(TrackOverlayIds.LineLayer, TrackOverlayIds.LineSource).withProperties(
-                PropertyFactory.lineColor("#6A1B9A"),
-                PropertyFactory.lineWidth(5f),
-                PropertyFactory.lineOpacity(0.9f),
-            ),
+        val layer = LineLayer(TrackOverlayIds.LineLayer, TrackOverlayIds.LineSource).withProperties(
+            PropertyFactory.lineColor("#6A1B9A"),
+            PropertyFactory.lineWidth(5f),
+            PropertyFactory.lineOpacity(0.9f),
         )
+        if (getLayer(FogOverlayIds.InstallGuardLayer) == null) {
+            addLayer(layer)
+        } else {
+            addLayerBelow(layer, FogOverlayIds.InstallGuardLayer)
+        }
     }
     if (getLayer(TrackOverlayIds.PointLayer) == null) {
-        addLayer(
-            CircleLayer(TrackOverlayIds.PointLayer, TrackOverlayIds.PointSource).withProperties(
-                PropertyFactory.circleRadius(5f),
-                PropertyFactory.circleColor("#6A1B9A"),
-                PropertyFactory.circleStrokeWidth(2f),
-                PropertyFactory.circleStrokeColor("#FFFFFF"),
-            ),
+        val layer = CircleLayer(TrackOverlayIds.PointLayer, TrackOverlayIds.PointSource).withProperties(
+            PropertyFactory.circleRadius(5f),
+            PropertyFactory.circleColor("#6A1B9A"),
+            PropertyFactory.circleStrokeWidth(2f),
+            PropertyFactory.circleStrokeColor("#FFFFFF"),
         )
+        if (getLayer(FogOverlayIds.InstallGuardLayer) == null) {
+            addLayer(layer)
+        } else {
+            addLayerBelow(layer, FogOverlayIds.InstallGuardLayer)
+        }
     }
 }
 
@@ -1183,9 +1223,12 @@ private suspend fun MapView.installFogOverlayAndAwait(
     style: Style,
     mosaic: FogTileMosaic,
     fogAlpha: Int,
+    installFaultForTesting: (() -> Unit)? = null,
 ) {
     val rendered = withTimeoutOrNull(FOG_FRAME_TIMEOUT_MILLIS) {
-        awaitFullyRenderedFrameAfter { style.installFogOverlay(mosaic, fogAlpha) }
+        awaitFullyRenderedFrameAfter {
+            style.installFogOverlay(mosaic, fogAlpha, installFaultForTesting)
+        }
         true
     }
     if (rendered != true) error("MapLibre did not fully render the fog frame in time")
