@@ -22,14 +22,24 @@ data class FogBackdropBands(
  * The edges an installed surround actually has, in fractions of the world.
  *
  * The surround has to be large rather than infinite, because a quad past the renderer's precision
- * is drawn over everything instead of being clipped. So the reach is an argument — thousands of
- * screens, more than any gesture travels — and this is what turns that argument into a check the
- * camera is measured against on every frame it moves.
+ * is drawn over everything instead of being clipped. So the finite reach is measured against the
+ * required gesture, and this type turns that measured margin into a check against the live camera.
  *
  * These are the *installed* edges, not a radius. An earlier version carried a centre and a radius
  * and inferred the rest, which was wrong in both directions: it reported a camera as covered over a
  * strip of map the surround had been trimmed away from, and it reported one as uncovered where the
  * coverage wrapped the world and had no edge to fall off at all.
+ *
+ * There used to be a second guard beside [covers]: past 0.75 zoom levels out from the zoom the
+ * overlay was built at, the map was covered rather than trusted, because a surround two million
+ * render pixels across is not drawn where its coordinates say — measured from render zoom 16, 0.05%
+ * of the screen bare at 1.63 levels out, 0.40% at 1.96, 0.67% at 2.68. `P4-024` made the surround
+ * sixty-four times smaller for an unrelated reason and the drift went with it: re-measured with
+ * that guard disabled, a pinch from render zoom 16 out to 13.14 held `uncovered=0.0000%` at every
+ * held frame. `P4-022` subsequently required a real four-level pinch, so the surround grew only as
+ * far as that measured viewport requires — still more than fifty times below the size that produced
+ * the band. [covers] is the honest guard: it measures the viewport against the surround that is
+ * actually installed instead of guessing from a zoom difference.
  */
 data class FogSurroundExtent(
     val centerLongitude: Double,
@@ -38,52 +48,55 @@ data class FogSurroundExtent(
     val southNormalizedY: Double,
     /** Whether coverage repeats across world copies, in which case it has no east or west edge. */
     val wrapsWorld: Boolean,
-    /** The camera zoom this surround was built for, or `null` when it was not recorded. */
-    val builtAtZoom: Double? = null,
 ) {
     /**
-     * How far a gesture may zoom out before the surround stops being drawn where it says it is.
+     * Whether every corner of the ground the camera can actually see is inside the surround.
      *
-     * A clamped surround is millions of render pixels across, and where it lands drifts from where
-     * its coordinates say by an amount that grows with its size — so the seam between it and the
-     * mosaic opens as the camera zooms away from the zoom it was built for. Measured from render
-     * zoom 16 on the API 36 emulator, auditing the map *underneath* the cover so the leak the cover
-     * hides is still counted: nothing at 1.57 levels out, 0.05% of the screen bare at 1.63, 0.13%
-     * at 1.69, 0.40% at 1.96, 0.67% at 2.68. The margin under this bound is therefore about 0.88
-     * levels. The gap also shrank by the same factor as the surround when the surround was made
-     * eight times smaller, which is what says it is proportional to size rather than incidental.
+     * It takes the corners of the map's own visible region, not the camera's position and half the
+     * viewport's width and height. Those two are the same shape only when the camera looks straight
+     * down with north up. Tilt it and the ground it sees runs away towards the horizon; turn it and
+     * the same screen covers a larger, rotated rectangle. Either way an axis-aligned box built from
+     * the viewport's size is smaller than what is on screen, and this returned true over map that
+     * had no fog on it.
      *
-     * Below this the map is covered rather than allowed to leak. It costs a dark map during a long
-     * pinch from close in; it does not affect panning, and it does not affect the zooms where the
-     * surround is the whole world — there the quads are small enough that the drift is under a
-     * pixel, measured at 0.0000% through a full pinch.
+     * Measured before it took corners: a shove to 60 degrees of pitch, then one pinch out, put
+     * **14.75%** of the screen — `(0,0)-(1079,1238)`, `bareAtWorst=216`, the unfogged basemap
+     * reference exactly — on screen as explored ground, with the safety cover never raised. The
+     * same reading at 78°N. A second guard used to hide it by blanking the map past 0.75 zoom
+     * levels out; `P4-022` retired that guard, which is what turned a latent blindness into a
+     * reachable leak.
+     *
+     * A corner the projection cannot give a finite answer for never reaches here: [GeoPoint]
+     * refuses one, so the caller has to decide before building it, and the only safe decision is
+     * not covered. Past the horizon there is no ground to be right about, and guessing in the
+     * covering direction is the one direction that shows unexplored map as explored.
      */
-    fun outrunByZoom(cameraZoom: Double): Boolean {
-        if (wrapsWorld) return false
-        val built = builtAtZoom ?: return false
-        return built - cameraZoom > MAX_UNCOVERED_ZOOM_OUT_LEVELS
-    }
-
-    /** Whether a viewport of the given size, in fractions of the world, is entirely inside. */
-    fun covers(
-        cameraLongitude: Double,
-        cameraLatitude: Double,
-        viewportHalfWorldsX: Double,
-        viewportHalfWorldsY: Double,
-    ): Boolean {
-        if (!cameraLongitude.isFinite() || !cameraLatitude.isFinite()) return false
-        if (!viewportHalfWorldsX.isFinite() || !viewportHalfWorldsY.isFinite()) return false
+    fun covers(visibleCorners: List<GeoPoint>): Boolean {
+        if (visibleCorners.isEmpty()) return false
         if (!wrapsWorld) {
-            val offset = kotlin.math.abs(
-                WebMercator.wrapLongitude(cameraLongitude - centerLongitude),
-            ) / FogBackdropGeometry.WORLD_LONGITUDE_SPAN
-            if (offset + viewportHalfWorldsX > halfWorlds + EDGE_TOLERANCE) return false
+            // Measured from the surround's own centre so that a region straddling the antimeridian
+            // stays one interval instead of splitting into two far-apart ones.
+            var west = Double.POSITIVE_INFINITY
+            var east = Double.NEGATIVE_INFINITY
+            visibleCorners.forEach { corner ->
+                val offset = WebMercator.wrapLongitude(corner.longitude - centerLongitude)
+                west = min(west, offset)
+                east = max(east, offset)
+            }
+            val reach = max(kotlin.math.abs(west), kotlin.math.abs(east)) /
+                FogBackdropGeometry.WORLD_LONGITUDE_SPAN
+            if (reach > halfWorlds + EDGE_TOLERANCE) return false
         }
-        // Only the part of the viewport inside the world can show map, so that is the part the
-        // surround has to reach. Past the poles the projection ends and nothing is drawn.
-        val cameraY = WebMercator.normalizedY(cameraLatitude)
-        val top = max(0.0, cameraY - viewportHalfWorldsY)
-        val bottom = min(1.0, cameraY + viewportHalfWorldsY)
+        // Only the part of the view inside the world can show map, so that is the part the surround
+        // has to reach. Past the poles the projection ends and nothing is drawn.
+        var top = 1.0
+        var bottom = 0.0
+        visibleCorners.forEach { corner ->
+            val y = WebMercator.normalizedY(corner.latitude)
+            if (!y.isFinite()) return false
+            top = min(top, max(0.0, y))
+            bottom = max(bottom, min(1.0, y))
+        }
         return top >= northNormalizedY - EDGE_TOLERANCE &&
             bottom <= southNormalizedY + EDGE_TOLERANCE
     }
@@ -91,9 +104,6 @@ data class FogSurroundExtent(
     private companion object {
         /** A billionth of the world: far under one screen pixel at any zoom this renderer draws. */
         const val EDGE_TOLERANCE = 1e-9
-
-        /** Three quarters of the 1.18 levels measured clean, so the bound has margin under it. */
-        const val MAX_UNCOVERED_ZOOM_OUT_LEVELS = 0.75
     }
 }
 
@@ -153,9 +163,10 @@ data class FogSideBands(
  *
  * Reaching the world edge everywhere would end the argument, but the renderer will not draw a quad
  * that large at a high zoom — it draws it over everything instead, burying the explored area. So
- * the surround is the world or [MAX_SURROUND_WORLD_PIXELS], whichever is smaller, and the surface
- * checks the live camera against [FogSurroundExtent] every frame rather than trusting that the
- * remaining headroom is enough.
+ * the surround is the world or [MAX_SURROUND_WORLD_PIXELS], whichever is smaller. The surface checks
+ * the live camera against [FogSurroundExtent] on dispatched camera-move callbacks, while the bands
+ * themselves remain renderer-anchored and cover the required gesture without relying on callback
+ * timing.
  */
 object FogBackdropGeometry {
     /**
@@ -188,12 +199,13 @@ object FogBackdropGeometry {
      * all. A user photographed that band twice.
      *
      * So the size is chosen to be as small as the job allows rather than as large as the renderer
-     * tolerates. The job is one gesture: the map is rebuilt the moment a gesture ends, a measured
-     * pinch travels 2.7 zoom levels, and [FogSurroundExtent.outrunByZoom] covers the map at 0.75
-     * levels out regardless. This is about eighty screens across on a phone, four to five zoom
-     * levels — comfortably past both, and sixty-four times under the size the band was measured at.
+     * tolerates. The job is one gesture, and `P4-022` requires a pinch through at least four zoom
+     * levels on the 2,400-pixel-tall validation viewport. 40,960 render pixels provide just over
+     * that geometric reach while remaining more than fifty times below the size that produced the
+     * band. Additional reach is not treated as free headroom because renderer drift grows with quad
+     * size.
      */
-    const val MAX_SURROUND_WORLD_PIXELS: Double = 32_768.0
+    const val MAX_SURROUND_WORLD_PIXELS: Double = 40_960.0
 
     /** MapLibre's own tile size, which is what makes a mosaic a known number of screen pixels. */
     const val RENDER_TILE_SIZE_PIXELS: Double = 512.0
@@ -216,9 +228,8 @@ object FogBackdropGeometry {
      * The region the mosaic and its bands cover between them: a square centred on the mosaic,
      * never larger than the world or than [MAX_SURROUND_WORLD_PIXELS].
      *
-     * At the zooms exploration happens at that is thousands of screens in every direction — far
-     * more than any one gesture travels before it ends and the fog is rebuilt. Below render zoom
-     * thirteen it is the whole world, where no gesture can outrun it at all.
+     * At exploration zooms it extends farther than the required four-level pinch. Through render
+     * zoom six it is the whole world, where no gesture can outrun it at all.
      */
     fun surround(mosaic: FogTileMosaic): FogTileBounds {
         val bounds = mosaic.bounds
@@ -317,7 +328,7 @@ object FogBackdropGeometry {
         spansWorld(mosaic) && renderZoom(mosaic) >= LOWEST_SELF_REPEATING_RENDER_ZOOM
 
     /** Where the installed surround is and how far it reaches, for checking a live camera. */
-    fun extent(mosaic: FogTileMosaic, builtAtZoom: Double? = null): FogSurroundExtent {
+    fun extent(mosaic: FogTileMosaic): FogSurroundExtent {
         val bounds = mosaic.bounds
         val halfWorlds = surroundHalfWorlds(mosaic)
         val vertical = verticalSpan(mosaic, halfWorlds)
@@ -329,7 +340,6 @@ object FogBackdropGeometry {
             // Where the surround reaches all the way round, a world copy is installed on each side
             // of it, so there is no east or west edge for a camera to fall off.
             wrapsWorld = halfWorlds >= 0.5,
-            builtAtZoom = builtAtZoom,
         )
     }
 

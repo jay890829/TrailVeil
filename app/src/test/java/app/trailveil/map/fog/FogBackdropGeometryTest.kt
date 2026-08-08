@@ -5,6 +5,7 @@ import kotlin.math.max
 import kotlin.math.min
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -195,14 +196,14 @@ class FogBackdropGeometryTest {
      * How much zoom-out the surround absorbs *geometrically* — that is, before the camera could see
      * past its edges.
      *
-     * This is not the limit that binds. Where the surround is clamped, the renderer stops drawing
-     * it where its coordinates say long before the camera reaches its edge, and
-     * [FogSurroundExtent.outrunByZoom] covers the map at 0.75 levels out for that reason. What this
-     * pins is that the geometry is not *also* a constraint, so there is exactly one thing to fix
-     * when the drift is understood.
+     * This used to be the slack limit rather than the binding one, because a second guard covered
+     * the map at 0.75 levels out to hide the drift of an oversized quad. `P4-022` retired that
+     * guard after `P4-024` shrank the surround and device measurements stopped finding drift. The
+     * task requires a real four-level pinch, so this geometric lower bound matches that acceptance
+     * criterion instead of the earlier 2.86-level sample.
      */
     @Test
-    fun theSurroundAbsorbsFarMoreZoomOutThanOneGestureProduces() {
+    fun theSurroundAbsorbsTheRequiredFourLevelGesture() {
         everyZoom().forEach { mosaic ->
             if (FogBackdropGeometry.surroundSpansWorld(mosaic)) {
                 // Nothing to absorb: this one is the whole world in both directions, and there is
@@ -222,6 +223,20 @@ class FogBackdropGeometryTest {
                 levels >= MINIMUM_ZOOM_LEVELS_ABSORBED,
             )
         }
+    }
+
+    @Test
+    fun theSurroundIsTheWholeWorldThroughRenderZoomSixOnly() {
+        assertTrue(
+            FogBackdropGeometry.surroundSpansWorld(
+                mosaicAround(center = GeoPoint(25.0330, 121.5654), zoom = 6),
+            ),
+        )
+        assertFalse(
+            FogBackdropGeometry.surroundSpansWorld(
+                mosaicAround(center = GeoPoint(25.0330, 121.5654), zoom = 7),
+            ),
+        )
     }
 
     /**
@@ -301,7 +316,7 @@ class FogBackdropGeometryTest {
 
         assertTrue(
             "a camera at the middle of its own surround was reported outside it",
-            extent.covers(
+            extent.coversViewport(
                 cameraLongitude = 121.5654,
                 cameraLatitude = 25.0330,
                 viewportHalfWorldsX = half / 2.0,
@@ -310,7 +325,7 @@ class FogBackdropGeometryTest {
         )
         assertFalse(
             "a viewport wider than the surround was reported as covered",
-            extent.covers(
+            extent.coversViewport(
                 cameraLongitude = 121.5654,
                 cameraLatitude = 25.0330,
                 viewportHalfWorldsX = half * 1.01,
@@ -319,7 +334,7 @@ class FogBackdropGeometryTest {
         )
         assertFalse(
             "a camera panned out of the surround was reported as covered",
-            extent.covers(
+            extent.coversViewport(
                 cameraLongitude = 121.5654 + half * 1.1 * 360.0,
                 cameraLatitude = 25.0330,
                 viewportHalfWorldsX = 0.0,
@@ -328,63 +343,20 @@ class FogBackdropGeometryTest {
         )
         assertFalse(
             "a camera moved off the surround in latitude alone was reported as covered",
-            extent.covers(
+            extent.coversViewport(
                 cameraLongitude = 121.5654,
                 cameraLatitude = 70.0,
                 viewportHalfWorldsX = 0.0,
                 viewportHalfWorldsY = 0.0,
             ),
         )
-        assertFalse(
-            "a camera with no position was reported as covered",
-            extent.covers(Double.NaN, 25.0, 0.0, 0.0),
-        )
-    }
-
-    /**
-     * The rule that keeps a clamped surround honest, since it is the one thing here that is a
-     * margin rather than a proof: past a measured distance from the zoom it was built for, the
-     * surround is treated as outrun and the map is covered instead of trusted.
-     */
-    @Test
-    fun aClampedSurroundIsOutrunByZoomingOutButAWorldWideOneIsNot() {
-        val clamped = FogBackdropGeometry.extent(
-            mosaicAround(GeoPoint(25.0330, 121.5654), zoom = 16),
-            builtAtZoom = 16.0,
-        )
-        assertFalse("expected a clamped surround", clamped.wrapsWorld)
-        assertFalse("a camera that has not moved was called outrun", clamped.outrunByZoom(16.0))
-        assertFalse("zooming *in* is not outrunning anything", clamped.outrunByZoom(18.0))
-        // The bound itself, not a range containing it. Measured on the API 36 emulator: the last
-        // clean uncovered frame is 0.75 levels out and the first leak of any size is 1.63, so the
-        // margin under this is 0.88 levels — and a value chosen loosely would spend it.
-        assertFalse(
-            "the guard fired before the measured bound",
-            clamped.outrunByZoom(16.0 - OUTRUN_ZOOM_LEVELS + 0.001),
-        )
-        assertTrue(
-            "the guard did not fire at the measured bound",
-            clamped.outrunByZoom(16.0 - OUTRUN_ZOOM_LEVELS - 0.001),
-        )
-
-        // Where the surround is the whole world there is nothing to outrun, and covering the map
-        // there would blank it during the ordinary pinch that P4-008 exists to keep smooth.
-        val worldWide = FogBackdropGeometry.extent(
-            mosaicAround(GeoPoint(25.0330, 121.5654), zoom = 4),
-            builtAtZoom = 4.0,
-        )
-        assertTrue("expected a world-wide surround", worldWide.wrapsWorld)
-        assertFalse(
-            "a full pinch from zoom 4 must not be treated as outrunning the world",
-            worldWide.outrunByZoom(0.84),
-        )
-
-        // An overlay installed before the build zoom was recorded must not be treated as outrun on
-        // the strength of a value nobody supplied.
-        assertFalse(
-            FogBackdropGeometry.extent(mosaicAround(GeoPoint(25.0330, 121.5654), zoom = 16))
-                .outrunByZoom(2.0),
-        )
+        // A camera with no position cannot reach `covers` at all: `GeoPoint` refuses a non-finite
+        // value by throwing, so the decision belongs to whoever reads the projection, and the only
+        // safe one there is "not covered". Pinned here so that guarantee is not quietly relaxed.
+        assertThrows(IllegalArgumentException::class.java) {
+            GeoPoint(25.0, Double.NaN)
+        }
+        assertFalse("no corners at all is not covered", extent.covers(emptyList()))
     }
 
     /**
@@ -421,7 +393,7 @@ class FogBackdropGeometryTest {
             assertEquals(1.0, extent.southNormalizedY, 1e-9)
             assertTrue(
                 "a world-wide surround at latitude $latitude claimed not to cover a pole",
-                extent.covers(
+                extent.coversViewport(
                     cameraLongitude = 121.5654,
                     cameraLatitude = 84.0,
                     viewportHalfWorldsX = 0.2,
@@ -446,15 +418,15 @@ class FogBackdropGeometryTest {
         val northEdge = WebMercator.latitudeAtNormalizedY(extent.northNormalizedY)
         assertTrue(
             "a camera inside the surround was reported as uncovered",
-            extent.covers(121.5654, 25.0330, 0.0, 0.0),
+            extent.coversViewport(121.5654, 25.0330, 0.0, 0.0),
         )
         assertFalse(
             "a camera past the surround's northern edge was reported as covered",
-            extent.covers(121.5654, northEdge + 1.0, 0.0, 0.0),
+            extent.coversViewport(121.5654, northEdge + 1.0, 0.0, 0.0),
         )
         assertFalse(
             "a viewport reaching past the surround's northern edge was reported as covered",
-            extent.covers(121.5654, 25.0330, 0.0, extent.halfWorlds * 1.5),
+            extent.coversViewport(121.5654, 25.0330, 0.0, extent.halfWorlds * 1.5),
         )
     }
 
@@ -473,7 +445,7 @@ class FogBackdropGeometryTest {
         // Taipei at zoom 1 on a 1080-pixel display: a third of a world from the mosaic's centre,
         // with a fifth of a world of viewport either side. This is what used to blank the map.
         assertTrue(
-            extent.covers(
+            extent.coversViewport(
                 cameraLongitude = 121.5654,
                 cameraLatitude = 25.0330,
                 viewportHalfWorldsX = 0.2009,
@@ -482,7 +454,7 @@ class FogBackdropGeometryTest {
         )
         assertTrue(
             "a camera on the far side of the world was reported as uncovered",
-            extent.covers(-121.5654, 0.0, 0.2009, 0.4464),
+            extent.coversViewport(-121.5654, 0.0, 0.2009, 0.4464),
         )
     }
 
@@ -781,10 +753,125 @@ class FogBackdropGeometryTest {
         }
     }
 
+    /**
+     * A trapezoid whose far edge leaves the surround while its axis-aligned box does not.
+     *
+     * This is the shape the change exists for and, until this case, the only shape the JVM suite
+     * never asked about: every other case here rebuilds a rectangle through `coversViewport`. A
+     * tilted camera's visible ground is wider far away than near, so the near corners can sit well
+     * inside a surround that the far ones have left — which is exactly what `covers` used to be
+     * unable to see, at a measured cost of 14.75% of the screen.
+     */
+    @Test
+    fun aViewThatLeavesTheSurroundOnlyAtItsFarEdgeIsNotCovered() {
+        val mosaic = mosaicAround(GeoPoint(25.0330, 121.5654), zoom = 16)
+        val extent = FogBackdropGeometry.extent(mosaic)
+        val half = extent.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
+
+        val near = GeoPoint(25.0330, 121.5654)
+        assertTrue(
+            "the near edge alone should be well inside",
+            extent.covers(
+                listOf(
+                    GeoPoint(near.latitude, near.longitude - half * 0.1),
+                    GeoPoint(near.latitude, near.longitude + half * 0.1),
+                ),
+            ),
+        )
+        // The same view, tilted: two near corners inside, two far corners past the edge. The
+        // axis-aligned box of the near pair would still say covered.
+        val farLatitude = WebMercator.latitudeAtNormalizedY(
+            WebMercator.normalizedY(near.latitude) - extent.halfWorlds * 1.2,
+        )
+        assertFalse(
+            "a view whose far edge has left the surround was reported as covered",
+            extent.covers(
+                listOf(
+                    GeoPoint(farLatitude, near.longitude - half * 1.4),
+                    GeoPoint(farLatitude, near.longitude + half * 1.4),
+                    GeoPoint(near.latitude, near.longitude + half * 0.1),
+                    GeoPoint(near.latitude, near.longitude - half * 0.1),
+                ),
+            ),
+        )
+    }
+
+    /**
+     * A view straddling the antimeridian is one interval, not two far-apart ones.
+     *
+     * `covers` folds each corner about the surround's own centre for this reason. The behaviour was
+     * measured by a verifier and correct; nothing in the tree asked for it until now.
+     */
+    @Test
+    fun aViewStraddlingTheAntimeridianIsMeasuredAsOneInterval() {
+        val mosaic = mosaicAround(GeoPoint(0.0, 179.97), zoom = 16)
+        val extent = FogBackdropGeometry.extent(mosaic)
+        val center = extent.centerLongitude
+        val reach = extent.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
+
+        fun wrapped(longitude: Double): Double {
+            var value = longitude
+            while (value > 180.0) value -= 360.0
+            while (value < -180.0) value += 360.0
+            return value
+        }
+        assertTrue(
+            "a view just inside the surround but across the seam was reported as outside",
+            extent.covers(
+                listOf(
+                    GeoPoint(0.0, wrapped(center - reach * 0.5)),
+                    GeoPoint(0.0, wrapped(center + reach * 0.5)),
+                ),
+            ),
+        )
+        assertFalse(
+            "a view past the surround's edge across the seam was reported as covered",
+            extent.covers(
+                listOf(
+                    GeoPoint(0.0, wrapped(center - reach * 0.5)),
+                    GeoPoint(0.0, wrapped(center + reach * 1.5)),
+                ),
+            ),
+        )
+    }
+
     /** How many whole worlds apart two longitudes are, which must be an integer or they differ. */
     private fun worldsBetween(first: Double, second: Double): Double {
         val worlds = (first - second) / 360.0
         return worlds - Math.round(worlds)
+    }
+
+    /**
+     * The old axis-aligned question, asked through the new corner-shaped one.
+     *
+     * `covers` takes the corners of what the camera can really see, because a tilted or turned
+     * camera sees a trapezoid rather than a box — see its own docstring for what that cost. These
+     * cases are all about the surround's edges rather than about the camera's shape, so they build
+     * the four corners of an untilted, north-up viewport and ask that.
+     */
+    private fun FogSurroundExtent.coversViewport(
+        cameraLongitude: Double,
+        cameraLatitude: Double,
+        viewportHalfWorldsX: Double,
+        viewportHalfWorldsY: Double,
+    ): Boolean {
+        val centerY = WebMercator.normalizedY(cameraLatitude)
+        val north = WebMercator.latitudeAtNormalizedY(
+            (centerY - viewportHalfWorldsY).coerceIn(0.0, 1.0),
+        )
+        val south = WebMercator.latitudeAtNormalizedY(
+            (centerY + viewportHalfWorldsY).coerceIn(0.0, 1.0),
+        )
+        val west = cameraLongitude - viewportHalfWorldsX * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
+        val east = cameraLongitude + viewportHalfWorldsX * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
+        return covers(
+            listOf(
+                GeoPoint(north, west),
+                GeoPoint(north, east),
+                GeoPoint(south, east),
+                GeoPoint(south, west),
+            ),
+        )
     }
 
     private fun mosaicAround(center: GeoPoint, zoom: Int): FogTileMosaic {
@@ -799,24 +886,16 @@ class FogBackdropGeometryTest {
         const val EDGE_TOLERANCE = 1e-9
         const val SURROUND_SAMPLES = 60
 
-        /**
-         * The bound `FogSurroundExtent` applies, restated here so that changing it has to be
-         * deliberate in two places rather than silent in one.
-         */
-        const val OUTRUN_ZOOM_LEVELS = 0.75
-
         /** A tablet in landscape, so the margin below is the one on the widest plausible screen. */
         const val WIDEST_PHONE_VIEWPORT_PIXELS = 2_400.0
 
         /**
-         * Measured on the API 36 emulator: one pinch moves 2.7 zoom levels and one quick zoom 1.8,
-         * and the map is covered at 0.75 levels out in this regime anyway.
-         *
          * This used to be nine, which the surround met by being about five thousand screens wide —
          * and being that wide is what made the renderer draw its inner edge fifty screen pixels
          * away from the mosaic, as a black band a user photographed twice. Headroom past what one
-         * gesture can use is not free, so what is pinned here is enough for one gesture and no more.
+         * gesture can use is not free, so this pins the four-level acceptance requirement and no
+         * more.
          */
-        const val MINIMUM_ZOOM_LEVELS_ABSORBED = 3.0
+        const val MINIMUM_ZOOM_LEVELS_ABSORBED = 4.0
     }
 }

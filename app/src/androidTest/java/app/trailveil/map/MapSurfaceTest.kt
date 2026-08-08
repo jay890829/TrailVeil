@@ -678,13 +678,229 @@ class MapSurfaceTest {
     )
 
     /**
+     * Tilt the map, then zoom out. The camera sees ground the viewport's own size does not describe.
+     *
+     * An adversarial verifier found this and it is the reason `P4-022` failed its first round: a
+     * shove to 60 degrees of pitch followed by one pinch put **14.7501%** of the screen on show as
+     * explored ground — `(0,0)-(1079,1238)`, `bareAtWorst=216`, the unfogged basemap reference
+     * exactly — with the safety cover never raised. The blindness was older than that task, in
+     * `covers` computing an axis-aligned box from the viewport's width and height; what `P4-022` did
+     * was retire the second guard that had been hiding it.
+     *
+     * Tilt and rotate stay enabled — they are ordinary map gestures and taking them away to make the
+     * arithmetic true was the alternative — so `covers` reads the projection's own visible region
+     * instead. Tilt is applied here as a programmed move rather than a two-finger shove because the
+     * shove detector rejects a vertically-stacked pointer pair and the injection is fragile; what
+     * matters is that the fog is rebuilt for a tilted camera before the measured gesture starts.
+     */
+    @Test
+    fun tiltingThenZoomingOutNeverExposesUnexploredMap() =
+        assertObliqueZoomOutIsCovered(tilt = 60.0, bearing = 0.0, label = "tilt")
+
+    /**
+     * The same question for bearing, which the fix claims is handled for the same reason.
+     *
+     * A turned camera covers a larger patch of ground with the same screen: the axis-aligned box the
+     * old arithmetic built is the *inscribed* rectangle of the rotated one. Nothing in the suite
+     * rotated the camera before this, so the claim that reading the projection handles rotation had
+     * no evidence behind it at all — only the argument that it comes from the same call.
+     */
+    @Test
+    fun rotatingThenZoomingOutNeverExposesUnexploredMap() =
+        assertObliqueZoomOutIsCovered(tilt = 0.0, bearing = 45.0, label = "bearing")
+
+    /** Both at once, which is the largest patch of ground a screen can be pointed at. */
+    @Test
+    fun rotatingAndTiltingThenZoomingOutNeverExposesUnexploredMap() =
+        assertObliqueZoomOutIsCovered(tilt = 60.0, bearing = 45.0, label = "tilt+bearing")
+
+    private fun assertObliqueZoomOutIsCovered(tilt: Double, bearing: Double, label: String) {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            revealTrack(database, REVEALED_CENTER)
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-tilt-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-tilt",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.oblique-zoom-out-$label",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = UNEXPLORED_NEAR_REVEALED,
+                        zoom = 16.0,
+                    ),
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = 30_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap())
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes().isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+
+            // Tilt as a programmed move, then let the fog rebuild for the tilted camera. Equivalent
+            // to the verifier's two-finger shove and far less fragile to inject.
+            composeRule.runOnUiThread {
+                map.easeCamera(
+                    CameraUpdateFactory.newCameraPosition(
+                        org.maplibre.android.camera.CameraPosition.Builder()
+                            .target(map.cameraPosition.target)
+                            .zoom(map.cameraPosition.zoom)
+                            .tilt(tilt)
+                            .bearing(bearing)
+                            .build(),
+                    ),
+                    300,
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes().isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            val startCameraZoom = map.cameraPosition.zoom
+            val report = StringBuilder(
+                "[$label] tilt=${map.cameraPosition.tilt} bearing=${map.cameraPosition.bearing}",
+            )
+            var covered = 0
+            // Starts below zero so that "no frame was ever measured" is distinguishable from
+            // "every measured frame was clean". A verifier defeated the first version of these
+            // gates by blanking the map at every audited state: they counted covered states, printed
+            // them, and asserted nothing about them, so all three passed while the user saw black.
+            var worst = -1.0
+            var holds = 0
+            longPinchOutInSteps(map) {
+                holds += 1
+                val isCovered = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes().isNotEmpty()
+                val zoom = map.cameraPosition.zoom
+                if (isCovered) {
+                    covered += 1
+                    report.append(" z=${"%.2f".format(java.util.Locale.US, zoom)}:covered")
+                    return@longPinchOutInSteps
+                }
+                val audit = map.auditFogCoverage()
+                if (audit.uncoveredFraction > worst) worst = audit.uncoveredFraction
+                report.append(
+                    " z=${"%.2f".format(java.util.Locale.US, zoom)}:" +
+                        "${"%.4f".format(java.util.Locale.US, audit.uncoveredFraction * 100)}%",
+                )
+            }
+            val endCameraZoom = map.cameraPosition.zoom
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply {
+                    putString(
+                        "stream",
+                        "TrailVeil oblique zoom-out: coveredFrames=$covered " +
+                            "worst=${"%.4f".format(java.util.Locale.US, worst * 100)}% $report",
+                    )
+                },
+            )
+            assertTrue(
+                "The camera never took the pose this measures, so it measured an upright map: " +
+                    report,
+                map.cameraPosition.tilt >= tilt - OBLIQUE_POSE_TOLERANCE &&
+                    kotlin.math.abs(map.cameraPosition.bearing - bearing) <= OBLIQUE_POSE_TOLERANCE,
+            )
+            assertTrue("The gesture never reported a held frame: $report", holds > 0)
+            assertTrue(
+                "The long gesture did not cover four zoom levels " +
+                    "(start=$startCameraZoom end=$endCameraZoom): $report",
+                startCameraZoom - endCameraZoom >= MINIMUM_LONG_GESTURE_ZOOM_CHANGE,
+            )
+            assertTrue(
+                "Every held frame was covered, so no coverage was measured at all: $report",
+                worst >= 0.0,
+            )
+            // One covered frame is the accepted cost of a tilted camera at the far end of a long
+            // zoom-out; a map blanked for the whole gesture is the defect `P4-008` exists to keep
+            // away, and this is what tells the two apart.
+            assertTrue(
+                "The map was blanked for more than the last frame of the gesture: $report",
+                covered <= MAXIMUM_OBLIQUE_COVERED_FRAMES,
+            )
+            assertTrue(
+                "An oblique camera showed unexplored map as revealed: $report",
+                worst <= MAXIMUM_SETTLED_REVEALED_FRACTION,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+
+    /**
+     * The same long pinch where Mercator is most stretched, which is where it is not quite clean.
+     *
+     * `P4-022` retired the guard that blanked the map past 0.75 zoom levels out, on evidence
+     * gathered at one place and one start zoom. Repeating it elsewhere: start zooms 18, 16 and 14
+     * over Taipei and a western-hemisphere camera all held `uncovered=0.0000%` at every held frame.
+     * At 78 degrees north it does not — a full-width line one pixel tall appears near the end of the
+     * measured pinch, `0.0091%` then `0.0203%` at `(0,1491)-(1079,1491)`.
+     *
+     * It does not grow without bound, and it is not two hundred times under the bound. A verifier
+     * corrected both claims: swept over latitude and pinch length it is *non-monotone* — worst
+     * `0.0301%` at 78°N and 3.75 levels, back to `0.0000%` at 3.92, and `0.0000%` at 84°N and 85°N
+     * where it lands on the over-fog side instead — saturating at about one full-width row. It is a
+     * plus-or-minus one pixel seam whose sign flips with sub-pixel alignment. And the bound it is
+     * measured against is `MAXIMUM_SETTLED_REVEALED_FRACTION` at 0.1%, so `0.0203%` is **4.9x**
+     * under it, not 200x; the 200x came from comparing against a different gate for a different
+     * quantity. Whose docstring, moreover, says the allowance is for the revealed track and not for
+     * a coverage gap — and at this camera the track is 5,000 km away, so all of it is gap.
+     *
+     * Kept as a gate because no other gesture test goes near the poles, and because a hairline that
+     * is allowed to grow silently is how the black band arrived in the first place.
+     */
+    @Test
+    fun aPinchZoomOutNearThePoleNeverExposesUnexploredMap() = sweepGesture(
+        provider = MapProviderConfiguration(
+            providerName = "fog-pinch-pole-test-provider",
+            styleUri = "https://tiles.invalid/styles/fog-pinch-pole",
+        ),
+        requireOnlineStyle = false,
+        savedStateKey = "trailveil.map.fog-pinch-pole-test",
+        gesture = ::pinchOutInSteps,
+        startPoint = GeoPoint(78.0, 15.0),
+        startZoom = 16.0,
+        expectCover = false,
+    )
+
+    /**
      * The pinch the three tests above cannot make: from the zoom people actually explore at.
      *
      * Those start at zoom 4, where the surround is the whole world and the pixel budget never
-     * binds. The clamp only applies from render zoom 13 up, so until this test the entire clamped
-     * regime — the one the budget was invented for — had no gesture evidence at all. It starts
-     * over unexplored ground rather than over the track, because at this zoom a revealed track
-     * fills more of the screen than the leak allowance.
+     * binds. The clamp only applies in the clamped regime, so until this test that regime — the one
+     * the budget was invented for — had no gesture evidence at all. It starts over unexplored
+     * ground rather than over the track, because at this zoom a revealed track fills more of the
+     * screen than the leak allowance.
+     *
+     * It asserts both halves now. Until `P4-022` this test accepted a covered map, because a
+     * second guard blanked the screen past 0.75 zoom levels out to hide the drift of an oversized
+     * quad; `P4-024` shrank the surround and the drift went with it. This gate now uses the full
+     * height and asserts that the camera actually travels at least four levels, rather than treating
+     * the earlier 2.86-level measurement as if it met the task. Every injected move after the scale
+     * detector engages is followed by a fully rendered frame and a coverage audit while the fingers
+     * remain down, rather than auditing only six settled holds. What is pinned here is that a long
+     * pinch from close in neither leaks nor blanks — the complaint `P4-008` was opened for, in the
+     * last case that still had it.
      */
     @Test
     fun aPinchZoomOutFromExplorationZoomNeverExposesUnexploredMap() = sweepGesture(
@@ -694,14 +910,14 @@ class MapSurfaceTest {
         ),
         requireOnlineStyle = false,
         savedStateKey = "trailveil.map.fog-pinch-close-test",
-        gesture = ::pinchOutInSteps,
+        gesture = ::frameAuditedLongPinchOutInSteps,
         startPoint = UNEXPLORED_NEAR_REVEALED,
         startZoom = 16.0,
-        // Here the surround is clamped to what the renderer will draw, and where it lands drifts
-        // as the camera zooms away from the zoom it was built for. Past a measured margin the map
-        // is covered instead of trusted — so what this asserts is that no frame is ever bare, not
-        // that no frame is ever hidden.
-        expectCover = true,
+        // Neither bare nor hidden. `expectCover = false` makes the harness assert
+        // `coveredFrames == 0`, so a regression that brings the blanking back fails here rather
+        // than passing quietly as it did while this read `true`.
+        expectCover = false,
+        minimumZoomChange = MINIMUM_LONG_GESTURE_ZOOM_CHANGE,
     )
 
     /**
@@ -1393,7 +1609,7 @@ class MapSurfaceTest {
             Thread.sleep(ZOOM_SETTLE_MILLIS)
 
             // Same calibration the settled sweep runs, for the same reason: a detector that cannot
-            // see a leak here would report every frame of the gesture as covered.
+            // see a leak here would report every audit of the gesture as covered.
             val calibration = map.auditWithFogRemoved()
             assertTrue(
                 "The map drew almost nothing, so this would pass vacuously: " +
@@ -1481,7 +1697,8 @@ class MapSurfaceTest {
                             "worst=$worstReport worstOverFogged=$worstOverFoggedReport " +
                             "atZoom=${"%.2f".format(java.util.Locale.US, worstZoom)} " +
                             "calibration=${calibration.report()} " +
-                            "generation=$generationAtTouchDown held=$generations " +
+                            "generationBeforeAttempts=$generationAtTouchDown " +
+                            "measuredGeneration=${generations.firstOrNull()} held=$generations " +
                             "moveReasons=$moveReasons " +
                             "coveredFrames=$coveredFrames trace=[$trace]\n",
                     )
@@ -1570,12 +1787,41 @@ class MapSurfaceTest {
     private fun pinchOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
         pinchInSteps(map, onHold, zoomIn = false)
 
+    /**
+     * A pinch that uses the whole screen rather than its shorter edge.
+     *
+     * The ordinary driver measures its span against `min(width, height)`, which on a portrait phone
+     * is the *width* — so it under-travels a real vertical pinch by about a zoom level. A verifier
+     * found the tilt leak at 2.9 and 3.9 levels out, past where the ordinary driver stops, so a gate
+     * for it has to reach at least that far.
+     */
+    private fun longPinchOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
+        pinchInSteps(map, onHold, zoomIn = false, spanEdge = PinchSpanEdge.TALLEST)
+
+    /** The acceptance pinch: the same single stream, audited after every move-induced frame. */
+    private fun frameAuditedLongPinchOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
+        pinchInSteps(
+            map,
+            onHold,
+            zoomIn = false,
+            spanEdge = PinchSpanEdge.TALLEST,
+            auditEveryMove = true,
+        )
+
     private fun pinchInInSteps(map: MapLibreMap, onHold: () -> Unit) =
         pinchInSteps(map, onHold, zoomIn = true)
 
-    private fun pinchInSteps(map: MapLibreMap, onHold: () -> Unit, zoomIn: Boolean) {
+    private enum class PinchSpanEdge { SHORTEST, TALLEST }
+
+    private fun pinchInSteps(
+        map: MapLibreMap,
+        onHold: () -> Unit,
+        zoomIn: Boolean,
+        spanEdge: PinchSpanEdge = PinchSpanEdge.SHORTEST,
+        auditEveryMove: Boolean = false,
+    ) {
         repeat(PINCH_ATTEMPTS) { attempt ->
-            if (pinchOnce(map, onHold, zoomIn)) return
+            if (pinchOnce(map, onHold, zoomIn, spanEdge, auditEveryMove)) return
         }
         // Every assertion downstream would still be sound, but reporting nothing measured is more
         // useful than reporting a clean gesture that never happened.
@@ -1583,17 +1829,36 @@ class MapSurfaceTest {
     }
 
     /** One pinch. Returns whether it actually zoomed, having run [onHold] at each held step. */
-    private fun pinchOnce(map: MapLibreMap, onHold: () -> Unit, zoomIn: Boolean): Boolean {
+    private fun pinchOnce(
+        map: MapLibreMap,
+        onHold: () -> Unit,
+        zoomIn: Boolean,
+        spanEdge: PinchSpanEdge = PinchSpanEdge.SHORTEST,
+        auditEveryMove: Boolean = false,
+    ): Boolean {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         val centerX = view.width / 2f
         val centerY = view.height / 2f
         val downTime = SystemClock.uptimeMillis()
-        val shorterEdge = minOf(view.width, view.height)
+        val shorterEdge = when (spanEdge) {
+            PinchSpanEdge.SHORTEST -> minOf(view.width, view.height)
+            // The pointers separate along Y, so a vertical pinch is bounded by the height. Kept
+            // just inside it so both pointers stay on screen for the whole travel.
+            PinchSpanEdge.TALLEST -> (view.height * TALL_PINCH_EDGE_FRACTION).toInt()
+        }
         // Fingers apart then together zooms out; together then apart zooms in.
+        val openSpanFraction = when (spanEdge) {
+            PinchSpanEdge.SHORTEST -> PINCH_START_SPAN_FRACTION
+            PinchSpanEdge.TALLEST -> LONG_PINCH_START_SPAN_FRACTION
+        }
+        val closeSpanFraction = when (spanEdge) {
+            PinchSpanEdge.SHORTEST -> PINCH_END_SPAN_FRACTION
+            PinchSpanEdge.TALLEST -> LONG_PINCH_END_SPAN_FRACTION
+        }
         val startSpan = shorterEdge *
-            if (zoomIn) PINCH_END_SPAN_FRACTION else PINCH_START_SPAN_FRACTION
+            if (zoomIn) closeSpanFraction else openSpanFraction
         val endSpan = shorterEdge *
-            if (zoomIn) PINCH_START_SPAN_FRACTION else PINCH_END_SPAN_FRACTION
+            if (zoomIn) openSpanFraction else closeSpanFraction
         val zoomAtTouchDown = map.cameraPosition.zoom
 
         // Every event in the stream is built the same way, including the first and the last. A
@@ -1654,13 +1919,24 @@ class MapSurfaceTest {
         // Engagement first, with nothing measured. An attempt that never reaches MapLibre's scale
         // detector is abandoned here, so a restarted pinch cannot contribute a frame — and the
         // frames that are measured all belong to one gesture over one installed overlay.
-        val engageSpan = startSpan + (endSpan - startSpan) * PINCH_ENGAGE_TRAVEL
+        // A long pinch first opens slightly so MapLibre's scale detector owns the stream before the
+        // inward travel begins. Otherwise its touch slop consumes roughly half a zoom level and a
+        // geometrically four-level stream only moves the camera about 3.7 levels. This remains one
+        // uninterrupted two-pointer gesture; the ordinary shorter driver keeps its established
+        // inward engagement path.
+        val engageSpan = when (spanEdge) {
+            PinchSpanEdge.SHORTEST ->
+                startSpan + (endSpan - startSpan) * PINCH_ENGAGE_TRAVEL
+            PinchSpanEdge.TALLEST -> startSpan * LONG_PINCH_ENGAGE_EXPANSION
+        }
         repeat(PINCH_ENGAGE_MOVES) { move ->
             val span = startSpan + (engageSpan - startSpan) * (move + 1) / PINCH_ENGAGE_MOVES
             send(MotionEvent.ACTION_MOVE, 2, span, SystemClock.uptimeMillis())
             SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
         }
-        val engagement = if (zoomIn) {
+        val engagement = if (spanEdge == PinchSpanEdge.TALLEST) {
+            kotlin.math.abs(map.cameraPosition.zoom - zoomAtTouchDown)
+        } else if (zoomIn) {
             map.cameraPosition.zoom - zoomAtTouchDown
         } else {
             zoomAtTouchDown - map.cameraPosition.zoom
@@ -1678,13 +1954,42 @@ class MapSurfaceTest {
             val span = engageSpan + (endSpan - engageSpan) * (move + 1) / moves
             send(MotionEvent.ACTION_MOVE, 2, span, SystemClock.uptimeMillis())
             SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
-            if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
+            if (auditEveryMove) {
+                map.awaitFullyRenderedFrame(view)
+                onHold()
+            } else if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
                 Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
                 onHold()
             }
         }
         lift(endSpan)
         return true
+    }
+
+    /** Requests and waits for a fully rendered frame at the camera state produced by the last move. */
+    private fun MapLibreMap.awaitFullyRenderedFrame(view: MapView) {
+        val ready = CountDownLatch(1)
+        lateinit var listener: MapView.OnDidFinishRenderingFrameListener
+        listener = MapView.OnDidFinishRenderingFrameListener { fullyRendered, _, _ ->
+            if (fullyRendered) {
+                view.removeOnDidFinishRenderingFrameListener(listener)
+                ready.countDown()
+            }
+        }
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            view.addOnDidFinishRenderingFrameListener(listener)
+            triggerRepaint()
+        }
+        try {
+            assertTrue(
+                "MapLibre did not fully render the camera state produced by a pinch move",
+                ready.await(SNAPSHOT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+            )
+        } finally {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                view.removeOnDidFinishRenderingFrameListener(listener)
+            }
+        }
     }
 
     /**
@@ -2806,6 +3111,16 @@ class MapSurfaceTest {
          */
         const val RECENTRE_LOOK_AWAY_DEGREES = 0.35
 
+        /** The camera must actually reach the pose, or the measurement is of an upright map. */
+        const val OBLIQUE_POSE_TOLERANCE = 1.0
+
+        /**
+         * A tilted camera sees ground running to the horizon, so the far end of a long zoom-out
+         * legitimately leaves the installed surround and is covered. Measured at one frame of six;
+         * more than that is the blanking this task exists to remove, coming back.
+         */
+        const val MAXIMUM_OBLIQUE_COVERED_FRAMES = 2
+
         /**
          * MapLibre's world is 512 logical pixels across at zoom 0 and it keeps that world covering
          * the viewport, so the lowest reachable zoom belongs to the display, not to this app. The
@@ -2842,8 +3157,15 @@ class MapSurfaceTest {
         const val GESTURE_MICRO_STEP_MILLIS = 16L
         const val GESTURE_HOLD_SETTLE_MILLIS = 500L
         const val MINIMUM_GESTURE_ZOOM_CHANGE = 1.5
+        const val MINIMUM_LONG_GESTURE_ZOOM_CHANGE = 4.0
+        /** How much of the height a full-screen vertical pinch may use. */
+        const val TALL_PINCH_EDGE_FRACTION = 0.95f
+
         const val PINCH_START_SPAN_FRACTION = 0.75f
         const val PINCH_END_SPAN_FRACTION = 0.06f
+        const val LONG_PINCH_START_SPAN_FRACTION = 0.82f
+        const val LONG_PINCH_END_SPAN_FRACTION = 0.021f
+        const val LONG_PINCH_ENGAGE_EXPANSION = 1.10f
 
         /**
          * How many times a pinch may be started over before the test gives up. Injected two-finger

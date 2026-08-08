@@ -453,8 +453,9 @@ internal fun TrailVeilMapSurface(
 
     // Keeping the camera on a walking user, once they have asked for it. The map is not hidden
     // for this: a follow step crosses at most one viewport and does not change the zoom, which is
-    // the axis a clamped surround is sensitive to — and the move listener covers the map anyway if
-    // the step ever does carry the camera past what is installed.
+    // the axis a clamped surround is sensitive to. If a step ever does carry the camera past what is
+    // installed, the dispatched move callback requests the Compose cover; that reaction is not part
+    // of the renderer frame and is tracked separately from the renderer-anchored surround.
     LaunchedEffect(readyMap, followLocation, cameraRequest) {
         val map = readyMap ?: return@LaunchedEffect
         val target = followLocation ?: return@LaunchedEffect
@@ -500,8 +501,9 @@ internal fun TrailVeilMapSurface(
         fogViewportGeneration += 1L
     }
 
-    // Kept in step with the camera on every move, and applied once after each install so a fresh
-    // overlay does not wait for the first movement to be right.
+    // Updated on every dispatched camera-move callback, and applied once after each install so a
+    // fresh overlay does not wait for the first callback to be right. MapLibre dispatches these
+    // callbacks through a Handler, so this is not a renderer-atomic switch.
     fun applyWorldCopyVisibility() {
         val style = readyStyle ?: return
         val map = readyMap ?: return
@@ -511,21 +513,25 @@ internal fun TrailVeilMapSurface(
     fun surroundHoldsForCamera(): Boolean {
         val extent = installedSurround ?: return true
         val map = readyMap ?: return true
-        val width = mapView.width
-        val height = mapView.height
         // Nothing is laid out yet, so there is no viewport to be outside of; the next camera move
         // asks again.
-        if (width <= 0 || height <= 0) return true
-        val position = map.cameraPosition
-        val target = position.target ?: return true
-        val worldPixels = FogBackdropGeometry.RENDER_TILE_SIZE_PIXELS *
-            Math.pow(2.0, position.zoom) * resources.displayMetrics.density
+        if (mapView.width <= 0 || mapView.height <= 0) return true
+        // The renderer's own answer to "what ground is on screen", rather than arithmetic on the
+        // viewport's width and height. Tilt and rotate are both enabled, and a tilted camera sees
+        // ground running away to the horizon that no axis-aligned box built from the screen's size
+        // contains — measured at 14.75% of the screen shown as explored when this did that sum
+        // itself.
+        val corners = map.projection.visibleRegion.let { region ->
+            listOfNotNull(region.farLeft, region.farRight, region.nearRight, region.nearLeft)
+        }
+        // Four finite corners or nothing. A region the projection could only partly answer for is
+        // not one this can conclude anything from — and `GeoPoint` refuses a non-finite value by
+        // throwing, which inside a camera-move listener would be a crash rather than a cover.
+        if (corners.size != VISIBLE_REGION_CORNERS) return false
+        if (corners.any { !it.latitude.isFinite() || !it.longitude.isFinite() }) return false
         return extent.covers(
-            cameraLongitude = target.longitude,
-            cameraLatitude = target.latitude,
-            viewportHalfWorldsX = width / 2.0 / worldPixels,
-            viewportHalfWorldsY = height / 2.0 / worldPixels,
-        ) && !extent.outrunByZoom(position.zoom)
+            corners.map { corner -> GeoPoint(corner.latitude, corner.longitude) },
+        )
     }
 
     LaunchedEffect(readyMap, compassTopInset, compassEndInset, density) {
@@ -639,8 +645,8 @@ internal fun TrailVeilMapSurface(
                 // A programmed camera move can jump anywhere at once, so it still hides the
                 // overlay until its rebuild lands. Gestures and follow steps do not: both are
                 // bounded, and both would black the map out under a user who is only walking or
-                // panning. What keeps that safe is the surround, and what keeps the surround
-                // honest is the move listener below.
+                // panning. The geographic surround is what keeps those moves safe in the renderer;
+                // the listener below is only the eventual fail-closed reaction if they leave it.
                 if (!gesture && !followingCameraMove.get()) {
                     fogCoverageInstalled = false
                     installedSurround = null
@@ -652,10 +658,12 @@ internal fun TrailVeilMapSurface(
                 }
             }
             // The surround is large but finite, because a quad past the renderer's precision is
-            // drawn over the whole map instead of being clipped, and where a clamped one lands
-            // drifts as the camera zooms away from the zoom it was built for. Everything else here
-            // argues that no gesture travels far enough to matter; this measures rather than
-            // argues, and covers the map when the camera does.
+            // drawn over the whole map instead of being clipped. Everything else here argues that
+            // no gesture travels far enough to matter; this checks each dispatched move and requests
+            // the Compose cover when the camera leaves. The callback and recomposition are not
+            // renderer-atomic. The required upright four-level gesture stays inside the surround and
+            // therefore does not depend on this reaction; long tilted gestures can request the cover
+            // at their final audited state.
             val moveListener = MapLibreMap.OnCameraMoveListener {
                 applyWorldCopyVisibility()
                 if (fogCoverageInstalled && !surroundHoldsForCamera()) {
@@ -722,7 +730,7 @@ internal fun TrailVeilMapSurface(
                 ) {
                     return@LaunchedEffect
                 }
-                installedSurround = FogBackdropGeometry.extent(installed, request.mapZoom)
+                installedSurround = FogBackdropGeometry.extent(installed)
             }
             applyWorldCopyVisibility()
             // Installing coverage is not the same as coverage being enough: the camera may have
@@ -796,7 +804,7 @@ internal fun TrailVeilMapSurface(
         ) {
             return@LaunchedEffect
         }
-        installedSurround = FogBackdropGeometry.extent(rendered.mosaic, request.mapZoom)
+        installedSurround = FogBackdropGeometry.extent(rendered.mosaic)
         applyWorldCopyVisibility()
         if (!surroundHoldsForCamera()) {
             requestViewport()
@@ -859,8 +867,8 @@ private fun MapLibreMap.fogViewportRequest(): FogViewportRequest {
 private fun Style.installFogOverlay(mosaic: FogTileMosaic, fogAlpha: Int) {
     val spansWorld = FogBackdropGeometry.spansWorld(mosaic)
     // The copies are always installed when there is a world to copy. Whether they are *drawn* is
-    // decided per frame from the live camera, because that is what the renderer's own repetition
-    // depends on — see [setFogMosaicRepeatsVisible].
+    // initialised after install and then updated from Handler-dispatched camera callbacks by
+    // [setFogWorldCopiesVisible]; it follows live camera zoom, but is not renderer-atomic.
     installFogMosaic(mosaic, spansWorld)
     installFogBackdrop(
         mosaic,
@@ -934,8 +942,8 @@ private fun Style.installFogMosaicQuad(
  *
  * Neither belongs to the overlay's build zoom, which is what made this wrong in both directions at
  * once: a gesture changes the camera without rebuilding anything, so zooming in from far out leaked
- * and zooming further out went black. Visibility costs nothing to change and can follow the camera
- * frame by frame.
+ * and zooming further out went black. Visibility is updated from dispatched camera callbacks, not
+ * atomically by the renderer; the transition-frame risk is tracked separately.
  */
 private fun Style.setFogWorldCopiesVisible(visible: Boolean) {
     val value = if (visible) Property.VISIBLE else Property.NONE
@@ -1232,6 +1240,9 @@ private suspend fun MapView.awaitFullyRenderedFrameAfter(action: () -> Unit) {
 }
 
 private const val WORLD_LONGITUDE_SPAN = 360.0
+
+/** A visible region is a quad; anything else means the projection could not answer. */
+private const val VISIBLE_REGION_CORNERS = 4
 
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
