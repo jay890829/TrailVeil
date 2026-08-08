@@ -15,8 +15,9 @@ local.properties
 .claude/
 
 # Local planning and agent instructions
-CLAUDE.md
-docs/
+/AGENTS.md
+/CLAUDE.md
+/docs/
 
 # Native build output
 .externalNativeBuild/
