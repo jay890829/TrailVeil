@@ -8,11 +8,16 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Relation
 import androidx.room.Transaction
+import app.trailveil.data.recording.ExpiredLocationOperationException
+import app.trailveil.data.recording.LOCATION_RECEIPT_PRUNE_INTERVAL
+import app.trailveil.data.recording.LOCATION_RECEIPT_RETAIN_COUNT
 import app.trailveil.data.recording.OperationIdCollisionException
+import app.trailveil.data.recording.locationSequenceOrNull
 import kotlinx.coroutines.flow.Flow
 
 internal data class StartedRecording(val sessionId: Long, val segmentId: Long)
 internal data class RecordingOperationResult(val receipt: RecordingOperationReceiptEntity, val replayed: Boolean)
+private const val LOCATION_COMMAND_KIND = "LOCATION"
 internal data class RecordingSessionWithSegments(@Embedded val session: RecordingSessionEntity, @Relation(parentColumn = "id", entityColumn = "session_id") val segments: List<TrackSegmentEntity>)
 internal data class ViewportTrackPointRow(
     @ColumnInfo(name = "point_id") val pointId: Long,
@@ -103,6 +108,68 @@ internal abstract class RecordingDao {
     abstract suspend fun receiptByOperationId(operationId: String): RecordingOperationReceiptEntity?
 
     @Query(
+        "SELECT expired_through_sequence FROM recording_location_receipt_windows " +
+            "WHERE runtime_token = :runtimeToken",
+    )
+    protected abstract suspend fun expiredLocationSequence(runtimeToken: String): Long?
+
+    @Query(
+        "INSERT INTO recording_location_receipt_windows(runtime_token, expired_through_sequence) " +
+            "VALUES(:runtimeToken, :expiredThrough) " +
+            "ON CONFLICT(runtime_token) DO UPDATE SET expired_through_sequence = " +
+            "MAX(expired_through_sequence, excluded.expired_through_sequence)",
+    )
+    protected abstract suspend fun advanceExpiredLocationSequence(
+        runtimeToken: String,
+        expiredThrough: Long,
+    )
+
+    @Query(
+        "SELECT operation_id FROM recording_operation_receipts " +
+            "WHERE session_id = :sessionId AND command_kind = 'LOCATION' " +
+            "AND operation_id LIKE 'location:%' " +
+            "ORDER BY rowid DESC LIMIT -1 OFFSET :retainCount",
+    )
+    protected abstract suspend fun prunableStructuredLocationReceipts(
+        sessionId: Long,
+        retainCount: Int,
+    ): List<String>
+
+    @Query("DELETE FROM recording_operation_receipts WHERE operation_id = :operationId")
+    protected abstract suspend fun deleteReceiptByOperationId(operationId: String): Int
+
+    @Query(
+        "INSERT INTO recording_location_receipt_retention_states(" +
+            "session_id, retained_receipt_count) VALUES(:sessionId, 1) " +
+            "ON CONFLICT(session_id) DO UPDATE SET retained_receipt_count = " +
+            "retained_receipt_count + 1",
+    )
+    protected abstract suspend fun incrementStructuredLocationReceiptCount(sessionId: Long)
+
+    @Query(
+        "SELECT retained_receipt_count FROM recording_location_receipt_retention_states " +
+            "WHERE session_id = :sessionId",
+    )
+    abstract suspend fun retainedStructuredLocationReceiptCount(sessionId: Long): Int?
+
+    @Query(
+        "UPDATE recording_location_receipt_retention_states SET retained_receipt_count = " +
+            "retained_receipt_count - :deletedCount WHERE session_id = :sessionId " +
+            "AND retained_receipt_count >= :deletedCount",
+    )
+    protected abstract suspend fun decrementStructuredLocationReceiptCount(
+        sessionId: Long,
+        deletedCount: Int,
+    ): Int
+
+    @Query(
+        "SELECT COUNT(*) FROM recording_operation_receipts " +
+            "WHERE session_id = :sessionId AND command_kind = 'LOCATION' " +
+            "AND operation_id LIKE 'location:%'",
+    )
+    abstract suspend fun structuredLocationReceiptCount(sessionId: Long): Int
+
+    @Query(
         "SELECT * FROM recording_operation_receipts " +
             "WHERE session_id = :sessionId AND command_kind = 'REQUEST_STOP' " +
             "AND outcome LIKE 'STOP_REQUESTED:%' ORDER BY created_at ASC, rowid ASC LIMIT 1",
@@ -132,8 +199,27 @@ internal abstract class RecordingDao {
     @Query("SELECT COALESCE(MAX(sequence) + 1, 0) FROM track_points WHERE segment_id = :segmentId")
     protected abstract suspend fun nextPointSequence(segmentId: Long): Long
 
+    suspend fun ensureMissingOperationCanUseKind(operationId: String, commandKind: String) {
+        val sequence = operationId.locationSequenceOrNull() ?: return
+        if (commandKind != LOCATION_COMMAND_KIND) {
+            throw OperationIdCollisionException(
+                "structured location operation id is reserved for LOCATION",
+            )
+        }
+        val expiredThrough = expiredLocationSequence(sequence.runtimeToken) ?: return
+        if (sequence.sequence <= expiredThrough) {
+            throw ExpiredLocationOperationException(
+                "location operation expired outside the supported receipt window",
+            )
+        }
+    }
+
     private suspend fun replay(operationId: String, commandKind: String): RecordingOperationResult? {
-        val receipt = receiptByOperationId(operationId) ?: return null
+        val receipt = receiptByOperationId(operationId)
+        if (receipt == null) {
+            ensureMissingOperationCanUseKind(operationId, commandKind)
+            return null
+        }
         if (receipt.commandKind != commandKind) { throw OperationIdCollisionException("operation id was already used for ".plus(receipt.commandKind)) }
         return RecordingOperationResult(receipt, replayed = true)
     }
@@ -153,7 +239,44 @@ internal abstract class RecordingDao {
             projectionDistanceMeters = session?.distanceMeters,
         )
         insertReceiptRow(stored)
+        pruneStructuredLocationReceipts(stored)
         return RecordingOperationResult(stored, replayed = false)
+    }
+
+    private suspend fun pruneStructuredLocationReceipts(receipt: RecordingOperationReceiptEntity) {
+        if (receipt.commandKind != LOCATION_COMMAND_KIND) return
+        receipt.operationId.locationSequenceOrNull() ?: return
+        val sessionId = receipt.sessionId ?: return
+        incrementStructuredLocationReceiptCount(sessionId)
+        val pruneAtCount =
+            LOCATION_RECEIPT_RETAIN_COUNT + LOCATION_RECEIPT_PRUNE_INTERVAL.toInt()
+        if (requireNotNull(retainedStructuredLocationReceiptCount(sessionId)) < pruneAtCount) return
+        val prunable = prunableStructuredLocationReceipts(
+            sessionId,
+            LOCATION_RECEIPT_RETAIN_COUNT,
+        )
+        if (prunable.isEmpty()) return
+        prunable
+            .map { operationId ->
+                requireNotNull(operationId.locationSequenceOrNull()) {
+                    "structured location receipt query returned a legacy operation id"
+                }
+            }
+            .groupBy { it.runtimeToken }
+            .forEach { (runtimeToken, sequences) ->
+                advanceExpiredLocationSequence(
+                    runtimeToken,
+                    requireNotNull(sequences.maxOfOrNull { it.sequence }),
+                )
+            }
+        prunable.forEach { operationId ->
+            check(deleteReceiptByOperationId(operationId) == 1) {
+                "location receipt changed during its pruning transaction"
+            }
+        }
+        check(decrementStructuredLocationReceiptCount(sessionId, prunable.size) == 1) {
+            "structured location receipt counter changed during its pruning transaction"
+        }
     }
 
     /**

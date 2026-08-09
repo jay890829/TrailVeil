@@ -19,7 +19,10 @@ internal class RoomRecordingStore(
         operationId: RecordingOperationId,
         expectedKind: RecordingOperationKind,
     ): StoreReceipt? {
-        val receipt = dao.receiptByOperationId(operationId.value) ?: return null
+        val receipt = dao.receiptByOperationId(operationId.value) ?: run {
+            dao.ensureMissingOperationCanUseKind(operationId.value, expectedKind.name)
+            return null
+        }
         val storedKind = runCatching { RecordingOperationKind.valueOf(receipt.commandKind) }.getOrNull()
         if (storedKind != expectedKind) {
             throw OperationIdCollisionException(

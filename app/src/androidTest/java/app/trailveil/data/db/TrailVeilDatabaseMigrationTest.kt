@@ -223,6 +223,43 @@ class TrailVeilDatabaseMigrationTest {
         )
         migrated.close()
     }
+
+    @Test
+    fun migrate3To4PreservesLegacyReceiptsAndAddsEmptyLocationWatermarks() {
+        migrationHelper.createDatabase("migration-p2-004", 3).apply {
+            execSQL(
+                "INSERT INTO recording_operation_receipts(" +
+                    "operation_id, command_kind, outcome, created_at" +
+                    ") VALUES ('legacy-location', 'LOCATION', 'LOCATION_SESSION_GUARD', 100)",
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            "migration-p2-004",
+            4,
+            true,
+            MIGRATION_3_4,
+        )
+        assertEquals(
+            1,
+            migrated.query(
+                "SELECT COUNT(*) FROM recording_operation_receipts " +
+                    "WHERE operation_id = 'legacy-location'",
+            ).use { cursor -> cursor.moveToFirst(); cursor.getInt(0) },
+        )
+        assertEquals(
+            0,
+            migrated.query("SELECT COUNT(*) FROM recording_location_receipt_windows")
+                .use { cursor -> cursor.moveToFirst(); cursor.getInt(0) },
+        )
+        assertEquals(
+            0,
+            migrated.query("SELECT COUNT(*) FROM recording_location_receipt_retention_states")
+                .use { cursor -> cursor.moveToFirst(); cursor.getInt(0) },
+        )
+        migrated.close()
+    }
     private companion object {
         const val TEST_DATABASE = "migration-p2-001"
     }

@@ -8,6 +8,7 @@ import app.trailveil.data.db.RecordingStatus
 import app.trailveil.data.db.TrackPointEntity
 import app.trailveil.data.db.TrailVeilDatabase
 import app.trailveil.data.location.RawLocationFix
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -146,6 +147,180 @@ class RoomRecordingStoreTest {
         assertTrue(repository.completeStart(id("activate-completed"), nextId, 1_201).activated)
         assertTrue(repository.stop(id("user-stop"), nextId, 1_300, "USER").stopped)
         assertEquals(RecordingStatus.COMPLETED, dao.sessionById(nextId)?.status)
+    }
+
+    @Test
+    fun structuredLocationReceiptWindowExpiresWithoutRepeatingCanonicalMutation() = runBlocking {
+        val repository = repository()
+        val sessionId = repository.begin("retention-begin", 1_000).sessionId
+        assertTrue(repository.completeStart(id("retention-activate"), sessionId, 1_001).activated)
+
+        val legacyOperationId = "retention-legacy-location"
+        repository.deliver(
+            operationId = legacyOperationId,
+            sessionId = sessionId,
+            capturedAtNanos = 0L,
+            epochMillis = 1_002L,
+            longitude = 121.0,
+            recordedAt = 1_002L,
+        )
+        val runtimeToken = UUID.randomUUID().toString()
+        val firstStructured = LocationOperationSequence(runtimeToken, 1L).toOperationId()
+        var lastStructured = firstStructured
+        val structuredOperationCount =
+            LOCATION_RECEIPT_RETAIN_COUNT + LOCATION_RECEIPT_PRUNE_INTERVAL.toInt()
+        repeat(structuredOperationCount - 1) { index ->
+            // Deliberately leave 255 generated-but-uncommitted IDs between writes. Retention is
+            // driven by actual per-session receipt count, never sequence divisibility.
+            val sequence = index.toLong() * LOCATION_RECEIPT_PRUNE_INTERVAL + 1L
+            val operationId = LocationOperationSequence(runtimeToken, sequence).toOperationId()
+            lastStructured = operationId
+            assertEquals(
+                LocationDisposition.ACCEPTED,
+                repository.deliver(
+                    operationId = operationId.value,
+                    sessionId = sessionId,
+                    capturedAtNanos = sequence * 1_000_000L,
+                    epochMillis = 2_000L + sequence,
+                    longitude = 121.0,
+                    recordedAt = 2_000L + sequence,
+                ).disposition,
+            )
+        }
+
+        val finalSequence =
+            (structuredOperationCount - 1L) * LOCATION_RECEIPT_PRUNE_INTERVAL + 1L
+        lastStructured = LocationOperationSequence(runtimeToken, finalSequence).toOperationId()
+        database.openHelper.writableDatabase.execSQL(
+            """
+            CREATE TRIGGER fail_structured_location_receipt_prune
+            BEFORE DELETE ON recording_operation_receipts
+            WHEN OLD.command_kind = 'LOCATION' AND OLD.operation_id LIKE 'location:%'
+            BEGIN SELECT RAISE(ABORT, 'injected location receipt prune failure'); END
+            """.trimIndent(),
+        )
+        try {
+            repository.deliver(
+                operationId = lastStructured.value,
+                sessionId = sessionId,
+                capturedAtNanos = finalSequence * 1_000_000L,
+                epochMillis = 2_000L + finalSequence,
+                longitude = 121.0,
+                recordedAt = 2_000L + finalSequence,
+            )
+            throw AssertionError("expected injected receipt prune failure")
+        } catch (_: Exception) {
+            // The outer location transaction must roll back its point, summary, receipt, and
+            // already-advanced watermark together.
+        }
+        assertEquals(structuredOperationCount, dao.pointCount())
+        assertEquals(null, dao.receiptByOperationId(lastStructured.value))
+        assertEquals(
+            structuredOperationCount - 1,
+            dao.retainedStructuredLocationReceiptCount(sessionId),
+        )
+        assertEquals(
+            0,
+            database.openHelper.writableDatabase.query(
+                "SELECT COUNT(*) FROM recording_location_receipt_windows",
+            ).use { cursor -> cursor.moveToFirst(); cursor.getInt(0) },
+        )
+        database.openHelper.writableDatabase.execSQL(
+            "DROP TRIGGER fail_structured_location_receipt_prune",
+        )
+        assertEquals(
+            LocationDisposition.ACCEPTED,
+            repository.deliver(
+                operationId = lastStructured.value,
+                sessionId = sessionId,
+                capturedAtNanos = finalSequence * 1_000_000L,
+                epochMillis = 2_000L + finalSequence,
+                longitude = 121.0,
+                recordedAt = 2_000L + finalSequence,
+            ).disposition,
+        )
+
+        assertEquals(LOCATION_RECEIPT_RETAIN_COUNT, dao.structuredLocationReceiptCount(sessionId))
+        assertEquals(
+            LOCATION_RECEIPT_RETAIN_COUNT,
+            dao.retainedStructuredLocationReceiptCount(sessionId),
+        )
+        assertEquals(null, dao.receiptByOperationId(firstStructured.value))
+        assertTrue(dao.receiptByOperationId(lastStructured.value) != null)
+        assertTrue(dao.receiptByOperationId(legacyOperationId) != null)
+        assertTrue(dao.receiptByOperationId("retention-begin") != null)
+        assertTrue(dao.receiptByOperationId("retention-activate") != null)
+
+        val beforeExpiredRetry = requireNotNull(dao.sessionById(sessionId))
+        try {
+            repository.deliver(
+                operationId = firstStructured.value,
+                sessionId = sessionId,
+                capturedAtNanos = 9_000_000_000L,
+                epochMillis = 9_000L,
+                longitude = 122.0,
+                recordedAt = 9_000L,
+            )
+            throw AssertionError("expected the pruned structured operation to be expired")
+        } catch (_: ExpiredLocationOperationException) {
+            // Expected: the durable watermark recognizes the retry without evaluating its fix.
+        }
+        assertEquals(beforeExpiredRetry, dao.sessionById(sessionId))
+        assertEquals(
+            structuredOperationCount + 1,
+            dao.pointCount(),
+        )
+
+        val beforeCrossKindReuse = requireNotNull(dao.sessionById(sessionId))
+        try {
+            repository.stop(
+                operationId = firstStructured,
+                sessionId = sessionId,
+                stoppedAtEpochMillis = 9_100L,
+                reason = "USER",
+            )
+            throw AssertionError("expected the pruned location id to remain reserved")
+        } catch (_: OperationIdCollisionException) {
+            // Pruning removes the full receipt, not the structured LOCATION namespace claim.
+        }
+        assertEquals(beforeCrossKindReuse, dao.sessionById(sessionId))
+        assertEquals(null, dao.receiptByOperationId(firstStructured.value))
+        assertEquals(structuredOperationCount + 1, dao.pointCount())
+
+        val beforeRetainedReplay = requireNotNull(dao.sessionById(sessionId))
+        assertEquals(
+            LocationDisposition.ACCEPTED,
+            repository.deliver(
+                operationId = lastStructured.value,
+                sessionId = sessionId,
+                capturedAtNanos = 10_000_000_000L,
+                epochMillis = 10_000L,
+                longitude = 123.0,
+                recordedAt = 10_000L,
+            ).disposition,
+        )
+        assertEquals(beforeRetainedReplay, dao.sessionById(sessionId))
+        assertEquals(
+            structuredOperationCount + 1,
+            dao.pointCount(),
+        )
+    }
+
+    @Test
+    fun structuredStaleLocationForAMissingSessionKeepsItsDurableGuardReceipt() = runBlocking {
+        val operationId = LocationOperationSequence(UUID.randomUUID().toString(), 1L).toOperationId()
+        val receipt = RoomRecordingStore(dao).rejectStaleLocation(
+            RejectLocationTransaction(
+                operationId = operationId,
+                requestedSessionId = 99_999L,
+                recordedAtEpochMillis = 1_000L,
+            ),
+        )
+
+        assertEquals(StoreOutcome.SessionGuardRejected(99_999L), receipt.outcome)
+        assertEquals("LOCATION_SESSION_GUARD", dao.receiptByOperationId(operationId.value)?.outcome)
+        assertEquals(1, dao.retainedStructuredLocationReceiptCount(99_999L))
+        assertEquals(0, dao.pointCount())
     }
 
     @Test

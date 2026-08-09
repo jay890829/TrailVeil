@@ -13,6 +13,7 @@ import app.trailveil.data.map.ViewportTrackDataSource
 import app.trailveil.data.recording.RecordingOperationId
 import app.trailveil.data.recording.ReconcileStartingResult
 import app.trailveil.data.recording.RecordingRepository
+import app.trailveil.data.recording.LocationOperationSequence
 import app.trailveil.data.recording.RoomRecordingStore
 import app.trailveil.map.fog.FogDiskTileCache
 import app.trailveil.map.fog.FogMemoryTileCache
@@ -23,6 +24,7 @@ import app.trailveil.map.fog.FogTileRenderer
 import app.trailveil.map.fog.FogViewportCoordinator
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.delay
 
 /** Process-scoped production wiring. Constructing it performs no recording action. */
@@ -145,6 +147,14 @@ internal fun interface RecordingOperationIdFactory {
 }
 
 internal object UuidRecordingOperationIdFactory : RecordingOperationIdFactory {
-    override fun next(prefix: String): RecordingOperationId =
+    private val locationRuntimeToken = UUID.randomUUID().toString()
+    private val locationSequence = AtomicLong(0L)
+
+    override fun next(prefix: String): RecordingOperationId = if (prefix == "location") {
+        val sequence = locationSequence.incrementAndGet()
+        check(sequence > 0L) { "location operation sequence exhausted" }
+        LocationOperationSequence(locationRuntimeToken, sequence).toOperationId()
+    } else {
         RecordingOperationId("$prefix-${UUID.randomUUID()}")
+    }
 }

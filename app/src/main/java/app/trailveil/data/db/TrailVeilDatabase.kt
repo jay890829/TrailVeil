@@ -13,8 +13,10 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         TrackSegmentEntity::class,
         TrackPointEntity::class,
         RecordingOperationReceiptEntity::class,
+        LocationReceiptWindowEntity::class,
+        LocationReceiptRetentionStateEntity::class,
     ],
-    version = 3,
+    version = 4,
     exportSchema = true,
 )
 @TypeConverters(RecordingStatusConverters::class)
@@ -42,7 +44,7 @@ internal abstract class TrailVeilDatabase : RoomDatabase() {
                 TrailVeilDatabase::class.java,
                 DATABASE_NAME,
             )
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
                 .addCallback(invariantCallback)
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)
                 .build()

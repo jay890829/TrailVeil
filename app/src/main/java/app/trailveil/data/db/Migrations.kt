@@ -218,3 +218,27 @@ internal val MIGRATION_2_3 = object : Migration(2, 3) {
         createDatabaseInvariantTriggers(db)
     }
 }
+
+/** Adds compact watermarks for bounded structured location-operation receipt retention. */
+internal val MIGRATION_3_4 = object : Migration(3, 4) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS recording_location_receipt_windows (
+                runtime_token TEXT NOT NULL,
+                expired_through_sequence INTEGER NOT NULL,
+                PRIMARY KEY(runtime_token)
+            )
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS recording_location_receipt_retention_states (
+                session_id INTEGER NOT NULL,
+                retained_receipt_count INTEGER NOT NULL,
+                PRIMARY KEY(session_id)
+            )
+            """.trimIndent(),
+        )
+    }
+}
