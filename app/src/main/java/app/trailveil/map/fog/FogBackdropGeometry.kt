@@ -170,9 +170,8 @@ data class FogSideBands(
  */
 object FogBackdropGeometry {
     /**
-     * Bands overlap the mosaic by half of one mosaic pixel. Both shapes are projected
-     * independently, so an exact shared edge could still round apart into a one-pixel seam of
-     * unfogged map; overlapping instead can only ever cost half a pixel of revealed area.
+     * Bands overlap the mosaic by half of one mosaic pixel. This remains the small geometric
+     * overlap; a renderer-pixel seam guard covers the independent ImageSource quantization gap.
      */
     const val MOSAIC_OVERLAP_PIXELS: Double = 0.5
 

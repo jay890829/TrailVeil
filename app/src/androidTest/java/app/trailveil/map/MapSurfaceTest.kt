@@ -291,6 +291,10 @@ class MapSurfaceTest {
             val allowInstallSuccess = AtomicBoolean(false)
             val installFailed = AtomicBoolean(false)
             val fogRendered = AtomicBoolean(false)
+            val injectedFailure = IllegalStateException(
+                "Injected failure after the first fog geometry mutation",
+            )
+            val testedMapView = AtomicReference<MapView?>(null)
 
             composeRule.setContent {
                 TrailVeilMapSurface(
@@ -312,18 +316,27 @@ class MapSurfaceTest {
                         zoom = 16.0,
                     ),
                     onFogRendered = { fogRendered.set(true) },
-                    onFogFailure = { installFailed.set(true) },
+                    // The surface can report an earlier placeholder/frame failure under a loaded
+                    // instrumentation process. Only the exact fault below proves that this test
+                    // reached the partial canonical install whose renderer guard it audits.
+                    onFogFailure = { failure ->
+                        if (failure === injectedFailure) installFailed.set(true)
+                    },
                     fogInstallFaultForTesting = {
                         if (!allowInstallSuccess.get()) {
-                            error("Injected failure after the first fog geometry mutation")
+                            throw injectedFailure
                         }
                     },
+                    onMapViewCreatedForTesting = testedMapView::set,
                 )
             }
 
             composeRule.waitUntil(timeoutMillis = 30_000L) { installFailed.get() }
-            val map = checkNotNull(awaitMap()) { "The map never became ready" }
-            val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            composeRule.waitUntil(timeoutMillis = 15_000L) {
+                testedMapView.get()?.isAttachedToWindow == true
+            }
+            val view = requireNotNull(testedMapView.get())
+            val map = checkNotNull(awaitMap(view)) { "The map never became ready" }
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 map.uiSettings.isLogoEnabled = false
                 map.uiSettings.isAttributionEnabled = false
@@ -760,7 +773,7 @@ class MapSurfaceTest {
         ),
         requireOnlineStyle = false,
         savedStateKey = "trailveil.map.fog-pinch-test",
-        gesture = ::pinchOutInSteps,
+        gesture = ::frameAuditedLongPinchOutInSteps,
     )
 
     /** The same pinch against the style that actually ships. */
@@ -959,39 +972,72 @@ class MapSurfaceTest {
 
 
     /**
-     * The same long pinch where Mercator is most stretched, which is where it is not quite clean.
+     * Long, frame-audited pinches where Web Mercator is most stretched.
      *
-     * `P4-022` retired the guard that blanked the map past 0.75 zoom levels out, on evidence
-     * gathered at one place and one start zoom. Repeating it elsewhere: start zooms 18, 16 and 14
-     * over Taipei and a western-hemisphere camera all held `uncovered=0.0000%` at every held frame.
-     * At 78 degrees north it does not — a full-width line one pixel tall appears near the end of the
-     * measured pinch, `0.0091%` then `0.0203%` at `(0,1491)-(1079,1491)`.
-     *
-     * It does not grow without bound, and it is not two hundred times under the bound. A verifier
-     * corrected both claims: swept over latitude and pinch length it is *non-monotone* — worst
-     * `0.0301%` at 78°N and 3.75 levels, back to `0.0000%` at 3.92, and `0.0000%` at 84°N and 85°N
-     * where it lands on the over-fog side instead — saturating at about one full-width row. It is a
-     * plus-or-minus one pixel seam whose sign flips with sub-pixel alignment. And the bound it is
-     * measured against is `MAXIMUM_SETTLED_REVEALED_FRACTION` at 0.1%, so `0.0203%` is **4.9x**
-     * under it, not 200x; the 200x came from comparing against a different gate for a different
-     * quantity. Whose docstring, moreover, says the allowance is for the revealed track and not for
-     * a coverage gap — and at this camera the track is 5,000 km away, so all of it is gap.
-     *
-     * Kept as a gate because no other gesture test goes near the poles, and because a hairline that
-     * is allowed to grow silently is how the black band arrived in the first place.
+     * Separate MapLibre ImageSources choose and quantize their geometry independently, so the
+     * half-mask-pixel geographic overlap used by the mosaic and large backdrop bands changed sign
+     * with latitude and zoom. A three-screen-pixel renderer line now bridges their four shared
+     * edges. These gates require exact zero bare pixels at both hemispheres and near both Mercator
+     * limits; the A/B below disables only that line and must reproduce the original seam.
      */
     @Test
-    fun aPinchZoomOutNearThePoleNeverExposesUnexploredMap() = sweepGesture(
+    fun aPinchZoomOutNearThePoleNeverExposesUnexploredMap() = highLatitudePinch(
+        latitude = 78.0,
+        savedStateSuffix = "north-78",
+    )
+
+    @Test
+    fun aPinchZoomOutNearTheSouthPoleNeverExposesUnexploredMap() = highLatitudePinch(
+        latitude = -78.0,
+        savedStateSuffix = "south-78",
+    )
+
+    @Test
+    fun aPinchZoomOutAtTheMercatorNorthLimitNeverExposesUnexploredMap() = highLatitudePinch(
+        latitude = 85.0,
+        savedStateSuffix = "north-85",
+    )
+
+    @Test
+    fun aPinchZoomOutAtTheMercatorSouthLimitNeverExposesUnexploredMap() = highLatitudePinch(
+        latitude = -85.0,
+        savedStateSuffix = "south-85",
+    )
+
+    @Test
+    fun aHighLatitudePinchReproducesTheBareSeamWithoutTheScreenPixelGuard() =
+        highLatitudePinch(
+            latitude = 85.0,
+            savedStateSuffix = "north-85-without-seam-guard",
+            seamGuardEnabled = false,
+            minimumUncoveredFraction = MINIMUM_REPRODUCED_HIGH_LATITUDE_SEAM_FRACTION,
+        )
+
+    private fun highLatitudePinch(
+        latitude: Double,
+        savedStateSuffix: String,
+        seamGuardEnabled: Boolean = true,
+        minimumUncoveredFraction: Double? = null,
+    ) = sweepGesture(
         provider = MapProviderConfiguration(
             providerName = "fog-pinch-pole-test-provider",
             styleUri = "https://tiles.invalid/styles/fog-pinch-pole",
         ),
         requireOnlineStyle = false,
-        savedStateKey = "trailveil.map.fog-pinch-pole-test",
-        gesture = ::pinchOutInSteps,
-        startPoint = GeoPoint(78.0, 15.0),
+        savedStateKey = "trailveil.map.fog-pinch-pole-$savedStateSuffix-test",
+        gesture = ::frameAuditedLongPinchOutInSteps,
+        startPoint = GeoPoint(latitude, 15.0),
         startZoom = 16.0,
         expectCover = false,
+        maximumUncoveredFraction = 0.0,
+        maximumOverFoggedFraction = MAXIMUM_HIGH_LATITUDE_OVER_FOGGED_FRACTION,
+        minimumZoomChange = MINIMUM_LONG_GESTURE_ZOOM_CHANGE,
+        configureFogLayers = if (seamGuardEnabled) {
+            null
+        } else {
+            { map -> map.setSingleFogLayerVisible(FogSeamGuardIds.Layer, false) }
+        },
+        minimumUncoveredFraction = minimumUncoveredFraction,
     )
 
     /**
@@ -1708,6 +1754,10 @@ class MapSurfaceTest {
         expectCover: Boolean = false,
         expectZoomIn: Boolean = false,
         minimumZoomChange: Double = MINIMUM_GESTURE_ZOOM_CHANGE,
+        maximumUncoveredFraction: Double = MAXIMUM_SETTLED_REVEALED_FRACTION,
+        maximumOverFoggedFraction: Double = MAXIMUM_OVER_FOGGED_FRACTION,
+        configureFogLayers: ((MapLibreMap) -> Unit)? = null,
+        minimumUncoveredFraction: Double? = null,
     ) {
         val database = inMemoryDatabase()
         try {
@@ -1762,6 +1812,7 @@ class MapSurfaceTest {
                     .isEmpty()
             }
             Thread.sleep(ZOOM_SETTLE_MILLIS)
+            configureFogLayers?.invoke(map)
 
             // Same calibration the settled sweep runs, for the same reason: a detector that cannot
             // see a leak here would report every audit of the gesture as covered.
@@ -1903,18 +1954,25 @@ class MapSurfaceTest {
                     "gesture is given: $generations (touch-down was $generationAtTouchDown)",
                 generations.all { it == generations.first() },
             )
-            assertTrue(
-                "A zoom-out gesture presented unexplored map as revealed at zoom $worstZoom: " +
-                    worstReport,
-                worstFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
-            )
+            if (minimumUncoveredFraction == null) {
+                assertTrue(
+                    "A zoom-out gesture presented unexplored map as revealed at zoom $worstZoom: " +
+                        worstReport,
+                    worstFraction <= maximumUncoveredFraction,
+                )
+            } else {
+                assertTrue(
+                    "The A/B mutation did not reproduce the high-latitude seam: $worstReport",
+                    worstFraction >= minimumUncoveredFraction,
+                )
+            }
             // A gesture can get coverage wrong in the other direction too, and until this was
             // measured it did: crossing the zoom where the renderer starts repeating an image
             // source by itself put a second coat of fog over half the screen.
             assertTrue(
                 "A gesture drew part of the map under more than one coat of fog: " +
                     worstOverFoggedReport,
-                worstOverFogged <= MAXIMUM_OVER_FOGGED_FRACTION,
+                worstOverFogged <= maximumOverFoggedFraction,
             )
             if (expectCover) {
                 // The other half of the contract in the regime where the surround is clamped: the
@@ -3070,13 +3128,7 @@ class MapSurfaceTest {
         val value = if (visible) Property.VISIBLE else Property.NONE
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
             val style = requireNotNull(style) { "The style is not ready" }
-            (
-                listOf(
-                    FogOverlayIds.Layer,
-                    FogOverlayIds.WestRepeatLayer,
-                    FogOverlayIds.EastRepeatLayer,
-                ) + FogBackdropIds.Layers
-                ).forEach { id ->
+            ALL_FOG_LAYERS.forEach { id ->
                 style.getLayer(id)?.setProperties(PropertyFactory.visibility(value))
             }
         }
@@ -3194,13 +3246,15 @@ class MapSurfaceTest {
             "pixels=$sampledPixels]"
     }
 
-    private fun awaitMap(): MapLibreMap? {
+    private fun awaitMap(exactMapView: MapView? = null): MapLibreMap? {
         val ready = CountDownLatch(1)
         val found = AtomicReference<MapLibreMap?>(null)
-        composeRule.waitUntil(timeoutMillis = 15_000L) {
-            composeRule.runOnIdle { attachedMapView() } != null
+        if (exactMapView == null) {
+            composeRule.waitUntil(timeoutMillis = 15_000L) {
+                composeRule.runOnIdle { attachedMapView() } != null
+            }
         }
-        val mapView = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        val mapView = exactMapView ?: requireNotNull(composeRule.runOnIdle { attachedMapView() })
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
             mapView.getMapAsync { map ->
                 found.set(map)
@@ -3334,13 +3388,16 @@ class MapSurfaceTest {
         /**
          * What the seams between fog quads are allowed to cost, and no more.
          *
-         * The bands deliberately overlap the mosaic by half of one *mosaic mask* pixel, which is
-         * sub-pixel at exploration zooms and about five screen pixels at render zoom 0, where one
-         * mask pixel is a two-hundred-and-fifty-sixth of the world. That is the whole of the
+         * ImageSource bands overlap by half of one *mosaic mask* pixel. A three-screen-pixel line
+         * bridges their independently quantized shared edges, deliberately paying a narrow strip
+         * of double fog instead of risking bare map. At render zoom 0 one mask pixel is a
+         * two-hundred-and-fifty-sixth of the world and is about five screen pixels on this device.
+         * That and the screen-pixel guard are the whole of the
          * residue this tolerates: measured 0.4167% at a camera with the world's top and bottom
          * edges on screen — two five-pixel strips across 1080 — and 1.2465% at the antimeridian,
-         * where the mosaic's east and west edges are on screen as well. `P4-023` is the task to
-         * make that overlap a screen-pixel quantity instead.
+         * where the mosaic's east and west edges are on screen as well. `P4-023` separately owns
+         * the stricter literal-zero-double-coat criterion; this gate records and bounds the guard's
+         * deliberate safety-side cost instead of calling it zero.
          *
          * A gesture adds to that. Where two fog quads abut — the mosaic and its own world copy —
          * the seam between them widens as the camera zooms away from the zoom the overlay was
@@ -3353,13 +3410,16 @@ class MapSurfaceTest {
          * during a gesture. This bound sits twenty times under that.
          */
         const val MAXIMUM_OVER_FOGGED_FRACTION = 0.05
+        const val MAXIMUM_HIGH_LATITUDE_OVER_FOGGED_FRACTION = 0.02
+        const val MINIMUM_REPRODUCED_HIGH_LATITUDE_SEAM_FRACTION = 0.0001
         const val FOG_VISIBILITY_SETTLE_MILLIS = 600L
 
-        /** Every quad the fog installs, in the order they are drawn. */
+        /** Every fog layer the coverage audit must hide and restore. */
         val ALL_FOG_LAYERS: List<String> = listOf(
             FogOverlayIds.Layer,
             FogOverlayIds.WestRepeatLayer,
             FogOverlayIds.EastRepeatLayer,
+            FogSeamGuardIds.Layer,
         ) + FogBackdropIds.Layers
 
         /**

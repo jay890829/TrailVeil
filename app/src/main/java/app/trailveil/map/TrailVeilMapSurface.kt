@@ -153,6 +153,11 @@ internal object FogBackdropIds {
     )
 }
 
+internal object FogSeamGuardIds {
+    const val Source = "trailveil-fog-seam-guard-source"
+    const val Layer = "trailveil-fog-seam-guard-layer"
+}
+
 internal object CurrentLocationOverlayIds {
     const val Source = "trailveil-current-location-source"
     const val Layer = "trailveil-current-location-layer"
@@ -261,6 +266,7 @@ internal fun TrailVeilMapSurface(
     onFogRendered: ((FogViewportRender) -> Unit)? = null,
     onFogFailure: (Throwable) -> Unit = {},
     fogInstallFaultForTesting: (() -> Unit)? = null,
+    onMapViewCreatedForTesting: ((MapView) -> Unit)? = null,
 ) {
     require(fallbackTimeoutMillis > 0L) { "fallbackTimeoutMillis must be positive" }
     require(savedStateKey.isNotBlank()) { "savedStateKey must not be blank" }
@@ -308,6 +314,7 @@ internal fun TrailVeilMapSurface(
     val currentOnFogRendered by rememberUpdatedState(onFogRendered)
     val currentOnFogFailure by rememberUpdatedState(onFogFailure)
     val currentOnUserMovedCamera by rememberUpdatedState(onUserMovedCamera)
+    val currentOnMapViewCreatedForTesting by rememberUpdatedState(onMapViewCreatedForTesting)
     // Set only around a follow step, whose reach is bounded by how far a person walked since the
     // last fix. Every other programmed move keeps hiding the overlay until its rebuild lands.
     val followingCameraMove = remember(mapView) { AtomicBoolean(false) }
@@ -337,6 +344,7 @@ internal fun TrailVeilMapSurface(
     var fogBaselineReady by remember(mapView, fogRuntime) {
         mutableStateOf(fogRuntime == null)
     }
+    SideEffect { currentOnMapViewCreatedForTesting?.invoke(mapView) }
     // Read in composition, not inside the effect: a state read performed only while applying a
     // side effect is not observed, so publication would silently stop tracking the state it
     // reports. The status badge short-circuits on the basemap state, so `canonicalFogLoaded` has
@@ -856,10 +864,11 @@ private fun MapLibreMap.fogViewportRequest(): FogViewportRequest {
 /**
  * Installs the mosaic and the bands that close around it in one main-thread call stack, without an
  * explicit renderer wait between their mutations. The renderer-owned guard is made visible first
- * and hidden last in this same call stack. MapLibre 13.4.1 coalesces those updates before forwarding
- * one immutable snapshot: success forwards complete geometry with the guard hidden, while a throw
- * forwards partial geometry with the guard still visible. The Compose cover remains a second line
- * of defence but is not part of this frame-ordering argument.
+ * and hidden last in this same call stack. MapLibre 13.4.1 coalesces the image and style updates;
+ * a synchronous throw therefore leaves the guard visible, which the failure-injection gate checks
+ * directly. The GeoJSON seam source tiles asynchronously, so this function does not claim that a
+ * successful rebuild is renderer-atomic before the later fully-rendered callback; that broader
+ * residual remains tracked separately. The Compose cover is a second line of defence.
  */
 private fun Style.installFogOverlay(
     mosaic: FogTileMosaic,
@@ -868,6 +877,7 @@ private fun Style.installFogOverlay(
 ) {
     val installGuard = ensureFogInstallGuard()
     installGuard.setProperties(PropertyFactory.visibility(Property.VISIBLE))
+    installFogSeamGuard(mosaic, fogAlpha)
     val spansWorld = FogBackdropGeometry.spansWorld(mosaic)
     // The copies are always installed when there is a world to copy. A camera-zoom opacity step is
     // attached before each layer enters the style, so the renderer — not a Handler-dispatched
@@ -883,6 +893,54 @@ private fun Style.installFogOverlay(
         repeatWorlds = FogBackdropGeometry.surroundSpansWorld(mosaic) && !spansWorld,
     )
     installGuard.setProperties(PropertyFactory.visibility(Property.NONE))
+}
+
+/** A screen-pixel bridge over the four independently quantized ImageSource edges. */
+private fun Style.installFogSeamGuard(mosaic: FogTileMosaic, fogAlpha: Int) {
+    val bands = FogBackdropGeometry.bands(mosaic)
+    val lines = if (FogBackdropGeometry.surroundSpansWorld(mosaic)) {
+        emptyList()
+    } else {
+        listOf(
+            listOf(
+                Point.fromLngLat(bands.north.westLongitude, bands.north.southLatitude),
+                Point.fromLngLat(bands.north.eastLongitude, bands.north.southLatitude),
+            ),
+            listOf(
+                Point.fromLngLat(bands.south.westLongitude, bands.south.northLatitude),
+                Point.fromLngLat(bands.south.eastLongitude, bands.south.northLatitude),
+            ),
+            listOf(
+                Point.fromLngLat(bands.west.eastLongitude, bands.west.southLatitude),
+                Point.fromLngLat(bands.west.eastLongitude, bands.west.northLatitude),
+            ),
+            listOf(
+                Point.fromLngLat(bands.east.westLongitude, bands.east.southLatitude),
+                Point.fromLngLat(bands.east.westLongitude, bands.east.northLatitude),
+            ),
+        )
+    }
+    installGeoJsonSource(
+        FogSeamGuardIds.Source,
+        FeatureCollection.fromFeatures(
+            lines.map { points -> Feature.fromGeometry(LineString.fromLngLats(points)) },
+        ),
+    )
+    val existing = getLayer(FogSeamGuardIds.Layer)
+    val layer = if (existing == null) {
+        LineLayer(FogSeamGuardIds.Layer, FogSeamGuardIds.Source).withProperties(
+            PropertyFactory.lineColor("#000000"),
+            PropertyFactory.lineWidth(FOG_SEAM_GUARD_WIDTH_PIXELS),
+        )
+    } else {
+        require(existing is LineLayer) { "${FogSeamGuardIds.Layer} is not a line layer" }
+        existing
+    }
+    layer.setProperties(
+        PropertyFactory.lineOpacity(fogAlpha / 255.0f),
+        PropertyFactory.visibility(if (lines.isEmpty()) Property.NONE else Property.VISIBLE),
+    )
+    if (existing == null) addLayerBelow(layer, FogOverlayIds.InstallGuardLayer)
 }
 
 private fun Style.ensureFogInstallGuard(): BackgroundLayer {
@@ -1077,8 +1135,8 @@ private fun Style.installFogBackdropBand(
         },
     )
     if (existingLayer == null) {
-        // Above the mosaic, so the half-pixel the bands deliberately overlap it stays one flat
-        // layer of fog instead of a darker seam, and still below the location and track overlays.
+        // Above the mosaic so any geometric overlap stays on the safe, over-fogged side. The
+        // screen-pixel seam guard separately covers the independent ImageSource vertex grids.
         if (getLayer(FogOverlayIds.Layer) == null) {
             addLayer(layer)
         } else {
@@ -1263,6 +1321,7 @@ private const val VISIBLE_REGION_CORNERS = 4
 
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
+private const val FOG_SEAM_GUARD_WIDTH_PIXELS = 3.0f
 private const val TRACK_CAMERA_PADDING_PX = 72
 
 /**
