@@ -1,7 +1,7 @@
 package app.trailveil.feature.recording
 
 import app.trailveil.data.history.RecordingHistoryAcceptedPoint
-import app.trailveil.data.history.RecordingHistoryDetail
+import app.trailveil.data.history.RecordingLatestSessionSummary
 import app.trailveil.data.history.RecordingHistoryOperationOutcome
 import app.trailveil.data.history.RecordingHistorySession
 import app.trailveil.data.history.RecordingHistoryStatus
@@ -268,7 +268,7 @@ class RecordingPresentationTest {
     private fun detail(
         status: RecordingHistoryStatus,
         outcome: String = "START_ACTIVATED",
-    ) = RecordingHistoryDetail(
+    ) = RecordingLatestSessionSummary(
         session = RecordingHistorySession(
             id = 7L,
             startedAt = 1_000L,
@@ -286,7 +286,6 @@ class RecordingPresentationTest {
             acceptedPointCount = 1L,
             rejectedPointCount = 0L,
         ),
-        segments = emptyList(),
         latestOperationOutcome = RecordingHistoryOperationOutcome(outcome),
         latestAcceptedPoint = RecordingHistoryAcceptedPoint(
             id = 11L,

@@ -1,7 +1,7 @@
 package app.trailveil.feature.recording
 
 import app.trailveil.data.history.RecordingHistoryAcceptedPoint
-import app.trailveil.data.history.RecordingHistoryDetail
+import app.trailveil.data.history.RecordingLatestSessionSummary
 import app.trailveil.data.history.RecordingHistoryStatus
 
 internal data class RecordingPresentation(
@@ -38,7 +38,7 @@ internal val ExpiringStartNotices = setOf(
     RecordingStartNotice.STOP_REQUESTED,
 )
 
-internal fun RecordingHistoryDetail?.toRecordingPresentation(
+internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
     stoppingSessionId: Long?,
 ): RecordingPresentation {
     if (this == null) {

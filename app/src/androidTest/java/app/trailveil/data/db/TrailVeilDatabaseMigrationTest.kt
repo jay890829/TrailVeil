@@ -260,6 +260,36 @@ class TrailVeilDatabaseMigrationTest {
         )
         migrated.close()
     }
+
+    @Test
+    fun migrate4To5AddsBoundedSummaryOrderingIndexes() {
+        migrationHelper.createDatabase("migration-p4-033", 4).close()
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            "migration-p4-033",
+            5,
+            true,
+            MIGRATION_4_5,
+        )
+        val indexes = migrated.query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' " +
+                "AND name IN (" +
+                "'index_recording_operation_receipts_session_id_created_at', " +
+                "'index_track_points_session_id_id') ORDER BY name",
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(cursor.getString(0))
+            }
+        }
+        assertEquals(
+            listOf(
+                "index_recording_operation_receipts_session_id_created_at",
+                "index_track_points_session_id_id",
+            ),
+            indexes,
+        )
+        migrated.close()
+    }
     private companion object {
         const val TEST_DATABASE = "migration-p2-001"
     }

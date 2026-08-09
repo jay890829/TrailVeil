@@ -14,6 +14,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -28,7 +29,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import app.trailveil.TrailVeilApplication
-import app.trailveil.data.history.RecordingHistoryDetail
+import app.trailveil.R
+import app.trailveil.data.history.RecordingLatestSessionSummary
 import app.trailveil.map.MapCameraRequest
 import app.trailveil.map.fog.GeoPoint
 import app.trailveil.recording.RecordingForegroundService
@@ -73,8 +75,8 @@ internal fun RecordingEntryRoute(
     // When the user's action produced the notice, so an acknowledgement expires on its own age
     // rather than on how long this screen has been drawn.
     var startNoticeRaisedAt by rememberSaveable { mutableStateOf<Long?>(null) }
-    var latestHistoryDetail by remember { mutableStateOf<RecordingHistoryDetail?>(null) }
-    // A null detail means both "no exploration exists" and "the newest one has not been read yet",
+    var latestSessionSummary by remember { mutableStateOf<RecordingLatestSessionSummary?>(null) }
+    // A null summary means both "no exploration exists" and "the newest one has not been read yet",
     // and the screen must not act on the second as if it were the first — that is how a live
     // recording could be offered a Start action instead of Stop.
     var latestHistoryLoaded by remember { mutableStateOf(false) }
@@ -102,8 +104,8 @@ internal fun RecordingEntryRoute(
     }
 
     LaunchedEffect(appContainer) {
-        appContainer.recordingHistory.latestSessionDetail().collectLatest { detail ->
-            latestHistoryDetail = detail
+        appContainer.recordingHistory.latestSessionSummary().collectLatest { summary ->
+            latestSessionSummary = summary
             latestHistoryLoaded = true
         }
     }
@@ -332,7 +334,19 @@ internal fun RecordingEntryRoute(
         }
     }
 
-    val recordingPresentation = latestHistoryDetail.toRecordingPresentation(stoppingSessionId)
+    val recordingPresentation = latestSessionSummary.toRecordingPresentation(stoppingSessionId)
+    // A view-tree diagnostic makes the production presentation boundary observable to scale and
+    // frame tests without exposing canonical coordinates or adding a second data subscription.
+    SideEffect {
+        activity.window.decorView.setTag(
+            R.id.recording_presentation_latest_point_id,
+            recordingPresentation.latestAcceptedPoint?.id,
+        )
+        activity.window.decorView.setTag(
+            R.id.recording_presentation_latest_outcome,
+            latestSessionSummary?.latestOperationOutcome?.value,
+        )
+    }
     val currentLocation = serviceLocation
         ?.takeIf { it.sessionId == recordingPresentation.activeSessionId }
         ?.let { GeoPoint(latitude = it.latitude, longitude = it.longitude) }

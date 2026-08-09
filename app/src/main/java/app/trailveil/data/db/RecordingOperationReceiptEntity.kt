@@ -12,6 +12,10 @@ import androidx.room.PrimaryKey
         Index(name = "index_recording_operation_receipts_command_kind", value = ["command_kind"]),
         Index(name = "index_recording_operation_receipts_session_id", value = ["session_id"]),
         Index(name = "index_recording_operation_receipts_created_at", value = ["created_at"]),
+        Index(
+            name = "index_recording_operation_receipts_session_id_created_at",
+            value = ["session_id", "created_at"],
+        ),
     ],
 )
 data class RecordingOperationReceiptEntity(

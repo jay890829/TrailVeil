@@ -82,6 +82,11 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
         locationEngineOverrideForTesting = engine
     }
 
+    /** Dedicated-process benchmark cleanup; the container must not be reused after this call. */
+    internal fun closeDatabaseForTesting() {
+        database.close()
+    }
+
     /**
      * Call from a background dispatcher: disk-cache discovery and trimming perform file I/O.
      * Failure to create the derived disk cache degrades to the bounded in-memory cache.

@@ -51,6 +51,7 @@ class RoomRecordingHistoryDataSourceTest {
     fun emptyAndMissingHistoryAreExplicitAndPersistedSessionsAreNewestFirst() = runBlocking {
         assertEquals(emptyList<RecordingHistorySession>(), history.sessions().first())
         assertNull(history.sessionDetail(999_999).first())
+        assertNull(history.latestSessionSummary().first())
 
         val completed = startActive(100)
         close(completed, 110, RecordingStatus.COMPLETED, "USER_STOP")
@@ -122,6 +123,16 @@ class RoomRecordingHistoryDataSourceTest {
         assertNull(active.segments.single().endedAt)
         assertEquals(listOf(listOf(0L)), active.acceptedPointSegments.map { it.points.map { point -> point.sequence } })
 
+        val summary = requireNotNull(history.latestSessionSummary().first())
+        assertEquals(recording.sessionId, summary.session.id)
+        assertEquals(RecordingHistoryStatus.ACTIVE, summary.session.status)
+        assertEquals(1L, summary.session.acceptedPointCount)
+        assertEquals(1L, summary.session.rejectedPointCount)
+        assertEquals("LOCATION_REJECTED_ACCURACY", summary.latestOperationOutcome?.value)
+        assertEquals(active.latestAcceptedPoint, summary.latestAcceptedPoint)
+        assertEquals(25.1, summary.latestAcceptedPoint?.latitude ?: -1.0, 0.0)
+        assertEquals(121.2, summary.latestAcceptedPoint?.longitude ?: -1.0, 0.0)
+
         val completed = async(start = CoroutineStart.UNDISPATCHED) {
             history.sessionDetail(recording.sessionId)
                 .filterNotNull()
@@ -134,18 +145,76 @@ class RoomRecordingHistoryDataSourceTest {
         assertEquals(130L, updated.segments.single().endedAt)
         assertEquals("USER_STOP", updated.segments.single().endReason)
         assertEquals("LOCATION_REJECTED_ACCURACY", updated.latestOperationOutcome?.value)
-        assertEquals(recording.sessionId, history.latestSessionDetail().first()?.session?.id)
+        assertEquals(recording.sessionId, history.latestSessionSummary().first()?.session?.id)
     }
 
     @Test
-    fun latestDetailUsesSessionInsertionOrderWhenTheClockMovesBackward() = runBlocking {
+    fun latestSummaryUsesSessionInsertionOrderWhenTheClockMovesBackward() = runBlocking {
         val first = startActive(500)
         close(first, 510, RecordingStatus.COMPLETED, "FIRST")
         val laterInserted = startActive(100)
 
-        val latest = requireNotNull(history.latestSessionDetail().first())
+        val latest = requireNotNull(history.latestSessionSummary().first())
         assertEquals(laterInserted.sessionId, latest.session.id)
         assertEquals(100L, latest.session.startedAt)
+    }
+
+    @Test
+    fun latestSummaryPreservesDetailOrderingWhenTheWallClockMovesBackward() = runBlocking {
+        val recording = startActive(100)
+        dao.persistAcceptedPoint(
+            point = TrackPointEntity(
+                sessionId = recording.sessionId,
+                segmentId = recording.segmentId,
+                sequence = 0,
+                timestamp = 200,
+                latitude = 25.0,
+                longitude = 121.0,
+                horizontalAccuracy = 5.0,
+            ),
+            distanceDeltaMeters = 0.0,
+            operationId = "summary-order-point-first",
+            commandKind = "LOCATION_ACCEPTED",
+            outcome = "LOCATION_ACCEPTED_FIRST",
+            createdAt = 200,
+        )
+        val laterInsertedPoint = dao.persistAcceptedPoint(
+            point = TrackPointEntity(
+                sessionId = recording.sessionId,
+                segmentId = recording.segmentId,
+                sequence = 1,
+                timestamp = 100,
+                latitude = 25.1,
+                longitude = 121.1,
+                horizontalAccuracy = 5.0,
+            ),
+            distanceDeltaMeters = 1.0,
+            operationId = "summary-order-point-second",
+            commandKind = "LOCATION_ACCEPTED",
+            outcome = "LOCATION_ACCEPTED_SECOND",
+            createdAt = 100,
+        )
+        dao.recordRejectedPoint(
+            sessionId = recording.sessionId,
+            operationId = "summary-order-outcome-newer-event",
+            commandKind = "LOCATION_REJECTED",
+            outcome = "OUTCOME_NEWER_EVENT",
+            createdAt = 300,
+        )
+        dao.recordRejectedPoint(
+            sessionId = recording.sessionId,
+            operationId = "summary-order-outcome-later-commit",
+            commandKind = "LOCATION_REJECTED",
+            outcome = "OUTCOME_LATER_COMMIT_OLDER_EVENT",
+            createdAt = 50,
+        )
+
+        val detail = requireNotNull(history.sessionDetail(recording.sessionId).first())
+        val summary = requireNotNull(history.latestSessionSummary().first())
+        assertEquals(requireNotNull(laterInsertedPoint.receipt.pointId), summary.latestAcceptedPoint?.id)
+        assertEquals(detail.latestAcceptedPoint, summary.latestAcceptedPoint)
+        assertEquals("OUTCOME_NEWER_EVENT", summary.latestOperationOutcome?.value)
+        assertEquals(detail.latestOperationOutcome, summary.latestOperationOutcome)
     }
 
     @Test

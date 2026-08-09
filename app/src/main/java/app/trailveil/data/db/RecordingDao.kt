@@ -18,7 +18,42 @@ import kotlinx.coroutines.flow.Flow
 internal data class StartedRecording(val sessionId: Long, val segmentId: Long)
 internal data class RecordingOperationResult(val receipt: RecordingOperationReceiptEntity, val replayed: Boolean)
 private const val LOCATION_COMMAND_KIND = "LOCATION"
+internal const val LATEST_RECORDING_SUMMARY_QUERY = """
+    SELECT
+        s.*,
+        (
+            SELECT r.outcome
+            FROM recording_operation_receipts r
+            WHERE r.session_id = s.id
+            ORDER BY r.created_at DESC, r.rowid DESC
+            LIMIT 1
+        ) AS latest_operation_outcome,
+        p.id AS latest_point_id,
+        p.sequence AS latest_point_sequence,
+        p.timestamp AS latest_point_timestamp,
+        p.latitude AS latest_point_latitude,
+        p.longitude AS latest_point_longitude
+    FROM recording_sessions s
+    LEFT JOIN track_points p ON p.id = (
+        SELECT latest.id
+        FROM track_points latest
+        WHERE latest.session_id = s.id
+        ORDER BY latest.id DESC
+        LIMIT 1
+    )
+    ORDER BY s.id DESC
+    LIMIT 1
+"""
 internal data class RecordingSessionWithSegments(@Embedded val session: RecordingSessionEntity, @Relation(parentColumn = "id", entityColumn = "session_id") val segments: List<TrackSegmentEntity>)
+internal data class LatestRecordingSummaryRow(
+    @Embedded val session: RecordingSessionEntity,
+    @ColumnInfo(name = "latest_operation_outcome") val latestOperationOutcome: String?,
+    @ColumnInfo(name = "latest_point_id") val latestPointId: Long?,
+    @ColumnInfo(name = "latest_point_sequence") val latestPointSequence: Long?,
+    @ColumnInfo(name = "latest_point_timestamp") val latestPointTimestamp: Long?,
+    @ColumnInfo(name = "latest_point_latitude") val latestPointLatitude: Double?,
+    @ColumnInfo(name = "latest_point_longitude") val latestPointLongitude: Double?,
+)
 internal data class ViewportTrackPointRow(
     @ColumnInfo(name = "point_id") val pointId: Long,
     @ColumnInfo(name = "session_id") val sessionId: Long,
@@ -436,9 +471,8 @@ internal abstract class RecordingDao {
     @Transaction
     @Query("SELECT * FROM recording_sessions WHERE id = :sessionId")
     abstract fun observeHistorySessionWithSegments(sessionId: Long): Flow<RecordingSessionWithSegments?>
-    @Transaction
-    @Query("SELECT * FROM recording_sessions ORDER BY id DESC LIMIT 1")
-    abstract fun observeLatestHistorySessionWithSegments(): Flow<RecordingSessionWithSegments?>
+    @Query(LATEST_RECORDING_SUMMARY_QUERY)
+    abstract fun observeLatestRecordingSummary(): Flow<LatestRecordingSummaryRow?>
     @Query("SELECT outcome FROM recording_operation_receipts WHERE session_id = :sessionId ORDER BY created_at DESC, rowid DESC LIMIT 1")
     abstract fun observeLatestOperationOutcome(sessionId: Long): Flow<String?>
     @Query("SELECT * FROM track_points WHERE session_id = :sessionId ORDER BY id DESC LIMIT 1")

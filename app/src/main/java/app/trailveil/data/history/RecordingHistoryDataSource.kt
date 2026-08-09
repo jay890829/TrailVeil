@@ -106,6 +106,13 @@ data class RecordingHistoryDetail(
     }
 }
 
+/** Bounded newest-session projection consumed by the always-visible recording entry route. */
+data class RecordingLatestSessionSummary(
+    val session: RecordingHistorySession,
+    val latestOperationOutcome: RecordingHistoryOperationOutcome?,
+    val latestAcceptedPoint: RecordingHistoryAcceptedPoint?,
+)
+
 /** Read-only persisted history contract; it intentionally has no service/runtime dependency. */
 interface RecordingHistoryDataSource {
     /** All durable sessions, newest first by persisted start time then id. */
@@ -114,6 +121,6 @@ interface RecordingHistoryDataSource {
     /** A selected durable session, or null when its id does not exist. */
     fun sessionDetail(sessionId: Long): Flow<RecordingHistoryDetail?>
 
-    /** The durable newest session detail, including its latest outcome and accepted coordinate. */
-    fun latestSessionDetail(): Flow<RecordingHistoryDetail?>
+    /** One bounded newest-session row; never reconstructs segments or the accepted-point list. */
+    fun latestSessionSummary(): Flow<RecordingLatestSessionSummary?>
 }

@@ -28,6 +28,10 @@ import androidx.room.PrimaryKey
             value = ["session_id", "timestamp"],
         ),
         Index(
+            name = "index_track_points_session_id_id",
+            value = ["session_id", "id"],
+        ),
+        Index(
             name = "index_track_points_segment_id_session_id",
             value = ["segment_id", "session_id"],
         ),

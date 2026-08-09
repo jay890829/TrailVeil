@@ -1,6 +1,7 @@
 package app.trailveil.data.history
 
 import app.trailveil.data.db.HistoryAcceptedTrackPointRow
+import app.trailveil.data.db.LatestRecordingSummaryRow
 import app.trailveil.data.db.RecordingDao
 import app.trailveil.data.db.RecordingSessionEntity
 import app.trailveil.data.db.RecordingSessionWithSegments
@@ -25,8 +26,8 @@ internal class RoomRecordingHistoryDataSource(
     override fun sessionDetail(sessionId: Long): Flow<RecordingHistoryDetail?> =
         dao.observeHistorySessionWithSegments(sessionId).flatMapLatest(::detailFlow)
 
-    override fun latestSessionDetail(): Flow<RecordingHistoryDetail?> =
-        dao.observeLatestHistorySessionWithSegments().flatMapLatest(::detailFlow)
+    override fun latestSessionSummary(): Flow<RecordingLatestSessionSummary?> =
+        dao.observeLatestRecordingSummary().map { row -> row?.toLatestSummary() }
 
     private fun detailFlow(
         projection: RecordingSessionWithSegments?,
@@ -66,6 +67,33 @@ internal class RoomRecordingHistoryDataSource(
         acceptedPointCount = acceptedPointCount,
         rejectedPointCount = rejectedPointCount,
     )
+
+    private fun LatestRecordingSummaryRow.toLatestSummary(): RecordingLatestSessionSummary {
+        val pointFields = listOf(
+            latestPointId,
+            latestPointSequence,
+            latestPointTimestamp,
+            latestPointLatitude,
+            latestPointLongitude,
+        )
+        require(pointFields.all { it == null } || pointFields.none { it == null }) {
+            "latest accepted point projection is partial"
+        }
+        val latestPoint = latestPointId?.let { pointId ->
+            RecordingHistoryAcceptedPoint(
+                id = pointId,
+                sequence = requireNotNull(latestPointSequence),
+                timestamp = requireNotNull(latestPointTimestamp),
+                latitude = requireNotNull(latestPointLatitude),
+                longitude = requireNotNull(latestPointLongitude),
+            )
+        }
+        return RecordingLatestSessionSummary(
+            session = session.toHistory(),
+            latestOperationOutcome = latestOperationOutcome?.let(::RecordingHistoryOperationOutcome),
+            latestAcceptedPoint = latestPoint,
+        )
+    }
 
     private fun TrackSegmentEntity.toHistory() = RecordingHistorySegment(
         id = id,

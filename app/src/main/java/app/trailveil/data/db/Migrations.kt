@@ -242,3 +242,21 @@ internal val MIGRATION_3_4 = object : Migration(3, 4) {
         )
     }
 }
+
+/** Adds ordering indexes for the bounded newest-session presentation projection. */
+internal val MIGRATION_4_5 = object : Migration(4, 5) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS index_recording_operation_receipts_session_id_created_at
+            ON recording_operation_receipts(session_id, created_at)
+            """.trimIndent(),
+        )
+        db.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS index_track_points_session_id_id
+            ON track_points(session_id, id)
+            """.trimIndent(),
+        )
+    }
+}
