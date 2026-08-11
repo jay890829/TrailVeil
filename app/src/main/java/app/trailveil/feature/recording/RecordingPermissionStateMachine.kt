@@ -143,6 +143,50 @@ internal enum class NotificationAccessState {
     GRANTED,
 }
 
+/**
+ * Saveable UI continuation for the one notification request that follows an explicit Start.
+ *
+ * The pending marker is deliberately not enough to resume recording: only the Activity Result
+ * callback can move [AWAITING_RESULT] to [RESULT_OBSERVED]. Keeping [REQUESTING_PERMISSION]
+ * separate closes the cancellation window while the request-history marker is being persisted;
+ * after recreation that phase retries the marker write and launches the prompt instead of silently
+ * losing the user's action.
+ */
+internal enum class NotificationStartContinuation {
+    IDLE,
+    REQUESTING_PERMISSION,
+    AWAITING_RESULT,
+    RESULT_OBSERVED,
+    ;
+
+    fun begin(): NotificationStartContinuation = when (this) {
+        IDLE -> REQUESTING_PERMISSION
+        else -> this
+    }
+
+    fun permissionRequestLaunched(): NotificationStartContinuation = when (this) {
+        REQUESTING_PERMISSION -> AWAITING_RESULT
+        else -> this
+    }
+
+    fun resultObserved(): NotificationStartContinuation = when (this) {
+        AWAITING_RESULT -> RESULT_OBSERVED
+        else -> this
+    }
+
+    fun canResumeStart(activityResumed: Boolean): Boolean =
+        this == RESULT_OBSERVED && activityResumed
+
+    val keepsStartPending: Boolean
+        get() = this != IDLE
+}
+
+/** Informational notification actions may not race or mutate an explicit pending Start. */
+internal fun canLaunchInformationalNotificationAction(
+    starting: Boolean,
+    continuation: NotificationStartContinuation,
+): Boolean = !starting && !continuation.keepsStartPending
+
 /** Effects interpreted by the Android/Compose coordinator; this file deliberately has no Android dependency. */
 internal sealed interface RecordingStartAction {
     data object WaitForResumedActivity : RecordingStartAction

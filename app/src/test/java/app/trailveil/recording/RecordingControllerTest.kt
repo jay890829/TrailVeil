@@ -51,6 +51,32 @@ class RecordingControllerTest {
     }
 
     @Test
+    fun `a recreation retry reuses the caller owned begin operation id`() = runBlocking {
+        val commands = FakeCommands()
+        val generatedPurposes = mutableListOf<String>()
+        val stableId = RecordingOperationId("begin-start-notification:stable")
+        val controller = controller(
+            commands = commands,
+            operationIds = RecordingControllerOperationIds { purpose ->
+                generatedPurposes += purpose
+                RecordingOperationId("$purpose:generated")
+            },
+        )
+
+        controller.startFromVisibleActivity(
+            activityVisible = true,
+            beginOperationId = stableId,
+        )
+        controller.startFromVisibleActivity(
+            activityVisible = true,
+            beginOperationId = stableId,
+        )
+
+        assertEquals(listOf(stableId, stableId), commands.beginOperationIds)
+        assertEquals(emptyList<String>(), generatedPurposes)
+    }
+
+    @Test
     fun `launch rejection durably fails a starting reservation`() = runBlocking {
         val commands = FakeCommands()
         val launcher = FakeLauncher(failure = SecurityException("denied"))
@@ -153,14 +179,15 @@ class RecordingControllerTest {
         preflight: RecordingStartPreflight = RecordingStartPreflight { null },
         commands: FakeCommands = FakeCommands(),
         launcher: FakeLauncher = FakeLauncher(),
+        operationIds: RecordingControllerOperationIds = RecordingControllerOperationIds { purpose ->
+            RecordingOperationId("$purpose:test")
+        },
     ) = RecordingController(
         preflight = preflight,
         commands = commands,
         launcher = launcher,
         clock = RecordingControllerClock { 123L },
-        operationIds = RecordingControllerOperationIds { purpose ->
-            RecordingOperationId("$purpose:test")
-        },
+        operationIds = operationIds,
         createdAppVersion = "test",
     )
 }
@@ -173,6 +200,7 @@ private class FakeCommands(
 ) : RecordingStartCommands {
     var beginCalls = 0
     var failCalls = 0
+    val beginOperationIds = mutableListOf<RecordingOperationId>()
 
     override suspend fun beginStart(
         operationId: RecordingOperationId,
@@ -180,6 +208,7 @@ private class FakeCommands(
         createdAppVersion: String,
     ): BeginStartResult {
         beginCalls++
+        beginOperationIds += operationId
         events += "begin"
         beginFailure?.let { throw it }
         return BeginStartResult(

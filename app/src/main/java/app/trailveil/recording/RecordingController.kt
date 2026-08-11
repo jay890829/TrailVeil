@@ -24,14 +24,17 @@ internal class RecordingController(
     private val operationIds: RecordingControllerOperationIds = UuidRecordingControllerOperationIds,
     private val createdAppVersion: String,
 ) {
-    suspend fun startFromVisibleActivity(activityVisible: Boolean): RecordingStartOutcome {
+    suspend fun startFromVisibleActivity(
+        activityVisible: Boolean,
+        beginOperationId: RecordingOperationId? = null,
+    ): RecordingStartOutcome {
         preflight.blocker(activityVisible)?.let {
             return RecordingStartOutcome.Blocked(it)
         }
 
         val reservation = try {
             commands.beginStart(
-                operationIds.next("begin-start"),
+                beginOperationId ?: operationIds.next("begin-start"),
                 clock.epochMillis(),
                 createdAppVersion,
             )

@@ -81,6 +81,18 @@ internal class PermissionHistoryStore(context: Context) {
         dataStore.edit { it[HasRequestedNotifications] = true }
     }
 
+    /** Same-process instrumentation fixture seam; production callers only use monotonic markers. */
+    internal suspend fun replaceForTesting(history: PermissionHistory) {
+        dataStore.edit { preferences ->
+            preferences.clear()
+            preferences[HasSeenIntroduction] = history.hasSeenIntroduction
+            preferences[HasRequestedLocation] = history.hasRequestedLocation
+            preferences[HasRetriedLocation] = history.hasRetriedLocation
+            preferences[HasRequestedPreciseUpgrade] = history.hasRequestedPreciseUpgrade
+            preferences[HasRequestedNotifications] = history.hasRequestedNotifications
+        }
+    }
+
 }
 
 /**

@@ -192,6 +192,60 @@ class RecordingPermissionStateMachineTest {
     }
 
     @Test
+    fun `a restored notification marker cannot resume before its result is observed`() {
+        val requesting = NotificationStartContinuation.IDLE.begin()
+        val awaiting = requesting.permissionRequestLaunched()
+
+        assertEquals(NotificationStartContinuation.REQUESTING_PERMISSION, requesting)
+        assertEquals(NotificationStartContinuation.AWAITING_RESULT, awaiting)
+        assertEquals(false, requesting.canResumeStart(activityResumed = true))
+        assertEquals(false, awaiting.canResumeStart(activityResumed = true))
+        assertEquals(true, awaiting.keepsStartPending)
+    }
+
+    @Test
+    fun `one notification result resumes once and duplicate callbacks stay consumed`() {
+        val awaiting = NotificationStartContinuation.IDLE
+            .begin()
+            .permissionRequestLaunched()
+        val observed = awaiting.resultObserved()
+
+        assertEquals(NotificationStartContinuation.RESULT_OBSERVED, observed)
+        assertEquals(false, observed.canResumeStart(activityResumed = false))
+        assertEquals(true, observed.canResumeStart(activityResumed = true))
+        assertEquals(observed, observed.resultObserved())
+        assertEquals(
+            NotificationStartContinuation.IDLE,
+            NotificationStartContinuation.IDLE.resultObserved(),
+        )
+    }
+
+    @Test
+    fun `informational notification actions cannot race an explicit Start`() {
+        assertEquals(
+            true,
+            canLaunchInformationalNotificationAction(
+                starting = false,
+                continuation = NotificationStartContinuation.IDLE,
+            ),
+        )
+        assertEquals(
+            false,
+            canLaunchInformationalNotificationAction(
+                starting = true,
+                continuation = NotificationStartContinuation.IDLE,
+            ),
+        )
+        assertEquals(
+            false,
+            canLaunchInformationalNotificationAction(
+                starting = false,
+                continuation = NotificationStartContinuation.AWAITING_RESULT,
+            ),
+        )
+    }
+
+    @Test
     fun `location result is refreshed through all gates rather than trusting callback map`() {
         assertEquals(
             RecordingStartAction.RequestNotificationThenStart,

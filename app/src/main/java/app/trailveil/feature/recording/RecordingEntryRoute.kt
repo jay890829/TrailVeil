@@ -23,6 +23,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
@@ -31,6 +32,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import app.trailveil.TrailVeilApplication
 import app.trailveil.R
 import app.trailveil.data.history.RecordingLatestSessionSummary
+import app.trailveil.data.recording.RecordingOperationId
 import app.trailveil.map.MapCameraRequest
 import app.trailveil.map.fog.GeoPoint
 import app.trailveil.recording.RecordingForegroundService
@@ -38,9 +40,11 @@ import app.trailveil.recording.RecordingStartBlocker
 import app.trailveil.recording.RecordingStartOutcome
 import app.trailveil.recording.RecordingServiceLocation
 import app.trailveil.map.fog.FogRuntime
+import java.util.UUID
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -67,9 +71,12 @@ internal fun RecordingEntryRoute(
     var platformRefresh by remember { mutableIntStateOf(0) }
     var locationResultVersion by remember { mutableIntStateOf(0) }
     var consumedLocationResultVersion by remember { mutableIntStateOf(0) }
-    var notificationResultVersion by remember { mutableIntStateOf(0) }
-    var consumedNotificationResultVersion by remember { mutableIntStateOf(0) }
-    var startAfterNotificationResult by remember { mutableStateOf(false) }
+    var notificationStartContinuationName by rememberSaveable {
+        mutableStateOf(NotificationStartContinuation.IDLE.name)
+    }
+    var notificationStartOperationIdValue by rememberSaveable { mutableStateOf<String?>(null) }
+    val notificationStartContinuation =
+        NotificationStartContinuation.valueOf(notificationStartContinuationName)
     var locationNotice by rememberSaveable { mutableStateOf<LocationNotice?>(null) }
     var startNotice by rememberSaveable { mutableStateOf<RecordingStartNotice?>(null) }
     // When the user's action produced the notice, so an acknowledgement expires on its own age
@@ -164,8 +171,17 @@ internal fun RecordingEntryRoute(
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission(),
     ) {
+        val continuation = NotificationStartContinuation.valueOf(
+            notificationStartContinuationName,
+        )
+        notificationStartContinuationName =
+            continuation.resultObserved().name
+        // The notification card can launch the same platform prompt without a pending Start.
+        // Its result must release that card's in-flight UI state, but must not create a Start.
+        if (continuation == NotificationStartContinuation.IDLE) {
+            starting = false
+        }
         platformRefresh += 1
-        notificationResultVersion += 1
     }
 
     fun raiseStartNotice(notice: RecordingStartNotice?) {
@@ -173,12 +189,13 @@ internal fun RecordingEntryRoute(
         startNoticeRaisedAt = notice?.let { System.currentTimeMillis() }
     }
 
-    suspend fun startRecording() {
+    suspend fun startRecording(beginOperationId: RecordingOperationId? = null) {
         starting = true
         locationNotice = null
         raiseStartNotice(null)
         val outcome = controller.startFromVisibleActivity(
             activityVisible = activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
+            beginOperationId = beginOperationId,
         )
         raiseStartNotice(
             when (outcome) {
@@ -249,26 +266,21 @@ internal fun RecordingEntryRoute(
                 starting = false
                 locationNotice = LocationNotice.LOCATION_SERVICES
             }
-            RecordingStartAction.RequestNotificationThenStart -> scope.launch {
+            RecordingStartAction.RequestNotificationThenStart -> {
                 starting = true
-                startAfterNotificationResult = true
-                try {
-                    historyStore.markNotificationsRequested()
-                    notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-                } catch (cancelled: CancellationException) {
-                    throw cancelled
-                } catch (_: Exception) {
-                    startAfterNotificationResult = false
-                    starting = false
-                    raiseStartNotice(RecordingStartNotice.PERSISTENCE_FAILURE)
+                val continuation = NotificationStartContinuation.valueOf(
+                    notificationStartContinuationName,
+                )
+                if (continuation == NotificationStartContinuation.IDLE) {
+                    notificationStartOperationIdValue =
+                        "begin-start-notification:${UUID.randomUUID()}"
+                    notificationStartContinuationName = continuation.begin().name
                 }
             }
             RecordingStartAction.ShowNotificationRationaleThenStart -> scope.launch {
-                startAfterNotificationResult = false
                 startRecording()
             }
             RecordingStartAction.StartRecording -> scope.launch {
-                startAfterNotificationResult = false
                 startRecording()
             }
         }
@@ -293,26 +305,58 @@ internal fun RecordingEntryRoute(
         )
     }
 
-    LaunchedEffect(notificationResultVersion, activityResumed) {
-        if (
-            !activityResumed ||
-            notificationResultVersion == 0 ||
-            notificationResultVersion == consumedNotificationResultVersion
-        ) {
-            return@LaunchedEffect
-        }
-        consumedNotificationResultVersion = notificationResultVersion
-        val shouldStart = startAfterNotificationResult
-        startAfterNotificationResult = false
-        starting = false
-        if (shouldStart) {
-            dispatch(
-                RecordingPermissionStateMachine.actionAfterNotificationPermissionResult(
-                    notificationGranted = activity.hasPermission(
+    LaunchedEffect(notificationStartContinuationName) {
+        val continuation = NotificationStartContinuation.valueOf(
+            notificationStartContinuationName,
+        )
+        when (continuation) {
+            NotificationStartContinuation.REQUESTING_PERMISSION -> {
+                snapshotFlow { activityResumed }.first { it }
+                starting = true
+                try {
+                    historyStore.markNotificationsRequested()
+                    notificationStartContinuationName =
+                        continuation.permissionRequestLaunched().name
+                    // The state transition and launch are deliberately in one main-thread call
+                    // stack. Recreation can retry the suspending marker write, but cannot strand
+                    // AWAITING_RESULT before the launcher has received this request.
+                    notificationPermissionLauncher.launch(
                         Manifest.permission.POST_NOTIFICATIONS,
-                    ),
-                ),
-            )
+                    )
+                } catch (cancelled: CancellationException) {
+                    throw cancelled
+                } catch (_: Exception) {
+                    notificationStartContinuationName =
+                        NotificationStartContinuation.IDLE.name
+                    notificationStartOperationIdValue = null
+                    starting = false
+                    raiseStartNotice(RecordingStartNotice.PERSISTENCE_FAILURE)
+                }
+            }
+            NotificationStartContinuation.RESULT_OBSERVED -> {
+                // A permission result can briefly produce RESUME -> PAUSE -> RESUME. Waiting inside
+                // this effect means that transient lifecycle edge cannot cancel and re-enter Start.
+                // Destroying the composition still cancels it; the saved operation id below then
+                // makes a recreation retry replay the same durable begin command.
+                snapshotFlow { activityResumed }.first { resumed ->
+                    continuation.canResumeStart(resumed)
+                }
+                starting = true
+                // Keep RESULT_OBSERVED saved until every current preflight and the controller call
+                // finish. Recreation cancels this effect and retries; the repository/service start
+                // path remains the durable idempotency boundary for that cancellation window.
+                val operationId = RecordingOperationId(
+                    checkNotNull(notificationStartOperationIdValue) {
+                        "pending notification Start has no stable operation id"
+                    },
+                )
+                startRecording(beginOperationId = operationId)
+                notificationStartContinuationName = NotificationStartContinuation.IDLE.name
+                notificationStartOperationIdValue = null
+            }
+            NotificationStartContinuation.IDLE,
+            NotificationStartContinuation.AWAITING_RESULT,
+            -> Unit
         }
     }
 
@@ -385,7 +429,7 @@ internal fun RecordingEntryRoute(
             startNotice = startNotice,
             startNoticeRaisedAt = startNoticeRaisedAt,
             recordingActive = recordingPresentation.activeSessionId != null,
-            starting = starting,
+            starting = starting || notificationStartContinuation.keepsStartPending,
             recordingState = recordingPresentation.state,
             latestSessionId = recordingPresentation.latestSessionId,
             latestEndedAt = recordingPresentation.latestEndedAt,
@@ -393,7 +437,7 @@ internal fun RecordingEntryRoute(
             followingLocation = following,
         ),
         onStart = {
-            if (!starting) {
+            if (!starting && !notificationStartContinuation.keepsStartPending) {
                 starting = true
                 raiseStartNotice(null)
                 locationNotice = null
@@ -471,9 +515,13 @@ internal fun RecordingEntryRoute(
         },
         onNotificationAction = {
             when (notificationNotice) {
-                NotificationNotice.RATIONALE -> if (!starting) {
+                NotificationNotice.RATIONALE -> if (
+                    canLaunchInformationalNotificationAction(
+                        starting = starting,
+                        continuation = notificationStartContinuation,
+                    )
+                ) {
                     starting = true
-                    startAfterNotificationResult = false
                     scope.launch {
                         try {
                             historyStore.markNotificationsRequested()
@@ -488,7 +536,14 @@ internal fun RecordingEntryRoute(
                         }
                     }
                 }
-                NotificationNotice.SETTINGS -> activity.openNotificationSettings()
+                NotificationNotice.SETTINGS -> if (
+                    canLaunchInformationalNotificationAction(
+                        starting = starting,
+                        continuation = notificationStartContinuation,
+                    )
+                ) {
+                    activity.openNotificationSettings()
+                }
                 null -> Unit
             }
         },
