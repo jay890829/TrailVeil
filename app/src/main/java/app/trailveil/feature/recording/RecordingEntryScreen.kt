@@ -136,6 +136,7 @@ internal fun RecordingEntryScreen(
     cameraRequest: MapCameraRequest? = null,
     currentLocation: GeoPoint? = null,
     followLocation: GeoPoint? = null,
+    clockMillis: () -> Long = { System.currentTimeMillis() },
 ) {
     var menuExpanded by rememberSaveable { mutableStateOf(false) }
     var privacyRequested by rememberSaveable { mutableStateOf(false) }
@@ -153,14 +154,14 @@ internal fun RecordingEntryScreen(
     // Re-read the clock only when something being timed changes, and once more when the nearest
     // window is due to close. Recomposition alone must not move it, or a card's lifetime would
     // depend on unrelated redraws.
-    var noticeNowMillis by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var noticeNowMillis by remember { mutableLongStateOf(clockMillis()) }
     LaunchedEffect(
         state.latestSessionId,
         state.latestEndedAt,
         state.startNotice,
         state.startNoticeRaisedAt,
     ) {
-        val now = System.currentTimeMillis()
+        val now = clockMillis()
         noticeNowMillis = now
         val deadlines = listOfNotNull(
             state.latestEndedAt.takeIf { state.recordingState in TerminalRecordingStates },
@@ -169,7 +170,7 @@ internal fun RecordingEntryScreen(
         var remaining = deadlines.filter { it > now }.minOrNull()?.minus(now)
         while (remaining != null) {
             delay(remaining)
-            val awake = System.currentTimeMillis()
+            val awake = clockMillis()
             noticeNowMillis = awake
             remaining = deadlines.filter { it > awake }.minOrNull()?.minus(awake)
         }

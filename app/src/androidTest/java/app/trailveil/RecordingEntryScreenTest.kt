@@ -3,10 +3,13 @@ package app.trailveil
 import android.graphics.Rect
 import android.view.View
 import android.view.ViewGroup
+import androidx.compose.material3.Text
+import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.assertTextEquals
+import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithContentDescription
@@ -18,6 +21,10 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
 import androidx.test.runner.lifecycle.Stage
+import androidx.navigation.NavHostController
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
 import app.trailveil.feature.recording.TRANSIENT_NOTICE_WINDOW_MILLIS
 import app.trailveil.feature.recording.LocationNotice
 import app.trailveil.feature.recording.NotificationNotice
@@ -27,6 +34,7 @@ import app.trailveil.feature.recording.RecordingEntryUiState
 import app.trailveil.feature.recording.RecordingDisplayState
 import app.trailveil.feature.recording.RecordingStartNotice
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -336,6 +344,7 @@ class RecordingEntryScreenTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val completed = context.getString(R.string.recording_state_completed)
         val interrupted = context.getString(R.string.recording_state_interrupted)
+        val historyDestination = "History test destination"
         val endedAt = System.currentTimeMillis()
         val published = mutableStateOf(
             RecordingEntryUiState(
@@ -345,15 +354,26 @@ class RecordingEntryScreenTest {
                 latestEndedAt = endedAt,
             ),
         )
-        composeRule.setContent {
-            RecordingEntryScreen(
-                state = published.value,
-                onStart = {},
-                onStop = {},
-                onLocationAction = {},
-                onDismissLocationNotice = {},
-                onNotificationAction = {},
-            )
+        val activeNavController = AtomicReference<NavHostController>()
+        val restoration = StateRestorationTester(composeRule)
+        restoration.setContent {
+            val navController = rememberNavController()
+            SideEffect { activeNavController.set(navController) }
+            NavHost(navController = navController, startDestination = "recording") {
+                composable("recording") {
+                    RecordingEntryScreen(
+                        state = published.value,
+                        onStart = {},
+                        onStop = {},
+                        onLocationAction = {},
+                        onDismissLocationNotice = {},
+                        onNotificationAction = {},
+                        onOpenHistory = { navController.navigate("history") },
+                        clockMillis = { endedAt },
+                    )
+                }
+                composable("history") { Text(historyDestination) }
+            }
         }
 
         composeRule.onNodeWithText(completed).assertIsDisplayed()
@@ -361,8 +381,22 @@ class RecordingEntryScreenTest {
         composeRule.onNodeWithTag(RecordingEntryTestTags.RecordingState).assertDoesNotExist()
         composeRule.onNodeWithText(completed).assertDoesNotExist()
 
-        // Leaving this screen and coming back republishes an unread state before the same session
-        // arrives again. Neither frame is a new outcome, so neither may revive the dismissal.
+        // Use a real Navigation destination round trip. Navigation Compose owns the saveable-state
+        // holder that production relies on, so replacing this with a loading-frame toggle would
+        // miss a destination whose state is discarded while it is off screen.
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.History).performClick()
+        composeRule.onNodeWithText(historyDestination).assertIsDisplayed()
+        composeRule.runOnIdle { assertTrue(activeNavController.get().popBackStack()) }
+        composeRule.onNodeWithText(completed).assertDoesNotExist()
+
+        // StateRestorationTester exercises the SaveableStateRegistry contract used for both
+        // configuration recreation and system process restoration of a retained task.
+        restoration.emulateSavedInstanceStateRestore()
+        composeRule.onNodeWithText(completed).assertDoesNotExist()
+
+        // Returning and restoration can each republish an unread/loading frame before the same
+        // session arrives again. Neither frame is a new outcome, so neither may revive dismissal.
         composeRule.runOnIdle {
             published.value = RecordingEntryUiState(firstVisit = false, loading = true)
         }
