@@ -114,13 +114,23 @@ class MapReturnInteractivityTest {
             }
         }.isSuccess
         val firstDragMillis = SystemClock.uptimeMillis() - start
+        val beforeSecondDrag = awaitStableCameraTarget(readyMap)
+        val secondStart = SystemClock.uptimeMillis()
+        drag()
+        val secondDragMoved = runCatching {
+            composeRule.waitUntil(DRAG_RESULT_TIMEOUT_MILLIS) {
+                movedFrom(readyMap, beforeSecondDrag)
+            }
+        }.isSuccess
+        val secondDragMillis = SystemClock.uptimeMillis() - secondStart
         InstrumentationRegistry.getInstrumentation().sendStatus(
             0,
             android.os.Bundle().apply {
                 putString(
                     "stream",
                         "TrailVeil return-from-history interactivity: firstDragMoved=$firstDragMoved " +
-                        "firstDragMillis=$firstDragMillis controlMillis=$controlMillis " +
+                        "firstDragMillis=$firstDragMillis secondDragMoved=$secondDragMoved " +
+                        "secondDragMillis=$secondDragMillis controlMillis=$controlMillis " +
                         "controlAttempts=$controlAttempts " +
                         "popMillis=${historyGoneAt.get() - popStartedAt} " +
                         "mapReadyAfterHistoryMillis=$readyAfterHistoryMillis " +
@@ -132,6 +142,10 @@ class MapReturnInteractivityTest {
             "The first drag after the history transition did not move the map; " +
                 "control moved in ${controlMillis}ms",
             firstDragMoved,
+        )
+        assertTrue(
+            "The second drag on the returned main-map instance did not move the map",
+            secondDragMoved,
         )
     }
 

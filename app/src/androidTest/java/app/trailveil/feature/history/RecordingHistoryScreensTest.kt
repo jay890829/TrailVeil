@@ -22,12 +22,15 @@ import app.trailveil.data.history.RecordingHistorySession
 import app.trailveil.data.history.RecordingHistoryStatus
 import app.trailveil.ui.theme.TrailVeilTheme
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 
 @RunWith(AndroidJUnit4::class)
@@ -170,11 +173,19 @@ class RecordingHistoryScreensTest {
         composeRule.onNodeWithTag(RecordingHistoryTestTags.TrackMap).assertIsDisplayed()
         composeRule.waitForIdle()
 
+        val map = awaitTrackMap()
         val beforeMapDrags = mapTop()
-        repeat(2) {
+        repeat(2) { dragIndex ->
+            val beforeCamera = awaitCameraSettled(map)
             composeRule.onNodeWithTag(RecordingHistoryTestTags.TrackMap)
                 .performTouchInput { swipeUp() }
-            composeRule.waitForIdle()
+            awaitCameraMoved(map, beforeCamera, dragIndex)
+            val afterCamera = awaitCameraSettled(map)
+            assertTrue(
+                "History-map drag ${dragIndex + 1} did not move the MapLibre camera: " +
+                    "$beforeCamera -> $afterCamera",
+                cameraDistance(beforeCamera, afterCamera) > CAMERA_MOVEMENT_EPSILON_DEGREES,
+            )
         }
         val afterMapDrags = mapTop()
 
@@ -232,6 +243,69 @@ class RecordingHistoryScreensTest {
         }
         error("The track map never attached a render view")
     }
+
+    private fun awaitTrackMap(): MapLibreMap {
+        val resolved = AtomicReference<MapLibreMap?>(null)
+        composeRule.runOnIdle {
+            checkNotNull(attachedMapView()) { "The track MapView was not attached" }
+                .getMapAsync(resolved::set)
+        }
+        composeRule.waitUntil(timeoutMillis = MAP_READY_TIMEOUT_MILLIS) {
+            resolved.get() != null
+        }
+        val map = checkNotNull(resolved.get()) { "The track MapLibreMap never became ready" }
+        composeRule.waitUntil(timeoutMillis = MAP_READY_TIMEOUT_MILLIS) {
+            map.cameraPosition.target?.let { target ->
+                abs(target.latitude) > INITIAL_CAMERA_EPSILON_DEGREES ||
+                    abs(target.longitude) > INITIAL_CAMERA_EPSILON_DEGREES
+            } ?: false
+        }
+        awaitCameraSettled(map)
+        return map
+    }
+
+    private fun awaitCameraSettled(map: MapLibreMap): LatLng {
+        var previous: LatLng? = null
+        var stableSamples = 0
+        repeat(CAMERA_SETTLE_POLLS) {
+            val current = composeRule.runOnIdle {
+                checkNotNull(map.cameraPosition.target) { "The track-map camera lost its target" }
+            }
+            if (
+                previous != null &&
+                cameraDistance(checkNotNull(previous), current) <= CAMERA_STABLE_EPSILON_DEGREES
+            ) {
+                stableSamples += 1
+                if (stableSamples >= CAMERA_STABLE_SAMPLE_COUNT) return current
+            } else {
+                stableSamples = 0
+            }
+            previous = current
+            Thread.sleep(CAMERA_SETTLE_POLL_MILLIS)
+        }
+        error("The track-map camera did not settle; last target=$previous")
+    }
+
+    private fun awaitCameraMoved(map: MapLibreMap, before: LatLng, dragIndex: Int) {
+        try {
+            composeRule.waitUntil(timeoutMillis = CAMERA_MOVEMENT_TIMEOUT_MILLIS) {
+                cameraDistance(before, cameraTarget(map)) > CAMERA_MOVEMENT_EPSILON_DEGREES
+            }
+        } catch (failure: AssertionError) {
+            throw AssertionError(
+                "History-map drag ${dragIndex + 1} never moved the MapLibre camera from $before; " +
+                    "last target=${cameraTarget(map)}",
+                failure,
+            )
+        }
+    }
+
+    private fun cameraTarget(map: MapLibreMap): LatLng = composeRule.runOnIdle {
+        checkNotNull(map.cameraPosition.target) { "The track-map camera lost its target" }
+    }
+
+    private fun cameraDistance(first: LatLng, second: LatLng): Double =
+        abs(first.latitude - second.latitude) + abs(first.longitude - second.longitude)
 
     private fun attachedMapView(): MapView? =
         ActivityLifecycleMonitorRegistry.getInstance()
@@ -327,5 +401,13 @@ class RecordingHistoryScreensTest {
         const val SCROLL_TOLERANCE_DP = 1.0
         const val RENDER_VIEW_POLLS = 50
         const val RENDER_VIEW_POLL_MILLIS = 100L
+        const val MAP_READY_TIMEOUT_MILLIS = 10_000L
+        const val INITIAL_CAMERA_EPSILON_DEGREES = 1.0
+        const val CAMERA_MOVEMENT_EPSILON_DEGREES = 0.000_001
+        const val CAMERA_MOVEMENT_TIMEOUT_MILLIS = 5_000L
+        const val CAMERA_STABLE_EPSILON_DEGREES = 0.000_000_01
+        const val CAMERA_STABLE_SAMPLE_COUNT = 3
+        const val CAMERA_SETTLE_POLLS = 100
+        const val CAMERA_SETTLE_POLL_MILLIS = 50L
     }
 }
