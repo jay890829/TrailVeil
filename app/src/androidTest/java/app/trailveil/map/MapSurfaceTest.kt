@@ -7,10 +7,13 @@ import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -1173,6 +1176,10 @@ class MapSurfaceTest {
         expectZoomOut = false,
         expectZoomIn = true,
         minimumZoomChange = ANTIMERIDIAN_ZOOM_CHANGE,
+        requiredEndZoomAbove = WORLD_COPY_SWITCH_ZOOM,
+        surfaceModifier = Modifier
+            .fillMaxWidth()
+            .height(ZOOM_ONE_TEST_MAP_HEIGHT_DP.dp),
     )
 
     /**
@@ -1341,7 +1348,7 @@ class MapSurfaceTest {
      * cover goes up, and the band lives past that.
      */
     @Test
-    fun noSettledZoomDrawsASeamOverTheMap() {
+    fun noSettledZoomDrawsABroadBlackBandOverTheMap() {
         val database = inMemoryDatabase()
         try {
             val fogRendered = AtomicBoolean(false)
@@ -1366,6 +1373,7 @@ class MapSurfaceTest {
             }
             composeRule.waitUntil(timeoutMillis = ONLINE_STYLE_SETUP_MILLIS) { fogRendered.get() }
             val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
             val loadState = composeRule.runOnIdle {
                 attachedMapView()?.getTag(R.id.map_basemap_load_state)
             }
@@ -1394,8 +1402,6 @@ class MapSurfaceTest {
                         .isEmpty()
                 }
                 Thread.sleep(ZOOM_SETTLE_MILLIS)
-                val visibility = ALL_FOG_LAYERS.associateWith { map.fogLayerVisibility(it) }
-                val renderedLayers = ALL_FOG_LAYERS.filter { map.fogLayerIsRendered(it) }
                 val audit = map.auditFogCoverage()
                 report.append(
                     "\n z=${"%.2f".format(java.util.Locale.US, map.cameraPosition.zoom)} " +
@@ -1405,28 +1411,33 @@ class MapSurfaceTest {
                     worst = audit.overFoggedFraction
                     worstReport = "at zoom $zoom: ${audit.report()}"
                 }
-                // Only when something is wrong, and only to say what: which quad is the second
-                // coat, and where each one really is. Localising this by hand cost a run apiece.
-                if (audit.overFoggedFraction > MAXIMUM_SETTLED_SEAM_FRACTION) {
-                    map.setFogLayersVisible(false)
-                    val bare = map.snapshotStableBarePixels("settled seam diagnostic")
-                    renderedLayers.forEach { id ->
-                        map.setSingleFogLayerVisible(id, true)
-                        val only = compareFogCoverage(map.snapshotPixels(), bare, snapshotWidth())
-                        map.setSingleFogLayerVisible(id, false)
-                        report.append("\n  only ${id.removePrefix("trailveil-")} -> ")
-                            .append(only.report())
+                // P4-031 deliberately pays a narrow double-fog strip to make this shared edge
+                // fail closed. At the two exact zooms where the old renderer-size defect drew a
+                // broad 2.08/3.04% band, remove only that guard and prove the underlying quads are
+                // still below the old 0.2% seam budget. Merely raising the final threshold would
+                // let the original defect pass; this A/B keeps the regression sensitive to it.
+                if (zoom in SETTLED_SEAM_GUARD_AB_ZOOMS) {
+                    assertTrue(
+                        "The seam guard was not renderer-selected at the original regression " +
+                            "zoom $zoom",
+                        map.fogLayerIsRendered(FogSeamGuardIds.Layer),
+                    )
+                    val visibility = ALL_FOG_LAYERS.associateWith { map.fogLayerVisibility(it) }
+                    val withoutGuard = try {
+                        map.setSingleFogLayerVisible(FogSeamGuardIds.Layer, false)
+                        map.awaitFullyRenderedFrame(view)
+                        map.auditFogCoverage()
+                    } finally {
+                        map.restoreFogLayerVisibility(visibility)
+                        map.awaitFullyRenderedFrame(view)
                     }
-                    map.restoreFogLayerVisibility(visibility)
-                    renderedLayers.forEach { id ->
-                        map.setSingleFogLayerVisible(id, false)
-                        val without =
-                            compareFogCoverage(map.snapshotPixels(), bare, snapshotWidth())
-                        map.setSingleFogLayerVisible(id, true)
-                        report.append("\n  without ${id.removePrefix("trailveil-")} -> ")
-                            .append(without.report())
-                    }
-                    map.restoreFogLayerVisibility(visibility)
+                    report.append("\n  without seam guard -> ").append(withoutGuard.report())
+                    assertTrue(
+                        "The broad settled black band remains after removing only the deliberate " +
+                            "seam guard at zoom $zoom: ${withoutGuard.report()}",
+                        withoutGuard.overFoggedFraction <=
+                            MAXIMUM_SETTLED_UNGUARDED_SEAM_FRACTION,
+                    )
                 }
             }
             InstrumentationRegistry.getInstrumentation().sendStatus(
@@ -1434,8 +1445,9 @@ class MapSurfaceTest {
                 Bundle().apply { putString("stream", "TrailVeil settled seam sweep:$report\n") },
             )
             assertTrue(
-                "A settled camera drew part of the map under more than one coat of fog $worstReport",
-                worst <= MAXIMUM_SETTLED_SEAM_FRACTION,
+                "A settled camera drew a broad black band beyond the deliberate seam-guard " +
+                    "budget $worstReport",
+                worst <= MAXIMUM_SETTLED_GUARDED_SEAM_FRACTION,
             )
         } finally {
             database.close()
@@ -1814,6 +1826,8 @@ class MapSurfaceTest {
         maximumOverFoggedFraction: Double = MAXIMUM_OVER_FOGGED_FRACTION,
         configureFogLayers: ((MapLibreMap) -> Unit)? = null,
         minimumUncoveredFraction: Double? = null,
+        requiredEndZoomAbove: Double? = null,
+        surfaceModifier: Modifier = Modifier.fillMaxSize(),
     ) {
         val database = inMemoryDatabase()
         try {
@@ -1823,7 +1837,7 @@ class MapSurfaceTest {
 
             composeRule.setContent {
                 TrailVeilMapSurface(
-                    modifier = Modifier.fillMaxSize(),
+                    modifier = surfaceModifier,
                     provider = provider,
                     fallbackTimeoutMillis = if (requireOnlineStyle) 20_000L else 100L,
                     savedStateKey = savedStateKey,
@@ -1997,6 +2011,13 @@ class MapSurfaceTest {
                         "(start=$startCameraZoom end=$endZoom)",
                     endZoom - startCameraZoom >= minimumZoomChange,
                 )
+                if (requiredEndZoomAbove != null) {
+                    assertTrue(
+                        "The gesture did not cross the required zoom boundary " +
+                            "$requiredEndZoomAbove (start=$startCameraZoom end=$endZoom)",
+                        endZoom > requiredEndZoomAbove,
+                    )
+                }
             } else if (expectZoomOut) {
                 assertTrue(
                     "The gesture did not zoom out, so this measured nothing " +
@@ -2381,22 +2402,60 @@ class MapSurfaceTest {
      * One finger: tap, then press and drag. MapLibre reads that as a zoom through a detector the
      * pinch never touches; dragging up zooms out and dragging down zooms in.
      */
-    private fun quickZoomOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
-        quickZoomInSteps(map, onHold, zoomIn = false, auditEveryMove = false)
-
     private fun frameAuditedQuickZoomOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
-        quickZoomInSteps(map, onHold, zoomIn = false, auditEveryMove = true)
+        frameAuditedQuickZoomInSteps(
+            map = map,
+            onHold = onHold,
+            zoomIn = false,
+            maximumUnmeasuredZoom = null,
+        )
 
-    /** The reverse zoom-1 transition, audited after every move without lifting the held tap. */
+    /**
+     * Reverse zoom-1 transition through MapLibre's one-finger double-tap-hold detector.
+     *
+     * The detector can reject a syntactically valid injected stream under full-suite load. Probe
+     * engagement without recording evidence, retry a rejected stream, then — without lifting the
+     * accepted stream — drag back to the zoom floor and audit that held baseline. All subsequent
+     * moves are renderer-frame audited, so the measured sequence contains both sides of zoom 1.
+     */
     private fun frameAuditedQuickZoomInInSteps(map: MapLibreMap, onHold: () -> Unit) =
-        quickZoomInSteps(map, onHold, zoomIn = true, auditEveryMove = true)
+        frameAuditedQuickZoomInSteps(
+            map = map,
+            onHold = onHold,
+            zoomIn = true,
+            maximumUnmeasuredZoom = WORLD_COPY_SWITCH_ZOOM,
+        )
 
-    private fun quickZoomInSteps(
+    private fun frameAuditedQuickZoomInSteps(
         map: MapLibreMap,
         onHold: () -> Unit,
         zoomIn: Boolean,
-        auditEveryMove: Boolean,
+        maximumUnmeasuredZoom: Double?,
     ) {
+        repeat(QUICK_ZOOM_ATTEMPTS) {
+            if (
+                quickZoomOnce(
+                    map = map,
+                    onHold = onHold,
+                    zoomIn = zoomIn,
+                    maximumUnmeasuredZoom = maximumUnmeasuredZoom,
+                )
+            ) {
+                return
+            }
+        }
+        throw AssertionError(
+            "The quick zoom never engaged MapLibre's double-tap detector in " +
+                "$QUICK_ZOOM_ATTEMPTS attempts",
+        )
+    }
+
+    private fun quickZoomOnce(
+        map: MapLibreMap,
+        onHold: () -> Unit,
+        zoomIn: Boolean,
+        maximumUnmeasuredZoom: Double?,
+    ): Boolean {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         val centerX = view.width / 2f
         val centerY = view.height / 2f
@@ -2414,9 +2473,7 @@ class MapSurfaceTest {
             )
         }
 
-        // A tap that lifts instantly, or a second tap that lands instantly, is not a double tap:
-        // the platform requires a minimum time on each side of the gap before it will call it one,
-        // and without that this degenerates into an ordinary drag that pans instead of zooming.
+        val zoomAtTouchDown = map.cameraPosition.zoom
         val tapDown = SystemClock.uptimeMillis()
         send(tapDown, MotionEvent.ACTION_DOWN, centerY)
         SystemClock.sleep(TAP_DURATION_MILLIS)
@@ -2425,26 +2482,70 @@ class MapSurfaceTest {
         val holdDown = SystemClock.uptimeMillis()
         send(holdDown, MotionEvent.ACTION_DOWN, centerY)
         SystemClock.sleep(TAP_DURATION_MILLIS)
+
         val travel = view.height * QUICK_ZOOM_TRAVEL_FRACTION
-        val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
         val direction = if (zoomIn) 1f else -1f
+        val engageY = centerY + direction * travel * QUICK_ZOOM_ENGAGE_TRAVEL
         var currentY = centerY
         var streamEnded = false
         try {
+            repeat(QUICK_ZOOM_ENGAGE_MOVES) { move ->
+                currentY = centerY +
+                    (engageY - centerY) * (move + 1) / QUICK_ZOOM_ENGAGE_MOVES
+                send(holdDown, MotionEvent.ACTION_MOVE, currentY)
+                SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+            }
+            map.awaitFullyRenderedFrame(view)
+            val engagement = if (zoomIn) {
+                map.cameraPosition.zoom - zoomAtTouchDown
+            } else {
+                zoomAtTouchDown - map.cameraPosition.zoom
+            }
+            if (engagement < MINIMUM_QUICK_ZOOM_ENGAGEMENT) {
+                send(holdDown, MotionEvent.ACTION_UP, currentY)
+                streamEnded = true
+                Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+                return false
+            }
+            if (maximumUnmeasuredZoom != null) {
+                assertTrue(
+                    "The unmeasured quick-zoom engagement crossed zoom " +
+                        "$maximumUnmeasuredZoom " +
+                        "(start=$zoomAtTouchDown actual=${map.cameraPosition.zoom})",
+                    map.cameraPosition.zoom < maximumUnmeasuredZoom,
+                )
+            }
+
+            // Keep the accepted detector and pointer stream, but return to the starting camera
+            // before any acceptance evidence is recorded. The zoom-in transition additionally
+            // proves that these setup moves stayed below zoom 1.
+            repeat(QUICK_ZOOM_REOPEN_MOVES) { move ->
+                currentY = engageY +
+                    (centerY - engageY) * (move + 1) / QUICK_ZOOM_REOPEN_MOVES
+                send(holdDown, MotionEvent.ACTION_MOVE, currentY)
+                SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+            }
+            map.awaitFullyRenderedFrame(view)
+            if (maximumUnmeasuredZoom != null) {
+                assertTrue(
+                    "The engaged quick zoom did not reopen below zoom " +
+                        "$maximumUnmeasuredZoom (actual=${map.cameraPosition.zoom})",
+                    map.cameraPosition.zoom < maximumUnmeasuredZoom,
+                )
+            }
+            onHold()
+
+            val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
             repeat(moves) { move ->
                 currentY = centerY + direction * travel * (move + 1) / moves
                 send(holdDown, MotionEvent.ACTION_MOVE, currentY)
                 SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
-                if (auditEveryMove) {
-                    map.awaitFullyRenderedFrame(view)
-                    onHold()
-                } else if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
-                    Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
-                    onHold()
-                }
+                map.awaitFullyRenderedFrame(view)
+                onHold()
             }
             send(holdDown, MotionEvent.ACTION_UP, currentY)
             streamEnded = true
+            return true
         } finally {
             if (!streamEnded) {
                 runCatching { send(holdDown, MotionEvent.ACTION_CANCEL, currentY) }
@@ -4005,11 +4106,22 @@ class MapSurfaceTest {
         val SETTLED_SEAM_ZOOMS = listOf(16.0, 14.0, 12.0, 10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0)
 
         /**
-         * A settled camera has no gesture to blame, so the seams between quads are the designed
-         * half a mosaic pixel and nothing else — a few screen pixels at most. The band this bounds
-         * measured 2.08% and 3.04%; every zoom now measures 0.0000%.
+         * With the P4-031 fail-closed line removed, the original render-size regression zooms must
+         * return to the pre-guard narrow-seam budget. This is an A/B discriminator for the broad
+         * 2.08/3.04% bands, not a claim that the guarded production frame has zero double fog.
          */
-        const val MAXIMUM_SETTLED_SEAM_FRACTION = 0.002
+        const val MAXIMUM_SETTLED_UNGUARDED_SEAM_FRACTION = 0.002
+
+        /**
+         * P4-031 intentionally trades a narrow double-fog safety strip for zero bare pixels. Fresh
+         * API 36 evidence bounds that strip at 1.15-1.25%; two percent leaves device/rendering
+         * margin while remaining below the original 2.08/3.04% broad bands. The guard-off A/B at
+         * their exact zooms is the authoritative regression discriminator, not this bound alone.
+         * P4-023 still owns the stricter product question of reducing the visible residue.
+         */
+        const val MAXIMUM_SETTLED_GUARDED_SEAM_FRACTION = 0.02
+
+        val SETTLED_SEAM_GUARD_AB_ZOOMS = setOf(14.0, 12.0)
 
         /** Looking around from far out, then pressing the button that takes you back in. */
         const val RECENTRE_FROM_ZOOM = 8.0
@@ -4104,6 +4216,11 @@ class MapSurfaceTest {
         const val MINIMUM_PINCH_ENGAGEMENT = 0.03
         const val PINCH_RETRY_SETTLE_MILLIS = 2_500L
         const val QUICK_ZOOM_TRAVEL_FRACTION = 0.45f
+        const val QUICK_ZOOM_ATTEMPTS = 4
+        const val QUICK_ZOOM_ENGAGE_MOVES = 8
+        const val QUICK_ZOOM_REOPEN_MOVES = 8
+        const val QUICK_ZOOM_ENGAGE_TRAVEL = 0.30f
+        const val MINIMUM_QUICK_ZOOM_ENGAGEMENT = 0.03
         const val TAP_DURATION_MILLIS = 60L
         const val DOUBLE_TAP_GAP_MILLIS = 80L
 
@@ -4125,6 +4242,8 @@ class MapSurfaceTest {
          * floor and only have to cross 0.95 between them.
          */
         const val ANTIMERIDIAN_ZOOM_CHANGE = 0.4
+        const val WORLD_COPY_SWITCH_ZOOM = 1.0
+        const val ZOOM_ONE_TEST_MAP_HEIGHT_DP = 560
 
         /** Either side of the measured edge, and one well clear of it. */
         val WORLD_COPY_EDGE_ZOOMS = listOf(0.98, 1.0, 1.6)
