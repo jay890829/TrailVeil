@@ -233,6 +233,12 @@ internal data class MapTrackOverlay(
     }
 }
 
+/** Immutable test evidence for the canonical fog geometry that actually reached the renderer. */
+internal data class InstalledFogCoverageSnapshot(
+    val generation: Long,
+    val extent: FogSurroundExtent,
+)
+
 /**
  * Provider failure is deliberately contained inside this surface. It never owns recording,
  * location permissions, canonical points, or fog state.
@@ -267,6 +273,7 @@ internal fun TrailVeilMapSurface(
     onFogFailure: (Throwable) -> Unit = {},
     fogInstallFaultForTesting: (() -> Unit)? = null,
     onMapViewCreatedForTesting: ((MapView) -> Unit)? = null,
+    onFogCoverageInstalledForTesting: ((InstalledFogCoverageSnapshot) -> Unit)? = null,
 ) {
     require(fallbackTimeoutMillis > 0L) { "fallbackTimeoutMillis must be positive" }
     require(savedStateKey.isNotBlank()) { "savedStateKey must not be blank" }
@@ -315,6 +322,9 @@ internal fun TrailVeilMapSurface(
     val currentOnFogFailure by rememberUpdatedState(onFogFailure)
     val currentOnUserMovedCamera by rememberUpdatedState(onUserMovedCamera)
     val currentOnMapViewCreatedForTesting by rememberUpdatedState(onMapViewCreatedForTesting)
+    val currentOnFogCoverageInstalledForTesting by rememberUpdatedState(
+        onFogCoverageInstalledForTesting,
+    )
     // Set only around a follow step, whose reach is bounded by how far a person walked since the
     // last fix. Every other programmed move keeps hiding the overlay until its rebuild lands.
     val followingCameraMove = remember(mapView) { AtomicBoolean(false) }
@@ -806,7 +816,8 @@ internal fun TrailVeilMapSurface(
         ) {
             return@LaunchedEffect
         }
-        installedSurround = FogBackdropGeometry.extent(rendered.mosaic)
+        val installedExtent = FogBackdropGeometry.extent(rendered.mosaic)
+        installedSurround = installedExtent
         if (!surroundHoldsForCamera()) {
             requestViewport()
             return@LaunchedEffect
@@ -814,6 +825,9 @@ internal fun TrailVeilMapSurface(
         fogCoverageInstalled = true
         canonicalFogLoaded = true
         fogRenderFailed = false
+        currentOnFogCoverageInstalledForTesting?.invoke(
+            InstalledFogCoverageSnapshot(generation = generation, extent = installedExtent),
+        )
         currentOnFogRendered?.invoke(rendered)
     }
 

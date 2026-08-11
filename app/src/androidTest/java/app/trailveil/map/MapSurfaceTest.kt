@@ -45,6 +45,7 @@ import app.trailveil.map.fog.FogTileRenderer
 import app.trailveil.map.fog.FogViewportCoordinator
 import app.trailveil.map.fog.GeoPoint
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -798,7 +799,7 @@ class MapSurfaceTest {
         ),
         requireOnlineStyle = false,
         savedStateKey = "trailveil.map.fog-quick-zoom-test",
-        gesture = ::quickZoomOutInSteps,
+        gesture = ::frameAuditedQuickZoomOutInSteps,
     )
 
     /**
@@ -1706,7 +1707,7 @@ class MapSurfaceTest {
         ),
         requireOnlineStyle = false,
         savedStateKey = "trailveil.map.fog-world-pan-test",
-        gesture = ::panInSteps,
+        gesture = ::frameAuditedPanInSteps,
         startPoint = GeoPoint(0.0, 121.5654),
         startZoom = 2.0,
         expectZoomOut = false,
@@ -1727,7 +1728,7 @@ class MapSurfaceTest {
         ),
         requireOnlineStyle = false,
         savedStateKey = "trailveil.map.fog-world-pan-far-test",
-        gesture = ::panInSteps,
+        gesture = ::frameAuditedPanInSteps,
         startPoint = GeoPoint(25.0330, 121.5654),
         startZoom = 1.0,
         expectZoomOut = false,
@@ -1762,6 +1763,7 @@ class MapSurfaceTest {
         val database = inMemoryDatabase()
         try {
             val fogRendered = AtomicBoolean(false)
+            val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
             revealTrack(database, REVEALED_CENTER)
 
             composeRule.setContent {
@@ -1781,6 +1783,7 @@ class MapSurfaceTest {
                         zoom = startZoom,
                     ),
                     onFogRendered = { fogRendered.set(true) },
+                    onFogCoverageInstalledForTesting = installedCoverage::set,
                 )
             }
 
@@ -1851,11 +1854,28 @@ class MapSurfaceTest {
             var worstZoom = startCameraZoom
             var holds = 0
             val generations = mutableListOf<Any?>()
+            var measuredCoverage: InstalledFogCoverageSnapshot? = null
             val trace = StringBuilder()
 
             gesture(map) {
                 holds += 1
                 generations += fogGeneration()
+                val installed = checkNotNull(installedCoverage.get()) {
+                    "No canonical installed-coverage snapshot was published for the gesture"
+                }
+                val frozen = measuredCoverage ?: installed.also { measuredCoverage = it }
+                assertEquals(
+                    "The installed fog geometry changed during one measured gesture",
+                    frozen,
+                    installed,
+                )
+                if (!expectCover) {
+                    assertTrue(
+                        "The gesture entered P4-034's finite-extent boundary instead of staying " +
+                            "inside P4-008's installed geometry: $frozen",
+                        frozen.extent.covers(map.visibleRegionCorners()),
+                    )
+                }
                 val covered = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                     .fetchSemanticsNodes()
                     .isNotEmpty()
@@ -2246,7 +2266,14 @@ class MapSurfaceTest {
      * One finger dragged diagonally, held between steps. Diagonal so that a single gesture crosses
      * both the edge a trimmed surround loses and the edge a wrongly-measured one thinks it has.
      */
-    private fun panInSteps(@Suppress("UNUSED_PARAMETER") map: MapLibreMap, onHold: () -> Unit) {
+    private fun frameAuditedPanInSteps(map: MapLibreMap, onHold: () -> Unit) =
+        panInSteps(map, onHold, auditEveryMove = true)
+
+    private fun panInSteps(
+        map: MapLibreMap,
+        onHold: () -> Unit,
+        auditEveryMove: Boolean = false,
+    ) {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         val fromX = view.width * 0.72f
         val toX = view.width * 0.22f
@@ -2271,7 +2298,10 @@ class MapSurfaceTest {
                 fromY + (toY - fromY) * progress,
             )
             SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
-            if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
+            if (auditEveryMove) {
+                map.awaitFullyRenderedFrame(view)
+                onHold()
+            } else if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
                 Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
                 onHold()
             }
@@ -2298,6 +2328,9 @@ class MapSurfaceTest {
      */
     private fun quickZoomOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
         quickZoomInSteps(map, onHold, zoomIn = false, auditEveryMove = false)
+
+    private fun frameAuditedQuickZoomOutInSteps(map: MapLibreMap, onHold: () -> Unit) =
+        quickZoomInSteps(map, onHold, zoomIn = false, auditEveryMove = true)
 
     /** The reverse zoom-1 transition, audited after every move without lifting the held tap. */
     private fun frameAuditedQuickZoomInInSteps(map: MapLibreMap, onHold: () -> Unit) =
@@ -2366,6 +2399,21 @@ class MapSurfaceTest {
 
     private fun fogGeneration(): Any? = composeRule.runOnIdle {
         attachedMapView()?.getTag(R.id.map_fog_canonical_generation)
+    }
+
+    private fun MapLibreMap.visibleRegionCorners(): List<GeoPoint> =
+        composeRule.runOnIdle { currentVisibleRegionCorners() }
+
+    /** Main-thread snapshot used directly from a renderer-finished callback. */
+    private fun MapLibreMap.currentVisibleRegionCorners(): List<GeoPoint> {
+        val corners = projection.visibleRegion.let { region ->
+            listOfNotNull(region.farLeft, region.farRight, region.nearRight, region.nearLeft)
+        }
+        check(corners.size == 4) { "MapLibre did not publish all visible-region corners" }
+        check(corners.all { it.latitude.isFinite() && it.longitude.isFinite() }) {
+            "MapLibre published a non-finite visible-region corner: $corners"
+        }
+        return corners.map { corner -> GeoPoint(corner.latitude, corner.longitude) }
     }
 
     /**
@@ -2689,6 +2737,7 @@ class MapSurfaceTest {
         val database = inMemoryDatabase()
         try {
             val fogRendered = AtomicBoolean(false)
+            val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
             val revealed = GeoPoint(25.0330, 121.5654)
             revealTrack(database, revealed)
 
@@ -2712,6 +2761,7 @@ class MapSurfaceTest {
                         zoom = 16.0,
                     ),
                     onFogRendered = { fogRendered.set(true) },
+                    onFogCoverageInstalledForTesting = installedCoverage::set,
                 )
             }
 
@@ -2734,8 +2784,94 @@ class MapSurfaceTest {
                 .displayMetrics
             val centerX = metrics.widthPixels / 2f
             val gestureFailure = AtomicReference<Throwable?>(null)
+            val flingCallbackFailure = AtomicReference<Throwable?>(null)
+            val flingActive = AtomicBoolean(false)
+            val flingCaptureInFlight = AtomicBoolean(false)
+            val expectedFlingCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
+            val expectedFlingStartTarget = AtomicReference<GeoPoint?>(null)
+            val flingFrameRequests = LinkedBlockingQueue<FlingFrameRequest>()
+            val renderedFlingFrames = LinkedBlockingQueue<FlingFrameAudit>()
+            val mapView = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            val flingFrameListener = MapView.OnDidFinishRenderingFrameListener {
+                    fullyRendered,
+                    _,
+                    _,
+                ->
+                if (
+                    flingActive.get() &&
+                    flingCaptureInFlight.compareAndSet(false, true)
+                ) {
+                    try {
+                        val expected = checkNotNull(expectedFlingCoverage.get()) {
+                            "A fling frame arrived without a frozen coverage snapshot"
+                        }
+                        val current = checkNotNull(installedCoverage.get()) {
+                            "The installed coverage disappeared during a fling"
+                        }
+                        val startTarget = checkNotNull(expectedFlingStartTarget.get()) {
+                            "A fling frame arrived without its camera baseline"
+                        }
+                        if (current == expected) {
+                            val corners = map.currentVisibleRegionCorners()
+                            val target = checkNotNull(map.cameraPosition.target) {
+                                "The fling camera had no target"
+                            }.let { GeoPoint(it.latitude, it.longitude) }
+                            flingFrameRequests.offer(
+                                FlingFrameRequest(
+                                    expectedCoverage = expected,
+                                    currentCoverage = current,
+                                    callbackCorners = corners,
+                                    startTarget = startTarget,
+                                    target = target,
+                                    fullyRendered = fullyRendered,
+                                ),
+                            )
+                        } else {
+                            flingActive.set(false)
+                            flingCaptureInFlight.set(false)
+                        }
+                    } catch (failure: Throwable) {
+                        flingCallbackFailure.compareAndSet(null, failure)
+                        flingCaptureInFlight.set(false)
+                    }
+                }
+            }
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                mapView.addOnDidFinishRenderingFrameListener(flingFrameListener)
+            }
+            fun prepareFlingAudit() {
+                while (flingCaptureInFlight.get()) {
+                    SystemClock.sleep(FLING_FRAME_REQUEST_POLL_MILLIS)
+                }
+                expectedFlingCoverage.set(
+                    checkNotNull(installedCoverage.get()) {
+                        "No installed coverage at fling start"
+                    },
+                )
+                InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    expectedFlingStartTarget.set(
+                        checkNotNull(map.cameraPosition.target) {
+                            "The fling camera had no starting target"
+                        }.let { GeoPoint(it.latitude, it.longitude) },
+                    )
+                }
+            }
             val gestures = Thread {
                 try {
+                    // Audit one real inertial fling against the canonical geometry that was stable
+                    // before any stress cancellation could schedule a replacement install.
+                    dragVertically(
+                        x = centerX,
+                        fromY = metrics.heightPixels * 0.80f,
+                        toY = metrics.heightPixels * 0.20f,
+                        steps = 6,
+                        stepMillis = 3L,
+                        lift = true,
+                        beforeLift = ::prepareFlingAudit,
+                        afterLift = { flingActive.set(true) },
+                    )
+                    Thread.sleep(FLING_SETTLE_MILLIS)
+                    flingActive.set(false)
                     repeat(SUSTAINED_DRAG_COUNT) {
                         dragVertically(
                             x = centerX,
@@ -2746,7 +2882,8 @@ class MapSurfaceTest {
                             lift = false,
                         )
                     }
-                    repeat(FLING_COUNT) {
+                    Thread.sleep(FLING_CANONICAL_SETTLE_MILLIS)
+                    repeat(FLING_COUNT - 1) {
                         dragVertically(
                             x = centerX,
                             fromY = metrics.heightPixels * 0.80f,
@@ -2754,8 +2891,11 @@ class MapSurfaceTest {
                             steps = 6,
                             stepMillis = 3L,
                             lift = true,
+                            beforeLift = ::prepareFlingAudit,
+                            afterLift = { flingActive.set(true) },
                         )
                         Thread.sleep(FLING_SETTLE_MILLIS)
+                        flingActive.set(false)
                     }
                 } catch (failure: Throwable) {
                     // An uncaught exception on this target-process thread kills instrumentation
@@ -2763,16 +2903,46 @@ class MapSurfaceTest {
                     gestureFailure.set(failure)
                 }
             }
-            gestures.start()
+            try {
+                gestures.start()
 
-            var samples = 0
-            var postExitFrames = 0
-            var postExitMaxLuminance = 0
-            var postExitMaxRevealed = 0.0
-            var exited = false
-            var coveredFrames = 0
-            val leaks = mutableListOf<FogCoverage>()
-            while (gestures.isAlive) {
+                var samples = 0
+                var postExitFrames = 0
+                var postExitMaxLuminance = 0
+                var postExitMaxRevealed = 0.0
+                var exited = false
+                var coveredFrames = 0
+                val leaks = mutableListOf<FogCoverage>()
+                while (gestures.isAlive || flingCaptureInFlight.get()) {
+                val flingRequest = flingFrameRequests.poll()
+                if (flingRequest != null) {
+                    val snapshotStartCorners = map.visibleRegionCorners()
+                    val bitmap = map.snapshotBitmap()
+                    try {
+                        renderedFlingFrames.offer(
+                            FlingFrameAudit(
+                                expectedCoverage = flingRequest.expectedCoverage,
+                                currentCoverage = flingRequest.currentCoverage,
+                                callbackCorners = flingRequest.callbackCorners,
+                                snapshotStartCorners = snapshotStartCorners,
+                                snapshotEndCorners = map.visibleRegionCorners(),
+                                startTarget = flingRequest.startTarget,
+                                target = flingRequest.target,
+                                fullyRendered = flingRequest.fullyRendered,
+                                bitmap = bitmap,
+                            ),
+                        )
+                    } catch (failure: Throwable) {
+                        bitmap.recycle()
+                        throw failure
+                    }
+                    flingCaptureInFlight.set(false)
+                    continue
+                }
+                if (!gestures.isAlive) {
+                    SystemClock.sleep(FLING_FRAME_REQUEST_POLL_MILLIS)
+                    continue
+                }
                 val coverage = map.renderedFogCoverage()
                 samples += 1
                 if (
@@ -2791,11 +2961,76 @@ class MapSurfaceTest {
                     postExitMaxRevealed = max(postExitMaxRevealed, coverage.revealedFraction)
                     if (coverage.revealedFraction > 0.0) leaks += coverage
                 }
-            }
-            gestures.join()
-            gestureFailure.get()?.let { failure ->
+                }
+                gestures.join()
+                gestureFailure.get()?.let { failure ->
                 throw AssertionError("The sustained input stream failed", failure)
             }
+            flingCallbackFailure.get()?.let { failure ->
+                throw AssertionError("The renderer-finished fling audit failed", failure)
+            }
+            val flingFrames = buildList { renderedFlingFrames.drainTo(this) }
+            var maximumFlingFrameMovement = 0.0
+            var flingExited = false
+            var postExitFlingFrames = 0
+            val flingLeaks = mutableListOf<FogCoverage>()
+            try {
+                assertTrue(
+                    "Too few renderer-finished fling frames were captured: ${flingFrames.size}",
+                    flingFrames.size >= MINIMUM_RENDERED_FLING_FRAMES,
+                )
+                assertTrue(
+                    "Every fling callback claimed fullyRendered=true, so inertial animation was " +
+                        "not actually sampled: $flingFrames",
+                    flingFrames.any { frame -> !frame.fullyRendered },
+                )
+                maximumFlingFrameMovement = flingFrames.maxOfOrNull { frame ->
+                    kotlin.math.abs(frame.target.latitude - frame.startTarget.latitude) +
+                        kotlin.math.abs(frame.target.longitude - frame.startTarget.longitude)
+                } ?: 0.0
+                assertTrue(
+                    "Renderer-finished fling frames did not span actual inertial camera movement: " +
+                        maximumFlingFrameMovement,
+                    maximumFlingFrameMovement > MINIMUM_FLING_FRAME_MOVEMENT_DEGREES,
+                )
+                flingFrames.forEach { frame ->
+                    assertEquals(
+                        "Canonical fog geometry changed during an audited fling",
+                        frame.expectedCoverage,
+                        frame.currentCoverage,
+                    )
+                    assertTrue(
+                        "A renderer callback entered P4-034's finite-extent boundary: $frame",
+                        frame.expectedCoverage.extent.covers(frame.callbackCorners),
+                    )
+                    assertTrue(
+                        "A fling snapshot started outside P4-008's installed geometry: $frame",
+                        frame.expectedCoverage.extent.covers(frame.snapshotStartCorners),
+                    )
+                    assertTrue(
+                        "A fling snapshot finished outside P4-008's installed geometry: $frame",
+                        frame.expectedCoverage.extent.covers(frame.snapshotEndCorners),
+                    )
+                    val coverage = frame.bitmap.fogCoverage()
+                    if (!flingExited && coverage.revealedFraction == 0.0) flingExited = true
+                    if (flingExited) {
+                        postExitFlingFrames += 1
+                        if (coverage.revealedFraction > 0.0) flingLeaks += coverage
+                    }
+                }
+            } finally {
+                flingFrames.forEach { frame -> frame.bitmap.recycle() }
+            }
+            assertTrue("No renderer-finished fling frame left the revealed track", flingExited)
+            assertTrue(
+                "Too few renderer-finished fling frames were audited after leaving the track: " +
+                    postExitFlingFrames,
+                postExitFlingFrames >= MINIMUM_POST_EXIT_RENDERED_FLING_FRAMES,
+            )
+            assertTrue(
+                "A renderer-finished fling frame exposed unexplored map: $flingLeaks",
+                flingLeaks.isEmpty(),
+            )
             val settled = map.renderedFogCoverage()
             val diagnostics = AtomicReference("")
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
@@ -2821,7 +3056,9 @@ class MapSurfaceTest {
                             "aboveThreshold=" +
                             "${"%.4f".format(java.util.Locale.US, postExitMaxRevealed * 100.0)}%] " +
                             "settled=${settled.report()} leaks=${leaks.size} " +
-                            "coveredFrames=$coveredFrames ${diagnostics.get()}\n",
+                            "coveredFrames=$coveredFrames renderedFlingFrames=${flingFrames.size} " +
+                            "postExitRenderedFlingFrames=$postExitFlingFrames " +
+                            "maxFlingFrameMove=$maximumFlingFrameMovement ${diagnostics.get()}\n",
                     )
                 },
             )
@@ -2842,6 +3079,18 @@ class MapSurfaceTest {
                 0,
                 coveredFrames,
             )
+            } finally {
+                flingActive.set(false)
+                InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    mapView.removeOnDidFinishRenderingFrameListener(flingFrameListener)
+                }
+                if (gestures.isAlive) {
+                    gestures.interrupt()
+                    gestures.join(2_000L)
+                }
+                val abandonedFrames = buildList { renderedFlingFrames.drainTo(this) }
+                abandonedFrames.forEach { frame -> frame.bitmap.recycle() }
+            }
         } finally {
             database.close()
         }
@@ -2854,6 +3103,8 @@ class MapSurfaceTest {
         steps: Int,
         stepMillis: Long,
         lift: Boolean,
+        beforeLift: (() -> Unit)? = null,
+        afterLift: (() -> Unit)? = null,
     ) {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
         val downTime = SystemClock.uptimeMillis()
@@ -2875,6 +3126,7 @@ class MapSurfaceTest {
             )
         }
         if (lift) {
+            beforeLift?.invoke()
             instrumentation.sendPointerSync(
                 MotionEvent.obtain(
                     downTime,
@@ -2885,6 +3137,7 @@ class MapSurfaceTest {
                     0,
                 ),
             )
+            afterLift?.invoke()
         } else {
             instrumentation.sendPointerSync(
                 MotionEvent.obtain(
@@ -2938,6 +3191,15 @@ class MapSurfaceTest {
      * bare basemap are far apart in luminance.
      */
     private fun MapLibreMap.renderedFogCoverage(): FogCoverage {
+        val bitmap = snapshotBitmap()
+        return try {
+            bitmap.fogCoverage()
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    private fun MapLibreMap.snapshotBitmap(): Bitmap {
         val ready = CountDownLatch(1)
         val captured = AtomicReference<Bitmap?>(null)
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
@@ -2950,10 +3212,12 @@ class MapSurfaceTest {
             "MapLibre did not produce a frame snapshot",
             ready.await(SNAPSHOT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
         )
-        val bitmap = requireNotNull(captured.get())
-        val pixels = IntArray(bitmap.width * bitmap.height)
-        bitmap.getPixels(pixels, 0, bitmap.width, 0, 0, bitmap.width, bitmap.height)
-        bitmap.recycle()
+        return requireNotNull(captured.get())
+    }
+
+    private fun Bitmap.fogCoverage(): FogCoverage {
+        val pixels = IntArray(width * height)
+        getPixels(pixels, 0, width, 0, 0, width, height)
         var revealed = 0L
         var maxLuminance = 0
         pixels.forEach { pixel ->
@@ -3246,6 +3510,27 @@ class MapSurfaceTest {
             "pixels=$sampledPixels]"
     }
 
+    private data class FlingFrameAudit(
+        val expectedCoverage: InstalledFogCoverageSnapshot,
+        val currentCoverage: InstalledFogCoverageSnapshot,
+        val callbackCorners: List<GeoPoint>,
+        val snapshotStartCorners: List<GeoPoint>,
+        val snapshotEndCorners: List<GeoPoint>,
+        val startTarget: GeoPoint,
+        val target: GeoPoint,
+        val fullyRendered: Boolean,
+        val bitmap: Bitmap,
+    )
+
+    private data class FlingFrameRequest(
+        val expectedCoverage: InstalledFogCoverageSnapshot,
+        val currentCoverage: InstalledFogCoverageSnapshot,
+        val callbackCorners: List<GeoPoint>,
+        val startTarget: GeoPoint,
+        val target: GeoPoint,
+        val fullyRendered: Boolean,
+    )
+
     private fun awaitMap(exactMapView: MapView? = null): MapLibreMap? {
         val ready = CountDownLatch(1)
         val found = AtomicReference<MapLibreMap?>(null)
@@ -3507,8 +3792,13 @@ class MapSurfaceTest {
         )
         const val SUSTAINED_DRAG_COUNT = 6
         const val FLING_COUNT = 4
-        const val FLING_SETTLE_MILLIS = 400L
+        const val FLING_SETTLE_MILLIS = 1_000L
+        const val FLING_CANONICAL_SETTLE_MILLIS = 1_500L
         const val MINIMUM_POST_EXIT_FRAMES = 20
+        const val FLING_FRAME_REQUEST_POLL_MILLIS = 10L
+        const val MINIMUM_RENDERED_FLING_FRAMES = 3
+        const val MINIMUM_POST_EXIT_RENDERED_FLING_FRAMES = 2
+        const val MINIMUM_FLING_FRAME_MOVEMENT_DEGREES = 0.000_001
 
         /**
          * The zoom the reported leak started from, and enough steps out of it to cross the range
