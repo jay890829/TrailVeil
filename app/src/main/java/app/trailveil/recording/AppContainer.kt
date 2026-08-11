@@ -87,6 +87,9 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
         database.close()
     }
 
+    /** Same-process integration-test fixture access; production callers never mutate Room directly. */
+    internal fun databaseForTesting(): TrailVeilDatabase = database
+
     /**
      * Call from a background dispatcher: disk-cache discovery and trimming perform file I/O.
      * Failure to create the derived disk cache degrades to the bounded in-memory cache.
