@@ -43,7 +43,9 @@ import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogTilePipeline
 import app.trailveil.map.fog.FogTileRenderer
 import app.trailveil.map.fog.FogViewportCoordinator
+import app.trailveil.map.fog.FogViewportRender
 import app.trailveil.map.fog.GeoPoint
+import app.trailveil.map.fog.WebMercator
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -596,6 +598,9 @@ class MapSurfaceTest {
         val database = inMemoryDatabase()
         try {
             val fogRendered = AtomicBoolean(false)
+            val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
+            val settledEvidence = AtomicReference<SettledFogEvidence?>(null)
+            val settledRenderSequence = AtomicInteger(0)
             val revealed = GeoPoint(25.0330, 121.5654)
             revealTrack(database, revealed)
             val cameraRequest = mutableStateOf(
@@ -614,7 +619,19 @@ class MapSurfaceTest {
                     ),
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
-                    onFogRendered = { fogRendered.set(true) },
+                    onFogCoverageInstalledForTesting = installedCoverage::set,
+                    onFogRendered = { rendered ->
+                        installedCoverage.get()?.let { installed ->
+                            settledEvidence.set(
+                                SettledFogEvidence(
+                                    sequence = settledRenderSequence.incrementAndGet(),
+                                    render = rendered,
+                                    installed = installed,
+                                ),
+                            )
+                            fogRendered.set(true)
+                        }
+                    },
                 )
             }
 
@@ -659,7 +676,34 @@ class MapSurfaceTest {
             // How far out this display itself allows, measured once rather than assumed, and
             // checked against what MapLibre's own rule predicts so that a floor added anywhere in
             // this app would show up as the measurement exceeding the prediction.
-            val zoomFloor = measureZoomFloor(map, cameraRequest)
+            val initialEvidence = checkNotNull(settledEvidence.get()) {
+                "The initial canonical render published no settled evidence"
+            }
+            var completedSequence = initialEvidence.sequence
+            var completedGeneration = initialEvidence.installed.generation
+            val zoomFloorCell = measureZoomFloor(
+                map = map,
+                cameraRequest = cameraRequest,
+                settledEvidence = settledEvidence,
+                newerThanSequence = completedSequence,
+                newerThanGeneration = completedGeneration,
+            )
+            val zoomFloor = zoomFloorCell.camera.zoom
+            completedSequence = zoomFloorCell.evidence.sequence
+            completedGeneration = zoomFloorCell.evidence.installed.generation
+            InstrumentationRegistry.getInstrumentation().sendStatus(
+                0,
+                Bundle().apply {
+                    putString(
+                        "stream",
+                        "TrailVeil settled zoom-floor evidence: requested=$ZOOM_FLOOR_PROBE " +
+                            "actualTarget=${zoomFloorCell.camera.target} " +
+                            "actualZoom=${zoomFloorCell.camera.zoom} " +
+                            "renderSequence=${zoomFloorCell.evidence.sequence} " +
+                            "generation=${zoomFloorCell.evidence.installed.generation}\n",
+                    )
+                },
+            )
             val predictedFloor = predictedZoomFloor()
             assertTrue(
                 "The camera stopped at zoom $zoomFloor when this display allows $predictedFloor, " +
@@ -677,8 +721,10 @@ class MapSurfaceTest {
             var worstOverFogged = 0.0
             var worstOverFoggedLabel = "none"
             var requestId = 100L
-            UNEXPLORED_VIEWPOINTS.forEach { (label, point) ->
-                ZOOM_SWEEP.forEach { zoom ->
+            SETTLED_SWEEP_VIEWPOINTS.forEach { viewpoint ->
+                viewpoint.zooms.forEach { zoom ->
+                    val label = viewpoint.label
+                    val point = viewpoint.point
                     requestId += 1L
                     composeRule.runOnUiThread {
                         cameraRequest.value = MapCameraRequest(
@@ -687,14 +733,23 @@ class MapSurfaceTest {
                             zoom = zoom,
                         )
                     }
-                    composeRule.waitUntil(timeoutMillis = 45_000L) {
-                        composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
-                            .fetchSemanticsNodes()
-                            .isEmpty()
-                    }
-                    Thread.sleep(ZOOM_SETTLE_MILLIS)
-                    val coverage = map.auditFogCoverage()
-                    val settledZoom = map.cameraPosition.zoom
+                    val cell = awaitSettledFogCell(
+                        map = map,
+                        settledEvidence = settledEvidence,
+                        newerThanSequence = completedSequence,
+                        newerThanGeneration = completedGeneration,
+                        requestedPoint = point,
+                        expectedZoom = max(zoom, zoomFloor),
+                    )
+                    completedSequence = cell.evidence.sequence
+                    completedGeneration = cell.evidence.installed.generation
+                    val fogged = map.snapshotStableFoggedPixels(
+                        label = "$label@z$zoom fogged reference",
+                        expected = cell,
+                        settledEvidence = settledEvidence,
+                    )
+                    val coverage = map.auditFogCoverage(fogged)
+                    val settledZoom = cell.camera.zoom
                     report.append(
                         "$label@z$zoom(actual=${"%.2f".format(java.util.Locale.US, settledZoom)})=" +
                             "${coverage.report()} ",
@@ -2422,22 +2477,131 @@ class MapSurfaceTest {
     private fun measureZoomFloor(
         map: MapLibreMap,
         cameraRequest: MutableState<MapCameraRequest>,
-    ): Double {
+        settledEvidence: AtomicReference<SettledFogEvidence?>,
+        newerThanSequence: Int,
+        newerThanGeneration: Long,
+    ): SettledFogCell {
         composeRule.runOnUiThread {
             cameraRequest.value = MapCameraRequest(
                 requestId = 2L,
-                point = UNEXPLORED_VIEWPOINTS.first().second,
+                point = ZOOM_FLOOR_PROBE,
                 zoom = 0.0,
             )
         }
-        composeRule.waitUntil(timeoutMillis = 25_000L) {
+        return awaitSettledFogCell(
+            map = map,
+            settledEvidence = settledEvidence,
+            newerThanSequence = newerThanSequence,
+            newerThanGeneration = newerThanGeneration,
+            requestedPoint = ZOOM_FLOOR_PROBE,
+            expectedZoom = null,
+        )
+    }
+
+    /**
+     * Waits for evidence produced by this exact programmed camera request, not merely for a frame
+     * where the previous request's cover happened to still be absent.
+     */
+    private fun awaitSettledFogCell(
+        map: MapLibreMap,
+        settledEvidence: AtomicReference<SettledFogEvidence?>,
+        newerThanSequence: Int,
+        newerThanGeneration: Long,
+        requestedPoint: GeoPoint,
+        expectedZoom: Double?,
+    ): SettledFogCell {
+        try {
+            composeRule.waitUntil(timeoutMillis = SETTLED_CELL_TIMEOUT_MILLIS) {
+                val evidence = settledEvidence.get() ?: return@waitUntil false
+                if (evidence.sequence <= newerThanSequence) return@waitUntil false
+                if (evidence.installed.generation < newerThanGeneration) return@waitUntil false
+                val camera = map.cameraAuditState()
+                if (!requestedPoint.matches(camera.target)) return@waitUntil false
+                if (
+                    expectedZoom != null &&
+                    kotlin.math.abs(camera.zoom - expectedZoom) > ZOOM_TOLERANCE
+                ) {
+                    return@waitUntil false
+                }
+                if (!evidence.render.request.matches(camera)) return@waitUntil false
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+        } catch (timeout: Throwable) {
+            val evidence = settledEvidence.get()
+            val camera = map.cameraAuditState()
+            val coverVisible = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                .fetchSemanticsNodes()
+                .isNotEmpty()
+            throw AssertionError(
+                "Timed out waiting for settled fog cell: requested=$requestedPoint " +
+                    "expectedZoom=$expectedZoom newerThanSequence=$newerThanSequence " +
+                    "newerThanGeneration=$newerThanGeneration camera=$camera " +
+                    "evidence=$evidence coverVisible=$coverVisible",
+                timeout,
+            )
+        }
+
+        val evidence = checkNotNull(settledEvidence.get()) {
+            "The settled camera published no canonical render evidence"
+        }
+        val camera = map.cameraAuditState()
+        assertTrue(
+            "No new canonical render completed for $requestedPoint: $evidence",
+            evidence.sequence > newerThanSequence,
+        )
+        assertTrue(
+            "The canonical generation moved backwards for $requestedPoint: $evidence",
+            evidence.installed.generation >= newerThanGeneration,
+        )
+        assertTrue(
+            "The camera target did not reach $requestedPoint: $camera",
+            requestedPoint.matches(camera.target),
+        )
+        expectedZoom?.let { zoom ->
+            assertEquals(
+                "The camera did not reach the requested settled zoom",
+                zoom,
+                camera.zoom,
+                ZOOM_TOLERANCE,
+            )
+        }
+        assertTrue(
+            "The canonical render request does not describe the settled camera: $evidence / $camera",
+            evidence.render.request.matches(camera),
+        )
+        assertTrue(
+            "The settled camera entered P4-034's finite-extent boundary: $evidence / $camera",
+            evidence.installed.extent.covers(map.visibleRegionCorners()),
+        )
+        assertTrue(
+            "The safety cover remained visible after the matching canonical render",
             composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                 .fetchSemanticsNodes()
-                .isEmpty()
-        }
-        Thread.sleep(ZOOM_SETTLE_MILLIS)
-        return map.cameraPosition.zoom
+                .isEmpty(),
+        )
+        return SettledFogCell(camera = camera, evidence = evidence)
     }
+
+    private fun MapLibreMap.cameraAuditState(): SettledCameraState = composeRule.runOnIdle {
+        val target = checkNotNull(cameraPosition.target) { "The settled camera has no target" }
+        SettledCameraState(
+            target = GeoPoint(target.latitude, target.longitude),
+            zoom = cameraPosition.zoom,
+        )
+    }
+
+    private fun GeoPoint.matches(actual: GeoPoint): Boolean =
+        kotlin.math.abs(latitude - actual.latitude) <= SETTLED_CAMERA_TOLERANCE_DEGREES &&
+            kotlin.math.abs(
+                WebMercator.wrapLongitude(longitude - actual.longitude),
+            ) <= SETTLED_CAMERA_TOLERANCE_DEGREES
+
+    private fun app.trailveil.map.fog.FogViewportRequest.matches(
+        camera: SettledCameraState,
+    ): Boolean = center.matches(camera.target) &&
+        kotlin.math.abs(mapZoom - camera.zoom) <= ZOOM_TOLERANCE
 
     /**
      * MapLibre keeps the world covering the viewport, and its world is 512 logical pixels across at
@@ -3279,7 +3443,10 @@ class MapSurfaceTest {
      * Only valid for a settled camera: it needs two frames of the same view.
      */
     private fun MapLibreMap.auditFogCoverage(): FogAudit {
-        val fogged = snapshotPixels()
+        return auditFogCoverage(snapshotPixels())
+    }
+
+    private fun MapLibreMap.auditFogCoverage(fogged: IntArray): FogAudit {
         // Put back what the app chose, not everything. Which fog quads are drawn depends on the
         // camera, and leaving them all visible would hand the next measurement an arrangement the
         // app never produces — two coats where it draws one.
@@ -3288,6 +3455,78 @@ class MapSurfaceTest {
         val bare = snapshotStableBarePixels("fog coverage reference")
         restoreFogLayerVisibility(visibility)
         return compareFogCoverage(fogged, bare, snapshotWidth())
+    }
+
+    /**
+     * Produces a stable fogged reference for a single settled-sweep cell.
+     *
+     * The public MapLibre snapshot API does not expose a renderer frame token. Requiring a
+     * renderer-finished callback before each capture, two bit-identical captures, and the same
+     * camera plus canonical evidence before and after every capture prevents the prior cell or an
+     * in-progress camera transition from being accepted as this cell's fogged frame.
+     */
+    private fun MapLibreMap.snapshotStableFoggedPixels(
+        label: String,
+        expected: SettledFogCell,
+        settledEvidence: AtomicReference<SettledFogEvidence?>,
+    ): IntArray {
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        var previous: IntArray? = null
+        var changedPixels = -1L
+        repeat(BARE_REFERENCE_STABILITY_ATTEMPTS) { attempt ->
+            if (attempt > 0) SystemClock.sleep(BARE_REFERENCE_STABILITY_RETRY_MILLIS)
+            awaitFullyRenderedFrame(view)
+            assertSettledFogCellUnchanged(label, expected, settledEvidence)
+            val current = snapshotPixels()
+            assertSettledFogCellUnchanged(label, expected, settledEvidence)
+            val prior = previous
+            if (prior != null) {
+                changedPixels = changedPixelCount(prior, current)
+                if (changedPixels == 0L) return current
+            }
+            previous = current
+        }
+        assertTrue(
+            "$label never produced two identical renderer-finished snapshots; " +
+                "lastChangedPixels=$changedPixels",
+            false,
+        )
+        return requireNotNull(previous)
+    }
+
+    private fun MapLibreMap.assertSettledFogCellUnchanged(
+        label: String,
+        expected: SettledFogCell,
+        settledEvidence: AtomicReference<SettledFogEvidence?>,
+    ) {
+        assertTrue(
+            "$label changed canonical render evidence during capture",
+            settledEvidence.get() === expected.evidence,
+        )
+        assertEquals(
+            "$label changed the published canonical generation during capture",
+            expected.evidence.installed.generation,
+            fogGeneration(),
+        )
+        val camera = cameraAuditState()
+        assertTrue(
+            "$label changed camera target during capture: $camera",
+            expected.camera.target.matches(camera.target),
+        )
+        assertEquals(
+            "$label changed camera zoom during capture",
+            expected.camera.zoom,
+            camera.zoom,
+            ZOOM_TOLERANCE,
+        )
+        assertTrue(
+            "$label no longer matches its canonical render request: $camera",
+            expected.evidence.render.request.matches(camera),
+        )
+        assertTrue(
+            "$label crossed the installed finite extent during capture: $camera",
+            expected.evidence.installed.extent.covers(visibleRegionCorners()),
+        )
     }
 
     /**
@@ -3529,6 +3768,28 @@ class MapSurfaceTest {
         val startTarget: GeoPoint,
         val target: GeoPoint,
         val fullyRendered: Boolean,
+    )
+
+    private data class SettledFogEvidence(
+        val sequence: Int,
+        val render: FogViewportRender,
+        val installed: InstalledFogCoverageSnapshot,
+    )
+
+    private data class SettledCameraState(
+        val target: GeoPoint,
+        val zoom: Double,
+    )
+
+    private data class SettledFogCell(
+        val camera: SettledCameraState,
+        val evidence: SettledFogEvidence,
+    )
+
+    private data class SettledSweepViewpoint(
+        val label: String,
+        val point: GeoPoint,
+        val zooms: List<Double>,
     )
 
     private fun awaitMap(exactMapView: MapView? = null): MapLibreMap? {
@@ -3779,16 +4040,25 @@ class MapSurfaceTest {
          */
         const val MAPLIBRE_WORLD_SIZE_DP = 512.0
         const val ZOOM_FLOOR_PREDICTION_TOLERANCE = 0.3
+        const val SETTLED_CELL_TIMEOUT_MILLIS = 45_000L
+        const val SETTLED_CAMERA_TOLERANCE_DEGREES = 0.000_1
+        val ZOOM_FLOOR_PROBE = GeoPoint(0.0, 45.0)
         val ZOOM_SWEEP = listOf(0.0, 1.0, 2.0, 3.0, 4.0, 6.0)
-        val UNEXPLORED_VIEWPOINTS = listOf(
-            "atlantic" to GeoPoint(0.0, 0.0),
+        val SETTLED_SWEEP_VIEWPOINTS = listOf(
+            SettledSweepViewpoint("atlantic", GeoPoint(0.0, 0.0), ZOOM_SWEEP),
             // An image quad is drawn once, in one world copy, while the basemap repeats. Both
             // sides of the seam are sampled because which side leaks depends on where the tile
             // window's western edge lands.
-            "antimeridian-east" to GeoPoint(0.0, 179.5),
-            "antimeridian-west" to GeoPoint(0.0, -179.5),
-            // Rows are clamped at the poles, so the surround has fewer tiles to work with here.
-            "high-latitude" to GeoPoint(80.0, 0.0),
+            SettledSweepViewpoint("antimeridian-east", GeoPoint(0.0, 179.5), ZOOM_SWEEP),
+            SettledSweepViewpoint("antimeridian-west", GeoPoint(0.0, -179.5), ZOOM_SWEEP),
+            // At the display-owned zoom floor the whole world is already viewport-high, so a
+            // high-latitude target is not a reachable camera state. From zoom 3 onward 80° is
+            // reachable; assert the target directly rather than labelling a clamped camera high.
+            SettledSweepViewpoint(
+                "high-latitude",
+                GeoPoint(80.0, 0.0),
+                listOf(3.0, 4.0, 6.0),
+            ),
         )
         const val SUSTAINED_DRAG_COUNT = 6
         const val FLING_COUNT = 4
