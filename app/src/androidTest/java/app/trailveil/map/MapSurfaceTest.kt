@@ -723,6 +723,10 @@ class MapSurfaceTest {
             var worstLabel = "none"
             var worstOverFogged = 0.0
             var worstOverFoggedLabel = "none"
+            var worstOverFoggedThickness = 0
+            var worstThicknessLabel = "none"
+            var worstDarkBlockOverFogged = 0.0
+            var worstDarkBlockLabel = "none"
             var requestId = 100L
             SETTLED_SWEEP_VIEWPOINTS.forEach { viewpoint ->
                 viewpoint.zooms.forEach { zoom ->
@@ -780,6 +784,21 @@ class MapSurfaceTest {
                         worstOverFogged = coverage.overFoggedFraction
                         worstOverFoggedLabel = "$label@z$zoom ${coverage.report()}"
                     }
+                    if (coverage.overFoggedThickness > worstOverFoggedThickness) {
+                        worstOverFoggedThickness = coverage.overFoggedThickness
+                        worstThicknessLabel = "$label@z$zoom ${coverage.report()}"
+                    }
+                    if (coverage.darkBlockOverFoggedFraction > worstDarkBlockOverFogged) {
+                        worstDarkBlockOverFogged = coverage.darkBlockOverFoggedFraction
+                        worstDarkBlockLabel = "$label@z$zoom ${coverage.report()}"
+                    }
+                    // A zero over-fog reading means nothing if nothing was bright enough to judge.
+                    assertTrue(
+                        "Settled camera $label@z$zoom judged only " +
+                            "${"%.2f".format(java.util.Locale.US, coverage.judgeableFraction * 100.0)}% " +
+                            "of its drawn pixels, so its over-fog reading is not evidence",
+                        coverage.judgeableFraction >= MINIMUM_JUDGEABLE_FRACTION,
+                    )
                 }
             }
             InstrumentationRegistry.getInstrumentation().sendStatus(
@@ -808,6 +827,25 @@ class MapSurfaceTest {
                     "${"%.4f".format(java.util.Locale.US, worstOverFogged * 100.0)}% of the map " +
                     "under more than one coat of fog",
                 worstOverFogged <= MAXIMUM_OVER_FOGGED_FRACTION,
+            )
+            // P4-023's actual criterion is about shape, not magnitude: a hairline seam and a blacked
+            // out region can carry the same pixel count and the same bounding box. The largest
+            // fully over-fogged square separates them. Measured 2026-08-12 across both styles: 3 at
+            // zoom 1.0 — exactly the seam guard's width — 5 and 9 at the display zoom floor where
+            // the world's edges meet, and 0 everywhere else.
+            assertTrue(
+                "Settled camera $worstThicknessLabel drew a solid ${worstOverFoggedThickness}px " +
+                    "square under more than one coat, which is a region rather than a seam",
+                worstOverFoggedThickness <= MAXIMUM_OVER_FOGGED_SQUARE_PIXELS,
+            )
+            // The strict ratio refuses to judge a dark basemap, which is exactly where this task's
+            // defect was reported. The floor-free block measure has no such blind spot.
+            assertTrue(
+                "Settled camera $worstDarkBlockLabel drew " +
+                    "${"%.4f".format(java.util.Locale.US, worstDarkBlockOverFogged * 100.0)}% of its " +
+                    "blocks under more than one coat, including where the basemap is too dark to " +
+                    "judge pixel by pixel",
+                worstDarkBlockOverFogged <= MAXIMUM_DARK_BLOCK_OVER_FOGGED_FRACTION,
             )
         } finally {
             database.close()
@@ -3531,6 +3569,83 @@ class MapSurfaceTest {
     }
 
     /**
+     * The over-fog side of the comparator had no calibration at all: every sweep proved the detector
+     * could see a *leak*, and nothing proved it could see a *double coat*. Setting
+     * `MINIMUM_BARE_FOR_OVER_FOG = 255` or `OVER_FOG_RATIO = 0.0` would have left every over-fog
+     * gate in this file reporting 0.0000% and the suite green. This pins all three instruments:
+     * that the strict ratio fires on a bright double coat, that the floor-free block measure fires
+     * on a dark-ocean one the strict ratio is designed to refuse, and that thickness separates the
+     * deliberate seam guard from a filled region.
+     */
+    @Test
+    fun theOverFogDetectorFiresOnADoubleCoatIncludingOverDarkOcean() {
+        val width = 16
+        val height = 16
+        // One coat transmits FOG_TRANSMISSION; a second coat squares it.
+        fun coats(bare: Int, count: Int): Int {
+            var value = bare.toDouble()
+            repeat(count) { value *= FOG_TRANSMISSION }
+            return gray(value.toInt())
+        }
+
+        val brightBare = IntArray(width * height) { gray(120) }
+        val brightOneCoat = IntArray(width * height) { coats(120, 1) }
+        val brightTwoCoats = IntArray(width * height) { coats(120, 2) }
+        assertEquals(
+            "A single coat was reported as over-fog on a bright basemap",
+            0.0,
+            compareFogCoverage(brightOneCoat, brightBare, width).overFoggedFraction,
+            0.0,
+        )
+        val doubled = compareFogCoverage(brightTwoCoats, brightBare, width)
+        assertEquals(
+            "The strict ratio did not fire on a full-frame double coat",
+            1.0,
+            doubled.overFoggedFraction,
+            0.0,
+        )
+        assertEquals("A bright basemap was not fully judgeable", 1.0, doubled.judgeableFraction, 0.0)
+
+        // Ocean sits at 18-28, below MINIMUM_BARE_FOR_OVER_FOG, which is exactly where P4-023's
+        // reported defect lived. The strict ratio must stay silent there and the block measure must
+        // not.
+        val oceanBare = IntArray(width * height) { gray(22) }
+        val oceanTwoCoats = IntArray(width * height) { coats(22, 2) }
+        val ocean = compareFogCoverage(oceanTwoCoats, oceanBare, width)
+        assertEquals(
+            "Dark ocean became judgeable by the strict ratio, which rounding cannot support",
+            0.0,
+            ocean.judgeableFraction,
+            0.0,
+        )
+        assertEquals(
+            "The floor-free block measure missed a double coat over dark ocean",
+            1.0,
+            ocean.darkBlockOverFoggedFraction,
+            0.0,
+        )
+
+        // Thickness: a three-pixel line and a filled block can carry the same pixel count and the
+        // same bounding box. Only thickness tells them apart.
+        val lineFogged = brightOneCoat.copyOf()
+        repeat(height) { y -> (0 until 3).forEach { dx -> lineFogged[y * width + dx] = coats(120, 2) } }
+        assertEquals(
+            "A three-pixel seam did not measure as three pixels thick",
+            3,
+            compareFogCoverage(lineFogged, brightBare, width).overFoggedThickness,
+        )
+        val blockFogged = brightOneCoat.copyOf()
+        for (y in 0 until 7) {
+            for (x in 0 until 7) blockFogged[y * width + x] = coats(120, 2)
+        }
+        assertEquals(
+            "A filled 7x7 region did not measure as seven pixels thick",
+            7,
+            compareFogCoverage(blockFogged, brightBare, width).overFoggedThickness,
+        )
+    }
+
+    /**
      * Whether each pixel of the rendered map actually has fog over it, measured against the same
      * frame with the fog layers hidden.
      *
@@ -3645,6 +3760,85 @@ class MapSurfaceTest {
         return compareFogCoverage(first, second, snapshotWidth())
     }
 
+    /**
+     * The thickest shape in [mask], as the largest `min(horizontal run, vertical run)` over all set
+     * pixels. A three-pixel line scores 3 no matter how long it is; an NxN block scores N. This is
+     * what separates the deliberate seam guard from a genuinely blacked-out region — the fraction
+     * and the bounding box cannot, because four hairlines around the frame produce a box the size of
+     * the frame.
+     */
+    private fun thickestRun(mask: BooleanArray, width: Int): Int {
+        if (mask.none { it }) return 0
+        val height = mask.size / width
+        // Largest fully-set axis-aligned square, by the standard dynamic program. Run length
+        // through a pixel is the wrong measure and was tried first: where a thin horizontal line
+        // crosses a thin vertical one both runs are long, so two hairlines scored 1080 on a frame
+        // with 1.2% of pixels set. A filled square cannot be faked that way.
+        val square = IntArray(mask.size)
+        var largest = 0
+        for (y in 0 until height) {
+            for (x in 0 until width) {
+                val index = y * width + x
+                if (!mask[index]) continue
+                square[index] = if (x == 0 || y == 0) {
+                    1
+                } else {
+                    1 + minOf(
+                        square[index - 1],
+                        square[index - width],
+                        square[index - width - 1],
+                    )
+                }
+                if (square[index] > largest) largest = square[index]
+            }
+        }
+        return largest
+    }
+
+    /**
+     * Over-fog judged on blocks rather than pixels, with no brightness floor. One coat transmits
+     * [FOG_TRANSMISSION]; two transmit its square. On dark ocean those land one or two levels apart
+     * per pixel and rounding decides, which is why the strict ratio refuses to judge there — but the
+     * mean over a block of 16 recovers the signal that quantisation destroys. Blocks are counted
+     * only where the bare map actually drew, so empty sky is neither numerator nor denominator.
+     */
+    private fun blockOverFoggedFraction(fogged: IntArray, bare: IntArray, width: Int): Double {
+        val height = bare.size / width
+        var blocks = 0L
+        var overFoggedBlocks = 0L
+        var blockY = 0
+        while (blockY < height) {
+            var blockX = 0
+            while (blockX < width) {
+                var bareTotal = 0L
+                var fogTotal = 0L
+                var samples = 0
+                for (y in blockY until minOf(blockY + OVER_FOG_BLOCK_PIXELS, height)) {
+                    for (x in blockX until minOf(blockX + OVER_FOG_BLOCK_PIXELS, width)) {
+                        val index = y * width + x
+                        val bareLuminance = luminance(bare[index])
+                        if (bareLuminance > 0) {
+                            bareTotal += bareLuminance.toLong()
+                            fogTotal += luminance(fogged[index]).toLong()
+                            samples += 1
+                        }
+                    }
+                }
+                if (samples >= OVER_FOG_BLOCK_PIXELS * OVER_FOG_BLOCK_PIXELS / 2) {
+                    blocks += 1L
+                    val bareMean = bareTotal.toDouble() / samples.toDouble()
+                    val fogMean = fogTotal.toDouble() / samples.toDouble()
+                    if (fogMean < FOG_TRANSMISSION * bareMean * OVER_FOG_RATIO) {
+                        overFoggedBlocks += 1L
+                    }
+                }
+                blockX += OVER_FOG_BLOCK_PIXELS
+            }
+            blockY += OVER_FOG_BLOCK_PIXELS
+        }
+        return if (blocks == 0L) 0.0 else overFoggedBlocks.toDouble() / blocks.toDouble()
+    }
+
     private fun compareFogCoverage(fogged: IntArray, bare: IntArray, width: Int): FogAudit {
         assertEquals("Snapshot sizes differ", bare.size, fogged.size)
         var uncovered = 0L
@@ -3699,12 +3893,23 @@ class MapSurfaceTest {
                 }
             }
         }
+        val overFoggedMask = BooleanArray(bare.size)
+        bare.indices.forEach { index ->
+            val bareLuminance = luminance(bare[index])
+            if (bareLuminance >= MINIMUM_BARE_FOR_OVER_FOG) {
+                overFoggedMask[index] =
+                    luminance(fogged[index]) < FOG_TRANSMISSION * bareLuminance * OVER_FOG_RATIO
+            }
+        }
         return FogAudit(
             uncoveredFraction = uncovered.toDouble() / bare.size.toDouble(),
             drawnFraction = drawn.toDouble() / bare.size.toDouble(),
             worstRatio = worstRatio,
             worstBareLuminance = worstBare,
             sampledPixels = bare.size.toLong(),
+            judgeableFraction = if (drawn == 0L) 0.0 else judgeable.toDouble() / drawn.toDouble(),
+            overFoggedThickness = thickestRun(overFoggedMask, width),
+            darkBlockOverFoggedFraction = blockOverFoggedFraction(fogged, bare, width),
             overFoggedFraction = if (judgeable == 0L) {
                 0.0
             } else {
@@ -3822,6 +4027,27 @@ class MapSurfaceTest {
         val uncoveredBounds: IntArray? = null,
         val overFoggedFraction: Double = 0.0,
         val overFoggedBounds: IntArray? = null,
+        /**
+         * What share of drawn pixels the over-fog ratio was allowed to judge. Without this,
+         * `overFogged=0.0000%` cannot be told apart from "nothing was bright enough to judge" —
+         * which is the normal state over ocean, exactly where `P4-023`'s defect was reported.
+         */
+        val judgeableFraction: Double = 0.0,
+        /**
+         * The thickest over-fogged shape on the frame, as `min(horizontal run, vertical run)`
+         * through its stoutest pixel. The deliberate seam guard is three screen pixels wide, so it
+         * scores about 3 however long it is; a filled region scores its short side. This is the
+         * line-versus-region distinction that a single bounding box cannot make — four separate
+         * hairlines and one solid block produce the same box.
+         */
+        val overFoggedThickness: Int = 0,
+        /**
+         * Over-fog measured on 4x4 blocks of *drawn* pixels with no brightness floor. Averaging a
+         * block suppresses the single-level rounding noise that the per-pixel floor exists to avoid,
+         * so a double coat over dark ocean is visible here while staying out of the strict ratio.
+         * Reported for calibration; the strict per-pixel figure remains what the gates assert.
+         */
+        val darkBlockOverFoggedFraction: Double = 0.0,
     ) {
         fun report(): String = "[uncovered=" +
             "${"%.4f".format(java.util.Locale.US, uncoveredFraction * 100.0)}% " +
@@ -3830,6 +4056,10 @@ class MapSurfaceTest {
             "bareAtWorst=$worstBareLuminance pixels=$sampledPixels" +
             (uncoveredBounds?.let { " at=(${it[0]},${it[1]})-(${it[2]},${it[3]})" } ?: "") +
             " overFogged=${"%.4f".format(java.util.Locale.US, overFoggedFraction * 100.0)}%" +
+            " judgeable=${"%.2f".format(java.util.Locale.US, judgeableFraction * 100.0)}%" +
+            " thickness=$overFoggedThickness" +
+            " darkBlockOverFogged=" +
+            "${"%.4f".format(java.util.Locale.US, darkBlockOverFoggedFraction * 100.0)}%" +
             (overFoggedBounds?.let { " dark=(${it[0]},${it[1]})-(${it[2]},${it[3]})" } ?: "") +
             "]"
 
@@ -4031,6 +4261,36 @@ class MapSurfaceTest {
          * is exactly the range that produced scattered false positives before this bound.
          */
         const val MINIMUM_BARE_FOR_OVER_FOG = 30
+
+        /**
+         * Block edge for the floor-free over-fog measure. Sixteen samples average away the one-level
+         * rounding that makes a single dark pixel unjudgeable, while staying far below the size of
+         * any region this task would call a defect.
+         */
+        const val OVER_FOG_BLOCK_PIXELS = 4
+
+        /**
+         * `P4-023`'s "no region under more than one coat", made measurable. The largest solid
+         * over-fogged square across both styles measured 3px at zoom 1.0 — the seam guard's own
+         * width — and 5-9px at the display zoom floor where the world's edges meet. Sixteen leaves
+         * headroom for a corner where several seams converge while remaining far below any shape a
+         * user would read as a blacked-out region; the historical defect filled half the screen.
+         */
+        const val MAXIMUM_OVER_FOGGED_SQUARE_PIXELS = 16
+
+        /**
+         * The same bound for the floor-free block measure, which can see a double coat over ocean
+         * that the strict per-pixel ratio refuses to judge. Measured worst case 1.0744% across both
+         * styles, against the historical 50.39% defect.
+         */
+        const val MAXIMUM_DARK_BLOCK_OVER_FOGGED_FRACTION = 0.02
+
+        /**
+         * How much of a drawn frame the strict over-fog ratio must be allowed to judge before its
+         * verdict counts. Measured 99.76-100% across both styles; well under that means the frame
+         * was too dark to conclude anything and a 0.0000% reading would be vacuous.
+         */
+        const val MINIMUM_JUDGEABLE_FRACTION = 0.90
 
         /**
          * What the seams between fog quads are allowed to cost, and no more.
