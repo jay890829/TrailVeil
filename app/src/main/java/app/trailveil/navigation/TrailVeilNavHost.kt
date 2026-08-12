@@ -54,7 +54,7 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
             popEnterTransition = {
                 slideIntoContainer(
                     towards = AnimatedContentTransitionScope.SlideDirection.Right,
-                    animationSpec = tween(HistoryPopDurationMillis),
+                    animationSpec = tween(HistoryBackTransitionDurationMillis),
                 )
             },
         ) {
@@ -65,10 +65,16 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
         }
         composable(
             route = HistoryRoute,
+            popEnterTransition = {
+                slideIntoContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Right,
+                    animationSpec = tween(HistoryBackTransitionDurationMillis),
+                )
+            },
             popExitTransition = {
                 slideOutOfContainer(
                     towards = AnimatedContentTransitionScope.SlideDirection.Right,
-                    animationSpec = tween(HistoryPopDurationMillis),
+                    animationSpec = tween(HistoryBackTransitionDurationMillis),
                 )
             },
         ) {
@@ -84,6 +90,12 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
             arguments = listOf(
                 navArgument(HistorySessionIdArgument) { type = NavType.LongType },
             ),
+            popExitTransition = {
+                slideOutOfContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Right,
+                    animationSpec = tween(HistoryBackTransitionDurationMillis),
+                )
+            },
         ) { entry ->
             val sessionId = entry.arguments?.getLong(HistorySessionIdArgument)
             RecordingHistoryDetailRoute(
@@ -95,7 +107,7 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
     }
 }
 
-private const val HistoryPopDurationMillis = 180
+internal const val HistoryBackTransitionDurationMillis = 250
 
 @Composable
 private fun RecordingHistoryListRoute(

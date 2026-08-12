@@ -283,7 +283,7 @@ class MapReturnInteractivityTest {
         const val NAVIGATION_TIMEOUT_MILLIS = 20_000L
 
         /**
-         * Engineering headroom after the visible 180 ms navigation transition, not a universal
+         * Engineering headroom after the visible 250 ms navigation transition, not a universal
          * human-perception threshold. The accepted transition is meant to cover MapView startup;
          * a longer hidden tail would recreate the user's original ambiguity.
          */
