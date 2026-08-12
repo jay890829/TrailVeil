@@ -108,45 +108,6 @@ data class FogSurroundExtent(
 }
 
 /**
- * Which of the two arrangements of the ground beside the mosaic is drawn.
- *
- * There are two, and they are alternatives: a pair of side bands anchored to the camera's copy of
- * the world, and one wrapped band that runs from the mosaic's east edge round to its west. Exactly
- * one of them must be drawn — both is a second coat of fog over the ground they share, neither is
- * that ground presented as explored.
- *
- * A rule rather than a branch at the call site, because the call site got it wrong: it returned
- * early when there was no wrapped band to show, which also skipped turning the side bands back on
- * after a rebuild removed the band that had replaced them.
- */
-data class FogSideBands(
-    val sideBandsVisible: Boolean,
-    val wrappedBandVisible: Boolean,
-) {
-    init {
-        require(sideBandsVisible != wrappedBandVisible) {
-            "exactly one arrangement of the ground beside the mosaic may be drawn"
-        }
-    }
-
-    companion object {
-        /**
-         * The wrapped band exists only where the surround spans a world, and is drawn only where
-         * the renderer repeats an image source by itself. Everywhere else the side bands are the
-         * only cover there is, so the absence of a wrapped band is what decides this, not the
-         * camera alone.
-         */
-        fun forCamera(rendererRepeatsWorldCopies: Boolean, hasWrappedBand: Boolean): FogSideBands {
-            val useWrapped = rendererRepeatsWorldCopies && hasWrappedBand
-            return FogSideBands(
-                sideBandsVisible = !useWrapped,
-                wrappedBandVisible = useWrapped,
-            )
-        }
-    }
-}
-
-/**
  * Builds the map-space surround of a rendered fog mosaic.
  *
  * The bands are geographic, so the renderer transforms them with the camera in the same frame
@@ -208,9 +169,6 @@ object FogBackdropGeometry {
 
     /** MapLibre's own tile size, which is what makes a mosaic a known number of screen pixels. */
     const val RENDER_TILE_SIZE_PIXELS: Double = 512.0
-
-    /** Below this the renderer repeats an image source itself; at and above it, it does not. */
-    const val LOWEST_SELF_REPEATING_RENDER_ZOOM: Int = 1
 
     /**
      * How far a repeated world copy overlaps the surround beside it.
@@ -300,31 +258,6 @@ object FogBackdropGeometry {
         val columns = max(1.0, kotlin.math.sqrt(mosaic.tileCount.toDouble() * aspect))
         return columns * RENDER_TILE_SIZE_PIXELS / mosaicWorlds
     }
-
-    /**
-     * The render zoom a mosaic was built for, recovered from its own size.
-     *
-     * Below render zoom 1 MapLibre repeats an image source across world copies by itself, and above
-     * it does not — which is why a mosaic that spans the world has to be repeated explicitly at
-     * render zoom 1 and must *not* be at render zoom 0. Measured at the antimeridian on the
-     * production style: repeating at render zoom 0 puts a second coat of fog over 50.39% of the
-     * screen, which is the black half-map a user reported; not repeating at render zoom 1 leaves
-     * 49.72% of it bare.
-     */
-    fun renderZoom(mosaic: FogTileMosaic): Int {
-        val worldPixels = worldPixels(mosaic)
-        if (worldPixels <= RENDER_TILE_SIZE_PIXELS) return 0
-        return Math.round(kotlin.math.ln(worldPixels / RENDER_TILE_SIZE_PIXELS) / kotlin.math.ln(2.0))
-            .toInt()
-            .coerceIn(0, 22)
-    }
-
-    /**
-     * Whether a world-spanning mosaic needs explicit copies beside it, or already has them from the
-     * renderer. See [renderZoom].
-     */
-    fun needsMosaicRepeats(mosaic: FogTileMosaic): Boolean =
-        spansWorld(mosaic) && renderZoom(mosaic) >= LOWEST_SELF_REPEATING_RENDER_ZOOM
 
     /** Where the installed surround is and how far it reaches, for checking a live camera. */
     fun extent(mosaic: FogTileMosaic): FogSurroundExtent {

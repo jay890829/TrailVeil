@@ -727,6 +727,8 @@ class MapSurfaceTest {
             var worstThicknessLabel = "none"
             var worstDarkBlockOverFogged = 0.0
             var worstDarkBlockLabel = "none"
+            var worstDarkBlockThickness = 0
+            var worstDarkSquareLabel = "none"
             var requestId = 100L
             SETTLED_SWEEP_VIEWPOINTS.forEach { viewpoint ->
                 viewpoint.zooms.forEach { zoom ->
@@ -792,6 +794,10 @@ class MapSurfaceTest {
                         worstDarkBlockOverFogged = coverage.darkBlockOverFoggedFraction
                         worstDarkBlockLabel = "$label@z$zoom ${coverage.report()}"
                     }
+                    if (coverage.darkBlockOverFoggedThickness > worstDarkBlockThickness) {
+                        worstDarkBlockThickness = coverage.darkBlockOverFoggedThickness
+                        worstDarkSquareLabel = "$label@z$zoom ${coverage.report()}"
+                    }
                     // A zero over-fog reading means nothing if nothing was bright enough to judge.
                     assertTrue(
                         "Settled camera $label@z$zoom judged only " +
@@ -846,6 +852,17 @@ class MapSurfaceTest {
                     "blocks under more than one coat, including where the basemap is too dark to " +
                     "judge pixel by pixel",
                 worstDarkBlockOverFogged <= MAXIMUM_DARK_BLOCK_OVER_FOGGED_FRACTION,
+            )
+            // The same shape question, asked of the measure that can see dark ocean — the per-pixel
+            // square above is blind below the brightness floor, which is exactly where a black
+            // region over ocean would live. Measured 2026-08-12 across both styles: worst 8px at the
+            // antimeridian display floor, 4px at zoom 1.0, 0 everywhere else, tracking the per-pixel
+            // square within one 4px block of quantisation.
+            assertTrue(
+                "Settled camera $worstDarkSquareLabel drew a solid " +
+                    "${worstDarkBlockThickness}px square under more than one coat by the " +
+                    "floor-free block measure, which is a region rather than a seam",
+                worstDarkBlockThickness <= MAXIMUM_OVER_FOGGED_SQUARE_PIXELS,
             )
         } finally {
             database.close()
@@ -1389,7 +1406,7 @@ class MapSurfaceTest {
     fun noSettledZoomDrawsABroadBlackBandOverTheMap() {
         val database = inMemoryDatabase()
         try {
-            val fogRendered = AtomicBoolean(false)
+            val fogRendered = AtomicInteger(0)
             revealTrack(database, REVEALED_CENTER)
             val cameraRequest = mutableStateOf(
                 MapCameraRequest(requestId = 1L, point = REVEALED_CENTER, zoom = 16.0),
@@ -1406,10 +1423,10 @@ class MapSurfaceTest {
                     ),
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
-                    onFogRendered = { fogRendered.set(true) },
+                    onFogRendered = { fogRendered.incrementAndGet() },
                 )
             }
-            composeRule.waitUntil(timeoutMillis = ONLINE_STYLE_SETUP_MILLIS) { fogRendered.get() }
+            composeRule.waitUntil(timeoutMillis = ONLINE_STYLE_SETUP_MILLIS) { fogRendered.get() > 0 }
             val map = checkNotNull(awaitMap()) { "The map never became ready" }
             val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
             val loadState = composeRule.runOnIdle {
@@ -1427,6 +1444,7 @@ class MapSurfaceTest {
             var worstReport = "none"
             SETTLED_SEAM_ZOOMS.forEach { zoom ->
                 requestId += 1L
+                val renderedBefore = fogRendered.get()
                 composeRule.runOnUiThread {
                     cameraRequest.value = MapCameraRequest(
                         requestId = requestId,
@@ -1439,8 +1457,17 @@ class MapSurfaceTest {
                         .fetchSemanticsNodes()
                         .isEmpty()
                 }
+                // The cover drops when the placeholder lands; the canonical install can still be
+                // seconds behind on a loaded host, and a frame measured before it lands attributes
+                // the placeholder to the production fog arrangement. Wait for a canonical render
+                // that postdates this cell's request.
+                composeRule.waitUntil(timeoutMillis = 45_000L) {
+                    fogRendered.get() > renderedBefore
+                }
                 Thread.sleep(ZOOM_SETTLE_MILLIS)
-                val audit = map.auditFogCoverage()
+                val audit = map.auditFogCoverage(
+                    map.snapshotStableSettledPixels(view, "guarded seam cell z$zoom"),
+                )
                 report.append(
                     "\n z=${"%.2f".format(java.util.Locale.US, map.cameraPosition.zoom)} " +
                         audit.report(),
@@ -1464,7 +1491,22 @@ class MapSurfaceTest {
                     val withoutGuard = try {
                         map.setSingleFogLayerVisible(FogSeamGuardIds.Layer, false)
                         map.awaitFullyRenderedFrame(view)
-                        map.auditFogCoverage()
+                        val fogged = map.snapshotStableSettledPixels(
+                            view,
+                            "guard-off seam cell z$zoom",
+                        )
+                        // A canonical install landing inside this window re-runs the seam-guard
+                        // install and silently re-shows the layer this A/B just hid, converting the
+                        // measurement into guard-on judged against the ten-times-tighter unguarded
+                        // budget. That is a capture to reject as invalid, not a band to report.
+                        assertEquals(
+                            "A concurrent fog install re-showed the seam guard during the " +
+                                "guard-off capture at zoom $zoom; this measurement does not " +
+                                "observe the unguarded quads",
+                            Property.NONE,
+                            map.fogLayerVisibility(FogSeamGuardIds.Layer),
+                        )
+                        map.auditFogCoverage(fogged)
                     } finally {
                         map.restoreFogLayerVisibility(visibility)
                         map.awaitFullyRenderedFrame(view)
@@ -3624,6 +3666,11 @@ class MapSurfaceTest {
             ocean.darkBlockOverFoggedFraction,
             0.0,
         )
+        assertEquals(
+            "The block-shape measure did not report the dark-ocean double coat as frame-sized",
+            width,
+            ocean.darkBlockOverFoggedThickness,
+        )
 
         // Thickness: a three-pixel line and a filled block can carry the same pixel count and the
         // same bounding box. Only thickness tells them apart.
@@ -3681,6 +3728,34 @@ class MapSurfaceTest {
      * camera plus canonical evidence before and after every capture prevents the prior cell or an
      * in-progress camera transition from being accepted as this cell's fogged frame.
      */
+    /**
+     * Two bit-identical renderer-finished captures for a settled camera with no cell-evidence
+     * binding. The seam sweep's fogged capture used to be a single unvalidated snapshot while every
+     * other measurement surface here demanded stability; a hosted run then failed its guard-off A/B
+     * on a frame whose over-fog filled only ~11% of its own bounding box — the shape of basemap
+     * churn between the fogged and bare captures, not of a displaced quad. Fails closed if the
+     * frame never settles.
+     */
+    private fun MapLibreMap.snapshotStableSettledPixels(view: MapView, label: String): IntArray {
+        var previous: IntArray? = null
+        var changedPixels = -1L
+        repeat(BARE_REFERENCE_STABILITY_ATTEMPTS) { attempt ->
+            if (attempt > 0) SystemClock.sleep(BARE_REFERENCE_STABILITY_RETRY_MILLIS)
+            awaitFullyRenderedFrame(view)
+            val current = snapshotPixels()
+            val prior = previous
+            if (prior != null) {
+                changedPixels = changedPixelCount(prior, current)
+                if (changedPixels == 0L) return current
+            }
+            previous = current
+        }
+        throw AssertionError(
+            "$label never produced two identical renderer-finished snapshots; " +
+                "lastChangedPixels=$changedPixels",
+        )
+    }
+
     private fun MapLibreMap.snapshotStableFoggedPixels(
         label: String,
         expected: SettledFogCell,
@@ -3802,8 +3877,11 @@ class MapSurfaceTest {
      * mean over a block of 16 recovers the signal that quantisation destroys. Blocks are counted
      * only where the bare map actually drew, so empty sky is neither numerator nor denominator.
      */
-    private fun blockOverFoggedFraction(fogged: IntArray, bare: IntArray, width: Int): Double {
+    private fun blockOverFog(fogged: IntArray, bare: IntArray, width: Int): BlockOverFog {
         val height = bare.size / width
+        val blockColumns = (width + OVER_FOG_BLOCK_PIXELS - 1) / OVER_FOG_BLOCK_PIXELS
+        val blockRows = (height + OVER_FOG_BLOCK_PIXELS - 1) / OVER_FOG_BLOCK_PIXELS
+        val blockMask = BooleanArray(blockColumns * blockRows)
         var blocks = 0L
         var overFoggedBlocks = 0L
         var blockY = 0
@@ -3830,14 +3908,23 @@ class MapSurfaceTest {
                     val fogMean = fogTotal.toDouble() / samples.toDouble()
                     if (fogMean < FOG_TRANSMISSION * bareMean * OVER_FOG_RATIO) {
                         overFoggedBlocks += 1L
+                        blockMask[
+                            (blockY / OVER_FOG_BLOCK_PIXELS) * blockColumns +
+                                blockX / OVER_FOG_BLOCK_PIXELS,
+                        ] = true
                     }
                 }
                 blockX += OVER_FOG_BLOCK_PIXELS
             }
             blockY += OVER_FOG_BLOCK_PIXELS
         }
-        return if (blocks == 0L) 0.0 else overFoggedBlocks.toDouble() / blocks.toDouble()
+        return BlockOverFog(
+            fraction = if (blocks == 0L) 0.0 else overFoggedBlocks.toDouble() / blocks.toDouble(),
+            thicknessPixels = thickestRun(blockMask, blockColumns) * OVER_FOG_BLOCK_PIXELS,
+        )
     }
+
+    private data class BlockOverFog(val fraction: Double, val thicknessPixels: Int)
 
     private fun compareFogCoverage(fogged: IntArray, bare: IntArray, width: Int): FogAudit {
         assertEquals("Snapshot sizes differ", bare.size, fogged.size)
@@ -3901,6 +3988,7 @@ class MapSurfaceTest {
                     luminance(fogged[index]) < FOG_TRANSMISSION * bareLuminance * OVER_FOG_RATIO
             }
         }
+        val blockCoats = blockOverFog(fogged, bare, width)
         return FogAudit(
             uncoveredFraction = uncovered.toDouble() / bare.size.toDouble(),
             drawnFraction = drawn.toDouble() / bare.size.toDouble(),
@@ -3909,7 +3997,8 @@ class MapSurfaceTest {
             sampledPixels = bare.size.toLong(),
             judgeableFraction = if (drawn == 0L) 0.0 else judgeable.toDouble() / drawn.toDouble(),
             overFoggedThickness = thickestRun(overFoggedMask, width),
-            darkBlockOverFoggedFraction = blockOverFoggedFraction(fogged, bare, width),
+            darkBlockOverFoggedFraction = blockCoats.fraction,
+            darkBlockOverFoggedThickness = blockCoats.thicknessPixels,
             overFoggedFraction = if (judgeable == 0L) {
                 0.0
             } else {
@@ -4034,11 +4123,12 @@ class MapSurfaceTest {
          */
         val judgeableFraction: Double = 0.0,
         /**
-         * The thickest over-fogged shape on the frame, as `min(horizontal run, vertical run)`
-         * through its stoutest pixel. The deliberate seam guard is three screen pixels wide, so it
-         * scores about 3 however long it is; a filled region scores its short side. This is the
-         * line-versus-region distinction that a single bounding box cannot make — four separate
-         * hairlines and one solid block produce the same box.
+         * The largest fully over-fogged axis-aligned square on the frame, in pixels. The deliberate
+         * seam guard is three screen pixels wide, so it scores about 3 however long its lines are;
+         * a filled region scores its side. This is the line-versus-region distinction that a single
+         * bounding box cannot make — four separate hairlines and one solid block produce the same
+         * box — and a run-length measure cannot make either, because two crossing hairlines carry
+         * long runs through their intersection.
          */
         val overFoggedThickness: Int = 0,
         /**
@@ -4048,6 +4138,14 @@ class MapSurfaceTest {
          * Reported for calibration; the strict per-pixel figure remains what the gates assert.
          */
         val darkBlockOverFoggedFraction: Double = 0.0,
+        /**
+         * The largest fully over-fogged square of the floor-free block measure, in pixels
+         * (blocks times [OVER_FOG_BLOCK_PIXELS]). The per-pixel thickness above is blind below the
+         * brightness floor, which is exactly where this task's defect was reported; this is the
+         * same shape question asked of the measure that can see dark ocean. Reported for
+         * measurement first; a bound belongs here only after real frames have calibrated it.
+         */
+        val darkBlockOverFoggedThickness: Int = 0,
     ) {
         fun report(): String = "[uncovered=" +
             "${"%.4f".format(java.util.Locale.US, uncoveredFraction * 100.0)}% " +
@@ -4060,6 +4158,7 @@ class MapSurfaceTest {
             " thickness=$overFoggedThickness" +
             " darkBlockOverFogged=" +
             "${"%.4f".format(java.util.Locale.US, darkBlockOverFoggedFraction * 100.0)}%" +
+            " darkBlockThickness=$darkBlockOverFoggedThickness" +
             (overFoggedBounds?.let { " dark=(${it[0]},${it[1]})-(${it[2]},${it[3]})" } ?: "") +
             "]"
 

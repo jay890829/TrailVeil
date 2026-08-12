@@ -723,37 +723,6 @@ class FogBackdropGeometryTest {
     }
 
     /**
-     * The ground beside the mosaic is covered by exactly one arrangement, in all four states.
-     *
-     * Both is a second coat of fog; neither is unexplored map presented as explored. The state that
-     * was wrong is the last one here — no wrapped band and the renderer repeating — where the call
-     * site used to return before it reached the side bands, leaving them hidden from a previous
-     * camera and never turning them back on. Measured at 89.3519% of the screen bare, with the
-     * safety cover down.
-     */
-    @Test
-    fun exactlyOneArrangementOfTheGroundBesideTheMosaicIsEverDrawn() {
-        listOf(true, false).forEach { repeats ->
-            listOf(true, false).forEach { hasWrapped ->
-                val bands = FogSideBands.forCamera(
-                    rendererRepeatsWorldCopies = repeats,
-                    hasWrappedBand = hasWrapped,
-                )
-                assertTrue(
-                    "repeats=$repeats hasWrapped=$hasWrapped drew $bands",
-                    bands.sideBandsVisible != bands.wrappedBandVisible,
-                )
-                assertEquals(
-                    "a wrapped band that does not exist cannot cover anything " +
-                        "(repeats=$repeats hasWrapped=$hasWrapped)",
-                    repeats && hasWrapped,
-                    bands.wrappedBandVisible,
-                )
-            }
-        }
-    }
-
-    /**
      * A trapezoid whose far edge leaves the surround while its axis-aligned box does not.
      *
      * This is the shape the change exists for and, until this case, the only shape the JVM suite
