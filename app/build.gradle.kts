@@ -159,8 +159,12 @@ android {
         checkTestSources = true
         warningsAsErrors = true
         disable += setOf(
-            // Deliberate pins and target choice from docs/ANDROID_BASELINE.md.
+            // Deliberate pins and target choice from docs/ANDROID_BASELINE.md. GradleDependency
+            // joined the list when a Compose BOM release broke CI with zero code change: with
+            // warningsAsErrors, "a newer version exists" turns every upstream publish into a
+            // build failure, while upgrades here are a deliberate baseline decision, not lint's.
             "AndroidGradlePluginVersion",
+            "GradleDependency",
             "NewerVersionAvailable",
             "OldTargetApi",
             // Assigned before sensitive storage and production branding land.
