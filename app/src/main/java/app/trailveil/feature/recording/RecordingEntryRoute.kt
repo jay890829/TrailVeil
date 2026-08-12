@@ -390,6 +390,13 @@ internal fun RecordingEntryRoute(
             R.id.recording_presentation_latest_outcome,
             latestSessionSummary?.latestOperationOutcome?.value,
         )
+        // Without this, a missing runtime prompt is ambiguous: the request may never have been
+        // launched, or it may have launched and the dialog not appeared. Only the first is a
+        // continuation defect, and the two need different fixes.
+        activity.window.decorView.setTag(
+            R.id.recording_notification_start_continuation,
+            notificationStartContinuationName,
+        )
     }
     val currentLocation = serviceLocation
         ?.takeIf { it.sessionId == recordingPresentation.activeSessionId }

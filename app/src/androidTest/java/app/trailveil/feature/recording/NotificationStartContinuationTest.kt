@@ -17,6 +17,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
+import app.trailveil.R
 import app.trailveil.TrailVeilApplication
 import app.trailveil.data.db.TrailVeilDatabase
 import app.trailveil.data.recording.RecordingLifecycle
@@ -102,6 +103,13 @@ class NotificationStartContinuationTest {
                     "the active window this is environmental; if this app stayed active the request " +
                     "was never launched, which is a P3-006 product defect: ${promptDiagnostics()}",
                 firstDeny,
+            )
+            // Also proves the diagnostic tag below is really wired: if it ever silently returned
+            // "unavailable", promptDiagnostics() would be decorative and this fails first.
+            assertEquals(
+                "The saved continuation did not reach AWAITING_RESULT while the prompt was visible",
+                "AWAITING_RESULT",
+                currentContinuation(),
             )
             val activityBeforePromptRecreation = composeRule.activity
             instrumentation.runOnMainSync { activityBeforePromptRecreation.recreate() }
@@ -323,6 +331,15 @@ class NotificationStartContinuationTest {
     private fun visibleDenyButton(): AccessibilityNodeInfo? =
         denyButtonNodes().firstOrNull { node -> node.isVisibleToUser && node.isEnabled }
 
+    /** The route's saved notification continuation, published as a view-tree diagnostic. */
+    private fun currentContinuation(): String = runCatching {
+        composeRule.runOnIdle {
+            composeRule.activity.window.decorView
+                .getTag(R.id.recording_notification_start_continuation)
+                ?.toString()
+        }
+    }.getOrNull() ?: "unavailable"
+
     /**
      * Separates the two ways this gate can fail. An environmental slow start leaves the permission
      * controller owning a window; a genuine P3-006 defect leaves this app active with no prompt
@@ -337,7 +354,12 @@ class NotificationStartContinuationTest {
             }.distinct()
         }.getOrDefault(emptyList())
         val controllerPresent = windowPackages.any { name -> name.endsWith("permissioncontroller") }
-        return "activeWindow=$activePackage windows=$windowPackages " +
+        // The decisive field. IDLE or REQUESTING_PERMISSION means the app never reached
+        // `launcher.launch` — a stall on the route's own DataStore writes looks exactly like a lost
+        // continuation without it. AWAITING_RESULT means the request really was launched and the
+        // prompt is what failed to appear.
+        val continuation = currentContinuation()
+        return "continuation=$continuation activeWindow=$activePackage windows=$windowPackages " +
             "permissionControllerWindow=$controllerPresent denyNodes=${denyButtonNodes().size} " +
             "selfPermission=${context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)}"
     }
