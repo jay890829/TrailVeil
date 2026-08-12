@@ -821,11 +821,16 @@ internal fun TrailVeilMapSurface(
         if (!surroundHoldsForCamera()) {
             // The new geometry is already in the renderer and provably does not reach the camera.
             // Declining to *set* the flag is not enough: a `true` left over from the previous
-            // install would keep the cover down over an overlay just proved insufficient. Clear it
-            // for the same reason the camera-move listener does, then rebuild. This cannot wedge —
-            // `requestViewport` bumps the generation that keys both install effects, and the
-            // placeholder effect now runs precisely because coverage is false.
-            fogCoverageInstalled = false
+            // install would keep the cover down over an overlay just proved insufficient.
+            //
+            // Following is exempt for the same reason the move-started listener exempts it: an
+            // install landing a step behind a walking user is routine, and blacking the map out
+            // under someone who is only walking is a worse outcome than the transient it fixes.
+            // That is not a hole — the camera-move listener still raises the cover on the next move
+            // if a followed camera has genuinely left the installed surround.
+            if (!followingCameraMove.get()) {
+                fogCoverageInstalled = false
+            }
             requestViewport()
             return@LaunchedEffect
         }
