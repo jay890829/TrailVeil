@@ -154,7 +154,9 @@ class HistoryDetailPopLifecycleTest {
                 Bundle().apply {
                     putString(
                         "stream",
-                        "TrailVeil detail-pop lifecycle: mapStable=${detector.mapStableDifference} " +
+                        "TrailVeil detail-pop lifecycle: " +
+                            "mapSettleAttempts=${detector.mapSettleAttempts} " +
+                            "mapStable=${detector.mapStableDifference} " +
                             "listStable=${detector.listStableDifference} " +
                             "separation=${detector.referenceSeparation} " +
                             "margin=${detector.classificationMargin} " +
@@ -311,28 +313,24 @@ class HistoryDetailPopLifecycleTest {
                 "(difference=$listStableDifference)",
             listStableDifference <= MAX_STABLE_REFERENCE_DIFFERENCE,
         )
+        // A settled camera does not mean a settled renderer. Under headless software rendering the
+        // map can still be changing well after the camera reports stable, so stability is waited
+        // for rather than asserted on the first attempt. A map that never settles still fails, by
+        // timeout, so this cannot turn a broken renderer into a pass.
+        val stable = awaitStableMapWindow(bounds)
+        val mapReference = stable.print
+        val mapStableDifference = stable.difference
         val textureBitmap = composeRule.runOnIdle {
             checkNotNull((mapView.renderView as TextureView).bitmap) {
                 "The detail TextureView produced no calibration bitmap"
             }
         }
-        val first = takeWholeWindowScreenshot()
-        val textureDifference = difference(textureBitmap, first, bounds)
+        val textureDifference = difference(textureBitmap, stable.bitmap, bounds)
         textureBitmap.recycle()
         assertTrue(
             "Whole-window capture omitted or altered the live detail TextureView " +
                 "(difference=$textureDifference)",
             textureDifference <= MAX_TEXTURE_TO_WINDOW_DIFFERENCE,
-        )
-        val mapReference = fingerprint(first, bounds)
-        first.recycle()
-        SystemClock.sleep(CALIBRATION_SETTLE_MILLIS)
-        val second = takeWholeWindowScreenshot()
-        val mapStableDifference = difference(mapReference, second)
-        assertTrue(
-            "The detail map was not stable enough to identify after pop " +
-                "(difference=$mapStableDifference)",
-            mapStableDifference <= MAX_STABLE_REFERENCE_DIFFERENCE,
         )
         val referenceSeparation = difference(mapReference, listReferenceWindow)
         assertTrue(
@@ -348,12 +346,13 @@ class HistoryDetailPopLifecycleTest {
             mapReference = mapReference,
             listReference = listReference,
             mapStableDifference = mapStableDifference,
+            mapSettleAttempts = stable.attempts,
             listStableDifference = listStableDifference,
             referenceSeparation = referenceSeparation,
             classificationMargin = classificationMargin,
         )
-        val positive = classify(detector, second)
-        second.recycle()
+        val positive = classify(detector, stable.bitmap)
+        stable.bitmap.recycle()
         val negative = classify(detector, listConfirmationWindow)
         assertTrue(
             "The calibrated detector did not recognize a live detail map: $positive",
@@ -365,6 +364,41 @@ class HistoryDetailPopLifecycleTest {
         )
         assertAdversarialMapSignaturesAreDetected(detector)
         return detector
+    }
+
+    /**
+     * Polls whole-window captures until two consecutive ones agree inside
+     * [MAX_STABLE_REFERENCE_DIFFERENCE] over the map bounds, and returns the settled one. Replaces a
+     * single fixed sleep whose implicit "the map has finished drawing by now" assumption held on a
+     * hardware-GL AVD and failed on hosted CI at difference=0.0534. Fails closed on timeout: a map
+     * that genuinely never settles produces no reference and no pass.
+     */
+    private fun awaitStableMapWindow(bounds: Rect): StableWindow {
+        val deadline = SystemClock.uptimeMillis() + CALIBRATION_STABILITY_TIMEOUT_MILLIS
+        var previous = takeWholeWindowScreenshot()
+        var closest = Double.MAX_VALUE
+        var attempts = 0
+        while (true) {
+            SystemClock.sleep(CALIBRATION_SETTLE_MILLIS)
+            val current = takeWholeWindowScreenshot()
+            val delta = difference(fingerprint(previous, bounds), current)
+            previous.recycle()
+            attempts += 1
+            if (delta <= MAX_STABLE_REFERENCE_DIFFERENCE) {
+                return StableWindow(current, fingerprint(current, bounds), delta, attempts)
+            }
+            closest = minOf(closest, delta)
+            if (SystemClock.uptimeMillis() >= deadline) {
+                current.recycle()
+                throw AssertionError(
+                    "The detail map never settled within " +
+                        "$CALIBRATION_STABILITY_TIMEOUT_MILLIS ms over $attempts comparisons; " +
+                        "closest consecutive difference=$closest " +
+                        "bound=$MAX_STABLE_REFERENCE_DIFFERENCE",
+                )
+            }
+            previous = current
+        }
     }
 
     private fun startFrameCapture(detector: MapDetector): FrameCapture {
@@ -726,6 +760,7 @@ class HistoryDetailPopLifecycleTest {
         val mapReference: MapFingerprint,
         val listReference: MapFingerprint,
         val mapStableDifference: Double,
+        val mapSettleAttempts: Int,
         val listStableDifference: Double,
         val referenceSeparation: Double,
         val classificationMargin: Double,
@@ -743,6 +778,13 @@ class HistoryDetailPopLifecycleTest {
     }
 
     private data class SignatureBlock(val indices: List<Int>, val energy: Double)
+
+    private class StableWindow(
+        val bitmap: Bitmap,
+        val print: MapFingerprint,
+        val difference: Double,
+        val attempts: Int,
+    )
 
     private data class FrameSample(
         val captureStartedAtMillis: Long,
@@ -784,6 +826,13 @@ class HistoryDetailPopLifecycleTest {
         const val DISCLOSURE_POLLS = 40
         const val POLL_MILLIS = 100L
         const val CALIBRATION_SETTLE_MILLIS = 250L
+
+        /**
+         * How long the live detail map may take to stop changing before calibration gives up. Only
+         * bounds the wait for a settled reference; it relaxes no absence assertion, and expiring it
+         * fails the gate.
+         */
+        const val CALIBRATION_STABILITY_TIMEOUT_MILLIS = 15_000L
         const val DETAIL_TEARDOWN_AFTER_LIST_BUDGET_MILLIS = 750L
         const val POST_LIST_CAPTURE_MILLIS = 1_000L
         const val FRAME_CAPTURE_GAP_MILLIS = 8L
