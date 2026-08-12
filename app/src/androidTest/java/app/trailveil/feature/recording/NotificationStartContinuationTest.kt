@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Bundle
 import android.os.ParcelFileDescriptor
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
@@ -92,9 +93,14 @@ class NotificationStartContinuationTest {
             composeRule.onNodeWithTag(RecordingEntryTestTags.Start).performClick()
             composeRule.waitForIdle()
 
-            val firstDeny = awaitDenyButton()
+            val firstRequestedAt = SystemClock.uptimeMillis()
+            val firstDeny = awaitDenyButton(PROMPT_APPEARANCE_TIMEOUT_MILLIS)
+            val firstPromptMillis = SystemClock.uptimeMillis() - firstRequestedAt
             assertNotNull(
-                "The runtime notification prompt was never shown",
+                "The runtime notification prompt was never shown within " +
+                    "$PROMPT_APPEARANCE_TIMEOUT_MILLIS ms. If the permission controller never became " +
+                    "the active window this is environmental; if this app stayed active the request " +
+                    "was never launched, which is a P3-006 product defect: ${promptDiagnostics()}",
                 firstDeny,
             )
             val activityBeforePromptRecreation = composeRule.activity
@@ -110,9 +116,12 @@ class NotificationStartContinuationTest {
                 "The Activity behind the runtime notification prompt was not recreated",
                 activityBeforePromptRecreation.isDestroyed,
             )
-            val recreatedDeny = awaitDenyButton()
+            val recreatedRequestedAt = SystemClock.uptimeMillis()
+            val recreatedDeny = awaitDenyButton(PROMPT_APPEARANCE_TIMEOUT_MILLIS)
+            val recreatedPromptMillis = SystemClock.uptimeMillis() - recreatedRequestedAt
             assertNotNull(
-                "The runtime notification prompt did not survive Activity recreation",
+                "The runtime notification prompt did not survive Activity recreation " +
+                    "within $PROMPT_APPEARANCE_TIMEOUT_MILLIS ms: ${promptDiagnostics()}",
                 recreatedDeny,
             )
             SystemClock.sleep(PRE_RESULT_DWELL_MILLIS)
@@ -180,6 +189,22 @@ class NotificationStartContinuationTest {
                     }
                 }
             }
+
+            // Recorded so a future hosted regression can be compared against real appearance
+            // latency instead of being re-diagnosed from scratch.
+            instrumentation.sendStatus(
+                0,
+                Bundle().apply {
+                    putString(
+                        "stream",
+                        "TrailVeil notification-start continuation: " +
+                            "firstPromptMillis=$firstPromptMillis " +
+                            "recreatedPromptMillis=$recreatedPromptMillis " +
+                            "promptBudgetMillis=$PROMPT_APPEARANCE_TIMEOUT_MILLIS " +
+                            "beginStartReceipts=${beginReceiptsAfterStart - beginReceiptsBeforeStart}\n",
+                    )
+                },
+            )
         } finally {
             val application = context.applicationContext as TrailVeilApplication
             val database = application.appContainer.databaseForTesting()
@@ -275,8 +300,8 @@ class NotificationStartContinuationTest {
         descriptor.close()
     }
 
-    private fun awaitDenyButton(): AccessibilityNodeInfo? {
-        val deadline = SystemClock.uptimeMillis() + UI_TIMEOUT_MILLIS
+    private fun awaitDenyButton(timeoutMillis: Long = UI_TIMEOUT_MILLIS): AccessibilityNodeInfo? {
+        val deadline = SystemClock.uptimeMillis() + timeoutMillis
         while (SystemClock.uptimeMillis() < deadline) {
             val found = visibleDenyButton()
             if (found != null) return found
@@ -285,20 +310,42 @@ class NotificationStartContinuationTest {
         return null
     }
 
+    private fun denyButtonNodes(): List<AccessibilityNodeInfo> {
+        val root = instrumentation.uiAutomation.rootInActiveWindow ?: return emptyList()
+        // The permission controller ships as com.google.android.permissioncontroller on Google APIs
+        // images while keeping the AOSP resource namespace. Match both so an image that namespaces
+        // its own resources cannot be misread as "the prompt never appeared".
+        return DENY_BUTTON_VIEW_IDS.flatMap { viewId ->
+            root.findAccessibilityNodeInfosByViewId(viewId).orEmpty()
+        }
+    }
+
     private fun visibleDenyButton(): AccessibilityNodeInfo? =
-        instrumentation.uiAutomation.rootInActiveWindow
-            ?.findAccessibilityNodeInfosByViewId(DENY_BUTTON_VIEW_ID)
-            .orEmpty()
-            .firstOrNull { node -> node.isVisibleToUser && node.isEnabled }
+        denyButtonNodes().firstOrNull { node -> node.isVisibleToUser && node.isEnabled }
+
+    /**
+     * Separates the two ways this gate can fail. An environmental slow start leaves the permission
+     * controller owning a window; a genuine P3-006 defect leaves this app active with no prompt
+     * ever launched. Without this, both present as "the prompt was never shown".
+     */
+    private fun promptDiagnostics(): String {
+        val automation = instrumentation.uiAutomation
+        val activePackage = automation.rootInActiveWindow?.packageName?.toString() ?: "none"
+        val windowPackages = runCatching {
+            automation.windows.mapNotNull { window ->
+                window.root?.packageName?.toString()
+            }.distinct()
+        }.getOrDefault(emptyList())
+        val controllerPresent = windowPackages.any { name -> name.endsWith("permissioncontroller") }
+        return "activeWindow=$activePackage windows=$windowPackages " +
+            "permissionControllerWindow=$controllerPresent denyNodes=${denyButtonNodes().size} " +
+            "selfPermission=${context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)}"
+    }
 
     private fun awaitDenyButtonGone(): Boolean {
         val deadline = SystemClock.uptimeMillis() + UI_TIMEOUT_MILLIS
         while (SystemClock.uptimeMillis() < deadline) {
-            val visible = instrumentation.uiAutomation.rootInActiveWindow
-                ?.findAccessibilityNodeInfosByViewId(DENY_BUTTON_VIEW_ID)
-                .orEmpty()
-                .any { node -> node.isVisibleToUser }
-            if (!visible) return true
+            if (denyButtonNodes().none { node -> node.isVisibleToUser }) return true
             SystemClock.sleep(POLL_MILLIS)
         }
         return false
@@ -328,9 +375,20 @@ class NotificationStartContinuationTest {
     }
 
     private companion object {
-        const val DENY_BUTTON_VIEW_ID =
-            "com.android.permissioncontroller:id/permission_deny_button"
+        val DENY_BUTTON_VIEW_IDS = listOf(
+            "com.android.permissioncontroller:id/permission_deny_button",
+            "com.google.android.permissioncontroller:id/permission_deny_button",
+        )
         const val UI_TIMEOUT_MILLIS = 10_000L
+
+        /**
+         * Only the prompt's first appearance uses this longer budget. A cold permission-controller
+         * start on a headless software-rendered CI emulator exceeded the 10 s general UI budget in
+         * two of three hosted runs while passing locally, so the old value measured the emulator
+         * rather than the product. Every product assertion — the pre-result dwell, the exactly-once
+         * BEGIN_START accounting, and the post-denial ACTIVE session — keeps its original budget.
+         */
+        const val PROMPT_APPEARANCE_TIMEOUT_MILLIS = 60_000L
         const val SERVICE_TIMEOUT_MILLIS = 15_000L
         const val POLL_MILLIS = 50L
         const val PRE_RESULT_DWELL_MILLIS = 500L
