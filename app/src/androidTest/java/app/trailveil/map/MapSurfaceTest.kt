@@ -952,6 +952,291 @@ class MapSurfaceTest {
     fun rotatingAndTiltingThenZoomingOutNeverExposesUnexploredMap() =
         assertObliqueZoomOutIsCovered(tilt = 60.0, bearing = 45.0, label = "tilt+bearing")
 
+    /**
+     * A real two-finger shove, not a programmed tilt. The oblique gates above apply tilt through
+     * `moveStartedListener`, which raises the cover and rebuilds the fog for the tilted camera
+     * before anything is measured; a real shove rebuilds nothing and raises nothing while the
+     * visible ground grows toward the horizon — the overlay under audit is exactly the one
+     * installed for the upright camera. P4-035: no committed stream had ever satisfied the shove
+     * detector, whose pointer pair must be horizontally separated.
+     */
+    @Test
+    fun aTwoFingerShoveNeverExposesUnexploredMap() = sweepGesture(
+        provider = MapProviderConfiguration(
+            providerName = "fog-shove-test-provider",
+            styleUri = "https://tiles.invalid/styles/fog-shove",
+        ),
+        requireOnlineStyle = false,
+        savedStateKey = "trailveil.map.fog-shove-test",
+        gesture = ::shoveInSteps,
+        // Over unexplored ground beside the track, like every exploration-zoom gesture gate: a
+        // camera over the revealed hole would report the legitimately revealed track itself as
+        // uncovered basemap.
+        startPoint = UNEXPLORED_NEAR_REVEALED,
+        startZoom = EXPLORATION_GESTURE_ZOOM,
+        expectZoomOut = false,
+        expectTiltChangeAtLeast = MINIMUM_ACCEPTED_SHOVE_TILT_DEGREES,
+    )
+
+    /**
+     * A real two-finger rotate. A turned camera covers a larger, rotated patch of ground with the
+     * same screen; the surround must hold it without any rebuild, because a gesture never
+     * rebuilds. P4-035: the rotate detector reads the angle between the pointers, which a stacked
+     * pair cannot change.
+     */
+    @Test
+    fun aTwoFingerRotateNeverExposesUnexploredMap() = sweepGesture(
+        provider = MapProviderConfiguration(
+            providerName = "fog-rotate-test-provider",
+            styleUri = "https://tiles.invalid/styles/fog-rotate",
+        ),
+        requireOnlineStyle = false,
+        savedStateKey = "trailveil.map.fog-rotate-test",
+        gesture = ::rotateInSteps,
+        // Over unexplored ground beside the track, like every exploration-zoom gesture gate: a
+        // camera over the revealed hole would report the legitimately revealed track itself as
+        // uncovered basemap.
+        startPoint = UNEXPLORED_NEAR_REVEALED,
+        startZoom = EXPLORATION_GESTURE_ZOOM,
+        expectZoomOut = false,
+        expectBearingChangeAtLeast = MINIMUM_ACCEPTED_ROTATE_DEGREES,
+    )
+
+    /**
+     * A double-tap zoom-in. The camera movement is the animation MapLibre runs on the gesture's
+     * behalf after the second tap, so the gesture outlives the fingers - and the camera idle that
+     * follows rebuilds the fog, which is why these two gates audit the animation with the frozen
+     * installed extent through renderer-frame callbacks rather than with the fogged-and-bare
+     * comparison: a pixel audit begun mid-animation races that rebuild, and the pixel-level claim
+     * for this trajectory is already held by the pinch and quick-zoom gates, whose held-finger
+     * paths bound the tap's one-level travel. P4-035: enabled in production, never injected by any
+     * committed test.
+     */
+    @Test
+    fun aDoubleTapZoomInNeverExposesUnexploredMap() =
+        aTapZoomStaysInsideItsInstalledFog(twoFinger = false)
+
+    /**
+     * A two-finger-tap zoom-out, the same way. Zooming out is the direction that can outrun
+     * coverage, so the animated one-level step must stay inside the installed surround for every
+     * rendered frame of the animation. P4-035: enabled in production, never injected by any
+     * committed test.
+     */
+    @Test
+    fun aTwoFingerTapZoomOutNeverExposesUnexploredMap() =
+        aTapZoomStaysInsideItsInstalledFog(twoFinger = true)
+
+    private fun aTapZoomStaysInsideItsInstalledFog(twoFinger: Boolean) {
+        val database = inMemoryDatabase()
+        try {
+            val name = if (twoFinger) "two-finger-tap" else "double-tap"
+            val fogRendered = AtomicBoolean(false)
+            val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
+            revealTrack(database, REVEALED_CENTER)
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-" + name + "-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-" + name,
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-" + name + "-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = UNEXPLORED_NEAR_REVEALED,
+                        zoom = EXPLORATION_GESTURE_ZOOM,
+                    ),
+                    onFogRendered = { fogRendered.set(true) },
+                    onFogCoverageInstalledForTesting = installedCoverage::set,
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = 30_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+            composeRule.waitUntil(timeoutMillis = 25_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+            // The same calibration every gesture gate runs: a detector that cannot see a leak
+            // would make the settled audit below meaningless.
+            val calibration = map.auditWithFogRemoved()
+            assertTrue(
+                "The map drew almost nothing, so this would pass vacuously: " + calibration.report(),
+                calibration.drawnFraction >= MINIMUM_DRAWN_FRACTION,
+            )
+            assertTrue(
+                "With the fog layers hidden the audit still reported the map as covered: " +
+                    calibration.report(),
+                calibration.uncoveredFraction >= MINIMUM_CALIBRATION_UNCOVERED_FRACTION,
+            )
+            val moveReasons = java.util.Collections.synchronizedList(mutableListOf<Int>())
+            val reasonListener = MapLibreMap.OnCameraMoveStartedListener { moveReasons += it }
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.addOnCameraMoveStartedListener(reasonListener)
+            }
+            try {
+                repeat(PINCH_ATTEMPTS) { _ ->
+                    // Reasons recorded by an abandoned attempt must not satisfy the accepted
+                    // attempt's interpretation check.
+                    moveReasons.clear()
+                    composeRule.waitUntil(timeoutMillis = 25_000L) { fogGeneration() != null }
+                    val frozen = checkNotNull(installedCoverage.get()) {
+                        "No canonical installed-coverage snapshot before the tap"
+                    }
+                    val zoomAtTap = map.cameraPosition.zoom
+                    val animationActive = AtomicBoolean(false)
+                    val framesDuringAnimation = AtomicInteger(0)
+                    val containmentBreaches =
+                        java.util.Collections.synchronizedList(mutableListOf<String>())
+                    val frameListener = MapView.OnDidFinishRenderingFrameListener { _, _, _ ->
+                        if (animationActive.get()) {
+                            framesDuringAnimation.incrementAndGet()
+                            // Containment against the geometry frozen before the tap. A post-idle
+                            // rebuild may legitimately install new geometry; the frozen extent
+                            // still bounds this one-level travel, so the check stays valid across
+                            // it without racing it.
+                            val corners = map.currentVisibleRegionCorners()
+                            if (!frozen.extent.covers(corners)) {
+                                containmentBreaches +=
+                                    "corners=" + corners + " outside " + frozen.extent
+                            }
+                        }
+                    }
+                    InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                        view.addOnDidFinishRenderingFrameListener(frameListener)
+                    }
+                    var engaged = false
+                    var coverSeen = false
+                    try {
+                        if (twoFinger) injectTwoFingerTap(view) else injectDoubleTap(view)
+                        animationActive.set(true)
+                        val deadline = SystemClock.uptimeMillis() + TAP_ANIMATION_TIMEOUT_MILLIS
+                        var lastZoom = zoomAtTap
+                        var stablePolls = 0
+                        while (
+                            SystemClock.uptimeMillis() < deadline && stablePolls < TAP_STABLE_POLLS
+                        ) {
+                            val zoom = map.cameraPosition.zoom
+                            val travelled = kotlin.math.abs(zoom - zoomAtTap)
+                            if (travelled >= MINIMUM_TAP_ZOOM_ENGAGEMENT) engaged = true
+                            if (
+                                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                                    .fetchSemanticsNodes()
+                                    .isNotEmpty()
+                            ) {
+                                coverSeen = true
+                            }
+                            stablePolls = if (
+                                engaged &&
+                                kotlin.math.abs(zoom - lastZoom) < TAP_ZOOM_STABLE_EPSILON
+                            ) {
+                                stablePolls + 1
+                            } else {
+                                0
+                            }
+                            lastZoom = zoom
+                            SystemClock.sleep(TAP_POLL_MILLIS)
+                        }
+                    } finally {
+                        animationActive.set(false)
+                        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                            view.removeOnDidFinishRenderingFrameListener(frameListener)
+                        }
+                    }
+                    val endZoom = map.cameraPosition.zoom
+                    if (engaged && framesDuringAnimation.get() > 0) {
+                        assertTrue(
+                            "The " + name + " animation left its installed fog geometry: " +
+                                containmentBreaches.joinToString(),
+                            containmentBreaches.isEmpty(),
+                        )
+                        assertTrue(
+                            "The safety cover flashed during a one-level " + name + " zoom",
+                            !coverSeen,
+                        )
+                        if (twoFinger) {
+                            assertTrue(
+                                "The " + name + " did not zoom out (start=" + zoomAtTap +
+                                    " end=" + endZoom + ")",
+                                zoomAtTap - endZoom >= MINIMUM_TAP_ZOOM_CHANGE,
+                            )
+                        } else {
+                            assertTrue(
+                                "The " + name + " did not zoom in (start=" + zoomAtTap +
+                                    " end=" + endZoom + ")",
+                                endZoom - zoomAtTap >= MINIMUM_TAP_ZOOM_CHANGE,
+                            )
+                        }
+                        assertTrue(
+                            "MapLibre never saw the taps as a gesture (reasons=" + moveReasons + ")",
+                            moveReasons.any {
+                                it == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE ||
+                                    it == MapLibreMap.OnCameraMoveStartedListener
+                                        .REASON_API_ANIMATION
+                            },
+                        )
+                        // The rebuilt, settled endpoint still gets the full pixel audit; only the
+                        // in-flight animation frames use the containment method above.
+                        composeRule.waitUntil(timeoutMillis = 25_000L) { fogGeneration() != null }
+                        Thread.sleep(ZOOM_SETTLE_MILLIS)
+                        val settled = map.auditFogCoverage()
+                        assertTrue(
+                            "The settled camera after the " + name + " presented unexplored map " +
+                                "as revealed: " + settled.report(),
+                            settled.uncoveredFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
+                        )
+                        assertTrue(
+                            "The settled camera after the " + name + " drew more than one coat: " +
+                                settled.report(),
+                            settled.overFoggedFraction <= MAXIMUM_OVER_FOGGED_FRACTION,
+                        )
+                        InstrumentationRegistry.getInstrumentation().sendStatus(
+                            0,
+                            Bundle().apply {
+                                putString(
+                                    "stream",
+                                    "TrailVeil " + name + " gesture: startZoom=" +
+                                        "%.2f".format(java.util.Locale.US, zoomAtTap) +
+                                        " endZoom=" +
+                                        "%.2f".format(java.util.Locale.US, endZoom) +
+                                        " animationFrames=" + framesDuringAnimation.get() +
+                                        " reasons=" + moveReasons +
+                                        " coverSeen=" + coverSeen +
+                                        " settled=" + settled.report() + "\n",
+                                )
+                            },
+                        )
+                        return
+                    }
+                    Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+                }
+                throw AssertionError(
+                    "The " + name + " never triggered MapLibre's animated zoom with rendered " +
+                        "frames in " + PINCH_ATTEMPTS + " attempts",
+                )
+            } finally {
+                InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    map.removeOnCameraMoveStartedListener(reasonListener)
+                }
+            }
+        } finally {
+            database.close()
+        }
+    }
+
     private fun assertObliqueZoomOutIsCovered(tilt: Double, bearing: Double, label: String) {
         val database = inMemoryDatabase()
         try {
@@ -1908,6 +2193,17 @@ class MapSurfaceTest {
         minimumUncoveredFraction: Double? = null,
         requiredEndZoomAbove: Double? = null,
         surfaceModifier: Modifier = Modifier.fillMaxSize(),
+        // A gesture that tilts or turns moves neither the target nor the zoom, so those endpoint
+        // proofs would call it vacuous. Exactly one movement expectation applies per gesture.
+        expectTiltChangeAtLeast: Double? = null,
+        expectBearingChangeAtLeast: Double? = null,
+        // Held gestures report REASON_API_GESTURE for every move. A tap-triggered zoom is a gesture
+        // whose camera movement is the animation MapLibre runs on the gesture's behalf, so those
+        // tests accept the animation reason as well — their non-vacuity comes from the mandatory
+        // zoom change, which nothing but the tap's own animation produces here.
+        acceptedMoveReasons: Set<Int> = setOf(
+            MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE,
+        ),
     ) {
         val database = inMemoryDatabase()
         try {
@@ -1985,6 +2281,8 @@ class MapSurfaceTest {
             composeRule.waitUntil(timeoutMillis = 25_000L) { fogGeneration() != null }
             val startCameraZoom = map.cameraPosition.zoom
             val startTarget = map.cameraPosition.target
+            val startTilt = map.cameraPosition.tilt
+            val startBearing = map.cameraPosition.bearing
             val generationAtTouchDown = fogGeneration()
             // What MapLibre made of the injected touches. Without this the test could report a
             // clean gesture that the map never actually received as one.
@@ -2081,9 +2379,7 @@ class MapSurfaceTest {
             )
             assertTrue(
                 "MapLibre never saw the injected touches as a gesture (reasons=$moveReasons)",
-                moveReasons.contains(
-                    MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE,
-                ),
+                moveReasons.any { reason -> reason in acceptedMoveReasons },
             )
             if (expectZoomIn) {
                 assertTrue(
@@ -2103,6 +2399,23 @@ class MapSurfaceTest {
                     "The gesture did not zoom out, so this measured nothing " +
                         "(start=$startCameraZoom end=$endZoom)",
                     startCameraZoom - endZoom >= minimumZoomChange,
+                )
+            } else if (expectTiltChangeAtLeast != null) {
+                val endTilt = map.cameraPosition.tilt
+                assertTrue(
+                    "The gesture did not tilt the camera, so this measured nothing " +
+                        "(tilt $startTilt -> $endTilt)",
+                    kotlin.math.abs(endTilt - startTilt) >= expectTiltChangeAtLeast,
+                )
+            } else if (expectBearingChangeAtLeast != null) {
+                val endBearing = map.cameraPosition.bearing
+                val turned = kotlin.math.abs(
+                    WebMercator.wrapLongitude(endBearing - startBearing),
+                )
+                assertTrue(
+                    "The gesture did not turn the camera, so this measured nothing " +
+                        "(bearing $startBearing -> $endBearing)",
+                    turned >= expectBearingChangeAtLeast,
                 )
             } else {
                 val moved = endTarget != null && startTarget != null &&
@@ -2227,6 +2540,9 @@ class MapSurfaceTest {
         auditEveryMove: Boolean = false,
     ): Boolean {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        // A stuck injected-pointer state from any earlier crashed stream would reject this
+        // stream's opening DOWN; clear it rather than inherit it.
+        bestEffortClearStuckInjectedPointers(view)
         val centerX = view.width / 2f
         val centerY = view.height / 2f
         val downTime = SystemClock.uptimeMillis()
@@ -2392,6 +2708,311 @@ class MapSurfaceTest {
         }
     }
 
+    /**
+     * Sends one two-pointer event with explicit per-pointer coordinates. The pinch's own sender
+     * fixes both pointers to the view's vertical axis, which is exactly why the shove and rotate
+     * detectors have never seen an injected gesture: a shove needs a horizontally separated pair
+     * and a rotate needs the pair's angle to change, neither of which a stacked pair can express.
+     */
+    private fun sendTwoPointer(
+        downTime: Long,
+        action: Int,
+        pointerCount: Int,
+        points: Array<Pair<Float, Float>>,
+    ) {
+        val properties = Array(pointerCount) { index ->
+            MotionEvent.PointerProperties().apply {
+                id = index
+                toolType = MotionEvent.TOOL_TYPE_FINGER
+            }
+        }
+        val coordinates = Array(pointerCount) { index ->
+            MotionEvent.PointerCoords().apply {
+                x = points[index].first
+                y = points[index].second
+                pressure = 1f
+                size = 1f
+            }
+        }
+        injectTouch(
+            MotionEvent.obtain(
+                downTime,
+                SystemClock.uptimeMillis(),
+                action,
+                pointerCount,
+                properties,
+                coordinates,
+                0,
+                0,
+                1f,
+                1f,
+                0,
+                0,
+                InputDevice.SOURCE_TOUCHSCREEN,
+                0,
+            ),
+        )
+    }
+
+    /**
+     * Clears injected pointers a crashed or interrupted stream left down. The injection device
+     * tracks its own pointer state, and a DOWN while it still holds {0, 1} is rejected as
+     * inconsistent — the wedge WORKFLOW.md documents, which previously needed an AVD reboot.
+     * A CANCEL against pointers that are not down is itself rejected, so neither injection is
+     * asserted: whichever matches the stuck state clears it and the other is discarded.
+     */
+    private fun bestEffortClearStuckInjectedPointers(view: MapView) {
+        val centerX = view.width / 2f
+        val centerY = view.height / 2f
+        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+        intArrayOf(2, 1).forEach { pointerCount ->
+            val properties = Array(pointerCount) { index ->
+                MotionEvent.PointerProperties().apply {
+                    id = index
+                    toolType = MotionEvent.TOOL_TYPE_FINGER
+                }
+            }
+            val coordinates = Array(pointerCount) { index ->
+                MotionEvent.PointerCoords().apply {
+                    x = centerX + index * 10f
+                    y = centerY
+                    pressure = 1f
+                    size = 1f
+                }
+            }
+            val now = SystemClock.uptimeMillis()
+            val event = MotionEvent.obtain(
+                now,
+                now,
+                MotionEvent.ACTION_CANCEL,
+                pointerCount,
+                properties,
+                coordinates,
+                0,
+                0,
+                1f,
+                1f,
+                0,
+                0,
+                InputDevice.SOURCE_TOUCHSCREEN,
+                0,
+            )
+            runCatching { automation.injectInputEvent(event, true) }
+            event.recycle()
+        }
+    }
+
+    /**
+     * A real two-finger shove: a horizontally separated pair travelling vertically together, which
+     * is what the shove detector demands and what the vertically stacked pinch stream could never
+     * be. Unlike the programmed tilt the oblique gates use, nothing here rebuilds the fog for the
+     * tilted camera first — the overlay under audit is exactly the one installed upright.
+     */
+    private fun shoveInSteps(map: MapLibreMap, onHold: () -> Unit) {
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        repeat(PINCH_ATTEMPTS) { attempt ->
+            // From zero tilt only one travel direction can move the pitch, and which one is the
+            // detector's convention rather than this test's business: alternate per attempt.
+            if (shoveOnce(map, view, onHold, upward = attempt % 2 == 0)) return
+        }
+        throw AssertionError(
+            "The shove never engaged MapLibre's shove detector in $PINCH_ATTEMPTS attempts",
+        )
+    }
+
+    private fun shoveOnce(
+        map: MapLibreMap,
+        view: MapView,
+        onHold: () -> Unit,
+        upward: Boolean,
+    ): Boolean {
+        val centerX = view.width / 2f
+        val gap = view.width * SHOVE_POINTER_GAP_FRACTION
+        val startY = view.height *
+            if (upward) SHOVE_START_Y_FRACTION else SHOVE_END_Y_FRACTION
+        val endY = view.height *
+            if (upward) SHOVE_END_Y_FRACTION else SHOVE_START_Y_FRACTION
+        val tiltAtTouchDown = map.cameraPosition.tilt
+        fun pairAt(y: Float) = arrayOf(centerX - gap / 2f to y, centerX + gap / 2f to y)
+
+        bestEffortClearStuckInjectedPointers(view)
+        val downTime = SystemClock.uptimeMillis()
+        var currentY = startY
+        var streamEnded = false
+        try {
+            sendTwoPointer(downTime, MotionEvent.ACTION_DOWN, 1, pairAt(startY))
+            sendTwoPointer(
+                downTime,
+                MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                2,
+                pairAt(startY),
+            )
+            // Engagement first, nothing measured: enough travel to clear the detector's own
+            // threshold, abandoned without contributing a frame if the tilt never moves.
+            val engageY = startY + (endY - startY) * PINCH_ENGAGE_TRAVEL
+            repeat(PINCH_ENGAGE_MOVES) { move ->
+                currentY = startY + (engageY - startY) * (move + 1) / PINCH_ENGAGE_MOVES
+                sendTwoPointer(downTime, MotionEvent.ACTION_MOVE, 2, pairAt(currentY))
+                SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+            }
+            map.awaitFullyRenderedFrame(view)
+            if (kotlin.math.abs(map.cameraPosition.tilt - tiltAtTouchDown) <
+                MINIMUM_SHOVE_ENGAGEMENT_DEGREES
+            ) {
+                liftTwoPointer(downTime, pairAt(currentY))
+                streamEnded = true
+                Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+                return false
+            }
+            val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
+            repeat(moves) { move ->
+                currentY = engageY + (endY - engageY) * (move + 1) / moves
+                sendTwoPointer(downTime, MotionEvent.ACTION_MOVE, 2, pairAt(currentY))
+                SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+                map.awaitFullyRenderedFrame(view)
+                onHold()
+            }
+            liftTwoPointer(downTime, pairAt(endY))
+            streamEnded = true
+            return true
+        } finally {
+            // A failure can strand either {0, 1} or just {0} (a DOWN whose POINTER_DOWN or whose
+            // partner UP was rejected), and a CANCEL only clears a state whose pointer count it
+            // matches - so try both, unasserted.
+            if (!streamEnded) bestEffortClearStuckInjectedPointers(view)
+        }
+    }
+
+    /**
+     * A real two-finger rotate: the pair orbits its midpoint at constant span, so only the angle
+     * between the pointers changes — the one degree of freedom the rotate detector reads and the
+     * one no committed stream has ever exercised.
+     */
+    private fun rotateInSteps(map: MapLibreMap, onHold: () -> Unit) {
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        repeat(PINCH_ATTEMPTS) {
+            if (rotateOnce(map, view, onHold)) return
+        }
+        throw AssertionError(
+            "The rotate never engaged MapLibre's rotate detector in $PINCH_ATTEMPTS attempts",
+        )
+    }
+
+    private fun rotateOnce(map: MapLibreMap, view: MapView, onHold: () -> Unit): Boolean {
+        val centerX = view.width / 2f
+        val centerY = view.height / 2f
+        val radius = minOf(view.width, view.height) * ROTATE_RADIUS_FRACTION
+        val bearingAtTouchDown = map.cameraPosition.bearing
+        fun pairAt(angleDegrees: Double): Array<Pair<Float, Float>> {
+            val radians = Math.toRadians(angleDegrees)
+            val dx = (radius * kotlin.math.cos(radians)).toFloat()
+            val dy = (radius * kotlin.math.sin(radians)).toFloat()
+            return arrayOf(centerX - dx to centerY - dy, centerX + dx to centerY + dy)
+        }
+
+        bestEffortClearStuckInjectedPointers(view)
+        val downTime = SystemClock.uptimeMillis()
+        var currentAngle = 0.0
+        var streamEnded = false
+        try {
+            sendTwoPointer(downTime, MotionEvent.ACTION_DOWN, 1, pairAt(0.0))
+            sendTwoPointer(
+                downTime,
+                MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                2,
+                pairAt(0.0),
+            )
+            val engageAngle = ROTATE_TOTAL_DEGREES * PINCH_ENGAGE_TRAVEL
+            repeat(PINCH_ENGAGE_MOVES) { move ->
+                currentAngle = engageAngle * (move + 1) / PINCH_ENGAGE_MOVES
+                sendTwoPointer(downTime, MotionEvent.ACTION_MOVE, 2, pairAt(currentAngle))
+                SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+            }
+            map.awaitFullyRenderedFrame(view)
+            val engaged = kotlin.math.abs(
+                WebMercator.wrapLongitude(map.cameraPosition.bearing - bearingAtTouchDown),
+            )
+            if (engaged < MINIMUM_ROTATE_ENGAGEMENT_DEGREES) {
+                liftTwoPointer(downTime, pairAt(currentAngle))
+                streamEnded = true
+                Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+                return false
+            }
+            val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
+            repeat(moves) { move ->
+                currentAngle = engageAngle +
+                    (ROTATE_TOTAL_DEGREES - engageAngle) * (move + 1) / moves
+                sendTwoPointer(downTime, MotionEvent.ACTION_MOVE, 2, pairAt(currentAngle))
+                SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+                map.awaitFullyRenderedFrame(view)
+                onHold()
+            }
+            liftTwoPointer(downTime, pairAt(ROTATE_TOTAL_DEGREES))
+            streamEnded = true
+            return true
+        } finally {
+            if (!streamEnded) bestEffortClearStuckInjectedPointers(view)
+        }
+    }
+
+    private fun liftTwoPointer(downTime: Long, points: Array<Pair<Float, Float>>) {
+        sendTwoPointer(
+            downTime,
+            MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+            2,
+            points,
+        )
+        sendTwoPointer(downTime, MotionEvent.ACTION_UP, 1, points)
+    }
+
+    /** One double tap at the view centre, with guaranteed stream termination. */
+    private fun injectDoubleTap(view: MapView) {
+        val centerX = view.width / 2f
+        val centerY = view.height / 2f
+        bestEffortClearStuckInjectedPointers(view)
+        repeat(2) { tap ->
+            val downTime = SystemClock.uptimeMillis()
+            var streamEnded = false
+            try {
+                sendTwoPointer(downTime, MotionEvent.ACTION_DOWN, 1, arrayOf(centerX to centerY))
+                SystemClock.sleep(TAP_DURATION_MILLIS)
+                sendTwoPointer(downTime, MotionEvent.ACTION_UP, 1, arrayOf(centerX to centerY))
+                streamEnded = true
+            } finally {
+                // A stream whose own UP was rejected leaves injected pointers down and wedges
+                // every later injection in the process; a best-effort CANCEL is the only honest
+                // cleanup left.
+                if (!streamEnded) bestEffortClearStuckInjectedPointers(view)
+            }
+            if (tap == 0) SystemClock.sleep(DOUBLE_TAP_GAP_MILLIS)
+        }
+    }
+
+    /** One two-finger tap about the view centre, with guaranteed stream termination. */
+    private fun injectTwoFingerTap(view: MapView) {
+        val centerX = view.width / 2f
+        val centerY = view.height / 2f
+        val gap = view.width * SHOVE_POINTER_GAP_FRACTION
+        val points = arrayOf(centerX - gap / 2f to centerY, centerX + gap / 2f to centerY)
+        bestEffortClearStuckInjectedPointers(view)
+        val downTime = SystemClock.uptimeMillis()
+        var streamEnded = false
+        try {
+            sendTwoPointer(downTime, MotionEvent.ACTION_DOWN, 1, points)
+            sendTwoPointer(
+                downTime,
+                MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                2,
+                points,
+            )
+            SystemClock.sleep(TAP_DURATION_MILLIS)
+            liftTwoPointer(downTime, points)
+            streamEnded = true
+        } finally {
+            if (!streamEnded) bestEffortClearStuckInjectedPointers(view)
+        }
+    }
+
     /** Requests and waits for a fully rendered frame at the current camera and style state. */
     private fun MapLibreMap.awaitFullyRenderedFrame(view: MapView) {
         val ready = CountDownLatch(1)
@@ -2431,6 +3052,7 @@ class MapSurfaceTest {
         auditEveryMove: Boolean = false,
     ) {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        bestEffortClearStuckInjectedPointers(view)
         val fromX = view.width * 0.72f
         val toX = view.width * 0.22f
         val fromY = view.height * 0.24f
@@ -2537,6 +3159,7 @@ class MapSurfaceTest {
         maximumUnmeasuredZoom: Double?,
     ): Boolean {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        bestEffortClearStuckInjectedPointers(view)
         val centerX = view.width / 2f
         val centerY = view.height / 2f
 
@@ -4569,6 +5192,37 @@ class MapSurfaceTest {
          * costs a second and makes the suite deterministic.
          */
         const val PINCH_ATTEMPTS = 4
+
+        /**
+         * P4-035 gesture-injection geometry. The shove pair sits half a screen apart horizontally —
+         * unmistakably a shove to a detector that rejects near-vertical pairs — and travels between
+         * 65% and 30% of the view's height. The rotate pair orbits the view centre at constant
+         * span so only the pointer angle changes. Engagement floors are far below the accepted
+         * endpoint movements, so a retry cannot hide a gesture that barely moved.
+         */
+        const val SHOVE_POINTER_GAP_FRACTION = 0.5f
+        const val SHOVE_START_Y_FRACTION = 0.65f
+        const val SHOVE_END_Y_FRACTION = 0.30f
+        const val MINIMUM_SHOVE_ENGAGEMENT_DEGREES = 1.0
+        const val MINIMUM_ACCEPTED_SHOVE_TILT_DEGREES = 15.0
+        const val ROTATE_RADIUS_FRACTION = 0.35f
+        const val ROTATE_TOTAL_DEGREES = 75.0
+        const val MINIMUM_ROTATE_ENGAGEMENT_DEGREES = 2.0
+        const val MINIMUM_ACCEPTED_ROTATE_DEGREES = 20.0
+        const val EXPLORATION_GESTURE_ZOOM = 16.0
+
+        /**
+         * The tap-zoom animation audit's bounds; tap timing reuses the quick-zoom stream's
+         * [TAP_DURATION_MILLIS] and [DOUBLE_TAP_GAP_MILLIS]. A tap zoom moves the camera exactly
+         * one level, so the accepted change is half of that - far above [TAP_ZOOM_STABLE_EPSILON],
+         * which only detects that the animation has ended.
+         */
+        const val TAP_ANIMATION_TIMEOUT_MILLIS = 5_000L
+        const val TAP_STABLE_POLLS = 3
+        const val TAP_POLL_MILLIS = 50L
+        const val MINIMUM_TAP_ZOOM_ENGAGEMENT = 0.2
+        const val TAP_ZOOM_STABLE_EPSILON = 0.001
+        const val MINIMUM_TAP_ZOOM_CHANGE = 0.5
         const val PINCH_ENGAGE_MOVES = 8
         const val PINCH_REOPEN_MOVES = 8
         const val PINCH_ENGAGE_TRAVEL = 0.30f
