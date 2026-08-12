@@ -819,6 +819,13 @@ internal fun TrailVeilMapSurface(
         val installedExtent = FogBackdropGeometry.extent(rendered.mosaic)
         installedSurround = installedExtent
         if (!surroundHoldsForCamera()) {
+            // The new geometry is already in the renderer and provably does not reach the camera.
+            // Declining to *set* the flag is not enough: a `true` left over from the previous
+            // install would keep the cover down over an overlay just proved insufficient. Clear it
+            // for the same reason the camera-move listener does, then rebuild. This cannot wedge —
+            // `requestViewport` bumps the generation that keys both install effects, and the
+            // placeholder effect now runs precisely because coverage is false.
+            fogCoverageInstalled = false
             requestViewport()
             return@LaunchedEffect
         }
