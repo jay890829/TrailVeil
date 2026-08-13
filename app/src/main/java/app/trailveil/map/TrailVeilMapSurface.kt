@@ -239,6 +239,35 @@ internal data class InstalledFogCoverageSnapshot(
     val extent: FogSurroundExtent,
 )
 
+/** Compose-applied state exposed only to renderer-ordering instrumentation. */
+internal data class ComposedFogCoverageSnapshot(
+    val generation: Long,
+    val coverageInstalled: Boolean,
+    val installedExtent: FogSurroundExtent?,
+)
+
+internal enum class CanonicalFogInstallCheckpointPhase {
+    BEFORE_STYLE_INSTALL,
+    AFTER_STYLE_INSTALL_BEFORE_RECONCILE,
+}
+
+/** A suspendable instrumentation seam; absent in every production call site. */
+internal data class CanonicalFogInstallCheckpoint(
+    val phase: CanonicalFogInstallCheckpointPhase,
+    val generation: Long,
+    val fogRevision: Long,
+    val render: FogViewportRender,
+    val installedExtent: FogSurroundExtent?,
+)
+
+internal data class CanonicalFogInstallDecision(
+    val generation: Long,
+    val render: FogViewportRender,
+    val installedExtent: FogSurroundExtent,
+    val rejectedBeforeStyleMutation: Boolean,
+    val coverageInstalledAtDecision: Boolean,
+)
+
 /**
  * Provider failure is deliberately contained inside this surface. It never owns recording,
  * location permissions, canonical points, or fog state.
@@ -274,6 +303,12 @@ internal fun TrailVeilMapSurface(
     fogInstallFaultForTesting: (() -> Unit)? = null,
     onMapViewCreatedForTesting: ((MapView) -> Unit)? = null,
     onFogCoverageInstalledForTesting: ((InstalledFogCoverageSnapshot) -> Unit)? = null,
+    onFogCoverageStateComposedForTesting: ((ComposedFogCoverageSnapshot) -> Unit)? = null,
+    canonicalFogInstallCheckpointForTesting:
+        (suspend (CanonicalFogInstallCheckpoint) -> Unit)? = null,
+    onCanonicalFogInstallDecisionForTesting: ((CanonicalFogInstallDecision) -> Unit)? = null,
+    canonicalViewportRequestForTesting: FogViewportRequest? = null,
+    fogSurroundCoverageForTesting: ((FogSurroundExtent) -> Boolean)? = null,
 ) {
     require(fallbackTimeoutMillis > 0L) { "fallbackTimeoutMillis must be positive" }
     require(savedStateKey.isNotBlank()) { "savedStateKey must not be blank" }
@@ -325,6 +360,21 @@ internal fun TrailVeilMapSurface(
     val currentOnFogCoverageInstalledForTesting by rememberUpdatedState(
         onFogCoverageInstalledForTesting,
     )
+    val currentOnFogCoverageStateComposedForTesting by rememberUpdatedState(
+        onFogCoverageStateComposedForTesting,
+    )
+    val currentCanonicalFogInstallCheckpointForTesting by rememberUpdatedState(
+        canonicalFogInstallCheckpointForTesting,
+    )
+    val currentOnCanonicalFogInstallDecisionForTesting by rememberUpdatedState(
+        onCanonicalFogInstallDecisionForTesting,
+    )
+    val currentCanonicalViewportRequestForTesting by rememberUpdatedState(
+        canonicalViewportRequestForTesting,
+    )
+    val currentFogSurroundCoverageForTesting by rememberUpdatedState(
+        fogSurroundCoverageForTesting,
+    )
     // Set only around a follow step, whose reach is bounded by how far a person walked since the
     // last fix. Every other programmed move keeps hiding the overlay until its rebuild lands.
     val followingCameraMove = remember(mapView) { AtomicBoolean(false) }
@@ -361,9 +411,15 @@ internal fun TrailVeilMapSurface(
     // no other composition read while the local fallback is active.
     val publishedFogGeneration = if (canonicalFogLoaded) fogViewportGeneration else null
     val publishedLoadState = loadState.name
+    val composedFogCoverageSnapshot = ComposedFogCoverageSnapshot(
+        generation = fogViewportGeneration,
+        coverageInstalled = fogCoverageInstalled,
+        installedExtent = installedSurround,
+    )
     SideEffect {
         mapView.setTag(R.id.map_fog_canonical_generation, publishedFogGeneration)
         mapView.setTag(R.id.map_basemap_load_state, publishedLoadState)
+        currentOnFogCoverageStateComposedForTesting?.invoke(composedFogCoverageSnapshot)
     }
 
     fun useLocalFallback() {
@@ -511,10 +567,8 @@ internal fun TrailVeilMapSurface(
     // installed is not the same as coverage being enough: a re-render can land while a gesture has
     // already carried the camera past what the installed surround holds, and lowering the cover on
     // the strength of a successful install alone would uncover a map that is leaking.
-    fun requestViewport() {
-        val map = readyMap ?: return
+    fun publishViewportRequest(request: FogViewportRequest) {
         followingCameraMove.set(false)
-        val request = map.fogViewportRequest()
         canonicalFogLoaded = false
         fogRenderFailed = false
         fogPlaceholderReadyGeneration = -1L
@@ -522,8 +576,24 @@ internal fun TrailVeilMapSurface(
         fogViewportGeneration += 1L
     }
 
-    fun surroundHoldsForCamera(): Boolean {
-        val extent = installedSurround ?: return true
+    fun requestViewport() {
+        val map = readyMap ?: return
+        publishViewportRequest(
+            currentCanonicalViewportRequestForTesting ?: map.fogViewportRequest(),
+        )
+    }
+
+    LaunchedEffect(readyMap, canonicalViewportRequestForTesting) {
+        if (readyMap != null) {
+            canonicalViewportRequestForTesting?.let(::publishViewportRequest)
+        }
+    }
+
+    fun surroundHoldsForCamera(extent: FogSurroundExtent? = installedSurround): Boolean {
+        val checkedExtent = extent ?: return true
+        currentFogSurroundCoverageForTesting?.let { coverage ->
+            return coverage(checkedExtent)
+        }
         val map = readyMap ?: return true
         // Nothing is laid out yet, so there is no viewport to be outside of; the next camera move
         // asks again.
@@ -541,7 +611,7 @@ internal fun TrailVeilMapSurface(
         // throwing, which inside a camera-move listener would be a crash rather than a cover.
         if (corners.size != VISIBLE_REGION_CORNERS) return false
         if (corners.any { !it.latitude.isFinite() || !it.longitude.isFinite() }) return false
-        return extent.covers(
+        return checkedExtent.covers(
             corners.map { corner -> GeoPoint(corner.latitude, corner.longitude) },
         )
     }
@@ -775,72 +845,131 @@ internal fun TrailVeilMapSurface(
         val generation = fogViewportGeneration
         if (!fogBaselineReady) return@LaunchedEffect
         if (fogPlaceholderReadyGeneration != generation) return@LaunchedEffect
-        val rendered = renderCanonicalFogWithRetry(
-            request = request,
-            retryDelayMillis = FOG_RETRY_DELAY_MILLIS,
-            render = { viewport ->
-                withContext(Dispatchers.Default) {
-                    runtime.viewportCoordinator.render(viewport)
-                }
-            },
-            installAndAwait = { viewport ->
-                mapView.installFogOverlayAndAwait(
-                    style = style,
-                    mosaic = viewport.mosaic,
-                    fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
-                    installFaultForTesting = fogInstallFaultForTesting,
-                )
-            },
-            onFailure = { failure ->
-                if (
-                    generation == fogViewportGeneration &&
-                    request == fogViewportRequest &&
-                    style === readyStyle
-                ) {
-                    // The install writes a mosaic, its repeats and six bands in one call stack,
-                    // so a throw part way through leaves a shape nobody can name. Treat installed
-                    // coverage as lost until a whole install has succeeded again, or that
-                    // half-applied state is presented as fog.
-                    fogCoverageInstalled = false
-                    installedSurround = null
-                    canonicalFogLoaded = false
-                    fogRenderFailed = true
-                    currentOnFogFailure(failure)
-                }
-            },
-        )
-        if (
-            generation != fogViewportGeneration ||
-            request != fogViewportRequest ||
-            style !== readyStyle
-        ) {
-            return@LaunchedEffect
-        }
-        val installedExtent = FogBackdropGeometry.extent(rendered.mosaic)
-        installedSurround = installedExtent
-        if (!surroundHoldsForCamera()) {
-            // The new geometry is already in the renderer and provably does not reach the camera.
-            // Declining to *set* the flag is not enough: a `true` left over from the previous
-            // install would keep the cover down over an overlay just proved insufficient.
-            //
-            // Following is exempt for the same reason the move-started listener exempts it: an
-            // install landing a step behind a walking user is routine, and blacking the map out
-            // under someone who is only walking is a worse outcome than the transient it fixes.
-            // That is not a hole — the camera-move listener still raises the cover on the next move
-            // if a followed camera has genuinely left the installed surround.
-            if (!followingCameraMove.get()) {
-                fogCoverageInstalled = false
+        var styleMayHaveChanged = false
+        var installedStateReconciled = false
+        try {
+            val rendered = renderCanonicalFogWithRetry(
+                request = request,
+                retryDelayMillis = FOG_RETRY_DELAY_MILLIS,
+                render = { viewport ->
+                    withContext(Dispatchers.Default) {
+                        runtime.viewportCoordinator.render(viewport)
+                    }
+                },
+                installAndAwait = { viewport ->
+                    val incomingExtent = FogBackdropGeometry.extent(viewport.mosaic)
+                    val cameraAlreadyOutsideIncoming = !surroundHoldsForCamera(incomingExtent)
+                    if (cameraAlreadyOutsideIncoming && !followingCameraMove.get()) {
+                        // Keep the older covering renderer geometry in place. Installing S2 first
+                        // and clearing Compose state only after its fully-rendered callback permits
+                        // exactly one non-covering frame. Rejecting a stale landing before style
+                        // mutation removes that ordering hole; the post-install check below still
+                        // handles movement that happens while a valid S2 is rendering.
+                        fogCoverageInstalled = false
+                        currentOnCanonicalFogInstallDecisionForTesting?.invoke(
+                            CanonicalFogInstallDecision(
+                                generation = generation,
+                                render = viewport,
+                                installedExtent = incomingExtent,
+                                rejectedBeforeStyleMutation = true,
+                                coverageInstalledAtDecision = fogCoverageInstalled,
+                            ),
+                        )
+                        requestViewport()
+                        throw StaleCanonicalFogInstallException
+                    }
+                    currentCanonicalFogInstallCheckpointForTesting?.invoke(
+                        CanonicalFogInstallCheckpoint(
+                            phase = CanonicalFogInstallCheckpointPhase.BEFORE_STYLE_INSTALL,
+                            generation = generation,
+                            fogRevision = fogRevision,
+                            render = viewport,
+                            installedExtent = null,
+                        ),
+                    )
+                    styleMayHaveChanged = true
+                    mapView.installFogOverlayAndAwait(
+                        style = style,
+                        mosaic = viewport.mosaic,
+                        fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
+                        installFaultForTesting = fogInstallFaultForTesting,
+                    )
+                },
+                onFailure = { failure ->
+                    if (failure !== StaleCanonicalFogInstallException &&
+                        generation == fogViewportGeneration &&
+                        request == fogViewportRequest &&
+                        style === readyStyle
+                    ) {
+                        // The install writes a mosaic, its repeats and six bands in one call stack,
+                        // so a throw part way through leaves a shape nobody can name. Treat installed
+                        // coverage as lost until a whole install has succeeded again, or that
+                        // half-applied state is presented as fog.
+                        fogCoverageInstalled = false
+                        installedSurround = null
+                        canonicalFogLoaded = false
+                        fogRenderFailed = true
+                        currentOnFogFailure(failure)
+                    }
+                },
+            )
+            currentCanonicalFogInstallCheckpointForTesting?.invoke(
+                CanonicalFogInstallCheckpoint(
+                    phase = CanonicalFogInstallCheckpointPhase.AFTER_STYLE_INSTALL_BEFORE_RECONCILE,
+                    generation = generation,
+                    fogRevision = fogRevision,
+                    render = rendered,
+                    installedExtent = FogBackdropGeometry.extent(rendered.mosaic),
+                ),
+            )
+            if (
+                generation != fogViewportGeneration ||
+                request != fogViewportRequest ||
+                style !== readyStyle
+            ) {
+                return@LaunchedEffect
             }
-            requestViewport()
-            return@LaunchedEffect
+            val installedExtent = FogBackdropGeometry.extent(rendered.mosaic)
+            installedSurround = installedExtent
+            if (!surroundHoldsForCamera()) {
+                // The new geometry is already in the renderer and provably does not reach the
+                // camera. Declining to set the flag is insufficient because `true` may belong to
+                // the previous install.
+                if (!followingCameraMove.get()) {
+                    fogCoverageInstalled = false
+                }
+                currentOnCanonicalFogInstallDecisionForTesting?.invoke(
+                    CanonicalFogInstallDecision(
+                        generation = generation,
+                        render = rendered,
+                        installedExtent = installedExtent,
+                        rejectedBeforeStyleMutation = false,
+                        coverageInstalledAtDecision = fogCoverageInstalled,
+                    ),
+                )
+                installedStateReconciled = true
+                requestViewport()
+                return@LaunchedEffect
+            }
+            fogCoverageInstalled = true
+            canonicalFogLoaded = true
+            fogRenderFailed = false
+            installedStateReconciled = true
+            currentOnFogCoverageInstalledForTesting?.invoke(
+                InstalledFogCoverageSnapshot(generation = generation, extent = installedExtent),
+            )
+            currentOnFogRendered?.invoke(rendered)
+        } finally {
+            if (styleMayHaveChanged && !installedStateReconciled) {
+                // Style mutation precedes a renderer-frame suspension. If this effect is cancelled
+                // or re-keyed during that wait, the renderer may already contain the incoming
+                // geometry while Compose still describes the previous extent. Never preserve a
+                // positive coverage claim across that uncommitted boundary.
+                fogCoverageInstalled = false
+                installedSurround = null
+                canonicalFogLoaded = false
+            }
         }
-        fogCoverageInstalled = true
-        canonicalFogLoaded = true
-        fogRenderFailed = false
-        currentOnFogCoverageInstalledForTesting?.invoke(
-            InstalledFogCoverageSnapshot(generation = generation, extent = installedExtent),
-        )
-        currentOnFogRendered?.invoke(rendered)
     }
 
     Box(modifier = modifier) {
@@ -1348,6 +1477,8 @@ private const val VISIBLE_REGION_CORNERS = 4
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
 private const val FOG_SEAM_GUARD_WIDTH_PIXELS = 3.0f
+
+private object StaleCanonicalFogInstallException : Exception()
 private const val TRACK_CAMERA_PADDING_PX = 72
 
 /**

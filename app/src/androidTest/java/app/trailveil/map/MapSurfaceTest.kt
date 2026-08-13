@@ -47,6 +47,7 @@ import app.trailveil.map.fog.FogTilePipeline
 import app.trailveil.map.fog.FogTileRenderer
 import app.trailveil.map.fog.FogViewportCoordinator
 import app.trailveil.map.fog.FogViewportRender
+import app.trailveil.map.fog.FogViewportRequest
 import app.trailveil.map.fog.GeoPoint
 import app.trailveil.map.fog.WebMercator
 import java.util.concurrent.CountDownLatch
@@ -57,10 +58,12 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.ln
 import kotlin.math.max
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -1027,6 +1030,277 @@ class MapSurfaceTest {
         aTapZoomStaysInsideItsInstalledFog(twoFinger = true)
 
     /**
+     * Suspends a valid, narrower S2 immediately before its style mutation, then changes only the
+     * test coverage decision so that S2 becomes non-covering while the install is suspended. The
+     * post-install reconciliation must clear the stale positive coverage claim and compose the
+     * safety cover without any camera callback. This proves state reconciliation, not that the
+     * Compose cover and the first S2 renderer frame share a compositor transaction (P4-034).
+     */
+    @Test
+    fun aCanonicalInstallThatTurnsNonCoveringRaisesTheSafetyCover() {
+        val database = inMemoryDatabase()
+        val forcedRequest = mutableStateOf<FogViewportRequest?>(null)
+        val beforeInstallEntered = CompletableDeferred<CanonicalFogInstallCheckpoint>()
+        val releaseBeforeInstall = CompletableDeferred<Unit>()
+        val nonCoveringDecision = CompletableDeferred<CanonicalFogInstallDecision>()
+        val gatedGeneration = AtomicReference<Long?>(null)
+        val checkpointRequests = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
+        val fogRenderCount = AtomicInteger(0)
+        val coverageHolds = AtomicBoolean(true)
+
+        try {
+            revealTrack(database, REVEALED_CENTER)
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-install-landing-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-install-landing",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-install-landing-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = UNEXPLORED_NEAR_REVEALED,
+                        zoom = INSTALL_GATE_WIDE_ZOOM,
+                    ),
+                    canonicalViewportRequestForTesting = forcedRequest.value,
+                    fogSurroundCoverageForTesting = { coverageHolds.get() },
+                    onFogRendered = { fogRenderCount.incrementAndGet() },
+                    onFogCoverageInstalledForTesting = installedCoverage::set,
+                    canonicalFogInstallCheckpointForTesting = { checkpoint ->
+                        checkpointRequests +=
+                            "${checkpoint.phase}:g=${checkpoint.generation} " +
+                            "z=${checkpoint.render.request.mapZoom}"
+                        if (
+                            checkpoint.phase ==
+                            CanonicalFogInstallCheckpointPhase.BEFORE_STYLE_INSTALL &&
+                            checkpoint.render.request.mapZoom == INSTALL_GATE_NARROW_ZOOM &&
+                            gatedGeneration.compareAndSet(null, checkpoint.generation)
+                        ) {
+                            beforeInstallEntered.complete(checkpoint)
+                            releaseBeforeInstall.await()
+                        }
+                    },
+                    onCanonicalFogInstallDecisionForTesting = { decision ->
+                        if (decision.generation == gatedGeneration.get()) {
+                            nonCoveringDecision.complete(decision)
+                        }
+                    },
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = 30_000L) { fogRenderCount.get() >= 1 }
+            val readyMap = checkNotNull(awaitMap()) { "The map never became ready" }
+            val mapView = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            composeRule.waitUntil(timeoutMillis = 10_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            readyMap.awaitFullyRenderedFrame(mapView)
+            val s1 = checkNotNull(installedCoverage.get()) {
+                "No wide S1 coverage was installed"
+            }
+            val target = checkNotNull(readyMap.cameraPosition.target)
+            val s2Request = FogViewportRequest(
+                center = GeoPoint(target.latitude, target.longitude),
+                mapZoom = INSTALL_GATE_NARROW_ZOOM,
+            )
+            composeRule.runOnUiThread { forcedRequest.value = s2Request }
+            runCatching {
+                composeRule.waitUntil(timeoutMillis = INSTALL_GATE_CHECKPOINT_TIMEOUT_MILLIS) {
+                    beforeInstallEntered.isCompleted
+                }
+            }.getOrElse { failure ->
+                throw AssertionError(
+                    "No forced narrow canonical checkpoint; observed=$checkpointRequests " +
+                        "camera=${readyMap.cameraPosition}",
+                    failure,
+                )
+            }
+            val incoming = runBlocking { beforeInstallEntered.await() }
+            val s2Extent = FogBackdropGeometry.extent(incoming.render.mosaic)
+            assertEquals(s2Request, incoming.render.request)
+            assertTrue(
+                "The gated S2 was not narrower than installed S1: S1=${s1.extent} S2=$s2Extent",
+                s2Extent.halfWorlds < s1.extent.halfWorlds,
+            )
+            assertTrue(
+                "The forced S2 was already outside the actual camera before the gate switched: " +
+                    "$s2Extent",
+                s2Extent.covers(readyMap.visibleRegionCorners()),
+            )
+            composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertDoesNotExist()
+            coverageHolds.set(false)
+            releaseBeforeInstall.complete(Unit)
+            runCatching {
+                composeRule.waitUntil(timeoutMillis = INSTALL_GATE_CHECKPOINT_TIMEOUT_MILLIS) {
+                    nonCoveringDecision.isCompleted
+                }
+            }.getOrElse { failure ->
+                throw AssertionError(
+                    "No post-install non-covering decision; observed=$checkpointRequests " +
+                        "camera=${readyMap.cameraPosition} S1=${s1.extent} S2=$s2Extent",
+                    failure,
+                )
+            }
+            val decision = runBlocking { nonCoveringDecision.await() }
+            assertEquals(incoming.generation, decision.generation)
+            assertEquals(s2Extent, decision.installedExtent)
+            assertTrue(
+                "S2 should have become stale only while its style install was suspended",
+                !decision.rejectedBeforeStyleMutation,
+            )
+            assertTrue(
+                "Post-install reconciliation retained a stale positive coverage claim: $decision",
+                !decision.coverageInstalledAtDecision,
+            )
+            composeRule.waitUntil(timeoutMillis = 5_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isNotEmpty()
+            }
+            composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertIsDisplayed()
+        } finally {
+            releaseBeforeInstall.complete(Unit)
+            database.close()
+        }
+    }
+
+    /**
+     * Cancels the canonical coroutine after its renderer mutation has completed but before matching
+     * Compose bookkeeping is reconciled. The shared cancellation/finally path must revoke the old
+     * positive coverage claim; otherwise a later re-keyed effect can inherit stale S1 state while
+     * the renderer already contains S2. Fog-revision keying is checked separately in source review.
+     */
+    @Test
+    fun cancellingAfterStyleInstallClearsTheUnreconciledCoverageClaim() {
+        val database = inMemoryDatabase()
+        val forcedRequest = mutableStateOf<FogViewportRequest?>(null)
+        val afterStyleEntered = CompletableDeferred<CanonicalFogInstallCheckpoint>()
+        val coverageCleared = CompletableDeferred<ComposedFogCoverageSnapshot>()
+        val cancelledGeneration = AtomicReference<Long?>(null)
+        val checkpointTrace = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
+        val fogRenderCount = AtomicInteger(0)
+
+        try {
+            revealTrack(database, REVEALED_CENTER)
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-cancelled-install-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-cancelled-install",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-cancelled-install-test",
+                    fogRuntime = fogRuntime(
+                        database,
+                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                    ),
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = UNEXPLORED_NEAR_REVEALED,
+                        zoom = INSTALL_GATE_WIDE_ZOOM,
+                    ),
+                    canonicalViewportRequestForTesting = forcedRequest.value,
+                    onFogRendered = { fogRenderCount.incrementAndGet() },
+                    onFogCoverageInstalledForTesting = installedCoverage::set,
+                    onFogCoverageStateComposedForTesting = { snapshot ->
+                        val expectedGeneration = cancelledGeneration.get()
+                        if (
+                            expectedGeneration != null &&
+                            snapshot.generation >= expectedGeneration &&
+                            !snapshot.coverageInstalled
+                        ) {
+                            coverageCleared.complete(snapshot)
+                        }
+                    },
+                    canonicalFogInstallCheckpointForTesting = { checkpoint ->
+                        checkpointTrace +=
+                            "${checkpoint.phase}:g=${checkpoint.generation} " +
+                            "z=${checkpoint.render.request.mapZoom}"
+                        when {
+                            checkpoint.phase ==
+                                CanonicalFogInstallCheckpointPhase.AFTER_STYLE_INSTALL_BEFORE_RECONCILE &&
+                                checkpoint.render.request.mapZoom ==
+                                CANCEL_GATE_ABANDONED_ZOOM -> {
+                                cancelledGeneration.set(checkpoint.generation)
+                                afterStyleEntered.complete(checkpoint)
+                                throw kotlinx.coroutines.CancellationException(
+                                    "Deterministic post-style cancellation",
+                                )
+                            }
+                        }
+                    },
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = 30_000L) { fogRenderCount.get() >= 1 }
+            val readyMap = checkNotNull(awaitMap()) { "The map never became ready" }
+            composeRule.waitUntil(timeoutMillis = 10_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            val initialCoverage = checkNotNull(installedCoverage.get()) {
+                "No initial canonical coverage was installed"
+            }
+            val target = checkNotNull(readyMap.cameraPosition.target)
+            val center = GeoPoint(target.latitude, target.longitude)
+            composeRule.runOnUiThread {
+                forcedRequest.value = FogViewportRequest(center, CANCEL_GATE_ABANDONED_ZOOM)
+            }
+            runCatching {
+                composeRule.waitUntil(timeoutMillis = INSTALL_GATE_CHECKPOINT_TIMEOUT_MILLIS) {
+                    afterStyleEntered.isCompleted
+                }
+            }.getOrElse { failure ->
+                throw AssertionError(
+                    "The abandoned generation never reached its post-style checkpoint; " +
+                        "trace=$checkpointTrace",
+                    failure,
+                )
+            }
+            val abandoned = runBlocking { afterStyleEntered.await() }
+            assertEquals(CANCEL_GATE_ABANDONED_ZOOM, abandoned.render.request.mapZoom, 0.0)
+            assertTrue(
+                "The abandoned S2 was not narrower than S1: S1=${initialCoverage.extent} " +
+                    "S2=${abandoned.installedExtent}",
+                checkNotNull(abandoned.installedExtent).halfWorlds <
+                    initialCoverage.extent.halfWorlds,
+            )
+
+            runCatching {
+                composeRule.waitUntil(timeoutMillis = INSTALL_GATE_CHECKPOINT_TIMEOUT_MILLIS) {
+                    coverageCleared.isCompleted
+                }
+            }.getOrElse { failure ->
+                throw AssertionError(
+                    "Cancellation kept a stale positive coverage claim; trace=$checkpointTrace",
+                    failure,
+                )
+            }
+            val cleared = runBlocking { coverageCleared.await() }
+            assertTrue(
+                "The coverage clear belongs to an older generation: clear=$cleared abandoned=$abandoned",
+                cleared.generation >= abandoned.generation,
+            )
+            assertTrue("Cancellation retained an installed extent: $cleared", cleared.installedExtent == null)
+            composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertIsDisplayed()
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
      * The composite the programmed-tilt gates cannot express: a real shove leaves the camera
      * tilted with the fog still the one installed upright, and the immediate regrab into a tall
      * pinch-out crosses one camera idle — so the rebuild that idle schedules races the second
@@ -1034,34 +1308,129 @@ class MapSurfaceTest {
      * of pitch plus about four levels of zoom-out the visible reach approaches the surround's
      * measured absorption, so this is the one injectable trajectory that can genuinely contest the
      * finite extent. The frozen-geometry claims are waived ([sweepGesture]'s rebuild mode); the
-     * claim that holds is the per-frame rule: every rendered held frame is either covered by the
-     * safety cover — fail-closed is correct here — or pixel-truthful against the bare basemap.
-     */
+     * held samples retain the pixel-truthful-or-cover rule. A renderer listener additionally proves
+     * that the lift/re-grab window renders and that tilt persists into the accepted pinch. It only
+     * records renderer-versus-Compose lag: those are different compositor timelines, so their
+     * same-frame fail-closed relationship remains P4-034 rather than being smuggled into this gate.
+    */
     @Test
-    fun aRealShoveThenATallPinchOutStaysCoveredOrTruthful() = sweepGesture(
-        provider = MapProviderConfiguration(
-            providerName = "fog-shove-pinch-test-provider",
-            styleUri = "https://tiles.invalid/styles/fog-shove-pinch",
-        ),
-        requireOnlineStyle = false,
-        savedStateKey = "trailveil.map.fog-shove-pinch-test",
-        gesture = { map, onHold ->
-            shoveInSteps(map, onHold)
-            pinchInSteps(
-                map,
-                onHold,
-                zoomIn = false,
-                spanEdge = PinchSpanEdge.TALLEST,
-                auditEveryMove = true,
-            )
-        },
-        startPoint = UNEXPLORED_NEAR_REVEALED,
-        startZoom = EXPLORATION_GESTURE_ZOOM,
-        expectCover = true,
-        expectZoomOut = true,
-        minimumZoomChange = MINIMUM_COMPOSITE_ZOOM_CHANGE,
-        allowRebuildDuringGesture = true,
-    )
+    fun aRealShoveThenAnImmediateTallPinchRetainsTiltAndAuditsHeldFrames() {
+        val composedCoverage = AtomicReference<ComposedFogCoverageSnapshot?>(null)
+        val phase = AtomicReference(CompositeGesturePhase.SHOVE)
+        val rendererSamples = java.util.Collections.synchronizedList(
+            mutableListOf<CompositeRendererSample>(),
+        )
+        val rendererFailure = AtomicReference<Throwable?>(null)
+        val shoveEndTilt = AtomicReference<Double?>(null)
+        val pinchEngagementTilt = AtomicReference<Double?>(null)
+
+        sweepGesture(
+            provider = MapProviderConfiguration(
+                providerName = "fog-shove-pinch-test-provider",
+                styleUri = "https://tiles.invalid/styles/fog-shove-pinch",
+            ),
+            requireOnlineStyle = false,
+            savedStateKey = "trailveil.map.fog-shove-pinch-test",
+            onFogCoverageStateComposedForTesting = composedCoverage::set,
+            gesture = { map, onHold ->
+                val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+                val listener = MapView.OnDidFinishRenderingFrameListener { fullyRendered, _, _ ->
+                    try {
+                        rendererSamples += CompositeRendererSample(
+                            phase = phase.get(),
+                            fullyRendered = fullyRendered,
+                            corners = map.currentVisibleRegionCorners(),
+                            tilt = map.cameraPosition.tilt,
+                            composedCoverage = checkNotNull(composedCoverage.get()) {
+                                "No composed fog-coverage state at renderer callback"
+                            },
+                        )
+                    } catch (failure: Throwable) {
+                        rendererFailure.compareAndSet(null, failure)
+                    }
+                }
+                InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    view.addOnDidFinishRenderingFrameListener(listener)
+                }
+                try {
+                    shoveInSteps(
+                        map = map,
+                        onHold = onHold,
+                        beforeLift = {
+                            val tilt = map.cameraPosition.tilt
+                            assertTrue(
+                                "The accepted shove lost its tilt before lift: $tilt",
+                                tilt >= MINIMUM_ACCEPTED_SHOVE_TILT_DEGREES,
+                            )
+                            shoveEndTilt.set(tilt)
+                            phase.set(CompositeGesturePhase.REGRAB)
+                        },
+                    )
+                    pinchInSteps(
+                        map = map,
+                        onHold = {
+                            assertTrue(
+                                "The shove tilt disappeared during the accepted pinch: " +
+                                    map.cameraPosition.tilt,
+                                map.cameraPosition.tilt >= MINIMUM_ACCEPTED_SHOVE_TILT_DEGREES,
+                            )
+                            onHold()
+                        },
+                        zoomIn = false,
+                        spanEdge = PinchSpanEdge.TALLEST,
+                        auditEveryMove = true,
+                        attemptLimit = 1,
+                        onEngaged = {
+                            val tilt = map.cameraPosition.tilt
+                            assertTrue(
+                                "The pinch engaged only after the shove tilt disappeared: $tilt",
+                                tilt >= MINIMUM_ACCEPTED_SHOVE_TILT_DEGREES,
+                            )
+                            pinchEngagementTilt.set(tilt)
+                            phase.set(CompositeGesturePhase.PINCH)
+                        },
+                    )
+                } finally {
+                    InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                        view.removeOnDidFinishRenderingFrameListener(listener)
+                    }
+                }
+            },
+            startPoint = UNEXPLORED_NEAR_REVEALED,
+            startZoom = EXPLORATION_GESTURE_ZOOM,
+            expectCover = true,
+            expectZoomOut = true,
+            minimumZoomChange = MINIMUM_COMPOSITE_ZOOM_CHANGE,
+            allowRebuildDuringGesture = true,
+        )
+
+        rendererFailure.get()?.let { throw AssertionError("Composite renderer audit failed", it) }
+        val samples = rendererSamples.toList()
+        val regrabSamples = samples.filter { it.phase == CompositeGesturePhase.REGRAB }
+        val pinchSamples = samples.filter { it.phase == CompositeGesturePhase.PINCH }
+        assertTrue("No renderer frame was observed during lift/re-grab", regrabSamples.isNotEmpty())
+        assertTrue("No renderer frame was observed during the accepted pinch", pinchSamples.isNotEmpty())
+        assertTrue("No accepted shove-end tilt was recorded", shoveEndTilt.get() != null)
+        assertTrue("No accepted pinch-engagement tilt was recorded", pinchEngagementTilt.get() != null)
+        assertTrue(
+            "A pinch renderer frame lost the shove tilt: $pinchSamples",
+            pinchSamples.all { it.tilt >= MINIMUM_ACCEPTED_SHOVE_TILT_DEGREES },
+        )
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            0,
+            Bundle().apply {
+                putString(
+                    "stream",
+                        "TrailVeil composite renderer audit: regrab=${regrabSamples.size} " +
+                        "pinch=${pinchSamples.size} shoveTilt=${shoveEndTilt.get()} " +
+                        "pinchTilt=${pinchEngagementTilt.get()} " +
+                        "coverComposed=${samples.count { !it.composedCoverage.coverageInstalled }} " +
+                        "rendererBookkeepingMismatch=" +
+                            "${samples.count { it.bookkeepingDoesNotCoverCorners() }}\n",
+                )
+            },
+        )
+    }
 
     private fun aTapZoomStaysInsideItsInstalledFog(twoFinger: Boolean) {
         val database = inMemoryDatabase()
@@ -2246,6 +2615,8 @@ class MapSurfaceTest {
         // are waived and the truth is carried entirely by the per-frame rule the cover audit
         // enforces: every rendered held frame is either covered or pixel-truthful.
         allowRebuildDuringGesture: Boolean = false,
+        onFogCoverageStateComposedForTesting:
+            ((ComposedFogCoverageSnapshot) -> Unit)? = null,
     ) {
         val database = inMemoryDatabase()
         try {
@@ -2271,6 +2642,8 @@ class MapSurfaceTest {
                     ),
                     onFogRendered = { fogRendered.set(true) },
                     onFogCoverageInstalledForTesting = installedCoverage::set,
+                    onFogCoverageStateComposedForTesting =
+                        onFogCoverageStateComposedForTesting,
                 )
             }
 
@@ -2335,7 +2708,7 @@ class MapSurfaceTest {
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 map.addOnCameraMoveStartedListener(reasonListener)
             }
-            var coveredFrames = 0
+            var coverSemanticsSamples = 0
             var worstFraction = -1.0
             var worstReport = "none"
             var worstOverFogged = 0.0
@@ -2367,15 +2740,16 @@ class MapSurfaceTest {
                         frozen.extent.covers(map.visibleRegionCorners()),
                     )
                 }
-                val covered = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                val coverComposed = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                     .fetchSemanticsNodes()
                     .isNotEmpty()
-                if (covered) coveredFrames += 1
+                if (coverComposed) coverSemanticsSamples += 1
                 val zoom = map.cameraPosition.zoom
-                // A covered frame shows the user nothing, and the snapshot is of the map surface
-                // underneath the cover, so auditing it would measure something nobody can see.
-                if (covered) {
-                    trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:covered ")
+                // A MapLibre snapshot contains only the map surface below the Compose cover. Once
+                // the cover state has composed, that snapshot no longer represents the combined
+                // UI, but it also does not prove same-frame compositor pixels (P4-034 owns that).
+                if (coverComposed) {
+                    trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:coverComposed ")
                     return@gesture
                 }
                 val audit = map.auditFogCoverage()
@@ -2399,7 +2773,7 @@ class MapSurfaceTest {
             }
             assertTrue("The gesture never reported a held frame", holds > 0)
             assertTrue(
-                "Every held frame was covered, so no coverage was measured at all",
+                "Every held sample reported composed cover state, so no map pixels were audited",
                 expectCover || worstFraction >= 0.0,
             )
 
@@ -2417,7 +2791,7 @@ class MapSurfaceTest {
                             "generationBeforeAttempts=$generationAtTouchDown " +
                             "measuredGeneration=${generations.firstOrNull()} held=$generations " +
                             "moveReasons=$moveReasons " +
-                            "coveredFrames=$coveredFrames trace=[$trace]\n",
+                            "coverSemanticsSamples=$coverSemanticsSamples trace=[$trace]\n",
                     )
                 },
             )
@@ -2514,14 +2888,14 @@ class MapSurfaceTest {
                 // The other half of the contract in the regime where the surround is clamped: the
                 // map is hidden rather than allowed to leak, and the guard really does fire.
                 assertTrue(
-                    "The gesture left the surround behind and nothing covered the map",
-                    coveredFrames > 0,
+                    "The gesture left the surround behind without a composed safety-cover state",
+                    coverSemanticsSamples > 0,
                 )
             } else {
                 assertEquals(
                     "The safety cover was raised during a gesture",
                     0,
-                    coveredFrames,
+                    coverSemanticsSamples,
                 )
             }
         } finally {
@@ -2569,13 +2943,16 @@ class MapSurfaceTest {
         zoomIn: Boolean,
         spanEdge: PinchSpanEdge = PinchSpanEdge.SHORTEST,
         auditEveryMove: Boolean = false,
+        attemptLimit: Int = PINCH_ATTEMPTS,
+        onEngaged: (() -> Unit)? = null,
     ) {
-        repeat(PINCH_ATTEMPTS) { attempt ->
-            if (pinchOnce(map, onHold, zoomIn, spanEdge, auditEveryMove)) return
+        require(attemptLimit > 0) { "attemptLimit must be positive" }
+        repeat(attemptLimit) {
+            if (pinchOnce(map, onHold, zoomIn, spanEdge, auditEveryMove, onEngaged)) return
         }
         // Every assertion downstream would still be sound, but reporting nothing measured is more
         // useful than reporting a clean gesture that never happened.
-        throw AssertionError("The pinch never engaged MapLibre's scale detector in $PINCH_ATTEMPTS attempts")
+        throw AssertionError("The pinch never engaged MapLibre's scale detector in $attemptLimit attempts")
     }
 
     /** One pinch. Returns whether it actually zoomed, having run [onHold] at each held step. */
@@ -2585,11 +2962,12 @@ class MapSurfaceTest {
         zoomIn: Boolean,
         spanEdge: PinchSpanEdge = PinchSpanEdge.SHORTEST,
         auditEveryMove: Boolean = false,
+        onEngaged: (() -> Unit)? = null,
     ): Boolean {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         // A stuck injected-pointer state from any earlier crashed stream would reject this
         // stream's opening DOWN; clear it rather than inherit it.
-        bestEffortClearStuckInjectedPointers(view)
+        bestEffortClearStuckInjectedPointers()
         val centerX = view.width / 2f
         val centerY = view.height / 2f
         val downTime = SystemClock.uptimeMillis()
@@ -2652,13 +3030,16 @@ class MapSurfaceTest {
             )
         }
 
-        send(MotionEvent.ACTION_DOWN, 1, startSpan, downTime)
-        send(
-            MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
-            2,
-            startSpan,
-            SystemClock.uptimeMillis(),
-        )
+        var currentSpan = startSpan
+        var streamEnded = false
+        try {
+            send(MotionEvent.ACTION_DOWN, 1, startSpan, downTime)
+            send(
+                MotionEvent.ACTION_POINTER_DOWN or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
+                2,
+                startSpan,
+                SystemClock.uptimeMillis(),
+            )
         fun lift(span: Float) {
             send(
                 MotionEvent.ACTION_POINTER_UP or (1 shl MotionEvent.ACTION_POINTER_INDEX_SHIFT),
@@ -2695,20 +3076,20 @@ class MapSurfaceTest {
         }
         if (engagement < MINIMUM_PINCH_ENGAGEMENT) {
             lift(engageSpan)
+            streamEnded = true
             // Lifting ends in a camera idle, which rebuilds the fog. Let that finish, so the next
             // attempt starts from a settled overlay rather than racing one.
             Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
             return false
         }
+        onEngaged?.invoke()
 
         // The tall stream spends enough inward travel to engage reliably that only about 3.7
         // levels remain. Once the scale detector owns the uninterrupted stream, reopen to the
         // original span and use the whole inward path for the per-move audit. These setup moves
         // stay near zoom 16, inside the already-proven surround; every move of the acceptance path
         // from the reopened span to [endSpan] is still audited below.
-        var currentSpan = engageSpan
-        var streamEnded = false
-        try {
+        currentSpan = engageSpan
             val measuredStartSpan = if (spanEdge == PinchSpanEdge.TALLEST) {
                 repeat(PINCH_REOPEN_MOVES) { move ->
                     currentSpan = engageSpan +
@@ -2740,17 +3121,9 @@ class MapSurfaceTest {
             return true
         } finally {
             if (!streamEnded) {
-                // An assertion in a per-move audit must not leave two pointers down and poison
-                // every test that follows it. Preserve the original failure if the window itself
-                // has already gone away and the best-effort cancellation is rejected.
-                runCatching {
-                    send(
-                        MotionEvent.ACTION_CANCEL,
-                        2,
-                        currentSpan,
-                        SystemClock.uptimeMillis(),
-                    )
-                }
+                // A failure can occur before POINTER_DOWN or after POINTER_UP. Probe both legal
+                // stuck states instead of assuming that two pointers are still down.
+                bestEffortClearStuckInjectedPointers()
             }
         }
     }
@@ -2802,65 +3175,31 @@ class MapSurfaceTest {
     }
 
     /**
-     * Clears injected pointers a crashed or interrupted stream left down. The injection device
-     * tracks its own pointer state, and a DOWN while it still holds {0, 1} is rejected as
-     * inconsistent — the wedge WORKFLOW.md documents, which previously needed an AVD reboot.
-     * A CANCEL against pointers that are not down is itself rejected, so neither injection is
-     * asserted: whichever matches the stuck state clears it and the other is discarded.
-     */
-    private fun bestEffortClearStuckInjectedPointers(view: MapView) {
-        val centerX = view.width / 2f
-        val centerY = view.height / 2f
-        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
-        intArrayOf(2, 1).forEach { pointerCount ->
-            val properties = Array(pointerCount) { index ->
-                MotionEvent.PointerProperties().apply {
-                    id = index
-                    toolType = MotionEvent.TOOL_TYPE_FINGER
-                }
-            }
-            val coordinates = Array(pointerCount) { index ->
-                MotionEvent.PointerCoords().apply {
-                    x = centerX + index * 10f
-                    y = centerY
-                    pressure = 1f
-                    size = 1f
-                }
-            }
-            val now = SystemClock.uptimeMillis()
-            val event = MotionEvent.obtain(
-                now,
-                now,
-                MotionEvent.ACTION_CANCEL,
-                pointerCount,
-                properties,
-                coordinates,
-                0,
-                0,
-                1f,
-                1f,
-                0,
-                0,
-                InputDevice.SOURCE_TOUCHSCREEN,
-                0,
-            )
-            runCatching { automation.injectInputEvent(event, true) }
-            event.recycle()
-        }
-    }
-
-    /**
      * A real two-finger shove: a horizontally separated pair travelling vertically together, which
      * is what the shove detector demands and what the vertically stacked pinch stream could never
      * be. Unlike the programmed tilt the oblique gates use, nothing here rebuilds the fog for the
      * tilted camera first — the overlay under audit is exactly the one installed upright.
      */
-    private fun shoveInSteps(map: MapLibreMap, onHold: () -> Unit) {
+    private fun shoveInSteps(
+        map: MapLibreMap,
+        onHold: () -> Unit,
+        beforeLift: (() -> Unit)? = null,
+    ) {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         repeat(PINCH_ATTEMPTS) { attempt ->
             // From zero tilt only one travel direction can move the pitch, and which one is the
             // detector's convention rather than this test's business: alternate per attempt.
-            if (shoveOnce(map, view, onHold, upward = attempt % 2 == 0)) return
+            if (
+                shoveOnce(
+                    map = map,
+                    view = view,
+                    onHold = onHold,
+                    upward = attempt % 2 == 0,
+                    beforeLift = beforeLift,
+                )
+            ) {
+                return
+            }
         }
         throw AssertionError(
             "The shove never engaged MapLibre's shove detector in $PINCH_ATTEMPTS attempts",
@@ -2872,6 +3211,7 @@ class MapSurfaceTest {
         view: MapView,
         onHold: () -> Unit,
         upward: Boolean,
+        beforeLift: (() -> Unit)?,
     ): Boolean {
         val centerX = view.width / 2f
         val gap = view.width * SHOVE_POINTER_GAP_FRACTION
@@ -2882,7 +3222,7 @@ class MapSurfaceTest {
         val tiltAtTouchDown = map.cameraPosition.tilt
         fun pairAt(y: Float) = arrayOf(centerX - gap / 2f to y, centerX + gap / 2f to y)
 
-        bestEffortClearStuckInjectedPointers(view)
+        bestEffortClearStuckInjectedPointers()
         val downTime = SystemClock.uptimeMillis()
         var currentY = startY
         var streamEnded = false
@@ -2919,6 +3259,7 @@ class MapSurfaceTest {
                 map.awaitFullyRenderedFrame(view)
                 onHold()
             }
+            beforeLift?.invoke()
             liftTwoPointer(downTime, pairAt(endY))
             streamEnded = true
             return true
@@ -2926,7 +3267,7 @@ class MapSurfaceTest {
             // A failure can strand either {0, 1} or just {0} (a DOWN whose POINTER_DOWN or whose
             // partner UP was rejected), and a CANCEL only clears a state whose pointer count it
             // matches - so try both, unasserted.
-            if (!streamEnded) bestEffortClearStuckInjectedPointers(view)
+            if (!streamEnded) bestEffortClearStuckInjectedPointers()
         }
     }
 
@@ -2957,7 +3298,7 @@ class MapSurfaceTest {
             return arrayOf(centerX - dx to centerY - dy, centerX + dx to centerY + dy)
         }
 
-        bestEffortClearStuckInjectedPointers(view)
+        bestEffortClearStuckInjectedPointers()
         val downTime = SystemClock.uptimeMillis()
         var currentAngle = 0.0
         var streamEnded = false
@@ -2998,7 +3339,7 @@ class MapSurfaceTest {
             streamEnded = true
             return true
         } finally {
-            if (!streamEnded) bestEffortClearStuckInjectedPointers(view)
+            if (!streamEnded) bestEffortClearStuckInjectedPointers()
         }
     }
 
@@ -3016,7 +3357,7 @@ class MapSurfaceTest {
     private fun injectDoubleTap(view: MapView) {
         val centerX = view.width / 2f
         val centerY = view.height / 2f
-        bestEffortClearStuckInjectedPointers(view)
+        bestEffortClearStuckInjectedPointers()
         repeat(2) { tap ->
             val downTime = SystemClock.uptimeMillis()
             var streamEnded = false
@@ -3029,7 +3370,7 @@ class MapSurfaceTest {
                 // A stream whose own UP was rejected leaves injected pointers down and wedges
                 // every later injection in the process; a best-effort CANCEL is the only honest
                 // cleanup left.
-                if (!streamEnded) bestEffortClearStuckInjectedPointers(view)
+                if (!streamEnded) bestEffortClearStuckInjectedPointers()
             }
             if (tap == 0) SystemClock.sleep(DOUBLE_TAP_GAP_MILLIS)
         }
@@ -3041,7 +3382,7 @@ class MapSurfaceTest {
         val centerY = view.height / 2f
         val gap = view.width * SHOVE_POINTER_GAP_FRACTION
         val points = arrayOf(centerX - gap / 2f to centerY, centerX + gap / 2f to centerY)
-        bestEffortClearStuckInjectedPointers(view)
+        bestEffortClearStuckInjectedPointers()
         val downTime = SystemClock.uptimeMillis()
         var streamEnded = false
         try {
@@ -3056,7 +3397,7 @@ class MapSurfaceTest {
             liftTwoPointer(downTime, points)
             streamEnded = true
         } finally {
-            if (!streamEnded) bestEffortClearStuckInjectedPointers(view)
+            if (!streamEnded) bestEffortClearStuckInjectedPointers()
         }
     }
 
@@ -3099,7 +3440,7 @@ class MapSurfaceTest {
         auditEveryMove: Boolean = false,
     ) {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
-        bestEffortClearStuckInjectedPointers(view)
+        bestEffortClearStuckInjectedPointers()
         val fromX = view.width * 0.72f
         val toX = view.width * 0.22f
         val fromY = view.height * 0.24f
@@ -3113,25 +3454,31 @@ class MapSurfaceTest {
             )
         }
 
-        send(MotionEvent.ACTION_DOWN, fromX, fromY)
-        val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
-        repeat(moves) { move ->
-            val progress = (move + 1).toFloat() / moves
-            send(
-                MotionEvent.ACTION_MOVE,
-                fromX + (toX - fromX) * progress,
-                fromY + (toY - fromY) * progress,
-            )
-            SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
-            if (auditEveryMove) {
-                map.awaitFullyRenderedFrame(view)
-                onHold()
-            } else if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
-                Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
-                onHold()
+        var streamEnded = false
+        try {
+            send(MotionEvent.ACTION_DOWN, fromX, fromY)
+            val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
+            repeat(moves) { move ->
+                val progress = (move + 1).toFloat() / moves
+                send(
+                    MotionEvent.ACTION_MOVE,
+                    fromX + (toX - fromX) * progress,
+                    fromY + (toY - fromY) * progress,
+                )
+                SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
+                if (auditEveryMove) {
+                    map.awaitFullyRenderedFrame(view)
+                    onHold()
+                } else if ((move + 1) % GESTURE_MICRO_STEPS == 0) {
+                    Thread.sleep(GESTURE_HOLD_SETTLE_MILLIS)
+                    onHold()
+                }
             }
+            send(MotionEvent.ACTION_UP, toX, toY)
+            streamEnded = true
+        } finally {
+            if (!streamEnded) bestEffortClearStuckInjectedPointers()
         }
-        send(MotionEvent.ACTION_UP, toX, toY)
     }
 
     /**
@@ -3206,7 +3553,7 @@ class MapSurfaceTest {
         maximumUnmeasuredZoom: Double?,
     ): Boolean {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
-        bestEffortClearStuckInjectedPointers(view)
+        bestEffortClearStuckInjectedPointers()
         val centerX = view.width / 2f
         val centerY = view.height / 2f
 
@@ -3223,22 +3570,25 @@ class MapSurfaceTest {
             )
         }
 
-        val zoomAtTouchDown = map.cameraPosition.zoom
-        val tapDown = SystemClock.uptimeMillis()
-        send(tapDown, MotionEvent.ACTION_DOWN, centerY)
-        SystemClock.sleep(TAP_DURATION_MILLIS)
-        send(tapDown, MotionEvent.ACTION_UP, centerY)
-        SystemClock.sleep(DOUBLE_TAP_GAP_MILLIS)
-        val holdDown = SystemClock.uptimeMillis()
-        send(holdDown, MotionEvent.ACTION_DOWN, centerY)
-        SystemClock.sleep(TAP_DURATION_MILLIS)
-
-        val travel = view.height * QUICK_ZOOM_TRAVEL_FRACTION
-        val direction = if (zoomIn) 1f else -1f
-        val engageY = centerY + direction * travel * QUICK_ZOOM_ENGAGE_TRAVEL
-        var currentY = centerY
         var streamEnded = false
         try {
+            val zoomAtTouchDown = map.cameraPosition.zoom
+            val tapDown = SystemClock.uptimeMillis()
+            send(tapDown, MotionEvent.ACTION_DOWN, centerY)
+            SystemClock.sleep(TAP_DURATION_MILLIS)
+            send(tapDown, MotionEvent.ACTION_UP, centerY)
+            streamEnded = true
+            SystemClock.sleep(DOUBLE_TAP_GAP_MILLIS)
+
+            val holdDown = SystemClock.uptimeMillis()
+            streamEnded = false
+            send(holdDown, MotionEvent.ACTION_DOWN, centerY)
+            SystemClock.sleep(TAP_DURATION_MILLIS)
+
+            val travel = view.height * QUICK_ZOOM_TRAVEL_FRACTION
+            val direction = if (zoomIn) 1f else -1f
+            val engageY = centerY + direction * travel * QUICK_ZOOM_ENGAGE_TRAVEL
+            var currentY = centerY
             repeat(QUICK_ZOOM_ENGAGE_MOVES) { move ->
                 currentY = centerY +
                     (engageY - centerY) * (move + 1) / QUICK_ZOOM_ENGAGE_MOVES
@@ -3298,7 +3648,7 @@ class MapSurfaceTest {
             return true
         } finally {
             if (!streamEnded) {
-                runCatching { send(holdDown, MotionEvent.ACTION_CANCEL, currentY) }
+                bestEffortClearStuckInjectedPointers()
             }
         }
     }
@@ -4124,49 +4474,47 @@ class MapSurfaceTest {
         beforeLift: (() -> Unit)? = null,
         afterLift: (() -> Unit)? = null,
     ) {
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
+        bestEffortClearStuckInjectedPointers()
         val downTime = SystemClock.uptimeMillis()
-        instrumentation.sendPointerSync(
-            MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, x, fromY, 0),
-        )
-        repeat(steps) { step ->
-            SystemClock.sleep(stepMillis)
-            val y = fromY + (toY - fromY) * (step + 1) / steps
-            instrumentation.sendPointerSync(
-                MotionEvent.obtain(
-                    downTime,
-                    SystemClock.uptimeMillis(),
-                    MotionEvent.ACTION_MOVE,
-                    x,
-                    y,
-                    0,
-                ),
-            )
+        fun send(action: Int, y: Float): Boolean {
+            val event = MotionEvent.obtain(
+                downTime,
+                SystemClock.uptimeMillis(),
+                action,
+                x,
+                y,
+                0,
+            ).apply { source = InputDevice.SOURCE_TOUCHSCREEN }
+            return try {
+                automation.injectInputEvent(event, true)
+            } finally {
+                event.recycle()
+            }
         }
-        if (lift) {
-            beforeLift?.invoke()
-            instrumentation.sendPointerSync(
-                MotionEvent.obtain(
-                    downTime,
-                    SystemClock.uptimeMillis(),
-                    MotionEvent.ACTION_UP,
-                    x,
-                    toY,
-                    0,
-                ),
-            )
-            afterLift?.invoke()
-        } else {
-            instrumentation.sendPointerSync(
-                MotionEvent.obtain(
-                    downTime,
-                    SystemClock.uptimeMillis(),
-                    MotionEvent.ACTION_CANCEL,
-                    x,
-                    toY,
-                    0,
-                ),
-            )
+        var streamEnded = false
+        try {
+            check(send(MotionEvent.ACTION_DOWN, fromY)) { "Vertical drag DOWN was rejected" }
+            repeat(steps) { step ->
+                SystemClock.sleep(stepMillis)
+                val y = fromY + (toY - fromY) * (step + 1) / steps
+                check(send(MotionEvent.ACTION_MOVE, y)) {
+                    "Vertical drag MOVE ${step + 1}/$steps was rejected"
+                }
+            }
+            if (lift) {
+                beforeLift?.invoke()
+                check(send(MotionEvent.ACTION_UP, toY)) { "Vertical drag UP was rejected" }
+                streamEnded = true
+                afterLift?.invoke()
+            } else {
+                check(send(MotionEvent.ACTION_CANCEL, toY)) {
+                    "Vertical drag CANCEL was rejected"
+                }
+                streamEnded = true
+            }
+        } finally {
+            if (!streamEnded) bestEffortClearStuckInjectedPointers()
         }
     }
 
@@ -4864,6 +5212,20 @@ class MapSurfaceTest {
         val bitmap: Bitmap,
     )
 
+    private enum class CompositeGesturePhase { SHOVE, REGRAB, PINCH }
+
+    private data class CompositeRendererSample(
+        val phase: CompositeGesturePhase,
+        val fullyRendered: Boolean,
+        val corners: List<GeoPoint>,
+        val tilt: Double,
+        val composedCoverage: ComposedFogCoverageSnapshot,
+    ) {
+        fun bookkeepingDoesNotCoverCorners(): Boolean =
+            composedCoverage.coverageInstalled &&
+                composedCoverage.installedExtent?.covers(corners) != true
+    }
+
     private data class FlingFrameRequest(
         val expectedCoverage: InstalledFogCoverageSnapshot,
         val currentCoverage: InstalledFogCoverageSnapshot,
@@ -5260,6 +5622,10 @@ class MapSurfaceTest {
         const val MINIMUM_ROTATE_ENGAGEMENT_DEGREES = 2.0
         const val MINIMUM_ACCEPTED_ROTATE_DEGREES = 20.0
         const val EXPLORATION_GESTURE_ZOOM = 16.0
+        const val INSTALL_GATE_WIDE_ZOOM = 12.0
+        const val INSTALL_GATE_NARROW_ZOOM = 17.0
+        const val CANCEL_GATE_ABANDONED_ZOOM = 13.0
+        const val INSTALL_GATE_CHECKPOINT_TIMEOUT_MILLIS = 20_000L
 
         /**
          * The composite's zoom-out floor. The tall pinch alone proves four levels upright; under

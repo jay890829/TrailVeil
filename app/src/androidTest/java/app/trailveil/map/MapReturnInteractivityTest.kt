@@ -1,6 +1,7 @@
 package app.trailveil.map
 
 import android.os.SystemClock
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -54,23 +55,20 @@ class MapReturnInteractivityTest {
         val controlStart = SystemClock.uptimeMillis()
         while (controlAttempts < CONTROL_ATTEMPT_LIMIT && !controlMoved) {
             controlAttempts += 1
-            drag()
-            controlMoved = runCatching {
-                composeRule.waitUntil(CONTROL_DRAG_RESULT_TIMEOUT_MILLIS) {
-                    movedFrom(map, controlBefore)
-                }
-            }.isSuccess
+            val injection = drag()
+            controlMoved = injection.accepted && runCatching {
+                    composeRule.waitUntil(CONTROL_DRAG_RESULT_TIMEOUT_MILLIS) {
+                        movedFrom(map, controlBefore)
+                    }
+                }.isSuccess
             if (!controlMoved) controlBefore = awaitStableCameraTarget(map)
         }
         val controlMillis = SystemClock.uptimeMillis() - controlStart
         assertTrue("The control drag did not move the map", controlMoved)
 
-        // An injected drag that never engages under load is the documented injection-flake
-        // class, not the product regression this gate exists for — it cost one local and one
-        // hosted full-suite run before this retry. A fresh cycle through history still measures a
-        // genuine first drag after a return, so retrying the whole cycle changes nothing about
-        // what a pass proves. The transition budgets stay asserted inside every attempt: a budget
-        // violation is the product defect and is never retried.
+        // Retry only when Android explicitly rejects an injected event. If every event enters the
+        // input pipeline but the map does not move, that overlaps the product failure this gate is
+        // meant to catch and must fail on the first returned instance.
         var returnCycles = 0
         var firstDragMoved = false
         var secondDragMoved = false
@@ -80,7 +78,14 @@ class MapReturnInteractivityTest {
         var lastPopMillis = -1L
         var coverUp = false
         var endZoom = 0.0
-        while (returnCycles < RETURN_CYCLE_ATTEMPTS && !(firstDragMoved && secondDragMoved)) {
+        var acceptedStreamFailedToMove = false
+        var firstInjectionFailure: String? = null
+        var secondInjectionFailure: String? = null
+        while (
+            returnCycles < RETURN_CYCLE_ATTEMPTS &&
+            !(firstDragMoved && secondDragMoved) &&
+            !acceptedStreamFailedToMove
+        ) {
             returnCycles += 1
             composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
             composeRule.onNodeWithTag(RecordingEntryTestTags.History).performClick()
@@ -128,22 +133,40 @@ class MapReturnInteractivityTest {
                 .fetchSemanticsNodes()
                 .isNotEmpty()
             val start = SystemClock.uptimeMillis()
-            drag()
+            val firstInjection = drag()
+            firstInjectionFailure = firstInjection.rejectedAction
+            if (!firstInjection.accepted) {
+                firstDragMillis = SystemClock.uptimeMillis() - start
+                endZoom = readyMap.cameraPosition.zoom
+                continue
+            }
             firstDragMoved = runCatching {
                 composeRule.waitUntil(DRAG_RESULT_TIMEOUT_MILLIS) {
                     movedFrom(readyMap, before)
                 }
             }.isSuccess
             firstDragMillis = SystemClock.uptimeMillis() - start
+            if (!firstDragMoved) {
+                acceptedStreamFailedToMove = true
+                endZoom = readyMap.cameraPosition.zoom
+                break
+            }
             val beforeSecondDrag = awaitStableCameraTarget(readyMap)
             val secondStart = SystemClock.uptimeMillis()
-            drag()
+            val secondInjection = drag()
+            secondInjectionFailure = secondInjection.rejectedAction
+            if (!secondInjection.accepted) {
+                secondDragMillis = SystemClock.uptimeMillis() - secondStart
+                endZoom = readyMap.cameraPosition.zoom
+                continue
+            }
             secondDragMoved = runCatching {
                 composeRule.waitUntil(DRAG_RESULT_TIMEOUT_MILLIS) {
                     movedFrom(readyMap, beforeSecondDrag)
                 }
             }.isSuccess
             secondDragMillis = SystemClock.uptimeMillis() - secondStart
+            if (!secondDragMoved) acceptedStreamFailedToMove = true
             endZoom = readyMap.cameraPosition.zoom
         }
         InstrumentationRegistry.getInstrumentation().sendStatus(
@@ -157,7 +180,9 @@ class MapReturnInteractivityTest {
                         "controlAttempts=$controlAttempts returnCycles=$returnCycles " +
                         "popMillis=$lastPopMillis " +
                         "mapReadyAfterHistoryMillis=$lastReadyAfterHistoryMillis " +
-                        "coverStillUp=$coverUp zoom=$endZoom\n",
+                        "coverStillUp=$coverUp firstInjectionFailure=$firstInjectionFailure " +
+                        "secondInjectionFailure=$secondInjectionFailure " +
+                        "acceptedStreamFailedToMove=$acceptedStreamFailedToMove zoom=$endZoom\n",
                 )
             },
         )
@@ -228,7 +253,12 @@ class MapReturnInteractivityTest {
         return requireNotNull(latest) { "Map camera never produced a stable target" }
     }
 
-    private fun drag() {
+    private data class DragInjectionResult(
+        val accepted: Boolean,
+        val rejectedAction: String? = null,
+    )
+
+    private fun drag(): DragInjectionResult {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() }) {
             "No attached MapView for drag"
         }
@@ -240,35 +270,45 @@ class MapReturnInteractivityTest {
         val fromX = (location[0] + view.width * 2 / 3).toFloat()
         val toX = (location[0] + view.width / 3).toFloat()
         val y = (location[1] + view.height / 2).toFloat()
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        bestEffortClearStuckInjectedPointers()
+        val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
         val downTime = SystemClock.uptimeMillis()
-        instrumentation.sendPointerSync(
-            MotionEvent.obtain(downTime, downTime, MotionEvent.ACTION_DOWN, fromX, y, 0),
-        )
-        repeat(DRAG_STEPS) { step ->
-            SystemClock.sleep(DRAG_STEP_MILLIS)
-            val x = fromX + (toX - fromX) * (step + 1) / DRAG_STEPS
-            instrumentation.sendPointerSync(
-                MotionEvent.obtain(
-                    downTime,
-                    SystemClock.uptimeMillis(),
-                    MotionEvent.ACTION_MOVE,
-                    x,
-                    y,
-                    0,
-                ),
-            )
-        }
-        instrumentation.sendPointerSync(
-            MotionEvent.obtain(
+        fun inject(action: Int, x: Float): Boolean {
+            val event = MotionEvent.obtain(
                 downTime,
                 SystemClock.uptimeMillis(),
-                MotionEvent.ACTION_UP,
-                toX,
+                action,
+                x,
                 y,
                 0,
-            ),
-        )
+            ).apply { source = InputDevice.SOURCE_TOUCHSCREEN }
+            return try {
+                automation.injectInputEvent(event, true)
+            } finally {
+                event.recycle()
+            }
+        }
+
+        var streamEnded = false
+        try {
+            if (!inject(MotionEvent.ACTION_DOWN, fromX)) {
+                return DragInjectionResult(false, "DOWN")
+            }
+            repeat(DRAG_STEPS) { step ->
+                SystemClock.sleep(DRAG_STEP_MILLIS)
+                val x = fromX + (toX - fromX) * (step + 1) / DRAG_STEPS
+                if (!inject(MotionEvent.ACTION_MOVE, x)) {
+                    return DragInjectionResult(false, "MOVE_${step + 1}")
+                }
+            }
+            if (!inject(MotionEvent.ACTION_UP, toX)) {
+                return DragInjectionResult(false, "UP")
+            }
+            streamEnded = true
+            return DragInjectionResult(true)
+        } finally {
+            if (!streamEnded) bestEffortClearStuckInjectedPointers()
+        }
     }
 
     private fun awaitMap(): MapLibreMap? {
@@ -306,9 +346,8 @@ class MapReturnInteractivityTest {
         const val NAVIGATION_TIMEOUT_MILLIS = 20_000L
 
         /**
-         * Whole return-cycle retries for an injected drag that never engaged. Each cycle is a
-         * fresh history round trip, so every attempt still measures a genuine first drag after a
-         * return; the transition budgets are asserted inside every attempt and never retried.
+         * Whole return-cycle retries are limited to an event that UiAutomation explicitly rejects.
+         * An accepted stream that does not move the map is a product failure and is never retried.
          */
         const val RETURN_CYCLE_ATTEMPTS = 3
 
