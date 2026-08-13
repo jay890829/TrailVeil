@@ -48,7 +48,8 @@ jobs:
   instrumentation:
     name: Compose instrumentation test
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # Long enough for one full suite, a hang detection, an emulator reboot, and one retry.
+    timeout-minutes: 90
 
     steps:
       - name: Check out repository
@@ -92,4 +93,23 @@ jobs:
             adb shell cmd overlay enable-exclusive --user 0 --category com.android.internal.systemui.navbar.threebutton
             adb shell cmd overlay list | grep -F '[x] com.android.internal.systemui.navbar.threebutton'
             adb shell cmd overlay list | grep -F '[ ] com.android.internal.systemui.navbar.gestural'
-            ./gradlew connectedDebugAndroidTest
+            # The starved SwiftShader renderer intermittently wedges the app's main thread while a
+            # real-Activity test creates the SurfaceView map ("bad color buffer"), which hangs the
+            # whole suite with zero test failures. `timeout` exits 124 only for that hang, so a
+            # genuine test failure still propagates immediately and is never retried; the one hang
+            # retry gets a rebooted emulator because the broken GL state survives the process.
+            set +e
+            timeout 38m ./gradlew connectedDebugAndroidTest
+            code=$?
+            set -e
+            if [ "$code" = "124" ]; then
+              echo "Instrumentation hung; rebooting the emulator for one retry"
+              adb reboot
+              adb wait-for-device
+              sleep 90
+              adb shell cmd overlay enable-exclusive --user 0 --category com.android.internal.systemui.navbar.threebutton
+              adb shell cmd overlay list | grep -F '[x] com.android.internal.systemui.navbar.threebutton'
+              ./gradlew connectedDebugAndroidTest
+            else
+              exit "$code"
+            fi
