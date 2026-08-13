@@ -1984,10 +1984,10 @@ class MapSurfaceTest {
      *
      * What this pins is that *an* arrangement is drawn, never *which* — a verifier defeated it by
      * making the wrapped band never chosen, which is internally consistent and is exactly the
-     * behaviour P4-024 was opened for. Which arrangement is right is pinned by
-     * [noSingleFogQuadIsDrawnMoreThanOnce], which reports 8.2455% against that same change, and by
-     * `exactlyOneArrangementOfTheGroundBesideTheMosaicIsEverDrawn` in the JVM suite. Read the three
-     * together; none of them is sufficient alone.
+     * behaviour P4-024 was opened for. Correct selection is instead pinned by the settled pixel
+     * sweeps, [noSingleFogQuadIsDrawnMoreThanOnce], [theWorldCopyEdgeIsCorrectOnBothSides], and the
+     * complementary renderer-owned zoom-opacity expressions. Read those with this lifecycle gate;
+     * none is sufficient alone.
      */
     @Test
     fun theSideBandsComeBackWhenTheWrappedBandIsRemoved() {
@@ -4857,11 +4857,10 @@ class MapSurfaceTest {
     }
 
     /**
-     * The thickest shape in [mask], as the largest `min(horizontal run, vertical run)` over all set
-     * pixels. A three-pixel line scores 3 no matter how long it is; an NxN block scores N. This is
-     * what separates the deliberate seam guard from a genuinely blacked-out region — the fraction
-     * and the bounding box cannot, because four hairlines around the frame produce a box the size of
-     * the frame.
+     * The largest fully set axis-aligned square in [mask]. A three-pixel-wide line scores at most 3
+     * no matter how long it is, while an NxN filled block scores N. This is what separates the
+     * deliberate seam guard from a genuinely blacked-out region — the fraction and bounding box
+     * cannot, because four hairlines around the frame produce a box the size of the frame.
      */
     private fun thickestRun(mask: BooleanArray, width: Int): Int {
         if (mask.none { it }) return 0
