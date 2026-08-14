@@ -48,9 +48,10 @@ jobs:
   instrumentation:
     name: Compose instrumentation test
     runs-on: ubuntu-latest
-    # Two full suite attempts (~46 minutes each at 132 cases), a hang detection window, and an
-    # emulator reboot between them.
-    timeout-minutes: 120
+    # Two emulator-fresh shards (map package, then the rest), each with a hang-triggered retry
+    # and an emulator reboot between attempts and between shards. Worst case is four shard
+    # attempts plus reboots; the green path is well under an hour.
+    timeout-minutes: 170
 
     steps:
       - name: Check out repository
