@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <item name="map_fog_canonical_generation" type="id" />
+    <item name="map_fog_active_slot" type="id" />
     <item name="map_basemap_load_state" type="id" />
     <item name="recording_presentation_latest_point_id" type="id" />
     <item name="recording_presentation_latest_outcome" type="id" />

@@ -15,6 +15,7 @@ import app.trailveil.MainActivity
 import app.trailveil.R
 import app.trailveil.data.db.TrailVeilDatabase
 import app.trailveil.map.BasemapLoadState
+import app.trailveil.map.FogGenerationSlot
 import app.trailveil.map.FogOverlayIds
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -178,12 +179,15 @@ class UiScaleBenchmarkTest {
             scenario.onActivity {
                 val camera = map.cameraPosition
                 val style = map.style
+                val slot = (mapView.getTag(R.id.map_fog_active_slot) as? String)
+                    ?.let(FogGenerationSlot::valueOf)
                 state.set(
                     MapState(
                         mapVisible = mapView.isShown,
                         camera = camera,
-                        fogInstalled = style?.getSourceAs<ImageSource>(FogOverlayIds.Source) != null &&
-                            style.getLayerAs<RasterLayer>(FogOverlayIds.Layer) != null,
+                        fogInstalled = slot != null &&
+                            style?.getSourceAs<ImageSource>(FogOverlayIds.source(slot)) != null &&
+                            style.getLayerAs<RasterLayer>(FogOverlayIds.layer(slot)) != null,
                         fogGeneration = mapView.getTag(R.id.map_fog_canonical_generation) as? Long,
                         localFallback =
                             mapView.getTag(R.id.map_basemap_load_state) ==

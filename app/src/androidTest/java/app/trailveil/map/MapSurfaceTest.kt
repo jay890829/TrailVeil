@@ -2,9 +2,14 @@ package app.trailveil.map
 
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.os.Looper
 import android.os.SystemClock
 import android.view.InputDevice
 import android.view.MotionEvent
+import android.view.PixelCopy
+import android.view.SurfaceView
 import android.view.View
 import android.view.ViewGroup
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,6 +25,7 @@ import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onAllNodesWithText
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.core.graphics.createBitmap
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -29,6 +35,7 @@ import androidx.test.runner.lifecycle.Stage
 import app.trailveil.R
 import app.trailveil.data.db.RecordingSessionEntity
 import app.trailveil.data.db.RecordingStatus
+import app.trailveil.data.db.StartedRecording
 import app.trailveil.data.db.TrackPointEntity
 import app.trailveil.data.db.TrackSegmentEntity
 import app.trailveil.data.db.TrailVeilDatabase
@@ -56,11 +63,13 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -286,11 +295,11 @@ class MapSurfaceTest {
     }
 
     /**
-     * A synchronous exception after the first fog mutation must not expose that partial style.
-     * This deliberately snapshots MapLibre itself rather than the Compose tree: the opaque frame
-     * must come from the renderer-owned install guard, before any separately scheduled Compose
-     * safety cover could help. The same retry then has to publish the complete fog and hide the
-     * guard again, or a guard that only fails closed by staying black would satisfy half the test.
+     * A synchronous exception after the first replacement mutation must not publish that partial
+     * slot or remove the complete active slot beneath it. Replacements deliberately keep the
+     * full-screen install guard hidden: the old immutable generation is the renderer-owned safety
+     * mechanism, avoiding a black flash on every ordinary rebuild. The retry must then publish the
+     * other complete slot and retire the old one.
      */
     @Test
     fun partialFogInstallFailureKeepsTheRendererOpaqueUntilRetrySucceeds() {
@@ -305,6 +314,10 @@ class MapSurfaceTest {
             )
             val testedMapView = AtomicReference<MapView?>(null)
 
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -314,10 +327,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.partial-fog-install-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -327,7 +337,7 @@ class MapSurfaceTest {
                     onFogRendered = { fogRendered.set(true) },
                     // The surface can report an earlier placeholder/frame failure under a loaded
                     // instrumentation process. Only the exact fault below proves that this test
-                    // reached the partial canonical install whose renderer guard it audits.
+                    // reached the partial canonical replacement whose retained slot it audits.
                     onFogFailure = { failure ->
                         if (failure === injectedFailure) installFailed.set(true)
                     },
@@ -353,37 +363,30 @@ class MapSurfaceTest {
             }
             map.awaitFullyRenderedFrame(view)
 
+            val failedActiveSlot = publishedFogSlot()
+            val completeActiveGeneration = AtomicBoolean(false)
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                val style = requireNotNull(map.style) { "The style is not ready" }
+                completeActiveGeneration.set(
+                    requiredFogGenerationLayers(failedActiveSlot)
+                        .all { layerId -> style.getLayer(layerId) != null },
+                )
+            }
+            assertTrue(
+                "The partial replacement removed part of the published $failedActiveSlot slot",
+                completeActiveGeneration.get(),
+            )
             assertEquals(
-                "The renderer guard was not visible after a partial install",
-                Property.VISIBLE,
+                "An ordinary replacement raised the opaque install guard instead of retaining " +
+                    "the complete $failedActiveSlot slot",
+                Property.NONE,
                 map.fogLayerVisibility(FogOverlayIds.InstallGuardLayer),
             )
             val failedFrame = map.snapshotPixels()
-            val width = snapshotWidth()
-            var minX = Int.MAX_VALUE
-            var minY = Int.MAX_VALUE
-            var maxX = Int.MIN_VALUE
-            var maxY = Int.MIN_VALUE
-            var maximumLuminance = 0
-            var nonBlackPixels = 0
-            failedFrame.forEachIndexed { index, pixel ->
-                val nonBlack = (pixel ushr 24) != 0xff || (pixel and 0x00ffffff) != 0
-                if (nonBlack) {
-                    nonBlackPixels += 1
-                    val x = index % width
-                    val y = index / width
-                    if (x < minX) minX = x
-                    if (x > maxX) maxX = x
-                    if (y < minY) minY = y
-                    if (y > maxY) maxY = y
-                    maximumLuminance = max(maximumLuminance, luminance(pixel))
-                }
-            }
-            assertEquals(
-                "The partial MapLibre style escaped the renderer-owned opaque guard: " +
-                    "bounds=($minX,$minY)-($maxX,$maxY) maxLuminance=$maximumLuminance",
-                0,
-                nonBlackPixels,
+            assertTrue(
+                "The failed replacement was hidden by an unnecessary black frame instead of the " +
+                    "published $failedActiveSlot generation",
+                failedFrame.any { pixel -> (pixel and 0x00ffffff) != 0 },
             )
 
             allowInstallSuccess.set(true)
@@ -394,6 +397,10 @@ class MapSurfaceTest {
                     .isEmpty()
             }
             map.awaitFullyRenderedFrame(view)
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                val slot = publishedFogSlot()
+                slot != failedActiveSlot && map.hasOnlyPublishedFogGeneration(slot)
+            }
 
             assertEquals(
                 "The renderer guard stayed visible after the complete retry",
@@ -427,6 +434,7 @@ class MapSurfaceTest {
         try {
             val fogFailed = AtomicBoolean(false)
 
+            val stableFogRuntime = fogRuntime(database, RecoverableChangeFeed())
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -436,7 +444,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.feed-failure-test",
-                    fogRuntime = fogRuntime(database, RecoverableChangeFeed()),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     onFogFailure = { fogFailed.set(true) },
                 )
@@ -473,6 +481,7 @@ class MapSurfaceTest {
             val feed = RecoverableChangeFeed()
             val fogRendered = AtomicBoolean(false)
 
+            val stableFogRuntime = fogRuntime(database, feed)
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -482,7 +491,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.feed-recovery-test",
-                    fogRuntime = fogRuntime(database, feed),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     onFogRendered = { fogRendered.set(true) },
                 )
@@ -506,24 +515,32 @@ class MapSurfaceTest {
     }
 
     /**
-     * The backdrop bands around a mosaic are finite, so a programmed camera move — which can
-     * cross any distance in one step — still has to raise the safety cover rather than expose
-     * unknown map as explored. Gestures are covered by the band surround instead and are asserted
-     * against the renderer's own frames in [sustainedGesturesNeverExposeUnexploredMap].
+     * A programmed camera move can cross any distance in one step, so it sits outside the
+     * continuous-crossing guarantee the renderer-native extent guard owns: the guard's GeoJSON
+     * tiles for a far-away region are extracted on demand, and a teleport can outrun them. For
+     * this one class of movement the reactive Compose cover remains the contract - it must rise
+     * after the jump and stay until the rebuilt canonical lands. Continuous gestures never rely on
+     * it; they are audited renderer-natively by the finite-extent crossing gates.
+     *
+     * The fog runtime is hoisted out of `setContent` deliberately: an inline runtime is a new
+     * instance on every recomposition, which re-keys the surface's fog state and composes the
+     * cover as a reset artifact rather than through the camera listeners. Production's runtime is
+     * a stable singleton, so only a stable runtime here makes this gate bind the production
+     * programmed-move path (the beyond-surround raise in the camera listeners).
      */
     @Test
     fun panningBeyondTheRenderedFogRaisesTheSafetyCover() {
         val database = inMemoryDatabase()
         try {
             val fogRendered = AtomicBoolean(false)
+            val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
             val cameraRequest = mutableStateOf(
-                MapCameraRequest(
-                    requestId = 1L,
-                    point = GeoPoint(25.0330, 121.5654),
-                    zoom = 16.0,
-                ),
+                MapCameraRequest(requestId = 1L, point = GeoPoint(25.0330, 121.5654), zoom = 16.0),
             )
-
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -533,19 +550,24 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.fog-cover-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
                     onFogRendered = { fogRendered.set(true) },
+                    onFogCoverageInstalledForTesting = installedCoverage::set,
                 )
             }
-
             composeRule.waitUntil(timeoutMillis = 15_000L) { fogRendered.get() }
+            // The attach-time publish can commit the default camera's world-wrapping generation
+            // first, and `onFogRendered` fires for it too. A world-wrapping surround covers any
+            // camera, so a jump taken then legitimately raises nothing - the renderer shows the
+            // coarse world mosaic's fog, which is safe but not this gate's scenario. Wait for the
+            // requested local canonical (reactions are live here, so it always arrives), so the
+            // jump provably leaves the installed surround.
+            composeRule.waitUntil(timeoutMillis = 15_000L) {
+                installedCoverage.get()?.extent?.wrapsWorld == false
+            }
             composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertDoesNotExist()
-
             composeRule.runOnUiThread {
                 cameraRequest.value = MapCameraRequest(
                     requestId = 2L,
@@ -553,7 +575,6 @@ class MapSurfaceTest {
                     zoom = 16.0,
                 )
             }
-
             composeRule.waitUntil(timeoutMillis = 15_000L) {
                 composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                     .fetchSemanticsNodes()
@@ -613,16 +634,17 @@ class MapSurfaceTest {
                 MapCameraRequest(requestId = 1L, point = revealed, zoom = 16.0),
             )
 
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
                     provider = provider,
                     fallbackTimeoutMillis = if (requireOnlineStyle) 20_000L else 100L,
                     savedStateKey = "trailveil.map.fog-zoom-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
                     onFogCoverageInstalledForTesting = installedCoverage::set,
@@ -1032,12 +1054,11 @@ class MapSurfaceTest {
     /**
      * Suspends a valid, narrower S2 immediately before its style mutation, then changes only the
      * test coverage decision so that S2 becomes non-covering while the install is suspended. The
-     * post-install reconciliation must clear the stale positive coverage claim and compose the
-     * safety cover without any camera callback. This proves state reconciliation, not that the
-     * Compose cover and the first S2 renderer frame share a compositor transaction (P4-034).
+     * post-install reconciliation must retain renderer coverage through S2's global exterior
+     * guard and request a newer canonical window without flashing the separately composed cover.
      */
     @Test
-    fun aCanonicalInstallThatTurnsNonCoveringRaisesTheSafetyCover() {
+    fun aCanonicalInstallThatTurnsNonCoveringRetainsRendererCoverage() {
         val database = inMemoryDatabase()
         val forcedRequest = mutableStateOf<FogViewportRequest?>(null)
         val beforeInstallEntered = CompletableDeferred<CanonicalFogInstallCheckpoint>()
@@ -1051,6 +1072,10 @@ class MapSurfaceTest {
 
         try {
             revealTrack(database, REVEALED_CENTER)
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -1060,10 +1085,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.fog-install-landing-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -1071,6 +1093,7 @@ class MapSurfaceTest {
                         zoom = INSTALL_GATE_WIDE_ZOOM,
                     ),
                     canonicalViewportRequestForTesting = forcedRequest.value,
+                    suppressFogCameraReactionsForTesting = true,
                     fogSurroundCoverageForTesting = { coverageHolds.get() },
                     onFogRendered = { fogRenderCount.incrementAndGet() },
                     onFogCoverageInstalledForTesting = installedCoverage::set,
@@ -1078,19 +1101,29 @@ class MapSurfaceTest {
                         checkpointRequests +=
                             "${checkpoint.phase}:g=${checkpoint.generation} " +
                             "z=${checkpoint.render.request.mapZoom}"
+                        // Not a one-shot: a mid-install effect restart (a fallback style
+                        // replacement re-keys the install effect) abandons the held attempt with
+                        // the generation counter unchanged, and the restarted attempt must hold
+                        // here too or it sails through before the test forces its predicate.
+                        // After release the await returns immediately, so retries never block.
                         if (
                             checkpoint.phase ==
                             CanonicalFogInstallCheckpointPhase.BEFORE_STYLE_INSTALL &&
-                            checkpoint.render.request.mapZoom == INSTALL_GATE_NARROW_ZOOM &&
-                            gatedGeneration.compareAndSet(null, checkpoint.generation)
+                            checkpoint.render.request.mapZoom == INSTALL_GATE_NARROW_ZOOM
                         ) {
-                            beforeInstallEntered.complete(checkpoint)
-                            releaseBeforeInstall.await()
+                            gatedGeneration.compareAndSet(null, checkpoint.generation)
+                            if (checkpoint.generation == gatedGeneration.get()) {
+                                beforeInstallEntered.complete(checkpoint)
+                                releaseBeforeInstall.await()
+                            }
                         }
                     },
                     onCanonicalFogInstallDecisionForTesting = { decision ->
                         if (decision.generation == gatedGeneration.get()) {
                             nonCoveringDecision.complete(decision)
+                            // Let the next request converge instead of leaving the test's forced
+                            // false predicate in a deliberate reject/recompose loop.
+                            coverageHolds.set(true)
                         }
                     },
                 )
@@ -1104,6 +1137,25 @@ class MapSurfaceTest {
                     .isEmpty()
             }
             readyMap.awaitFullyRenderedFrame(mapView)
+            // Camera reactions are suppressed so a late-dispatched idle cannot republish the
+            // forced request and stale the gated install between its style mutation and its
+            // decision - the race a full-battery run caught once. The suppressed idle also means
+            // the requested wide viewport must be driven through the forced-request seam, after
+            // the camera has actually landed; the attach-time publish may have committed a
+            // world-wrapping default-camera generation instead.
+            composeRule.waitUntil(timeoutMillis = 10_000L) {
+                abs(readyMap.cameraPosition.zoom - INSTALL_GATE_WIDE_ZOOM) < 0.01
+            }
+            val wideTarget = checkNotNull(readyMap.cameraPosition.target)
+            composeRule.runOnUiThread {
+                forcedRequest.value = FogViewportRequest(
+                    center = GeoPoint(wideTarget.latitude, wideTarget.longitude),
+                    mapZoom = INSTALL_GATE_WIDE_ZOOM,
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                installedCoverage.get()?.extent?.wrapsWorld == false
+            }
             val s1 = checkNotNull(installedCoverage.get()) {
                 "No wide S1 coverage was installed"
             }
@@ -1138,6 +1190,10 @@ class MapSurfaceTest {
             )
             composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertDoesNotExist()
             coverageHolds.set(false)
+            // The committed slot the gated install must not clobber is the one active at release
+            // time — an ordinary intervening install may legitimately have advanced the parity
+            // since S1 was captured.
+            val activeAtRelease = checkNotNull(installedCoverage.get()).slot
             releaseBeforeInstall.complete(Unit)
             runCatching {
                 composeRule.waitUntil(timeoutMillis = INSTALL_GATE_CHECKPOINT_TIMEOUT_MILLIS) {
@@ -1158,15 +1214,47 @@ class MapSurfaceTest {
                 !decision.rejectedBeforeStyleMutation,
             )
             assertTrue(
-                "Post-install reconciliation retained a stale positive coverage claim: $decision",
-                !decision.coverageInstalledAtDecision,
+                "Post-install reconciliation discarded globally guarded renderer coverage: $decision",
+                decision.coverageInstalledAtDecision,
+            )
+            assertTrue(
+                "The non-covering install reused the committed $activeAtRelease slot in place: " +
+                    "$decision",
+                checkNotNull(decision.installedSlot) != activeAtRelease,
+            )
+            // The flag above is set by the same branch that reports it, so it cannot fail alone;
+            // the renderer can. With the retention decision taken and no Compose cover composed,
+            // the frame itself must be fogged: nothing revealed over this unexplored camera, and
+            // not blacked out either.
+            readyMap.awaitFullyRenderedFrame(mapView)
+            val retainedFrame = mapView.pixelCopyFogCoverage()
+            assertTrue(
+                "The retained renderer frame revealed unexplored ground: ${retainedFrame.report()}",
+                retainedFrame.revealedFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
+            )
+            // During the A/B overlap window both slots may fog the same ground; a double coat
+            // reads darker than the single-coat luminance floor and is the accepted safe
+            // direction. Blackout means the opaque install guard, whose frames are near-fully
+            // black - nonBlack is the discriminator.
+            assertTrue(
+                "The retained renderer frame was blacked out: ${retainedFrame.report()}",
+                retainedFrame.nonBlackFraction >= MINIMUM_GUARDED_NON_BLACK_FRACTION,
             )
             composeRule.waitUntil(timeoutMillis = 5_000L) {
                 composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                     .fetchSemanticsNodes()
-                    .isNotEmpty()
+                    .isEmpty()
             }
-            composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertIsDisplayed()
+            composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertDoesNotExist()
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                val settledSlot = runCatching { publishedFogSlot() }.getOrNull()
+                settledSlot != null && readyMap.hasOnlyPublishedFogGeneration(settledSlot)
+            }
+            val settledSlot = publishedFogSlot()
+            assertTrue(
+                "A superseded slot was not retired after the globally guarded recovery",
+                readyMap.hasOnlyPublishedFogGeneration(settledSlot),
+            )
         } finally {
             releaseBeforeInstall.complete(Unit)
             database.close()
@@ -1174,24 +1262,28 @@ class MapSurfaceTest {
     }
 
     /**
-     * Cancels the canonical coroutine after its renderer mutation has completed but before matching
-     * Compose bookkeeping is reconciled. The shared cancellation/finally path must revoke the old
-     * positive coverage claim; otherwise a later re-keyed effect can inherit stale S1 state while
-     * the renderer already contains S2. Fog-revision keying is checked separately in source review.
+     * Cancels the canonical coroutine after the additive target slot is complete but before it is
+     * published. The already-published immutable generation must stay authoritative and visible;
+     * raising the Compose cover here would turn routine location-driven re-keying into a black
+     * flash. A subsequent request must remove/rebuild the abandoned target, publish it, and retire
+     * the original slot normally.
      */
     @Test
-    fun cancellingAfterStyleInstallClearsTheUnreconciledCoverageClaim() {
+    fun cancellingAfterStyleInstallRetainsTheCommittedGeneration() {
         val database = inMemoryDatabase()
         val forcedRequest = mutableStateOf<FogViewportRequest?>(null)
         val afterStyleEntered = CompletableDeferred<CanonicalFogInstallCheckpoint>()
-        val coverageCleared = CompletableDeferred<ComposedFogCoverageSnapshot>()
-        val cancelledGeneration = AtomicReference<Long?>(null)
         val checkpointTrace = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val coverageTrace = java.util.Collections.synchronizedList(mutableListOf<String>())
         val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
         val fogRenderCount = AtomicInteger(0)
 
         try {
             revealTrack(database, REVEALED_CENTER)
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -1201,10 +1293,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.fog-cancelled-install-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -1215,14 +1304,10 @@ class MapSurfaceTest {
                     onFogRendered = { fogRenderCount.incrementAndGet() },
                     onFogCoverageInstalledForTesting = installedCoverage::set,
                     onFogCoverageStateComposedForTesting = { snapshot ->
-                        val expectedGeneration = cancelledGeneration.get()
-                        if (
-                            expectedGeneration != null &&
-                            snapshot.generation >= expectedGeneration &&
-                            !snapshot.coverageInstalled
-                        ) {
-                            coverageCleared.complete(snapshot)
-                        }
+                        coverageTrace +=
+                            "g=${snapshot.generation}:coverage=${snapshot.coverageInstalled}:" +
+                            "slot=${snapshot.activeSlot}:extent=${snapshot.installedExtent != null}:" +
+                            "canonical=${snapshot.canonicalLoaded}"
                     },
                     canonicalFogInstallCheckpointForTesting = { checkpoint ->
                         checkpointTrace +=
@@ -1233,7 +1318,6 @@ class MapSurfaceTest {
                                 CanonicalFogInstallCheckpointPhase.AFTER_STYLE_INSTALL_BEFORE_RECONCILE &&
                                 checkpoint.render.request.mapZoom ==
                                 CANCEL_GATE_ABANDONED_ZOOM -> {
-                                cancelledGeneration.set(checkpoint.generation)
                                 afterStyleEntered.complete(checkpoint)
                                 throw kotlinx.coroutines.CancellationException(
                                     "Deterministic post-style cancellation",
@@ -1250,9 +1334,25 @@ class MapSurfaceTest {
                     .fetchSemanticsNodes()
                     .isEmpty()
             }
+            composeRule.waitUntil(timeoutMillis = 25_000L) {
+                val installed = installedCoverage.get() ?: return@waitUntil false
+                runCatching { publishedFogSlot() }.getOrNull() == installed.slot &&
+                    readyMap.hasOnlyPublishedFogGeneration(installed.slot)
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
             val initialCoverage = checkNotNull(installedCoverage.get()) {
                 "No initial canonical coverage was installed"
             }
+            assertEquals(
+                "The initial slot changed before the cancellation probe was armed",
+                initialCoverage.slot,
+                publishedFogSlot(),
+            )
+            assertTrue(
+                "The initial generation was not stably retired before the probe",
+                readyMap.hasOnlyPublishedFogGeneration(initialCoverage.slot),
+            )
+            coverageTrace.clear()
             val target = checkNotNull(readyMap.cameraPosition.target)
             val center = GeoPoint(target.latitude, target.longitude)
             composeRule.runOnUiThread {
@@ -1277,24 +1377,49 @@ class MapSurfaceTest {
                 checkNotNull(abandoned.installedExtent).halfWorlds <
                     initialCoverage.extent.halfWorlds,
             )
-
-            runCatching {
-                composeRule.waitUntil(timeoutMillis = INSTALL_GATE_CHECKPOINT_TIMEOUT_MILLIS) {
-                    coverageCleared.isCompleted
-                }
-            }.getOrElse { failure ->
-                throw AssertionError(
-                    "Cancellation kept a stale positive coverage claim; trace=$checkpointTrace",
-                    failure,
+            composeRule.waitForIdle()
+            assertTrue(
+                "Cancellation raised the cover before recovery; trace=$coverageTrace",
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes().isEmpty(),
+            )
+            val committedAfterCancellation = publishedFogSlot()
+            assertTrue(
+                "Cancellation published its uncommitted ${abandoned.installedSlot} target slot",
+                committedAfterCancellation != checkNotNull(abandoned.installedSlot),
+            )
+            val committedStillComplete = AtomicBoolean(false)
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                val style = requireNotNull(readyMap.style) { "The style is not ready" }
+                committedStillComplete.set(
+                    requiredFogGenerationLayers(committedAfterCancellation)
+                        .all { id -> style.getLayer(id) != null },
                 )
             }
-            val cleared = runBlocking { coverageCleared.await() }
             assertTrue(
-                "The coverage clear belongs to an older generation: clear=$cleared abandoned=$abandoned",
-                cleared.generation >= abandoned.generation,
+                "Cancellation damaged the committed $committedAfterCancellation generation",
+                committedStillComplete.get(),
             )
-            assertTrue("Cancellation retained an installed extent: $cleared", cleared.installedExtent == null)
-            composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertIsDisplayed()
+            assertEquals(
+                "Cancellation raised the initial-only renderer guard",
+                Property.NONE,
+                readyMap.fogLayerVisibility(FogOverlayIds.InstallGuardLayer),
+            )
+
+            composeRule.runOnUiThread {
+                forcedRequest.value = FogViewportRequest(center, INSTALL_GATE_WIDE_ZOOM)
+            }
+            composeRule.waitUntil(timeoutMillis = INSTALL_GATE_CHECKPOINT_TIMEOUT_MILLIS) {
+                val recovered = installedCoverage.get()
+                recovered != null &&
+                    recovered.slot != committedAfterCancellation &&
+                    readyMap.hasOnlyPublishedFogGeneration(recovered.slot)
+            }
+            assertTrue(
+                "Recovery raised the cover despite a complete committed slot; trace=$coverageTrace",
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes().isEmpty(),
+            )
         } finally {
             database.close()
         }
@@ -1398,10 +1523,11 @@ class MapSurfaceTest {
             },
             startPoint = UNEXPLORED_NEAR_REVEALED,
             startZoom = EXPLORATION_GESTURE_ZOOM,
-            expectCover = true,
+            expectCover = false,
             expectZoomOut = true,
             minimumZoomChange = MINIMUM_COMPOSITE_ZOOM_CHANGE,
             allowRebuildDuringGesture = true,
+            allowFiniteExtentCrossing = true,
         )
 
         rendererFailure.get()?.let { throw AssertionError("Composite renderer audit failed", it) }
@@ -1432,6 +1558,322 @@ class MapSurfaceTest {
         )
     }
 
+    /**
+     * P4-034's delayed-callback gate. All camera-driven fog reactions are suppressed, so the same
+     * renderer generation must remain globally fail-closed after the visible region actually leaves
+     * its finite extent. Every formal shove/pinch move waits for a renderer-finished state and then
+     * performs the ordinary fog-versus-bare pixel audit while Compose's cover remains absent.
+     */
+    @Test
+    fun aFiniteExtentCrossingIsCoveredByTheRendererOwnedGuard() =
+        assertFiniteExtentGuard(FiniteExtentPath.ZOOM, spatialGuardEnabled = true)
+
+    /** Sensitivity control: remove only the spatial guard and reproduce the historical bare band. */
+    @Test
+    fun removingTheFiniteExtentGuardReproducesTheCrossingLeak() =
+        assertFiniteExtentGuard(FiniteExtentPath.ZOOM, spatialGuardEnabled = false)
+
+    @Test
+    fun panningAcrossTheFiniteExtentIsCoveredByTheRendererOwnedGuard() =
+        assertFiniteExtentGuard(FiniteExtentPath.PAN, spatialGuardEnabled = true)
+
+    @Test
+    fun tiltingAcrossTheFiniteExtentIsCoveredByTheRendererOwnedGuard() =
+        assertFiniteExtentGuard(FiniteExtentPath.TILT, spatialGuardEnabled = true)
+
+    @Test
+    fun rotatingAcrossTheFiniteExtentIsCoveredByTheRendererOwnedGuard() =
+        assertFiniteExtentGuard(FiniteExtentPath.BEARING, spatialGuardEnabled = true)
+
+    @Test
+    fun aFrozenFiniteGuardCoversWrappedWorldCopiesBelowZoomOne() =
+        assertFrozenFiniteGuardAcrossWorldCopies(spatialGuardEnabled = true)
+
+    @Test
+    fun removingTheFiniteGuardReproducesAWrappedWorldLeakBelowZoomOne() =
+        assertFrozenFiniteGuardAcrossWorldCopies(spatialGuardEnabled = false)
+
+    /** A normal in-extent rebuild keeps the old generation instead of flashing the install guard. */
+    @Test
+    fun replacingAnInExtentFogGenerationNeverBlacksOutTheRenderer() {
+        val database = inMemoryDatabase()
+        try {
+            val recording = revealTrack(database, REVEALED_CENTER)
+            val pointChanges = TriggerableRoomChangeFeed(database)
+            val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
+            val installCount = AtomicInteger(0)
+            val stableFogRuntime = fogRuntime(database, pointChanges)
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-generation-swap-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-generation-swap",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-generation-swap-test",
+                    fogRuntime = stableFogRuntime,
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = REVEALED_CENTER,
+                        zoom = EXPLORATION_GESTURE_ZOOM,
+                    ),
+                    onFogCoverageInstalledForTesting = { installed ->
+                        installedCoverage.set(installed)
+                        installCount.incrementAndGet()
+                    },
+                )
+            }
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                installedCoverage.get() != null &&
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                        .fetchSemanticsNodes()
+                        .isEmpty()
+            }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            map.awaitFullyRenderedFrame(view)
+            val initialCoverage = checkNotNull(installedCoverage.get())
+            assertTrue(
+                "The generation-swap control camera was not inside its installed extent",
+                initialCoverage.extent.covers(map.visibleRegionCorners()),
+            )
+            var stableInstallCount = installCount.get()
+            var stableSince = SystemClock.uptimeMillis()
+            val stabilityDeadline = stableSince + 10_000L
+            while (SystemClock.uptimeMillis() < stabilityDeadline) {
+                SystemClock.sleep(100L)
+                val currentCount = installCount.get()
+                val publishedSlot = publishedFogSlot()
+                val callbackSlot = checkNotNull(installedCoverage.get()).slot
+                if (currentCount != stableInstallCount || publishedSlot != callbackSlot) {
+                    stableInstallCount = currentCount
+                    stableSince = SystemClock.uptimeMillis()
+                } else if (SystemClock.uptimeMillis() - stableSince >= 1_000L) {
+                    break
+                }
+            }
+            assertTrue(
+                "The initial canonical fog install never became quiescent",
+                SystemClock.uptimeMillis() - stableSince >= 1_000L,
+            )
+            val initialSlot = publishedFogSlot()
+            val initialInstallCount = installCount.get()
+            val auditor = SurfaceTransitionAuditor(view, map, initialCoverage.extent)
+            var audit: SurfaceTransitionAudit? = null
+            try {
+                auditor.armAndCaptureCurrentState()
+                runBlocking {
+                    database.recordingDao().appendAcceptedPoint(
+                        point = TrackPointEntity(
+                            sessionId = recording.sessionId,
+                            segmentId = recording.segmentId,
+                            sequence = REVEALED_POINT_COUNT.toLong(),
+                            timestamp = 100_000L,
+                            latitude = REVEALED_CENTER.latitude,
+                            longitude = REVEALED_CENTER.longitude + 0.001,
+                            horizontalAccuracy = 5.0,
+                        ),
+                        distanceDeltaMeters = 20.0,
+                    )
+                    pointChanges.publishLatest()
+                }
+                try {
+                    composeRule.waitUntil(timeoutMillis = 30_000L) {
+                        val slot = composeRule.runOnIdle {
+                            attachedMapView()?.getTag(R.id.map_fog_active_slot) as? String
+                        }
+                        installCount.get() > initialInstallCount &&
+                            installedCoverage.get()?.slot == initialSlot.other() &&
+                            slot == initialSlot.other().name
+                    }
+                } catch (timeout: Throwable) {
+                    val diagnostic = composeRule.runOnIdle {
+                        "installCount=${installCount.get()} initial=$initialInstallCount " +
+                            "slot=${attachedMapView()?.getTag(R.id.map_fog_active_slot)} " +
+                            "callbackSlot=${installedCoverage.get()?.slot} " +
+                            "initialSlot=$initialSlot " +
+                            "generation=${attachedMapView()?.getTag(R.id.map_fog_canonical_generation)}"
+                    }
+                    val latestCursor = runBlocking { pointChanges.latestCursor() }
+                    throw AssertionError(
+                        "The point revision did not complete an A/B fog swap: " +
+                            "$diagnostic latestCursor=$latestCursor",
+                        timeout,
+                    )
+                }
+                map.awaitFullyRenderedFrame(view)
+            } finally {
+                audit = auditor.finish()
+            }
+            val completedAudit = checkNotNull(audit)
+            assertTrue(
+                "No renderer callback was sampled during the in-extent generation swap",
+                completedAudit.samples.isNotEmpty(),
+            )
+            val darkest = completedAudit.samples.minBy { it.coverage.nonBlackFraction }
+            assertTrue(
+                "An ordinary in-extent generation swap blacked out the SurfaceView: $darkest",
+                darkest.coverage.nonBlackFraction >= MINIMUM_IN_EXTENT_NON_BLACK_FRACTION,
+            )
+            assertEquals(
+                "The opaque install guard was left visible after an in-extent generation swap",
+                Property.NONE,
+                map.fogLayerVisibility(FogOverlayIds.InstallGuardLayer),
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    private fun assertFrozenFiniteGuardAcrossWorldCopies(spatialGuardEnabled: Boolean) =
+        sweepGesture(
+            provider = MapProviderConfiguration(
+                providerName = if (spatialGuardEnabled) {
+                    "fog-finite-wrapped-world-guard-test-provider"
+                } else {
+                    "fog-finite-wrapped-world-guard-control-provider"
+                },
+                styleUri = "https://tiles.invalid/styles/fog-finite-wrapped-world-guard",
+            ),
+            requireOnlineStyle = false,
+            savedStateKey = if (spatialGuardEnabled) {
+                "trailveil.map.fog-finite-wrapped-world-guard-test"
+            } else {
+                "trailveil.map.fog-finite-wrapped-world-guard-control"
+            },
+            gesture = { map, onHold ->
+                map.moveFrozenFiniteGenerationAcrossWorldCopies(onHold)
+            },
+            startPoint = ANTIMERIDIAN,
+            startZoom = EXPLORATION_GESTURE_ZOOM,
+            expectZoomOut = true,
+            minimumZoomChange = MINIMUM_WRAPPED_WORLD_ZOOM_CHANGE,
+            maximumUncoveredFraction = MAXIMUM_SETTLED_REVEALED_FRACTION,
+            configureFogLayers = if (spatialGuardEnabled) {
+                null
+            } else {
+                { map -> map.setFiniteExtentGuardsVisible(false) }
+            },
+            minimumUncoveredFraction = if (spatialGuardEnabled) {
+                null
+            } else {
+                MINIMUM_FINITE_EXTENT_CONTROL_LEAK_FRACTION
+            },
+            allowFiniteExtentCrossing = true,
+            suppressFogCameraReactionsForTesting = true,
+            useSurfacePixelAudit = true,
+            requireGestureReason = false,
+            auditRendererTransitionsFromGestureStart = true,
+        )
+
+    private fun assertFiniteExtentGuard(
+        path: FiniteExtentPath,
+        spatialGuardEnabled: Boolean,
+    ) = sweepGesture(
+        provider = MapProviderConfiguration(
+            providerName = if (spatialGuardEnabled) {
+                "fog-finite-extent-${path.name.lowercase()}-guard-test-provider"
+            } else {
+                "fog-finite-extent-${path.name.lowercase()}-guard-control-provider"
+            },
+            styleUri = "https://tiles.invalid/styles/fog-finite-extent-guard",
+        ),
+        requireOnlineStyle = false,
+        savedStateKey = if (spatialGuardEnabled) {
+            "trailveil.map.fog-finite-extent-${path.name.lowercase()}-guard-test"
+        } else {
+            "trailveil.map.fog-finite-extent-${path.name.lowercase()}-guard-control"
+        },
+        gesture = { map, onHold ->
+            when (path) {
+                FiniteExtentPath.PAN -> panInSteps(map, onHold, auditEveryMove = true)
+                FiniteExtentPath.TILT -> shoveInSteps(
+                    map = map,
+                    onHold = onHold,
+                    onEngaged = onHold,
+                    attemptLimit = 1,
+                )
+                FiniteExtentPath.BEARING -> rotateInSteps(
+                    map = map,
+                    onHold = onHold,
+                    onEngaged = onHold,
+                    attemptLimit = 1,
+                )
+                FiniteExtentPath.ZOOM -> pinchInSteps(
+                    map = map,
+                    onHold = onHold,
+                    zoomIn = false,
+                    spanEdge = PinchSpanEdge.TALLEST,
+                    auditEveryMove = true,
+                    attemptLimit = 1,
+                    onEngaged = onHold,
+                )
+            }
+        },
+        prepareFrozenCamera = { map, installed ->
+            if (path == FiniteExtentPath.BEARING) {
+                map.positionFrozenCameraNearEastExtent(
+                    extent = installed.extent,
+                    tilt = 60.0,
+                    bearing = 0.0,
+                    retreatFraction = 0.003,
+                )
+            } else {
+                map.positionFrozenCameraNearNorthExtent(
+                    extent = installed.extent,
+                    tilt = 0.0,
+                    bearing = 0.0,
+                    retreatFraction = when (path) {
+                        FiniteExtentPath.PAN -> 0.005
+                        FiniteExtentPath.TILT -> 0.08
+                        FiniteExtentPath.ZOOM -> 0.05
+                        FiniteExtentPath.BEARING -> error("handled above")
+                    },
+                )
+            }
+        },
+        startPoint = UNEXPLORED_NEAR_REVEALED,
+        startZoom = EXPLORATION_GESTURE_ZOOM,
+        expectZoomOut = path == FiniteExtentPath.ZOOM,
+        expectTiltChangeAtLeast = if (path == FiniteExtentPath.TILT) {
+            MINIMUM_ACCEPTED_SHOVE_TILT_DEGREES
+        } else {
+            null
+        },
+        expectBearingChangeAtLeast = if (path == FiniteExtentPath.BEARING) {
+            MINIMUM_ACCEPTED_ROTATE_DEGREES
+        } else {
+            null
+        },
+        minimumZoomChange = if (path == FiniteExtentPath.ZOOM) {
+            MINIMUM_COMPOSITE_ZOOM_CHANGE
+        } else {
+            MINIMUM_GESTURE_ZOOM_CHANGE
+        },
+        minimumPanDegrees = if (path == FiniteExtentPath.PAN) {
+            MINIMUM_FINITE_EXTENT_PAN_DEGREES
+        } else {
+            MINIMUM_PAN_DEGREES
+        },
+        maximumUncoveredFraction = MAXIMUM_SETTLED_REVEALED_FRACTION,
+        configureFogLayers = if (spatialGuardEnabled) {
+            null
+        } else {
+            { map -> map.setFiniteExtentGuardsVisible(false) }
+        },
+        minimumUncoveredFraction = if (spatialGuardEnabled) {
+            null
+        } else {
+            MINIMUM_FINITE_EXTENT_CONTROL_LEAK_FRACTION
+        },
+        allowFiniteExtentCrossing = true,
+        suppressFogCameraReactionsForTesting = true,
+        useSurfacePixelAudit = true,
+        auditRendererTransitionsFromGestureStart = true,
+    )
+
     private fun aTapZoomStaysInsideItsInstalledFog(twoFinger: Boolean) {
         val database = inMemoryDatabase()
         try {
@@ -1439,6 +1881,10 @@ class MapSurfaceTest {
             val fogRendered = AtomicBoolean(false)
             val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
             revealTrack(database, REVEALED_CENTER)
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -1448,10 +1894,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.fog-" + name + "-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -1648,6 +2091,10 @@ class MapSurfaceTest {
         try {
             val fogRendered = AtomicBoolean(false)
             revealTrack(database, REVEALED_CENTER)
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -1657,10 +2104,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.oblique-zoom-out-$label",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -1840,7 +2284,12 @@ class MapSurfaceTest {
         configureFogLayers = if (seamGuardEnabled) {
             null
         } else {
-            { map -> map.setSingleFogLayerVisible(FogSeamGuardIds.Layer, false) }
+            { map ->
+                map.setSingleFogLayerVisible(
+                    FogSeamGuardIds.layer(publishedFogSlot()),
+                    false,
+                )
+            }
         },
         minimumUncoveredFraction = minimumUncoveredFraction,
     )
@@ -1999,6 +2448,10 @@ class MapSurfaceTest {
             val cameraRequest = mutableStateOf(
                 MapCameraRequest(requestId = 1L, point = REVEALED_CENTER, zoom = 3.0),
             )
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -2008,10 +2461,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.fog-side-band-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
                     onFogRendered = { fogRendered.set(true) },
@@ -2040,13 +2490,24 @@ class MapSurfaceTest {
                         .fetchSemanticsNodes()
                         .isEmpty()
                 }
+                composeRule.waitUntil(timeoutMillis = 30_000L) {
+                    val slotName = composeRule.runOnIdle {
+                        attachedMapView()?.getTag(R.id.map_fog_active_slot) as? String
+                    }
+                    val slot = slotName?.let(FogGenerationSlot::valueOf)
+                    slot != null && map.hasOnlyPublishedFogGeneration(slot)
+                }
                 Thread.sleep(ZOOM_SETTLE_MILLIS)
             }
 
             fun assertGroundBesideTheMosaicIsCoveredOnce(label: String) {
-                val westDrawn = map.fogLayerIsRendered(FogBackdropIds.WestLayer)
-                val eastDrawn = map.fogLayerIsRendered(FogBackdropIds.EastLayer)
-                val wrappedDrawn = map.fogLayerIsRendered(FogBackdropIds.WrappedSideLayer)
+                val slot = publishedFogSlot()
+                val westDrawn = map.fogLayerIsRendered(FogBackdropIds.westLayer(slot), slot)
+                val eastDrawn = map.fogLayerIsRendered(FogBackdropIds.eastLayer(slot), slot)
+                val wrappedDrawn = map.fogLayerIsRendered(
+                    FogBackdropIds.wrappedSideLayer(slot),
+                    slot,
+                )
                 trace.append(
                     "\n $label west=$westDrawn east=$eastDrawn wrapped=$wrappedDrawn",
                 )
@@ -2102,16 +2563,17 @@ class MapSurfaceTest {
             val cameraRequest = mutableStateOf(
                 MapCameraRequest(requestId = 1L, point = REVEALED_CENTER, zoom = 16.0),
             )
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
                     provider = ProductionMapProvider,
                     fallbackTimeoutMillis = 20_000L,
                     savedStateKey = "trailveil.map.fog-seam-probe",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
                     onFogRendered = { fogRendered.incrementAndGet() },
@@ -2173,14 +2635,15 @@ class MapSurfaceTest {
                 // still below the old 0.2% seam budget. Merely raising the final threshold would
                 // let the original defect pass; this A/B keeps the regression sensitive to it.
                 if (zoom in SETTLED_SEAM_GUARD_AB_ZOOMS) {
+                    val seamLayerId = FogSeamGuardIds.layer(publishedFogSlot())
                     assertTrue(
                         "The seam guard was not renderer-selected at the original regression " +
                             "zoom $zoom",
-                        map.fogLayerIsRendered(FogSeamGuardIds.Layer),
+                        map.fogLayerIsRendered(seamLayerId),
                     )
                     val visibility = ALL_FOG_LAYERS.associateWith { map.fogLayerVisibility(it) }
                     val withoutGuard = try {
-                        map.setSingleFogLayerVisible(FogSeamGuardIds.Layer, false)
+                        map.setSingleFogLayerVisible(seamLayerId, false)
                         map.awaitFullyRenderedFrame(view)
                         val fogged = map.snapshotStableSettledPixels(
                             view,
@@ -2195,7 +2658,7 @@ class MapSurfaceTest {
                                 "guard-off capture at zoom $zoom; this measurement does not " +
                                 "observe the unguarded quads",
                             Property.NONE,
-                            map.fogLayerVisibility(FogSeamGuardIds.Layer),
+                            map.fogLayerVisibility(seamLayerId),
                         )
                         map.auditFogCoverage(fogged)
                     } finally {
@@ -2254,16 +2717,17 @@ class MapSurfaceTest {
         try {
             val fogRendered = AtomicBoolean(false)
             revealTrack(database, REVEALED_CENTER)
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
                     provider = ProductionMapProvider,
                     fallbackTimeoutMillis = 20_000L,
                     savedStateKey = "trailveil.map.fog-single-quad-$label",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -2384,22 +2848,26 @@ class MapSurfaceTest {
     }
 
     /** What the renderer selects after visibility and the installed camera-zoom opacity step. */
-    private fun MapLibreMap.fogLayerIsRendered(id: String): Boolean {
+    private fun MapLibreMap.fogLayerIsRendered(
+        id: String,
+        activeSlot: FogGenerationSlot = publishedFogSlot(),
+    ): Boolean {
         val captured = AtomicBoolean(false)
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
             val layer = style?.getLayer(id)
             val zoom = cameraPosition.zoom
-            val hasWrappedBand = style?.getLayer(FogBackdropIds.WrappedSideLayer) != null
+            val hasWrappedBand =
+                style?.getLayer(FogBackdropIds.wrappedSideLayer(activeSlot)) != null
             val zoomOpacityIsVisible = when (id) {
-                FogOverlayIds.WestRepeatLayer,
-                FogOverlayIds.EastRepeatLayer,
-                FogBackdropIds.WestWorldLayer,
-                FogBackdropIds.EastWorldLayer,
+                FogOverlayIds.westRepeatLayer(activeSlot),
+                FogOverlayIds.eastRepeatLayer(activeSlot),
+                FogBackdropIds.westWorldLayer(activeSlot),
+                FogBackdropIds.eastWorldLayer(activeSlot),
                 -> zoom >= WORLD_COPY_RENDER_EDGE_ZOOM
 
-                FogBackdropIds.WrappedSideLayer -> zoom < WORLD_COPY_RENDER_EDGE_ZOOM
-                FogBackdropIds.WestLayer,
-                FogBackdropIds.EastLayer,
+                FogBackdropIds.wrappedSideLayer(activeSlot) -> zoom < WORLD_COPY_RENDER_EDGE_ZOOM
+                FogBackdropIds.westLayer(activeSlot),
+                FogBackdropIds.eastLayer(activeSlot),
                 -> !hasWrappedBand || zoom >= WORLD_COPY_RENDER_EDGE_ZOOM
 
                 else -> true
@@ -2447,29 +2915,32 @@ class MapSurfaceTest {
     fun theWorldCopyEdgeIsCorrectOnBothSides() {
         val database = inMemoryDatabase()
         try {
-            val fogRendered = AtomicBoolean(false)
+            val fogRendered = AtomicReference<FogViewportRender?>(null)
             revealTrack(database, REVEALED_CENTER)
             val cameraRequest = mutableStateOf(
                 MapCameraRequest(requestId = 1L, point = ANTIMERIDIAN, zoom = 2.0),
             )
 
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
                     provider = ProductionMapProvider,
                     fallbackTimeoutMillis = 20_000L,
                     savedStateKey = "trailveil.map.fog-world-copy-edge",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
-                    onFogRendered = { fogRendered.set(true) },
+                    onFogRendered = fogRendered::set,
                 )
             }
 
-            composeRule.waitUntil(timeoutMillis = ONLINE_STYLE_SETUP_MILLIS) { fogRendered.get() }
+            composeRule.waitUntil(timeoutMillis = ONLINE_STYLE_SETUP_MILLIS) {
+                fogRendered.get() != null
+            }
             val map = checkNotNull(awaitMap()) { "The map never became ready" }
             val loadState = composeRule.runOnIdle {
                 attachedMapView()?.getTag(R.id.map_basemap_load_state)
@@ -2501,19 +2972,56 @@ class MapSurfaceTest {
                         .fetchSemanticsNodes()
                         .isEmpty()
                 }
+                composeRule.waitUntil(timeoutMillis = 45_000L) {
+                    fogRendered.get()?.request?.matches(map.cameraAuditState()) == true
+                }
+                composeRule.waitUntil(timeoutMillis = 30_000L) {
+                    val slotName = composeRule.runOnIdle {
+                        attachedMapView()?.getTag(R.id.map_fog_active_slot) as? String
+                    }
+                    val slot = slotName?.let(FogGenerationSlot::valueOf)
+                    slot != null && map.hasOnlyPublishedFogGeneration(slot)
+                }
                 Thread.sleep(ZOOM_SETTLE_MILLIS)
                 val settled = map.cameraPosition.zoom
-                val audit = map.auditFogCoverage()
+                // The waits above can be satisfied by the PREVIOUS zoom's generation when its
+                // render matches this camera within tolerance, and the idle-republished canonical
+                // for the new zoom then lands mid-audit - every A/B transition legitimately
+                // carries both generations for its overlap window, which is not this settled
+                // claim's subject. Audit with a validity retry: capture only between transitions,
+                // and discard a capture the pipeline moved under.
+                var activeSlot = publishedFogSlot()
+                var styleReport = map.fogGenerationStyleReport(activeSlot)
+                var audit = map.auditFogCoverage()
+                val auditDeadline = SystemClock.uptimeMillis() + 30_000L
+                while (SystemClock.uptimeMillis() < auditDeadline) {
+                    val slotBefore = runCatching { publishedFogSlot() }.getOrNull()
+                    if (slotBefore == null || !map.hasOnlyPublishedFogGeneration(slotBefore)) {
+                        Thread.sleep(250L)
+                        continue
+                    }
+                    val candidateReport = map.fogGenerationStyleReport(slotBefore)
+                    val candidate = map.auditFogCoverage()
+                    val slotAfter = runCatching { publishedFogSlot() }.getOrNull()
+                    if (slotAfter == slotBefore && map.hasOnlyPublishedFogGeneration(slotBefore)) {
+                        activeSlot = slotBefore
+                        styleReport = candidateReport
+                        audit = candidate
+                        break
+                    }
+                }
                 report.append(
-                    " z=${"%.2f".format(java.util.Locale.US, settled)}=${audit.report()}",
+                    " z=${"%.2f".format(java.util.Locale.US, settled)} slot=$activeSlot " +
+                        "$styleReport=${audit.report()}",
                 )
                 assertTrue(
-                    "At zoom $settled the map was left bare past the world edge: ${audit.report()}",
+                    "At zoom $settled the map was left bare past the world edge: " +
+                        "slot=$activeSlot $styleReport ${audit.report()}",
                     audit.uncoveredFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
                 )
                 assertTrue(
                     "At zoom $settled part of the map was under more than one coat of fog: " +
-                        audit.report(),
+                        "slot=$activeSlot $styleReport ${audit.report()}",
                     audit.overFoggedFraction <= MAXIMUM_OVER_FOGGED_FRACTION,
                 )
             }
@@ -2593,6 +3101,7 @@ class MapSurfaceTest {
         expectCover: Boolean = false,
         expectZoomIn: Boolean = false,
         minimumZoomChange: Double = MINIMUM_GESTURE_ZOOM_CHANGE,
+        minimumPanDegrees: Double = MINIMUM_PAN_DEGREES,
         maximumUncoveredFraction: Double = MAXIMUM_SETTLED_REVEALED_FRACTION,
         maximumOverFoggedFraction: Double = MAXIMUM_OVER_FOGGED_FRACTION,
         configureFogLayers: ((MapLibreMap) -> Unit)? = null,
@@ -2617,23 +3126,36 @@ class MapSurfaceTest {
         allowRebuildDuringGesture: Boolean = false,
         onFogCoverageStateComposedForTesting:
             ((ComposedFogCoverageSnapshot) -> Unit)? = null,
+        allowFiniteExtentCrossing: Boolean = false,
+        suppressFogCameraReactionsForTesting: Boolean = false,
+        prepareFrozenCamera:
+            ((MapLibreMap, InstalledFogCoverageSnapshot) -> Unit)? = null,
+        // P4-034 cannot use auditFogCoverage(): that helper temporarily hides the fog to produce a
+        // bare reference, which would itself present unsafe SurfaceView frames during the gesture.
+        // The local fallback is a known flat light colour, so this mode copies the real SurfaceView
+        // without mutating Style and applies the separately calibrated luminance discriminator.
+        useSurfacePixelAudit: Boolean = false,
+        requireGestureReason: Boolean = true,
+        auditRendererTransitionsFromGestureStart: Boolean = false,
     ) {
         val database = inMemoryDatabase()
         try {
             val fogRendered = AtomicBoolean(false)
             val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
+            val fogCameraReactionsSuppressed = mutableStateOf(false)
             revealTrack(database, REVEALED_CENTER)
 
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = surfaceModifier,
                     provider = provider,
                     fallbackTimeoutMillis = if (requireOnlineStyle) 20_000L else 100L,
                     savedStateKey = savedStateKey,
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -2644,6 +3166,8 @@ class MapSurfaceTest {
                     onFogCoverageInstalledForTesting = installedCoverage::set,
                     onFogCoverageStateComposedForTesting =
                         onFogCoverageStateComposedForTesting,
+                    suppressFogCameraReactionsForTesting =
+                        fogCameraReactionsSuppressed.value,
                 )
             }
 
@@ -2654,6 +3178,7 @@ class MapSurfaceTest {
                 timeoutMillis = if (requireOnlineStyle) ONLINE_STYLE_SETUP_MILLIS else 30_000L,
             ) { fogRendered.get() }
             val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            val mapView = requireNotNull(composeRule.runOnIdle { attachedMapView() })
             if (requireOnlineStyle) {
                 val loadState = composeRule.runOnIdle {
                     attachedMapView()?.getTag(R.id.map_basemap_load_state)
@@ -2664,6 +3189,25 @@ class MapSurfaceTest {
                     loadState == BasemapLoadState.ONLINE.name,
                 )
             }
+            if (suppressFogCameraReactionsForTesting) {
+                // Do not freeze the style's first canonical generation. It can be built at the
+                // MapLibre default camera before the explicit start camera lands and therefore be
+                // a world-wrapping zoom-zero generation. Let production idle handling install the
+                // finite start-camera generation first, then detach those reactions before touch.
+                composeRule.waitUntil(timeoutMillis = 45_000L) {
+                    val installed = installedCoverage.get() ?: return@waitUntil false
+                    val generation = fogGeneration() as? Long ?: return@waitUntil false
+                    installed.generation == generation &&
+                        !installed.extent.wrapsWorld &&
+                        installed.extent.covers(map.visibleRegionCorners())
+                }
+                composeRule.runOnIdle { fogCameraReactionsSuppressed.value = true }
+                composeRule.waitForIdle()
+                composeRule.waitUntil(timeoutMillis = 25_000L) {
+                    val installed = installedCoverage.get() ?: return@waitUntil false
+                    map.hasOnlyPublishedFogGeneration(installed.slot)
+                }
+            }
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 map.uiSettings.isLogoEnabled = false
                 map.uiSettings.isAttributionEnabled = false
@@ -2673,6 +3217,28 @@ class MapSurfaceTest {
                 composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                     .fetchSemanticsNodes()
                     .isEmpty()
+            }
+            if (prepareFrozenCamera != null) {
+                val installed = checkNotNull(installedCoverage.get()) {
+                    "No finite fog generation was available for the camera setup"
+                }
+                prepareFrozenCamera(map, installed)
+                assertTrue(
+                    "The prepared camera did not finish inside its frozen extent: " +
+                        "extent=${installed.extent} corners=${map.visibleRegionCorners()}",
+                    installed.extent.covers(map.visibleRegionCorners()),
+                )
+                assertEquals(
+                    "Preparing a finite-boundary path rebuilt the canonical fog",
+                    installed,
+                    installedCoverage.get(),
+                )
+                assertTrue(
+                    "Preparing a finite-boundary path raised the Compose safety cover",
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                        .fetchSemanticsNodes()
+                        .isEmpty(),
+                )
             }
             Thread.sleep(ZOOM_SETTLE_MILLIS)
             configureFogLayers?.invoke(map)
@@ -2690,10 +3256,36 @@ class MapSurfaceTest {
                     calibration.report(),
                 calibration.uncoveredFraction >= MINIMUM_CALIBRATION_UNCOVERED_FRACTION,
             )
+            val inExtentSurface = if (useSurfacePixelAudit) {
+                mapView.pixelCopyFogCoverage().also { coverage ->
+                    assertTrue(
+                        "The finite-extent guard blacked out the ordinary in-extent control: " +
+                            coverage.report(),
+                        coverage.maxLuminance >= MINIMUM_FOGGED_SURFACE_LUMINANCE,
+                    )
+                }
+            } else {
+                null
+            }
 
             // Canonical fog has to be installed before the fingers land, or the gesture would be
             // measured against a placeholder and the generation check would compare with nothing.
             composeRule.waitUntil(timeoutMillis = 25_000L) { fogGeneration() != null }
+            val finiteCoverageAtStart = checkNotNull(installedCoverage.get())
+            if (useSurfacePixelAudit) {
+                map.assertFiniteGuardStyleState(
+                    activeSlot = finiteCoverageAtStart.slot,
+                    guardVisible = minimumUncoveredFraction == null,
+                )
+            }
+            val transitionAuditor = if (useSurfacePixelAudit) {
+                SurfaceTransitionAuditor(mapView, map, finiteCoverageAtStart.extent)
+            } else {
+                null
+            }
+            if (auditRendererTransitionsFromGestureStart) {
+                transitionAuditor?.armAndCaptureCurrentState()
+            }
             val startCameraZoom = map.cameraPosition.zoom
             val startTarget = map.cameraPosition.target
             val startTilt = map.cameraPosition.tilt
@@ -2717,61 +3309,154 @@ class MapSurfaceTest {
             var holds = 0
             val generations = mutableListOf<Any?>()
             var measuredCoverage: InstalledFogCoverageSnapshot? = null
+            var insideExtentHolds = 0
+            var outsideExtentHolds = 0
             val trace = StringBuilder()
 
-            gesture(map) {
-                holds += 1
-                generations += fogGeneration()
-                val installed = checkNotNull(installedCoverage.get()) {
-                    "No canonical installed-coverage snapshot was published for the gesture"
+            var transitionAudit: SurfaceTransitionAudit? = null
+            try {
+                gesture(map) {
+                    transitionAuditor?.awaitThroughCurrentState()
+                    holds += 1
+                    generations += fogGeneration()
+                    val installed = checkNotNull(installedCoverage.get()) {
+                        "No canonical installed-coverage snapshot was published for the gesture"
+                    }
+                    val frozen = measuredCoverage ?: installed.also { measuredCoverage = it }
+                    if (!allowRebuildDuringGesture) {
+                        assertEquals(
+                            "The installed fog geometry changed during one measured gesture",
+                            frozen,
+                            installed,
+                        )
+                    }
+                    val extentCovers = frozen.extent.covers(map.visibleRegionCorners())
+                    if (extentCovers) insideExtentHolds += 1 else outsideExtentHolds += 1
+                    if (!expectCover && !allowFiniteExtentCrossing) {
+                        assertTrue(
+                            "The gesture entered P4-034's finite-extent boundary instead of " +
+                                "staying inside P4-008's installed geometry: $frozen",
+                            extentCovers,
+                        )
+                    }
+                    val coverComposed = composeRule
+                        .onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                        .fetchSemanticsNodes()
+                        .isNotEmpty()
+                    if (coverComposed) coverSemanticsSamples += 1
+                    val zoom = map.cameraPosition.zoom
+                    if (coverComposed) {
+                        trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:coverComposed ")
+                        return@gesture
+                    }
+                    if (useSurfacePixelAudit) {
+                        val coverage = mapView.pixelCopyFogCoverage()
+                        trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:")
+                            .append(if (extentCovers) "inside=" else "outside=")
+                            .append(
+                                "${"%.4f".format(
+                                    java.util.Locale.US,
+                                    coverage.revealedFraction * 100.0,
+                                )}% ",
+                            )
+                        if (!extentCovers && coverage.revealedFraction > worstFraction) {
+                            worstFraction = coverage.revealedFraction
+                            worstReport = coverage.report()
+                            worstZoom = zoom
+                        }
+                    } else {
+                        val audit = map.auditFogCoverage()
+                        trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:")
+                            .append(
+                                "${"%.4f".format(
+                                    java.util.Locale.US,
+                                    audit.uncoveredFraction * 100.0,
+                                )}%",
+                            )
+                            .append(
+                                "/${"%.4f".format(
+                                    java.util.Locale.US,
+                                    audit.overFoggedFraction * 100.0,
+                                )}% ",
+                            )
+                        if (audit.overFoggedFraction > worstOverFogged) {
+                            worstOverFogged = audit.overFoggedFraction
+                            worstOverFoggedReport = audit.report()
+                        }
+                        if (audit.uncoveredFraction > worstFraction) {
+                            worstFraction = audit.uncoveredFraction
+                            worstReport = audit.report()
+                            worstZoom = zoom
+                        }
+                    }
                 }
-                val frozen = measuredCoverage ?: installed.also { measuredCoverage = it }
-                if (!allowRebuildDuringGesture) {
-                    assertEquals(
-                        "The installed fog geometry changed during one measured gesture",
-                        frozen,
-                        installed,
-                    )
+            } finally {
+                InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    map.removeOnCameraMoveStartedListener(reasonListener)
                 }
-                if (!expectCover) {
-                    assertTrue(
-                        "The gesture entered P4-034's finite-extent boundary instead of staying " +
-                            "inside P4-008's installed geometry: $frozen",
-                        frozen.extent.covers(map.visibleRegionCorners()),
-                    )
-                }
-                val coverComposed = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
-                    .fetchSemanticsNodes()
-                    .isNotEmpty()
-                if (coverComposed) coverSemanticsSamples += 1
-                val zoom = map.cameraPosition.zoom
-                // A MapLibre snapshot contains only the map surface below the Compose cover. Once
-                // the cover state has composed, that snapshot no longer represents the combined
-                // UI, but it also does not prove same-frame compositor pixels (P4-034 owns that).
-                if (coverComposed) {
-                    trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:coverComposed ")
-                    return@gesture
-                }
-                val audit = map.auditFogCoverage()
-                trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:")
-                    .append("${"%.4f".format(java.util.Locale.US, audit.uncoveredFraction * 100.0)}%")
-                    .append("/${"%.4f".format(java.util.Locale.US, audit.overFoggedFraction * 100.0)}% ")
-                if (audit.overFoggedFraction > worstOverFogged) {
-                    worstOverFogged = audit.overFoggedFraction
-                    worstOverFoggedReport = audit.report()
-                }
-                if (audit.uncoveredFraction > worstFraction) {
-                    worstFraction = audit.uncoveredFraction
-                    worstReport = audit.report()
-                    worstZoom = zoom
-                }
+                transitionAudit = transitionAuditor?.finish()
             }
             val endZoom = map.cameraPosition.zoom
             val endTarget = map.cameraPosition.target
-            InstrumentationRegistry.getInstrumentation().runOnMainSync {
-                map.removeOnCameraMoveStartedListener(reasonListener)
-            }
             assertTrue("The gesture never reported a held frame", holds > 0)
+            if (allowFiniteExtentCrossing) {
+                assertTrue(
+                    "The finite-extent gate had no in-extent control hold",
+                    insideExtentHolds > 0,
+                )
+                assertTrue(
+                    "The gesture never crossed the exact installed finite extent: " +
+                        "startZoom=$startCameraZoom endZoom=$endZoom " +
+                        "tilt=${map.cameraPosition.tilt} extent=${measuredCoverage?.extent} " +
+                        "corners=${map.visibleRegionCorners()}",
+                    outsideExtentHolds > 0,
+                )
+            }
+            transitionAudit?.let { audit ->
+                assertEquals(
+                    "A distinct renderer camera state finished before its preceding PixelCopy " +
+                        "could be attributed",
+                    0,
+                    audit.overlappingStates,
+                )
+                assertEquals(
+                    "A renderer-finished callback was not followed by a SurfaceView PixelCopy",
+                    audit.callbacks,
+                    audit.samples.size,
+                )
+                assertEquals(
+                    "A formal hold was not matched to a camera state already captured by the " +
+                        "persistent renderer listener: audit=$audit",
+                    holds,
+                    audit.verifiedHolds,
+                )
+                val insideTransitions = audit.samples.filter { sample -> !sample.outsideExtent }
+                val outsideTransitions = audit.samples.filter { sample -> sample.outsideExtent }
+                assertTrue(
+                    "The persistent renderer listener captured no in-extent control state",
+                    insideTransitions.isNotEmpty(),
+                )
+                assertTrue(
+                    "The persistent renderer listener captured no outside-extent state",
+                    outsideTransitions.isNotEmpty(),
+                )
+                val worstTransition = outsideTransitions.maxBy { sample ->
+                    sample.coverage.revealedFraction
+                }
+                if (minimumUncoveredFraction == null) {
+                    assertTrue(
+                        "A distinct renderer-finished outside state exposed unexplored map: " +
+                            worstTransition,
+                        worstTransition.coverage.revealedFraction <= maximumUncoveredFraction,
+                    )
+                } else {
+                    assertTrue(
+                        "The renderer-transition A/B did not reproduce the outside leak: " +
+                            worstTransition,
+                        worstTransition.coverage.revealedFraction >= minimumUncoveredFraction,
+                    )
+                }
+            }
             assertTrue(
                 "Every held sample reported composed cover state, so no map pixels were audited",
                 expectCover || worstFraction >= 0.0,
@@ -2791,14 +3476,25 @@ class MapSurfaceTest {
                             "generationBeforeAttempts=$generationAtTouchDown " +
                             "measuredGeneration=${generations.firstOrNull()} held=$generations " +
                             "moveReasons=$moveReasons " +
-                            "coverSemanticsSamples=$coverSemanticsSamples trace=[$trace]\n",
+                            "coverSemanticsSamples=$coverSemanticsSamples " +
+                            "insideExtentHolds=$insideExtentHolds " +
+                            "outsideExtentHolds=$outsideExtentHolds " +
+                            "inExtentSurface=${inExtentSurface?.report()} " +
+                            "rendererTransitions=${transitionAudit?.let { audit ->
+                                    "callbacks=${audit.callbacks},same=${audit.sameStateCallbacks}," +
+                                    "overlap=${audit.overlappingStates},samples=${audit.samples.size}," +
+                                    "verifiedHolds=${audit.verifiedHolds}," +
+                                    "partial=${audit.samples.count { !it.fullyRendered }}"
+                            }} trace=[$trace]\n",
                     )
                 },
             )
-            assertTrue(
-                "MapLibre never saw the injected touches as a gesture (reasons=$moveReasons)",
-                moveReasons.any { reason -> reason in acceptedMoveReasons },
-            )
+            if (requireGestureReason) {
+                assertTrue(
+                    "MapLibre never saw the injected touches as a gesture (reasons=$moveReasons)",
+                    moveReasons.any { reason -> reason in acceptedMoveReasons },
+                )
+            }
             if (expectZoomIn) {
                 assertTrue(
                     "The gesture did not zoom in, so this measured nothing " +
@@ -2840,7 +3536,7 @@ class MapSurfaceTest {
                     (
                         kotlin.math.abs(endTarget.latitude - startTarget.latitude) +
                             kotlin.math.abs(endTarget.longitude - startTarget.longitude)
-                        ) > MINIMUM_PAN_DEGREES
+                        ) > minimumPanDegrees
                 assertTrue(
                     "The gesture did not move the camera, so this measured nothing " +
                         "($startTarget -> $endTarget)",
@@ -2948,7 +3644,16 @@ class MapSurfaceTest {
     ) {
         require(attemptLimit > 0) { "attemptLimit must be positive" }
         repeat(attemptLimit) {
-            if (pinchOnce(map, onHold, zoomIn, spanEdge, auditEveryMove, onEngaged)) return
+            if (
+                pinchOnce(
+                    map,
+                    onHold,
+                    zoomIn,
+                    spanEdge,
+                    auditEveryMove,
+                    onEngaged,
+                )
+            ) return
         }
         // Every assertion downstream would still be sound, but reporting nothing measured is more
         // useful than reporting a clean gesture that never happened.
@@ -3184,9 +3889,11 @@ class MapSurfaceTest {
         map: MapLibreMap,
         onHold: () -> Unit,
         beforeLift: (() -> Unit)? = null,
+        onEngaged: (() -> Unit)? = null,
+        attemptLimit: Int = PINCH_ATTEMPTS,
     ) {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
-        repeat(PINCH_ATTEMPTS) { attempt ->
+        repeat(attemptLimit) { attempt ->
             // From zero tilt only one travel direction can move the pitch, and which one is the
             // detector's convention rather than this test's business: alternate per attempt.
             if (
@@ -3196,13 +3903,14 @@ class MapSurfaceTest {
                     onHold = onHold,
                     upward = attempt % 2 == 0,
                     beforeLift = beforeLift,
+                    onEngaged = onEngaged,
                 )
             ) {
                 return
             }
         }
         throw AssertionError(
-            "The shove never engaged MapLibre's shove detector in $PINCH_ATTEMPTS attempts",
+            "The shove never engaged MapLibre's shove detector in $attemptLimit attempts",
         )
     }
 
@@ -3212,6 +3920,7 @@ class MapSurfaceTest {
         onHold: () -> Unit,
         upward: Boolean,
         beforeLift: (() -> Unit)?,
+        onEngaged: (() -> Unit)?,
     ): Boolean {
         val centerX = view.width / 2f
         val gap = view.width * SHOVE_POINTER_GAP_FRACTION
@@ -3251,6 +3960,7 @@ class MapSurfaceTest {
                 Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
                 return false
             }
+            onEngaged?.invoke()
             val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
             repeat(moves) { move ->
                 currentY = engageY + (endY - engageY) * (move + 1) / moves
@@ -3276,17 +3986,27 @@ class MapSurfaceTest {
      * between the pointers changes — the one degree of freedom the rotate detector reads and the
      * one no committed stream has ever exercised.
      */
-    private fun rotateInSteps(map: MapLibreMap, onHold: () -> Unit) {
+    private fun rotateInSteps(
+        map: MapLibreMap,
+        onHold: () -> Unit,
+        onEngaged: (() -> Unit)? = null,
+        attemptLimit: Int = PINCH_ATTEMPTS,
+    ) {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
-        repeat(PINCH_ATTEMPTS) {
-            if (rotateOnce(map, view, onHold)) return
+        repeat(attemptLimit) {
+            if (rotateOnce(map, view, onHold, onEngaged)) return
         }
         throw AssertionError(
-            "The rotate never engaged MapLibre's rotate detector in $PINCH_ATTEMPTS attempts",
+            "The rotate never engaged MapLibre's rotate detector in $attemptLimit attempts",
         )
     }
 
-    private fun rotateOnce(map: MapLibreMap, view: MapView, onHold: () -> Unit): Boolean {
+    private fun rotateOnce(
+        map: MapLibreMap,
+        view: MapView,
+        onHold: () -> Unit,
+        onEngaged: (() -> Unit)?,
+    ): Boolean {
         val centerX = view.width / 2f
         val centerY = view.height / 2f
         val radius = minOf(view.width, view.height) * ROTATE_RADIUS_FRACTION
@@ -3326,6 +4046,7 @@ class MapSurfaceTest {
                 Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
                 return false
             }
+            onEngaged?.invoke()
             val moves = GESTURE_STEPS * GESTURE_MICRO_STEPS
             repeat(moves) { move ->
                 currentAngle = engageAngle +
@@ -3825,17 +4546,23 @@ class MapSurfaceTest {
      * Every programmed camera move used to hide the overlay until its rebuild landed, which is the
      * right answer for a jump across the world and the wrong one for a person walking: they would
      * have watched the map go black every time they crossed the dead zone. A follow step is bounded
-     * by the ground crossed between two fixes, and the surround is now the whole world, so there is
-     * nothing left for such a step to outrun.
+     * by the ground crossed between two fixes. The installed generation's finite outside guard is
+     * global, so cancellation can safely retain it while the next canonical reveal window builds.
      */
     @Test
     fun followingALocationMovesTheMapWithoutBlankingIt() {
         val database = inMemoryDatabase()
         try {
-            val fogRendered = AtomicBoolean(false)
+            val fogRendered = AtomicReference<FogViewportRender?>(null)
+            val coverageTrace = java.util.Collections.synchronizedList(mutableListOf<String>())
+            val failureTrace = java.util.Collections.synchronizedList(mutableListOf<String>())
             val revealed = GeoPoint(25.0330, 121.5654)
             revealTrack(database, revealed)
             val followLocation = mutableStateOf<GeoPoint?>(null)
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
 
             composeRule.setContent {
                 TrailVeilMapSurface(
@@ -3846,10 +4573,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.fog-follow-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -3857,18 +4581,34 @@ class MapSurfaceTest {
                         zoom = 16.0,
                     ),
                     followLocation = followLocation.value,
-                    onFogRendered = { fogRendered.set(true) },
+                    onFogRendered = fogRendered::set,
+                    onFogFailure = { failure -> failureTrace += failure.toString() },
+                    onFogCoverageStateComposedForTesting = { snapshot ->
+                        coverageTrace +=
+                            "g=${snapshot.generation}:coverage=${snapshot.coverageInstalled}:" +
+                            "slot=${snapshot.activeSlot}:extent=${snapshot.installedExtent != null}:" +
+                            "canonical=${snapshot.canonicalLoaded}"
+                    },
                 )
             }
 
-            composeRule.waitUntil(timeoutMillis = 20_000L) { fogRendered.get() }
+            composeRule.waitUntil(timeoutMillis = 20_000L) { fogRendered.get() != null }
             val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                fogRendered.get()?.request?.matches(map.cameraAuditState()) == true
+            }
+            composeRule.waitUntil(timeoutMillis = 30_000L) {
+                val slot = runCatching { publishedFogSlot() }.getOrNull()
+                slot != null && map.hasOnlyPublishedFogGeneration(slot)
+            }
             composeRule.waitUntil(timeoutMillis = 20_000L) {
                 composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                     .fetchSemanticsNodes()
                     .isEmpty()
             }
             Thread.sleep(ZOOM_SETTLE_MILLIS)
+            coverageTrace.clear()
+            failureTrace.clear()
 
             // A step that stays inside the viewport but well outside the dead zone, which is what
             // a few minutes of walking looks like at this zoom.
@@ -3904,7 +4644,8 @@ class MapSurfaceTest {
                         "stream",
                         "TrailVeil follow step: from=${revealed.latitude} to=${walked.latitude} " +
                             "settled=${settled?.latitude} arrived=$arrived " +
-                            "coveredFrames=$coveredFrames\n",
+                            "coveredFrames=$coveredFrames coverageTrace=$coverageTrace " +
+                            "failures=$failureTrace\n",
                     )
                 },
             )
@@ -3913,7 +4654,8 @@ class MapSurfaceTest {
                 arrived,
             )
             assertEquals(
-                "The safety cover was raised while following a walking user",
+                "The safety cover was raised while following a walking user; " +
+                    "coverageTrace=$coverageTrace failures=$failureTrace",
                 0,
                 coveredFrames,
             )
@@ -3950,6 +4692,10 @@ class MapSurfaceTest {
                 MapCameraRequest(requestId = 1L, point = lookedAround, zoom = RECENTRE_FROM_ZOOM),
             )
 
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -3959,10 +4705,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.fog-recentre-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
                     followLocation = followLocation.value,
@@ -4026,6 +4769,10 @@ class MapSurfaceTest {
             val followLocation = mutableStateOf<GeoPoint?>(null)
             val userMoves = AtomicInteger()
 
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -4035,10 +4782,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.fog-follow-cancel-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -4106,6 +4850,10 @@ class MapSurfaceTest {
             val revealed = GeoPoint(25.0330, 121.5654)
             revealTrack(database, revealed)
 
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
             composeRule.setContent {
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
@@ -4115,10 +4863,7 @@ class MapSurfaceTest {
                     ),
                     fallbackTimeoutMillis = 100L,
                     savedStateKey = "trailveil.map.fog-gesture-test",
-                    fogRuntime = fogRuntime(
-                        database,
-                        RoomPersistedTrackPointChangeFeed(database.recordingDao()),
-                    ),
+                    fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = MapCameraRequest(
                         requestId = 1L,
@@ -4401,13 +5146,16 @@ class MapSurfaceTest {
             )
             val settled = map.renderedFogCoverage()
             val diagnostics = AtomicReference("")
+            val activeSlot = publishedFogSlot()
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 val style = map.style
                 diagnostics.set(
                     "camera=${map.cameraPosition.target}/${map.cameraPosition.zoom} " +
-                        "mosaicSource=${style?.getSource(FogOverlayIds.Source) != null} " +
-                        "mosaicLayer=${style?.getLayer(FogOverlayIds.Layer) != null} " +
-                        "bands=" + FogBackdropIds.Layers.count { style?.getLayer(it) != null } +
+                        "activeSlot=$activeSlot " +
+                        "mosaicSource=${style?.getSource(FogOverlayIds.source(activeSlot)) != null} " +
+                        "mosaicLayer=${style?.getLayer(FogOverlayIds.layer(activeSlot)) != null} " +
+                        "bands=" + FogBackdropIds.layers(activeSlot)
+                            .count { style?.getLayer(it) != null } +
                         " layers=" + style?.layers?.map { it.id },
                 )
             }
@@ -4518,9 +5266,9 @@ class MapSurfaceTest {
         }
     }
 
-    private fun revealTrack(database: TrailVeilDatabase, center: GeoPoint) {
+    private fun revealTrack(database: TrailVeilDatabase, center: GeoPoint): StartedRecording {
         val dao = database.recordingDao()
-        runBlocking {
+        return runBlocking {
             val recording = dao.startSession(
                 session = RecordingSessionEntity(
                     startedAt = 1_000L,
@@ -4548,6 +5296,7 @@ class MapSurfaceTest {
                     distanceDeltaMeters = 20.0,
                 )
             }
+            recording
         }
     }
 
@@ -4585,6 +5334,7 @@ class MapSurfaceTest {
         val pixels = IntArray(width * height)
         getPixels(pixels, 0, width, 0, 0, width, height)
         var revealed = 0L
+        var nonBlack = 0L
         var maxLuminance = 0
         pixels.forEach { pixel ->
             val luminance = (
@@ -4594,9 +5344,11 @@ class MapSurfaceTest {
                 ) shr 8
             if (luminance > maxLuminance) maxLuminance = luminance
             if (luminance >= UNFOGGED_LUMINANCE) revealed += 1L
+            if (luminance >= MINIMUM_VISIBLE_SURFACE_LUMINANCE) nonBlack += 1L
         }
         return FogCoverage(
             revealedFraction = revealed.toDouble() / pixels.size.toDouble(),
+            nonBlackFraction = nonBlack.toDouble() / pixels.size.toDouble(),
             maxLuminance = maxLuminance,
             sampledPixels = pixels.size.toLong(),
         )
@@ -5053,6 +5805,519 @@ class MapSurfaceTest {
         Thread.sleep(FOG_VISIBILITY_SETTLE_MILLIS)
     }
 
+    private fun MapLibreMap.setFiniteExtentGuardsVisible(visible: Boolean) {
+        val value = if (visible) Property.VISIBLE else Property.NONE
+        val activeSlotName = composeRule.runOnIdle {
+            attachedMapView()?.getTag(R.id.map_fog_active_slot) as? String
+        }
+        val activeSlot = requireNotNull(activeSlotName?.let(FogGenerationSlot::valueOf)) {
+            "No active fog slot was published before the finite-extent A/B mutation"
+        }
+        val activeLayers = listOf(
+            FogSeamGuardIds.extentFillLayer(activeSlot),
+            FogSeamGuardIds.extentBoundaryLayer(activeSlot),
+        )
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val style = requireNotNull(style) { "The style is not ready" }
+            val installedGuardLayers = FogSeamGuardIds.ExtentGuardLayers.filter { id ->
+                style.getLayer(id) != null
+            }
+            assertEquals(
+                "The A/B mutation did not identify exactly the active slot's finite guard",
+                activeLayers.toSet(),
+                installedGuardLayers.toSet(),
+            )
+            activeLayers.forEach { id ->
+                requireNotNull(style.getLayer(id)) { "$id is missing" }
+                    .setProperties(PropertyFactory.visibility(value))
+            }
+        }
+        Thread.sleep(FOG_VISIBILITY_SETTLE_MILLIS)
+    }
+
+    private fun publishedFogSlot(): FogGenerationSlot {
+        val activeSlotName = composeRule.runOnIdle {
+            attachedMapView()?.getTag(R.id.map_fog_active_slot) as? String
+        }
+        return requireNotNull(activeSlotName?.let(FogGenerationSlot::valueOf)) {
+            "No active fog slot was published"
+        }
+    }
+
+    private fun MapLibreMap.hasOnlyPublishedFogGeneration(activeSlot: FogGenerationSlot): Boolean {
+        val result = AtomicBoolean(false)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val style = style ?: return@runOnMainSync
+            val activeComplete = requiredFogGenerationLayers(activeSlot)
+                .all { id -> style.getLayer(id) != null }
+            val inactiveGone = FogOverlayIds.generationLayers(activeSlot.other())
+                .none { id -> style.getLayer(id) != null }
+            result.set(activeComplete && inactiveGone)
+        }
+        return result.get()
+    }
+
+    private fun MapLibreMap.fogGenerationStyleReport(activeSlot: FogGenerationSlot): String {
+        val report = AtomicReference<String>()
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val style = requireNotNull(style) { "The style is not ready" }
+            fun slotReport(slot: FogGenerationSlot): String =
+                FogOverlayIds.generationLayers(slot).joinToString(",") { id ->
+                    val layer = style.getLayer(id)
+                    "$id=" + if (layer == null) "missing" else layer.visibility.value
+                }
+            report.set(
+                "active=$activeSlot guard=" +
+                    style.getLayer(FogOverlayIds.InstallGuardLayer)?.visibility?.value +
+                    " A=[${slotReport(FogGenerationSlot.A)}] " +
+                    "B=[${slotReport(FogGenerationSlot.B)}]",
+            )
+        }
+        return requireNotNull(report.get())
+    }
+
+    /** Layers installed by every generation; repeat/world-copy layers are geometry-dependent. */
+    private fun requiredFogGenerationLayers(slot: FogGenerationSlot): List<String> = listOf(
+        FogOverlayIds.layer(slot),
+        FogBackdropIds.northLayer(slot),
+        FogBackdropIds.southLayer(slot),
+        FogBackdropIds.westLayer(slot),
+        FogBackdropIds.eastLayer(slot),
+        FogSeamGuardIds.layer(slot),
+        FogSeamGuardIds.extentFillLayer(slot),
+        FogSeamGuardIds.extentBoundaryLayer(slot),
+    )
+
+    private fun MapLibreMap.assertFiniteGuardStyleState(
+        activeSlot: FogGenerationSlot,
+        guardVisible: Boolean,
+    ) {
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val style = requireNotNull(style) { "The style is not ready" }
+            assertEquals(
+                "The initial full-screen renderer guard remained active during exploration",
+                Property.NONE,
+                style.getLayer(FogOverlayIds.InstallGuardLayer)?.visibility?.value,
+            )
+            val expectedVisibility = if (guardVisible) Property.VISIBLE else Property.NONE
+            listOf(
+                FogSeamGuardIds.extentFillLayer(activeSlot),
+                FogSeamGuardIds.extentBoundaryLayer(activeSlot),
+            ).forEach { id ->
+                assertEquals(
+                    "Finite guard layer $id has the wrong A/B visibility",
+                    expectedVisibility,
+                    style.getLayer(id)?.visibility?.value,
+                )
+            }
+            assertTrue(
+                "The inactive fog slot still has renderer layers during a frozen crossing",
+                FogOverlayIds.generationLayers(activeSlot.other())
+                    .none { id -> style.getLayer(id) != null },
+            )
+        }
+    }
+
+    /**
+     * Moves a frozen generation to a measured point just inside its north edge.
+     *
+     * The binary search asks MapLibre's own visible-region projection at the requested tilt and
+     * bearing. No viewport arithmetic guesses where the horizon or rotated corners land. The final
+     * retreat leaves a small in-extent acquisition margin; the real gesture must consume it and
+     * produce both inside and outside audited states.
+     */
+    private fun MapLibreMap.positionFrozenCameraNearNorthExtent(
+        extent: app.trailveil.map.fog.FogSurroundExtent,
+        tilt: Double,
+        bearing: Double,
+        retreatFraction: Double,
+    ) {
+        require(retreatFraction in 0.0..0.25)
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        val centerY = (extent.northNormalizedY + extent.southNormalizedY) / 2.0
+        val verticalSpan = extent.southNormalizedY - extent.northNormalizedY
+
+        fun moveTo(normalizedY: Double) {
+            val latitude = WebMercator.latitudeAtNormalizedY(normalizedY.coerceIn(0.0, 1.0))
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                moveCamera(
+                    CameraUpdateFactory.newCameraPosition(
+                        org.maplibre.android.camera.CameraPosition.Builder()
+                            .target(LatLng(latitude, extent.centerLongitude))
+                            .zoom(EXPLORATION_GESTURE_ZOOM)
+                            .tilt(tilt)
+                            .bearing(bearing)
+                            .build(),
+                    ),
+                )
+            }
+            awaitFullyRenderedFrame(view)
+        }
+
+        moveTo(centerY)
+        assertTrue(
+            "The configured camera is not covered at the extent centre",
+            extent.covers(visibleRegionCorners()),
+        )
+        var insideY = centerY
+        var outsideY = (extent.northNormalizedY - maxOf(verticalSpan * 0.25, 1e-5))
+            .coerceAtLeast(0.0)
+        moveTo(outsideY)
+        assertTrue(
+            "The boundary search never found a camera outside the finite north edge",
+            !extent.covers(visibleRegionCorners()),
+        )
+        repeat(FINITE_EXTENT_BINARY_SEARCH_STEPS) {
+            val middle = (insideY + outsideY) / 2.0
+            moveTo(middle)
+            if (extent.covers(visibleRegionCorners())) {
+                insideY = middle
+            } else {
+                outsideY = middle
+            }
+        }
+        val retreatY = insideY + (centerY - insideY) * retreatFraction
+        moveTo(retreatY)
+        assertTrue(
+            "The finite-boundary setup did not retreat to the safe side",
+            extent.covers(visibleRegionCorners()),
+        )
+    }
+
+    /** East-edge counterpart used by the real bearing gesture. */
+    private fun MapLibreMap.positionFrozenCameraNearEastExtent(
+        extent: app.trailveil.map.fog.FogSurroundExtent,
+        tilt: Double,
+        bearing: Double,
+        retreatFraction: Double,
+    ) {
+        require(!extent.wrapsWorld) { "A wrapping extent has no east edge" }
+        require(retreatFraction in 0.0..0.25)
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        val centerY = (extent.northNormalizedY + extent.southNormalizedY) / 2.0
+        val centerLatitude = WebMercator.latitudeAtNormalizedY(centerY)
+        val halfDegrees = extent.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
+
+        fun moveTo(longitude: Double) {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                moveCamera(
+                    CameraUpdateFactory.newCameraPosition(
+                        org.maplibre.android.camera.CameraPosition.Builder()
+                            .target(LatLng(centerLatitude, longitude))
+                            .zoom(EXPLORATION_GESTURE_ZOOM)
+                            .tilt(tilt)
+                            .bearing(bearing)
+                            .build(),
+                    ),
+                )
+            }
+            awaitFullyRenderedFrame(view)
+        }
+
+        moveTo(extent.centerLongitude)
+        assertTrue(
+            "The configured camera is not covered at the extent centre",
+            extent.covers(visibleRegionCorners()),
+        )
+        var insideLongitude = extent.centerLongitude
+        var outsideLongitude = extent.centerLongitude + halfDegrees * 1.25
+        moveTo(outsideLongitude)
+        assertTrue(
+            "The boundary search never found a camera outside the finite east edge",
+            !extent.covers(visibleRegionCorners()),
+        )
+        repeat(FINITE_EXTENT_BINARY_SEARCH_STEPS) {
+            val middle = (insideLongitude + outsideLongitude) / 2.0
+            moveTo(middle)
+            if (extent.covers(visibleRegionCorners())) {
+                insideLongitude = middle
+            } else {
+                outsideLongitude = middle
+            }
+        }
+        val retreatedLongitude = insideLongitude -
+            (insideLongitude - extent.centerLongitude) * retreatFraction
+        moveTo(retreatedLongitude)
+        assertTrue(
+            "The finite-boundary setup did not retreat to the safe side",
+            extent.covers(visibleRegionCorners()),
+        )
+    }
+
+    /**
+     * Keeps one high-zoom finite generation installed while visiting both neighbouring world
+     * copies and a viewport wider than one world. GeoJSON world wrapping is a pinned MapLibre
+     * implementation property rather than a GeoJSON guarantee, so this is intentionally a device
+     * gate rather than only coordinate arithmetic.
+     */
+    private fun MapLibreMap.moveFrozenFiniteGenerationAcrossWorldCopies(onHold: () -> Unit) {
+        val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+        val start = requireNotNull(cameraPosition.target)
+        val observedLongitudes = mutableListOf<Double>()
+
+        fun moveTo(longitude: Double, zoom: Double) {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                moveCamera(
+                    CameraUpdateFactory.newCameraPosition(
+                        org.maplibre.android.camera.CameraPosition.Builder()
+                            .target(LatLng(start.latitude, longitude))
+                            .zoom(zoom)
+                            .tilt(0.0)
+                            .bearing(0.0)
+                            .build(),
+                    ),
+                )
+            }
+            awaitFullyRenderedFrame(view)
+            observedLongitudes += requireNotNull(cameraPosition.target).longitude
+            onHold()
+        }
+
+        moveTo(start.longitude, 12.0)
+        moveTo(start.longitude + 360.0, 4.0)
+        moveTo(start.longitude + 360.0, WRAPPED_WORLD_TEST_ZOOM)
+        moveTo(start.longitude - 360.0, WRAPPED_WORLD_TEST_ZOOM)
+        val finalTarget = requireNotNull(cameraPosition.target)
+        val finalCorners = visibleRegionCorners()
+        val worldPixelWidth = FogBackdropGeometry.RENDER_TILE_SIZE_PIXELS *
+            Math.pow(2.0, cameraPosition.zoom)
+        assertTrue(
+            "The final viewport is not wider than one rendered world: " +
+                "view=${view.width} world=$worldPixelWidth zoom=${cameraPosition.zoom}",
+            view.width > worldPixelWidth,
+        )
+        assertTrue(
+            "The wrapped-world gate did not remain at the antimeridian: $finalTarget",
+            kotlin.math.abs(
+                kotlin.math.abs(WebMercator.wrapLongitude(finalTarget.longitude)) - 180.0,
+            ) < 2.0,
+        )
+        InstrumentationRegistry.getInstrumentation().sendStatus(
+            0,
+            Bundle().apply {
+                putString(
+                    "stream",
+                    "TrailVeil finite guard world copies: start=${start.longitude} " +
+                        "normalizedTargets=$observedLongitudes zoom=${cameraPosition.zoom} " +
+                        "viewWidth=${view.width} worldWidth=$worldPixelWidth " +
+                        "corners=$finalCorners\n",
+                )
+            },
+        )
+    }
+
+    /** Copies the pixels users actually see from MapLibre's SurfaceView without a Style mutation. */
+    private fun MapView.pixelCopyFogCoverage(): FogCoverage {
+        val ready = CountDownLatch(1)
+        val result = AtomicInteger(Int.MIN_VALUE)
+        val bitmap = AtomicReference<Bitmap?>(null)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val surface = renderView as? SurfaceView
+                ?: throw AssertionError("The main MapView is not backed by a SurfaceView")
+            assertTrue("The MapLibre SurfaceView has no drawable width", surface.width > 0)
+            assertTrue("The MapLibre SurfaceView has no drawable height", surface.height > 0)
+            val destination = createBitmap(surface.width, surface.height)
+            bitmap.set(destination)
+            PixelCopy.request(
+                surface,
+                destination,
+                { copyResult ->
+                    result.set(copyResult)
+                    ready.countDown()
+                },
+                Handler(Looper.getMainLooper()),
+            )
+        }
+        assertTrue(
+            "PixelCopy did not return the MapLibre SurfaceView",
+            ready.await(SNAPSHOT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+        )
+        val captured = requireNotNull(bitmap.get())
+        try {
+            assertEquals("PixelCopy failed", PixelCopy.SUCCESS, result.get())
+            return captured.fogCoverage()
+        } finally {
+            captured.recycle()
+        }
+    }
+
+    /**
+     * Captures every distinct camera state reported by MapLibre after this auditor is armed.
+     *
+     * PixelCopy has no renderer-frame token. Each distinct renderer callback therefore requests a
+     * copy immediately and keeps the main callback blocked while PixelCopy completes on a private
+     * HandlerThread. The input driver also waits before sending its next formal MOVE. This prevents
+     * a later callback from being silently assigned to the preceding camera state.
+     */
+    private inner class SurfaceTransitionAuditor(
+        private val mapView: MapView,
+        private val map: MapLibreMap,
+        private val extent: app.trailveil.map.fog.FogSurroundExtent,
+    ) {
+        private val armed = AtomicBoolean(false)
+        private val lastState = AtomicReference<RendererCameraState?>(null)
+        private val pending = AtomicReference<CountDownLatch?>(null)
+        private val failure = AtomicReference<Throwable?>(null)
+        private val callbackCount = AtomicInteger(0)
+        private val sameStateCallbacks = AtomicInteger(0)
+        private val overlappingStates = AtomicInteger(0)
+        private val verifiedHoldCount = AtomicInteger(0)
+        private val pixelCopyThread = HandlerThread("trailveil-fog-transition-copy").apply { start() }
+        private val pixelCopyHandler = Handler(pixelCopyThread.looper)
+        private val samples = java.util.Collections.synchronizedList(
+            mutableListOf<SurfaceTransitionSample>(),
+        )
+        private val listener = MapView.OnDidFinishRenderingFrameListener { fullyRendered, _, _ ->
+            if (!armed.get()) return@OnDidFinishRenderingFrameListener
+            callbackCount.incrementAndGet()
+            val state = currentCameraState() ?: return@OnDidFinishRenderingFrameListener
+            if (lastState.get() == state) {
+                sameStateCallbacks.incrementAndGet()
+            }
+            val ready = CountDownLatch(1)
+            if (!pending.compareAndSet(null, ready)) {
+                overlappingStates.incrementAndGet()
+                return@OnDidFinishRenderingFrameListener
+            }
+            lastState.set(state)
+            val corners = map.currentVisibleRegionCorners()
+            val outsideExtent = !extent.covers(corners)
+            val surface = mapView.renderView as? SurfaceView
+            if (surface == null || surface.width <= 0 || surface.height <= 0) {
+                failure.compareAndSet(null, AssertionError("MapLibre has no drawable SurfaceView"))
+                pending.compareAndSet(ready, null)
+                ready.countDown()
+                return@OnDidFinishRenderingFrameListener
+            }
+            val bitmap = createBitmap(surface.width, surface.height)
+            try {
+                PixelCopy.request(
+                    surface,
+                    bitmap,
+                    { result ->
+                        try {
+                            if (result != PixelCopy.SUCCESS) {
+                                throw AssertionError("Renderer-transition PixelCopy failed: $result")
+                            }
+                            samples += SurfaceTransitionSample(
+                                state = state,
+                                fullyRendered = fullyRendered,
+                                outsideExtent = outsideExtent,
+                                corners = corners,
+                                coverage = bitmap.fogCoverage(),
+                            )
+                        } catch (captured: Throwable) {
+                            failure.compareAndSet(null, captured)
+                        } finally {
+                            bitmap.recycle()
+                            pending.compareAndSet(ready, null)
+                            ready.countDown()
+                        }
+                    },
+                    pixelCopyHandler,
+                )
+                if (!ready.await(SNAPSHOT_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    failure.compareAndSet(
+                        null,
+                        AssertionError("Renderer-transition PixelCopy timed out inside callback"),
+                    )
+                }
+            } catch (captured: Throwable) {
+                bitmap.recycle()
+                failure.compareAndSet(null, captured)
+                pending.compareAndSet(ready, null)
+                ready.countDown()
+            }
+        }
+
+        init {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                mapView.addOnDidFinishRenderingFrameListener(listener)
+            }
+        }
+
+        fun armAndCaptureCurrentState() {
+            if (armed.compareAndSet(false, true)) {
+                map.awaitFullyRenderedFrame(mapView)
+            }
+            awaitQuiescent()
+        }
+
+        fun awaitThroughCurrentState() {
+            if (!armed.get()) armAndCaptureCurrentState()
+            repeat(3) { attempt ->
+                awaitQuiescent()
+                val current = checkNotNull(currentCameraState()) {
+                    "MapLibre had no camera target at a formal renderer-audit hold"
+                }
+                if (current == lastState.get()) {
+                    verifiedHoldCount.incrementAndGet()
+                    return
+                }
+                if (attempt < 2) {
+                    // The gesture helper's one-shot fully-rendered listener can consume a frame
+                    // already in flight before the MOVE's camera state is presented. Force a new
+                    // repaint and require the persistent listener to capture that current state.
+                    map.awaitFullyRenderedFrame(mapView)
+                }
+            }
+            val current = checkNotNull(currentCameraState())
+            assertEquals(
+                "The formal hold camera was not the last state captured by the persistent " +
+                    "renderer listener",
+                current,
+                lastState.get(),
+            )
+        }
+
+        fun finish(): SurfaceTransitionAudit {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                mapView.removeOnDidFinishRenderingFrameListener(listener)
+            }
+            try {
+                awaitQuiescent()
+                failure.get()?.let { captured ->
+                    throw AssertionError("The renderer-transition audit failed", captured)
+                }
+                return SurfaceTransitionAudit(
+                    callbacks = callbackCount.get(),
+                    sameStateCallbacks = sameStateCallbacks.get(),
+                    overlappingStates = overlappingStates.get(),
+                    verifiedHolds = verifiedHoldCount.get(),
+                    samples = synchronized(samples) { samples.toList() },
+                )
+            } finally {
+                pixelCopyThread.quitSafely()
+                pixelCopyThread.join(SNAPSHOT_TIMEOUT_SECONDS * 1_000L)
+            }
+        }
+
+        private fun awaitQuiescent() {
+            while (true) {
+                val current = pending.get() ?: break
+                assertTrue(
+                    "A renderer-transition PixelCopy did not finish",
+                    current.await(SNAPSHOT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                )
+            }
+            failure.get()?.let { captured ->
+                throw AssertionError("The renderer-transition audit failed", captured)
+            }
+        }
+
+        private fun currentCameraState(): RendererCameraState? {
+            val position = map.cameraPosition
+            val target = position.target ?: return null
+            return RendererCameraState(
+                latitude = target.latitude,
+                longitude = target.longitude,
+                zoom = position.zoom,
+                tilt = position.tilt,
+                bearing = position.bearing,
+            )
+        }
+    }
+
     private fun snapshotWidth(): Int =
         requireNotNull(composeRule.runOnIdle { attachedMapView() }).width
 
@@ -5191,11 +6456,13 @@ class MapSurfaceTest {
 
     private data class FogCoverage(
         val revealedFraction: Double,
+        val nonBlackFraction: Double,
         val maxLuminance: Int,
         val sampledPixels: Long,
     ) {
         fun report(): String = "[maxLuminance=$maxLuminance " +
             "aboveThreshold=${"%.4f".format(java.util.Locale.US, revealedFraction * 100.0)}% " +
+            "nonBlack=${"%.4f".format(java.util.Locale.US, nonBlackFraction * 100.0)}% " +
             "pixels=$sampledPixels]"
     }
 
@@ -5211,7 +6478,33 @@ class MapSurfaceTest {
         val bitmap: Bitmap,
     )
 
+    private data class RendererCameraState(
+        val latitude: Double,
+        val longitude: Double,
+        val zoom: Double,
+        val tilt: Double,
+        val bearing: Double,
+    )
+
+    private data class SurfaceTransitionSample(
+        val state: RendererCameraState,
+        val fullyRendered: Boolean,
+        val outsideExtent: Boolean,
+        val corners: List<GeoPoint>,
+        val coverage: FogCoverage,
+    )
+
+    private data class SurfaceTransitionAudit(
+        val callbacks: Int,
+        val sameStateCallbacks: Int,
+        val overlappingStates: Int,
+        val verifiedHolds: Int,
+        val samples: List<SurfaceTransitionSample>,
+    )
+
     private enum class CompositeGesturePhase { SHOVE, REGRAB, PINCH }
+
+    private enum class FiniteExtentPath { PAN, TILT, BEARING, ZOOM }
 
     private data class CompositeRendererSample(
         val phase: CompositeGesturePhase,
@@ -5339,6 +6632,29 @@ class MapSurfaceTest {
         }
     }
 
+    /** Real Room reads with a deterministic revision publication point for renderer-order tests. */
+    private class TriggerableRoomChangeFeed(database: TrailVeilDatabase) :
+        PersistedTrackPointChangeFeed {
+        private val delegate = RoomPersistedTrackPointChangeFeed(database.recordingDao())
+        private val revisions = MutableSharedFlow<PersistedPointRevision>(
+            replay = 1,
+            extraBufferCapacity = 1,
+        )
+
+        override suspend fun latestCursor(): PersistedPointCursor = delegate.latestCursor()
+
+        override fun revisionsAfter(cursor: PersistedPointCursor): Flow<PersistedPointRevision> = revisions
+
+        override suspend fun readChangesAfter(
+            cursor: PersistedPointCursor,
+            limit: Int,
+        ): List<PersistedTrackPointChange> = delegate.readChangesAfter(cursor, limit)
+
+        suspend fun publishLatest() {
+            revisions.emit(PersistedPointRevision(delegate.latestCursor()))
+        }
+    }
+
     private fun attachedMapView(): MapView? =
         ActivityLifecycleMonitorRegistry.getInstance()
             .getActivitiesInStage(Stage.RESUMED)
@@ -5452,15 +6768,13 @@ class MapSurfaceTest {
         const val MAXIMUM_OVER_FOGGED_FRACTION = 0.05
         const val MAXIMUM_HIGH_LATITUDE_OVER_FOGGED_FRACTION = 0.02
         const val MINIMUM_REPRODUCED_HIGH_LATITUDE_SEAM_FRACTION = 0.0001
+        const val MINIMUM_FINITE_EXTENT_CONTROL_LEAK_FRACTION = 0.01
+
         const val FOG_VISIBILITY_SETTLE_MILLIS = 600L
 
         /** Every fog layer the coverage audit must hide and restore. */
-        val ALL_FOG_LAYERS: List<String> = listOf(
-            FogOverlayIds.Layer,
-            FogOverlayIds.WestRepeatLayer,
-            FogOverlayIds.EastRepeatLayer,
-            FogSeamGuardIds.Layer,
-        ) + FogBackdropIds.Layers
+        val ALL_FOG_LAYERS: List<String> =
+            listOf(FogOverlayIds.InstallGuardLayer) + FogOverlayIds.AllGenerationLayers
 
         /**
          * One quad drawn on its own is one coat of fog, everywhere it reaches, or it is being
@@ -5475,6 +6789,24 @@ class MapSurfaceTest {
 
         /** With the fog hidden, nearly everything the map draws must read as uncovered. */
         const val MINIMUM_CALIBRATION_UNCOVERED_FRACTION = 0.5
+
+        /** The fallback under one ordinary fog coat measures 60; the opaque install guard is 0. */
+        const val MINIMUM_FOGGED_SURFACE_LUMINANCE = 20
+
+        /**
+         * "Not blacked out" for frames inside the A/B overlap or retention windows, where a
+         * legitimate double coat sits below the single-coat luminance floor. The opaque install
+         * guard reads near-fully black; a fogged basemap - single or double coat - does not.
+         */
+        const val MINIMUM_GUARDED_NON_BLACK_FRACTION = 0.5
+
+        /** Two overlapping 72% fog generations measure about 17; an opaque guard measures zero. */
+        const val MINIMUM_VISIBLE_SURFACE_LUMINANCE = 5
+        const val MINIMUM_IN_EXTENT_NON_BLACK_FRACTION = 0.99
+        const val FINITE_EXTENT_BINARY_SEARCH_STEPS = 18
+        const val MINIMUM_FINITE_EXTENT_PAN_DEGREES = 0.001
+        const val WRAPPED_WORLD_TEST_ZOOM = 0.84
+        const val MINIMUM_WRAPPED_WORLD_ZOOM_CHANGE = 14.0
         /**
          * How long a production-style test may take to fetch a style, its tiles and a first fog
          * frame before it is called a failure.

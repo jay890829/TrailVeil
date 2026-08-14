@@ -430,6 +430,204 @@ class FogBackdropGeometryTest {
         )
     }
 
+    @Test
+    fun anExtentGuardIsTheCanonicalComplementOnBothSidesOfTheAntimeridian() {
+        listOf(0.0, 175.0, -175.0, 535.0, -535.0).forEach { center ->
+            val extent = FogSurroundExtent(
+                centerLongitude = center,
+                halfWorlds = 0.1,
+                northNormalizedY = 0.3,
+                southNormalizedY = 0.7,
+                wrapsWorld = false,
+            )
+            val guard = FogBackdropGeometry.extentGuard(extent)
+            guard.rectangles.forEach { rectangle ->
+                assertTrue(rectangle.westLongitude >= -180.0)
+                assertTrue(rectangle.eastLongitude <= 180.0)
+                assertTrue(rectangle.westLongitude < rectangle.eastLongitude)
+                assertTrue(rectangle.southLatitude < rectangle.northLatitude)
+                assertTrue(
+                    "guard rectangle crosses half a canonical world: $rectangle",
+                    rectangle.eastLongitude - rectangle.westLongitude <= 180.0 + 1e-9,
+                )
+            }
+            listOf(-179.0, -140.0, -20.0, 0.0, 20.0, 140.0, 179.0).forEach { longitude ->
+                listOf(0.1, 0.5, 0.9).forEach { y ->
+                    val point = GeoPoint(WebMercator.latitudeAtNormalizedY(y), longitude)
+                    val expectedGuard = !extent.covers(listOf(point))
+                    val actualGuard = guard.rectangles.any { contains(it, point) }
+                    assertEquals(
+                        "center=$center longitude=$longitude y=$y guard=$guard",
+                        expectedGuard,
+                        actualGuard,
+                    )
+                }
+            }
+        }
+    }
+
+    /**
+     * No gap, anywhere: every point the extent does not cover must be inside some guard rectangle,
+     * over a dense longitude grid plus each extent's own four boundary values and their
+     * epsilon-neighbours. The earlier spot checks sampled seven fixed longitudes at three fixed
+     * depths, so a sub-degree shave off the west or south guard boundary survived the whole suite;
+     * this sweep samples the joints the extents actually have. Overlap in the other direction is
+     * deliberately free — the guard hugging the exact edge is safe-side over-fog.
+     */
+    @Test
+    fun theExtentGuardLeavesNoGapAnywhereOutsideTheExtent() {
+        val epsilon = 1e-7
+        val centers = listOf(-179.5, -121.5654, -90.0, 0.0, 90.0, 121.5654, 179.5)
+        val halfWorldsChoices = listOf(0.01, 0.1, 0.3, 0.49)
+        val latitudeBands = listOf(0.3 to 0.7, 0.02 to 0.35, 0.65 to 0.98, 0.45 to 0.55)
+        centers.forEach { center ->
+            halfWorldsChoices.forEach { halfWorlds ->
+                latitudeBands.forEach { (northY, southY) ->
+                    val extent = FogSurroundExtent(
+                        centerLongitude = center,
+                        halfWorlds = halfWorlds,
+                        northNormalizedY = northY,
+                        southNormalizedY = southY,
+                        wrapsWorld = false,
+                    )
+                    val guard = FogBackdropGeometry.extentGuard(extent)
+                    val westEdge = WebMercator.wrapLongitude(
+                        center - halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN,
+                    )
+                    val eastEdge = WebMercator.wrapLongitude(
+                        center + halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN,
+                    )
+                    val longitudes = buildSet {
+                        var lon = -180.0
+                        while (lon < 180.0) {
+                            add(lon)
+                            lon += 2.5
+                        }
+                        listOf(westEdge, eastEdge, center).forEach { edge ->
+                            add(WebMercator.wrapLongitude(edge - epsilon))
+                            add(WebMercator.wrapLongitude(edge))
+                            add(WebMercator.wrapLongitude(edge + epsilon))
+                        }
+                    }
+                    val ys = buildSet {
+                        var y = 0.005
+                        while (y < 1.0) {
+                            add(y)
+                            y += 0.05
+                        }
+                        listOf(northY, southY).forEach { edge ->
+                            add((edge - epsilon).coerceIn(0.0, 1.0))
+                            add(edge)
+                            add((edge + epsilon).coerceIn(0.0, 1.0))
+                        }
+                    }
+                    longitudes.forEach { longitude ->
+                        ys.forEach { y ->
+                            val point = GeoPoint(WebMercator.latitudeAtNormalizedY(y), longitude)
+                            if (!extent.covers(listOf(point))) {
+                                assertTrue(
+                                    "gap outside extent center=$center halfWorlds=$halfWorlds " +
+                                        "band=$northY..$southY at lon=$longitude y=$y",
+                                    guard.rectangles.any { contains(it, point) },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /** The exact-edge closure of [theExtentGuardLeavesNoGapAnywhereOutsideTheExtent], per edge. */
+    @Test
+    fun theExtentGuardClosesAllFourExactEdges() {
+        val extent = FogSurroundExtent(
+            centerLongitude = 121.5654,
+            halfWorlds = 0.12,
+            northNormalizedY = 0.28,
+            southNormalizedY = 0.66,
+            wrapsWorld = false,
+        )
+        val guard = FogBackdropGeometry.extentGuard(extent)
+        val westEdge = WebMercator.wrapLongitude(
+            extent.centerLongitude - extent.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN,
+        )
+        val eastEdge = WebMercator.wrapLongitude(
+            extent.centerLongitude + extent.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN,
+        )
+        val midLatitude = WebMercator.latitudeAtNormalizedY(0.47)
+        val northLatitude = WebMercator.latitudeAtNormalizedY(extent.northNormalizedY)
+        val southLatitude = WebMercator.latitudeAtNormalizedY(extent.southNormalizedY)
+        listOf(
+            "west" to GeoPoint(midLatitude, westEdge),
+            "east" to GeoPoint(midLatitude, eastEdge),
+            "north" to GeoPoint(northLatitude, extent.centerLongitude),
+            "south" to GeoPoint(southLatitude, extent.centerLongitude),
+        ).forEach { (edge, exact) ->
+            assertTrue(
+                "the $edge exact edge must remain safe-side over-fog",
+                extent.covers(listOf(exact)),
+            )
+            assertTrue(
+                "the guard left a rounding gap at the $edge exact edge",
+                guard.rectangles.any { contains(it, exact) },
+            )
+        }
+    }
+
+    @Test
+    fun anExtentGuardOverlapsTheExactSafeEdgeButNotItsInterior() {
+        val extent = FogSurroundExtent(
+            centerLongitude = 0.0,
+            halfWorlds = 0.1,
+            northNormalizedY = 0.3,
+            southNormalizedY = 0.7,
+            wrapsWorld = false,
+        )
+        val guard = FogBackdropGeometry.extentGuard(extent)
+        val latitude = WebMercator.latitudeAtNormalizedY(0.5)
+        val eastEdge = extent.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
+        val inside = GeoPoint(latitude, eastEdge - 1e-5)
+        val exact = GeoPoint(latitude, eastEdge)
+        val outside = GeoPoint(latitude, eastEdge + 1e-5)
+
+        assertTrue(extent.covers(listOf(inside)))
+        assertFalse(guard.rectangles.any { contains(it, inside) })
+        assertTrue("the exact edge must remain safe-side over-fog", extent.covers(listOf(exact)))
+        assertTrue(
+            "the guard left a rounding gap at the exact edge",
+            guard.rectangles.any { contains(it, exact) },
+        )
+        assertFalse(extent.covers(listOf(outside)))
+        assertTrue(guard.rectangles.any { contains(it, outside) })
+    }
+
+    @Test
+    fun aWorldWrappingExtentNeedsOnlyNorthAndSouthGuards() {
+        val extent = FogSurroundExtent(
+            centerLongitude = 175.0,
+            halfWorlds = 0.5,
+            northNormalizedY = 0.2,
+            southNormalizedY = 0.8,
+            wrapsWorld = true,
+        )
+        val rectangles = FogBackdropGeometry.extentGuard(extent).rectangles
+        assertEquals(4, rectangles.size)
+        assertTrue(rectangles.all { it.eastLongitude - it.westLongitude <= 180.0 })
+        listOf(-179.0, -90.0, 0.0, 90.0, 179.0).forEach { longitude ->
+            assertFalse(
+                rectangles.any {
+                    contains(it, GeoPoint(WebMercator.latitudeAtNormalizedY(0.5), longitude))
+                },
+            )
+            assertTrue(
+                rectangles.any {
+                    contains(it, GeoPoint(WebMercator.latitudeAtNormalizedY(0.05), longitude))
+                },
+            )
+        }
+    }
+
     /**
      * The second defect from the same verification: coverage that wraps the world has no east or
      * west edge, because a world copy is installed on each side of it. Measuring the camera against

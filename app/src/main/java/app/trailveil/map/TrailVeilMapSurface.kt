@@ -71,16 +71,19 @@ import org.maplibre.android.maps.Style
 import org.maplibre.android.style.expressions.Expression
 import org.maplibre.android.style.layers.BackgroundLayer
 import org.maplibre.android.style.layers.CircleLayer
+import org.maplibre.android.style.layers.FillLayer
 import org.maplibre.android.style.layers.LineLayer
 import org.maplibre.android.style.layers.Property
 import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.layers.RasterLayer
 import org.maplibre.android.style.sources.ImageSource
 import org.maplibre.android.style.sources.GeoJsonSource
+import org.maplibre.android.style.sources.GeoJsonOptions
 import org.maplibre.geojson.Feature
 import org.maplibre.geojson.FeatureCollection
 import org.maplibre.geojson.LineString
 import org.maplibre.geojson.Point
+import org.maplibre.geojson.Polygon
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
@@ -112,7 +115,38 @@ internal object FogOverlayIds {
     const val WestRepeatLayer = "trailveil-cumulative-fog-west-repeat-layer"
     const val EastRepeatSource = "trailveil-cumulative-fog-east-repeat-source"
     const val EastRepeatLayer = "trailveil-cumulative-fog-east-repeat-layer"
+
+    fun source(slot: FogGenerationSlot): String = Source.forSlot(slot)
+    fun layer(slot: FogGenerationSlot): String = Layer.forSlot(slot)
+    fun westRepeatSource(slot: FogGenerationSlot): String = WestRepeatSource.forSlot(slot)
+    fun westRepeatLayer(slot: FogGenerationSlot): String = WestRepeatLayer.forSlot(slot)
+    fun eastRepeatSource(slot: FogGenerationSlot): String = EastRepeatSource.forSlot(slot)
+    fun eastRepeatLayer(slot: FogGenerationSlot): String = EastRepeatLayer.forSlot(slot)
+
+    fun generationLayers(slot: FogGenerationSlot): List<String> = listOf(
+        layer(slot),
+        westRepeatLayer(slot),
+        eastRepeatLayer(slot),
+    ) + FogBackdropIds.layers(slot) + FogSeamGuardIds.layers(slot)
+
+    val AllGenerationLayers: List<String> = FogGenerationSlot.entries.flatMap(::generationLayers)
 }
+
+internal enum class FogGenerationSlot {
+    A,
+    B,
+    ;
+
+    fun other(): FogGenerationSlot = if (this == A) B else A
+
+    companion object {
+        /** Slot B holds the initial opaque placeholder, leaving legacy slot A for first canonical. */
+        fun next(active: FogGenerationSlot?): FogGenerationSlot = active?.other() ?: B
+    }
+}
+
+private fun String.forSlot(slot: FogGenerationSlot): String =
+    if (slot == FogGenerationSlot.A) this else "$this-b"
 
 /**
  * The mosaic has finite bounds, so the map outside them carries its own fog in map coordinates.
@@ -151,11 +185,45 @@ internal object FogBackdropIds {
         EastWorldLayer,
         WrappedSideLayer,
     )
+
+    fun northSource(slot: FogGenerationSlot): String = NorthSource.forSlot(slot)
+    fun northLayer(slot: FogGenerationSlot): String = NorthLayer.forSlot(slot)
+    fun southSource(slot: FogGenerationSlot): String = SouthSource.forSlot(slot)
+    fun southLayer(slot: FogGenerationSlot): String = SouthLayer.forSlot(slot)
+    fun westSource(slot: FogGenerationSlot): String = WestSource.forSlot(slot)
+    fun westLayer(slot: FogGenerationSlot): String = WestLayer.forSlot(slot)
+    fun eastSource(slot: FogGenerationSlot): String = EastSource.forSlot(slot)
+    fun eastLayer(slot: FogGenerationSlot): String = EastLayer.forSlot(slot)
+    fun westWorldSource(slot: FogGenerationSlot): String = WestWorldSource.forSlot(slot)
+    fun westWorldLayer(slot: FogGenerationSlot): String = WestWorldLayer.forSlot(slot)
+    fun eastWorldSource(slot: FogGenerationSlot): String = EastWorldSource.forSlot(slot)
+    fun eastWorldLayer(slot: FogGenerationSlot): String = EastWorldLayer.forSlot(slot)
+    fun wrappedSideSource(slot: FogGenerationSlot): String = WrappedSideSource.forSlot(slot)
+    fun wrappedSideLayer(slot: FogGenerationSlot): String = WrappedSideLayer.forSlot(slot)
+    fun layers(slot: FogGenerationSlot): List<String> = Layers.map { it.forSlot(slot) }
 }
 
 internal object FogSeamGuardIds {
     const val Source = "trailveil-fog-seam-guard-source"
     const val Layer = "trailveil-fog-seam-guard-layer"
+    const val ExtentSource = "trailveil-fog-extent-guard-source"
+    const val ExtentFillLayer = "trailveil-fog-extent-guard-fill-layer"
+    const val ExtentBoundaryLayer = "trailveil-fog-extent-guard-boundary-layer"
+
+    fun source(slot: FogGenerationSlot): String = Source.forSlot(slot)
+    fun layer(slot: FogGenerationSlot): String = Layer.forSlot(slot)
+    fun extentSource(slot: FogGenerationSlot): String = ExtentSource.forSlot(slot)
+    fun extentFillLayer(slot: FogGenerationSlot): String = ExtentFillLayer.forSlot(slot)
+    fun extentBoundaryLayer(slot: FogGenerationSlot): String = ExtentBoundaryLayer.forSlot(slot)
+    fun layers(slot: FogGenerationSlot): List<String> = listOf(
+        layer(slot),
+        extentFillLayer(slot),
+        extentBoundaryLayer(slot),
+    )
+
+    val ExtentGuardLayers: List<String> = FogGenerationSlot.entries.flatMap { slot ->
+        listOf(extentFillLayer(slot), extentBoundaryLayer(slot))
+    }
 }
 
 internal object CurrentLocationOverlayIds {
@@ -237,6 +305,13 @@ internal data class MapTrackOverlay(
 internal data class InstalledFogCoverageSnapshot(
     val generation: Long,
     val extent: FogSurroundExtent,
+    val slot: FogGenerationSlot,
+)
+
+private data class PreparedFogGeneration(
+    val mosaic: FogTileMosaic,
+    val previousSlot: FogGenerationSlot?,
+    val installedSlot: FogGenerationSlot,
 )
 
 /** Compose-applied state exposed only to renderer-ordering instrumentation. */
@@ -244,6 +319,8 @@ internal data class ComposedFogCoverageSnapshot(
     val generation: Long,
     val coverageInstalled: Boolean,
     val installedExtent: FogSurroundExtent?,
+    val activeSlot: FogGenerationSlot?,
+    val canonicalLoaded: Boolean,
 )
 
 internal enum class CanonicalFogInstallCheckpointPhase {
@@ -258,12 +335,14 @@ internal data class CanonicalFogInstallCheckpoint(
     val fogRevision: Long,
     val render: FogViewportRender,
     val installedExtent: FogSurroundExtent?,
+    val installedSlot: FogGenerationSlot?,
 )
 
 internal data class CanonicalFogInstallDecision(
     val generation: Long,
     val render: FogViewportRender,
     val installedExtent: FogSurroundExtent,
+    val installedSlot: FogGenerationSlot?,
     val rejectedBeforeStyleMutation: Boolean,
     val coverageInstalledAtDecision: Boolean,
 )
@@ -309,6 +388,7 @@ internal fun TrailVeilMapSurface(
     onCanonicalFogInstallDecisionForTesting: ((CanonicalFogInstallDecision) -> Unit)? = null,
     canonicalViewportRequestForTesting: FogViewportRequest? = null,
     fogSurroundCoverageForTesting: ((FogSurroundExtent) -> Boolean)? = null,
+    suppressFogCameraReactionsForTesting: Boolean = false,
 ) {
     require(fallbackTimeoutMillis > 0L) { "fallbackTimeoutMillis must be positive" }
     require(savedStateKey.isNotBlank()) { "savedStateKey must not be blank" }
@@ -396,6 +476,9 @@ internal fun TrailVeilMapSurface(
     var installedSurround by remember(mapView, fogRuntime, readyStyle) {
         mutableStateOf<FogSurroundExtent?>(null)
     }
+    var activeFogSlot by remember(mapView, fogRuntime, readyStyle) {
+        mutableStateOf<FogGenerationSlot?>(null)
+    }
     var canonicalFogLoaded by remember(mapView, fogRuntime, fogRequired) {
         mutableStateOf(!fogRequired)
     }
@@ -411,14 +494,18 @@ internal fun TrailVeilMapSurface(
     // no other composition read while the local fallback is active.
     val publishedFogGeneration = if (canonicalFogLoaded) fogViewportGeneration else null
     val publishedLoadState = loadState.name
+    val publishedActiveFogSlot = activeFogSlot?.name
     val composedFogCoverageSnapshot = ComposedFogCoverageSnapshot(
         generation = fogViewportGeneration,
         coverageInstalled = fogCoverageInstalled,
         installedExtent = installedSurround,
+        activeSlot = activeFogSlot,
+        canonicalLoaded = canonicalFogLoaded,
     )
     SideEffect {
         mapView.setTag(R.id.map_fog_canonical_generation, publishedFogGeneration)
         mapView.setTag(R.id.map_basemap_load_state, publishedLoadState)
+        mapView.setTag(R.id.map_fog_active_slot, publishedActiveFogSlot)
         currentOnFogCoverageStateComposedForTesting?.invoke(composedFogCoverageSnapshot)
     }
 
@@ -427,7 +514,9 @@ internal fun TrailVeilMapSurface(
         if (!compositionActive.get() || !styleGenerationActive.get()) return
         if (fallbackRequested) return
         fallbackRequested = true
-        map.setStyle(Style.Builder().fromJson(fallbackStyleJson)) { style ->
+        map.setStyle(
+            Style.Builder().fromJson(fallbackStyleJson).withInitialFogGuard(fogRequired),
+        ) { style ->
             if (compositionActive.get() && styleGenerationActive.get()) {
                 readyStyle = style
                 loadState = BasemapLoadState.LOCAL_FALLBACK
@@ -484,7 +573,9 @@ internal fun TrailVeilMapSurface(
         mapView.getMapAsync { map ->
             if (!compositionActive.get() || !styleGenerationActive.get()) return@getMapAsync
             readyMap = map
-            map.setStyle(Style.Builder().fromUri(provider.styleUri)) { style ->
+            map.setStyle(
+                Style.Builder().fromUri(provider.styleUri).withInitialFogGuard(fogRequired),
+            ) { style ->
                 if (
                     compositionActive.get() &&
                     styleGenerationActive.get() &&
@@ -589,11 +680,12 @@ internal fun TrailVeilMapSurface(
         }
     }
 
+    // Pure geometry, deliberately: the coverage test seam is consulted only at the canonical
+    // install decision below. Routing it through here once let a test's forced decision answer
+    // poison the movement raise and the pre-mutation staleness check, which ask a different
+    // question of the same extent.
     fun surroundHoldsForCamera(extent: FogSurroundExtent? = installedSurround): Boolean {
         val checkedExtent = extent ?: return true
-        currentFogSurroundCoverageForTesting?.let { coverage ->
-            return coverage(checkedExtent)
-        }
         val map = readyMap ?: return true
         // Nothing is laid out yet, so there is no viewport to be outside of; the next camera move
         // asks again.
@@ -614,6 +706,22 @@ internal fun TrailVeilMapSurface(
         return checkedExtent.covers(
             corners.map { corner -> GeoPoint(corner.latitude, corner.longitude) },
         )
+    }
+
+    /**
+     * A published A/B generation is globally fail-closed: canonical fog covers its reveal window
+     * and the slot-scoped extent guard covers everything outside it. Failures and camera changes
+     * may make that reveal window stale, but cannot make the renderer bare. A style with no
+     * complete published slot needs the separately composed opaque cover; so does a programmed
+     * move that leaves the reveal window (the camera listeners' second cover writer), because a
+     * jump can outrun on-demand guard tile extraction.
+     */
+    fun retainCommittedGenerationOrRaiseCover() {
+        canonicalFogLoaded = false
+        if (activeFogSlot == null || installedSurround == null) {
+            fogCoverageInstalled = false
+            installedSurround = null
+        }
     }
 
     LaunchedEffect(readyMap, compassTopInset, compassEndInset, density) {
@@ -699,8 +807,7 @@ internal fun TrailVeilMapSurface(
                 throw cancelled
             } catch (failure: Exception) {
                 fogBaselineReady = false
-                fogCoverageInstalled = false
-                canonicalFogLoaded = false
+                retainCommittedGenerationOrRaiseCover()
                 fogRenderFailed = true
                 fogSyncFailed = true
                 fogPlaceholderReadyGeneration = -1L
@@ -711,7 +818,13 @@ internal fun TrailVeilMapSurface(
         }
     }
 
-    DisposableEffect(readyMap, readyStyle, fogRuntime, fogRequired) {
+    DisposableEffect(
+        readyMap,
+        readyStyle,
+        fogRuntime,
+        fogRequired,
+        suppressFogCameraReactionsForTesting,
+    ) {
         val map = readyMap
         val style = readyStyle
         val runtime = fogRuntime
@@ -721,37 +834,61 @@ internal fun TrailVeilMapSurface(
             // Gesture motion deliberately leaves the installed overlay alone. The mosaic is
             // anchored to the map, so it stays truthful wherever a gesture takes the camera, and
             // the backdrop bands keep everything around it fogged in the same rendered frame.
-            val idleListener = MapLibreMap.OnCameraIdleListener(::requestViewport)
+            val idleListener = MapLibreMap.OnCameraIdleListener {
+                if (!suppressFogCameraReactionsForTesting) requestViewport()
+            }
+            // A programmed move differs from a gesture in one way that matters here: it can cross
+            // any distance in one step, and the exterior guard's GeoJSON tiles for far ground are
+            // extracted on demand, so a jump can outrun them. The renderer-native guard therefore
+            // owns continuous movement, while a programmed move that leaves the canonical reveal
+            // window raises the reactive cover until the rebuilt canonical lands — the deliberate
+            // second writer of `fogCoverageInstalled = false` beside
+            // `retainCommittedGenerationOrRaiseCover`. In-window programmed moves keep the
+            // committed generation and no cover flash.
+            var lastMoveWasGesture = false
+            fun raiseCoverForProgrammedMoveBeyondSurround() {
+                if (installedSurround != null && !surroundHoldsForCamera()) {
+                    fogCoverageInstalled = false
+                }
+            }
             val moveStartedListener = MapLibreMap.OnCameraMoveStartedListener { reason ->
                 val gesture = reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE
-                // A programmed camera move can jump anywhere at once, so it still hides the
-                // overlay until its rebuild lands. Gestures and follow steps do not: both are
-                // bounded, and both would black the map out under a user who is only walking or
-                // panning. The geographic surround is what keeps those moves safe in the renderer;
-                // the listener below is only the eventual fail-closed reaction if they leave it.
-                if (!gesture && !followingCameraMove.get()) {
-                    fogCoverageInstalled = false
-                    installedSurround = null
-                    canonicalFogLoaded = false
+                lastMoveWasGesture = gesture
+                // A complete generation remains renderer-safe across every in-window programmed
+                // move: its exterior guard fogs everything beyond the canonical reveal window.
+                // Invalidate the canonical claim and rebuild at idle; raise the separately
+                // composed cover only when no complete slot exists yet or the camera has already
+                // left the reveal window (an instant jump dispatches this listener with the
+                // camera already at its target).
+                if (
+                    !suppressFogCameraReactionsForTesting &&
+                    !gesture &&
+                    !followingCameraMove.get()
+                ) {
+                    retainCommittedGenerationOrRaiseCover()
                     fogRenderFailed = false
                     fogPlaceholderReadyGeneration = -1L
                     fogViewportRequest = null
                     fogViewportGeneration += 1L
+                    raiseCoverForProgrammedMoveBeyondSurround()
                 }
             }
-            // The surround is large but finite, because a quad past the renderer's precision is
-            // drawn over the whole map instead of being clipped. Everything else here argues that
-            // no gesture travels far enough to matter; this checks each dispatched move and requests
-            // the Compose cover when the camera leaves. The callback and recomposition are not
-            // renderer-atomic. The required upright four-level gesture stays inside the surround and
-            // therefore does not depend on this reaction; long tilted gestures can request the cover
-            // at their final audited state.
+            // Animated programmed moves leave the reveal window mid-flight, after the started
+            // dispatch; this per-frame check catches that exit. Reactive by design: the raise is
+            // Handler-ordered after the frame that crossed, which is the recorded teleport
+            // exception, not the continuous-gesture guarantee.
             val moveListener = MapLibreMap.OnCameraMoveListener {
-                if (fogCoverageInstalled && !surroundHoldsForCamera()) {
-                    fogCoverageInstalled = false
+                if (
+                    !suppressFogCameraReactionsForTesting &&
+                    !lastMoveWasGesture &&
+                    !followingCameraMove.get()
+                ) {
+                    raiseCoverForProgrammedMoveBeyondSurround()
                 }
             }
-            val moveCanceledListener = MapLibreMap.OnCameraMoveCanceledListener(::requestViewport)
+            val moveCanceledListener = MapLibreMap.OnCameraMoveCanceledListener {
+                if (!suppressFogCameraReactionsForTesting) requestViewport()
+            }
             map.addOnCameraIdleListener(idleListener)
             map.addOnCameraMoveStartedListener(moveStartedListener)
             map.addOnCameraMoveListener(moveListener)
@@ -773,6 +910,7 @@ internal fun TrailVeilMapSurface(
         fogViewportGeneration,
     ) {
         val runtime = fogRuntime ?: return@LaunchedEffect
+        val map = readyMap ?: return@LaunchedEffect
         val style = readyStyle ?: return@LaunchedEffect
         val request = fogViewportRequest ?: return@LaunchedEffect
         val generation = fogViewportGeneration
@@ -788,21 +926,26 @@ internal fun TrailVeilMapSurface(
                         request == fogViewportRequest &&
                         style === readyStyle
                     ) {
-                        fogCoverageInstalled = false
-                        installedSurround = null
-                        canonicalFogLoaded = false
+                        retainCommittedGenerationOrRaiseCover()
                         fogRenderFailed = true
                         currentOnFogFailure(failure)
                     }
                 },
             ) {
                 val placeholder = runtime.viewportCoordinator.placeholder(request)
-                mapView.installFogOverlayAndAwait(
+                val previousSlot = activeFogSlot
+                val installedSlot = mapView.installFogGenerationAndAwait(
+                    map = map,
                     style = style,
                     mosaic = placeholder.mosaic,
                     fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
+                    activeSlot = previousSlot,
                 )
-                placeholder.mosaic
+                PreparedFogGeneration(
+                    mosaic = placeholder.mosaic,
+                    previousSlot = previousSlot,
+                    installedSlot = installedSlot,
+                )
             }.let { installed ->
                 if (
                     generation != fogViewportGeneration ||
@@ -811,7 +954,17 @@ internal fun TrailVeilMapSurface(
                 ) {
                     return@LaunchedEffect
                 }
-                installedSurround = FogBackdropGeometry.extent(installed)
+                activeFogSlot = installed.installedSlot
+                installedSurround = FogBackdropGeometry.extent(installed.mosaic)
+                if (installed.previousSlot == null) {
+                    mapView.hideInitialFogGuardAndAwait(map, style)
+                } else {
+                    mapView.retireFogGenerationAndAwait(
+                        map = map,
+                        style = style,
+                        retiredSlot = installed.previousSlot,
+                    )
+                }
             }
             // Installing coverage is not the same as coverage being enough: the camera may have
             // moved on while this was being built. Asking for another rebuild — rather than only
@@ -820,6 +973,10 @@ internal fun TrailVeilMapSurface(
             if (surroundHoldsForCamera()) {
                 fogCoverageInstalled = true
             } else {
+                // The complete slot's renderer-native exterior guard is already global coverage.
+                // Keep it visible while a request centred on the newer camera replaces the stale
+                // canonical reveal window.
+                fogCoverageInstalled = true
                 requestViewport()
                 return@LaunchedEffect
             }
@@ -847,6 +1004,8 @@ internal fun TrailVeilMapSurface(
         if (fogPlaceholderReadyGeneration != generation) return@LaunchedEffect
         var styleMayHaveChanged = false
         var installedStateReconciled = false
+        var preparedSlot: FogGenerationSlot? = null
+        var previousSlot: FogGenerationSlot? = null
         try {
             val rendered = renderCanonicalFogWithRetry(
                 request = request,
@@ -860,17 +1019,16 @@ internal fun TrailVeilMapSurface(
                     val incomingExtent = FogBackdropGeometry.extent(viewport.mosaic)
                     val cameraAlreadyOutsideIncoming = !surroundHoldsForCamera(incomingExtent)
                     if (cameraAlreadyOutsideIncoming && !followingCameraMove.get()) {
-                        // Keep the older covering renderer geometry in place. Installing S2 first
-                        // and clearing Compose state only after its fully-rendered callback permits
-                        // exactly one non-covering frame. Rejecting a stale landing before style
-                        // mutation removes that ordering hole; the post-install check below still
-                        // handles movement that happens while a valid S2 is rendering.
-                        fogCoverageInstalled = false
+                        // Keep the older globally guarded renderer generation in place. Rejecting a
+                        // stale landing before style mutation avoids needless work; the post-install
+                        // check below still handles movement that happens while a valid S2 renders.
+                        retainCommittedGenerationOrRaiseCover()
                         currentOnCanonicalFogInstallDecisionForTesting?.invoke(
                             CanonicalFogInstallDecision(
                                 generation = generation,
                                 render = viewport,
                                 installedExtent = incomingExtent,
+                                installedSlot = null,
                                 rejectedBeforeStyleMutation = true,
                                 coverageInstalledAtDecision = fogCoverageInstalled,
                             ),
@@ -885,13 +1043,17 @@ internal fun TrailVeilMapSurface(
                             fogRevision = fogRevision,
                             render = viewport,
                             installedExtent = null,
+                            installedSlot = null,
                         ),
                     )
                     styleMayHaveChanged = true
-                    mapView.installFogOverlayAndAwait(
+                    previousSlot = activeFogSlot
+                    preparedSlot = mapView.installFogGenerationAndAwait(
+                        map = checkNotNull(readyMap) { "Map disappeared during canonical fog install" },
                         style = style,
                         mosaic = viewport.mosaic,
                         fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
+                        activeSlot = previousSlot,
                         installFaultForTesting = fogInstallFaultForTesting,
                     )
                 },
@@ -901,13 +1063,10 @@ internal fun TrailVeilMapSurface(
                         request == fogViewportRequest &&
                         style === readyStyle
                     ) {
-                        // The install writes a mosaic, its repeats and six bands in one call stack,
-                        // so a throw part way through leaves a shape nobody can name. Treat installed
-                        // coverage as lost until a whole install has succeeded again, or that
-                        // half-applied state is presented as fog.
-                        fogCoverageInstalled = false
-                        installedSurround = null
-                        canonicalFogLoaded = false
+                        // A partial target is never published and only adds fog above the complete
+                        // active slot. Preserve that committed generation; the next attempt removes
+                        // the abandoned target before reusing its IDs.
+                        retainCommittedGenerationOrRaiseCover()
                         fogRenderFailed = true
                         currentOnFogFailure(failure)
                     }
@@ -920,6 +1079,7 @@ internal fun TrailVeilMapSurface(
                     fogRevision = fogRevision,
                     render = rendered,
                     installedExtent = FogBackdropGeometry.extent(rendered.mosaic),
+                    installedSlot = preparedSlot,
                 ),
             )
             if (
@@ -930,24 +1090,42 @@ internal fun TrailVeilMapSurface(
                 return@LaunchedEffect
             }
             val installedExtent = FogBackdropGeometry.extent(rendered.mosaic)
+            val installedSlot = checkNotNull(preparedSlot) {
+                "Canonical fog rendered without a prepared renderer generation"
+            }
+            activeFogSlot = installedSlot
             installedSurround = installedExtent
-            if (!surroundHoldsForCamera()) {
-                // The new geometry is already in the renderer and provably does not reach the
-                // camera. Declining to set the flag is insufficient because `true` may belong to
-                // the previous install.
-                if (!followingCameraMove.get()) {
-                    fogCoverageInstalled = false
-                }
+            // The coverage seam is consulted here and only here: it forces this decision, not the
+            // movement raise or the pre-mutation staleness check, so a forced non-covering answer
+            // cannot leak into paths that must keep answering from real geometry (a transient
+            // install retry once re-ran the pre-check against the forced answer and failed red).
+            val decisionCoverageHolds =
+                currentFogSurroundCoverageForTesting?.invoke(installedExtent)
+                    ?: surroundHoldsForCamera()
+            if (!decisionCoverageHolds) {
+                // The canonical reveal window is stale, but this complete slot's exterior guard
+                // still covers the live camera. Retain renderer coverage and request a better
+                // window instead of flashing the separately composed opaque cover.
+                fogCoverageInstalled = true
+                canonicalFogLoaded = false
                 currentOnCanonicalFogInstallDecisionForTesting?.invoke(
                     CanonicalFogInstallDecision(
                         generation = generation,
                         render = rendered,
                         installedExtent = installedExtent,
+                        installedSlot = installedSlot,
                         rejectedBeforeStyleMutation = false,
                         coverageInstalledAtDecision = fogCoverageInstalled,
                     ),
                 )
                 installedStateReconciled = true
+                previousSlot?.let { retired ->
+                    mapView.retireFogGenerationAndAwait(
+                        map = checkNotNull(readyMap) { "Map disappeared while retiring fog" },
+                        style = style,
+                        retiredSlot = retired,
+                    )
+                }
                 requestViewport()
                 return@LaunchedEffect
             }
@@ -955,19 +1133,36 @@ internal fun TrailVeilMapSurface(
             canonicalFogLoaded = true
             fogRenderFailed = false
             installedStateReconciled = true
+            previousSlot?.let { retired ->
+                mapView.retireFogGenerationAndAwait(
+                    map = checkNotNull(readyMap) { "Map disappeared while retiring fog" },
+                    style = style,
+                    retiredSlot = retired,
+                )
+            }
             currentOnFogCoverageInstalledForTesting?.invoke(
-                InstalledFogCoverageSnapshot(generation = generation, extent = installedExtent),
+                InstalledFogCoverageSnapshot(
+                    generation = generation,
+                    extent = installedExtent,
+                    slot = installedSlot,
+                ),
             )
             currentOnFogRendered?.invoke(rendered)
         } finally {
             if (styleMayHaveChanged && !installedStateReconciled) {
-                // Style mutation precedes a renderer-frame suspension. If this effect is cancelled
-                // or re-keyed during that wait, the renderer may already contain the incoming
-                // geometry while Compose still describes the previous extent. Never preserve a
-                // positive coverage claim across that uncommitted boundary.
-                fogCoverageInstalled = false
-                installedSurround = null
-                canonicalFogLoaded = false
+                // The target slot is additive: cancellation can leave an uncommitted *new* slot,
+                // but it never mutates or removes the published one. Preserve that committed
+                // generation while it still belongs to this style and retains its positive claim;
+                // its finite-extent guard makes that generation globally fail-closed even beyond
+                // the canonical reveal window. Clearing it here caused an avoidable black flash on
+                // every follow-location re-key.
+                // A later attempt removes the abandoned target before reusing its IDs - it is
+                // the ONLY mutation owner for that slot. A synchronous removal here was tried and
+                // reverted: this finally can fire arbitrarily late on a cancelled coroutine, and a
+                // late removal races the superseding effect's half-installed generation in the
+                // same slot, deleting freshly installed layers. Initial install or style
+                // replacement still has no committed slot and raises the cover.
+                retainCommittedGenerationOrRaiseCover()
             }
         }
     }
@@ -1016,44 +1211,71 @@ private fun MapLibreMap.fogViewportRequest(): FogViewportRequest {
     )
 }
 
+private fun Style.Builder.withInitialFogGuard(fogRequired: Boolean): Style.Builder {
+    if (fogRequired) withLayer(newFogInstallGuard(Property.VISIBLE))
+    return this
+}
+
+private fun newFogInstallGuard(visibility: String): BackgroundLayer =
+    BackgroundLayer(FogOverlayIds.InstallGuardLayer).withProperties(
+        PropertyFactory.backgroundColor("#000000"),
+        PropertyFactory.backgroundOpacity(1.0f),
+        PropertyFactory.visibility(visibility),
+    )
+
 /**
- * Installs the mosaic and the bands that close around it in one main-thread call stack, without an
- * explicit renderer wait between their mutations. The renderer-owned guard is made visible first
- * and hidden last in this same call stack. MapLibre 13.4.1 coalesces the image and style updates;
- * a synchronous throw therefore leaves the guard visible, which the failure-injection gate checks
- * directly. The GeoJSON seam source tiles asynchronously, so this function does not claim that a
- * successful rebuild is renderer-atomic before the later fully-rendered callback; that broader
- * residual remains tracked separately. The Compose cover is a second line of defence.
+ * Adds one complete immutable fog generation while the previous generation remains attached.
+ * Every mutable source/layer has a slot-specific ID. A successful renderer transition therefore
+ * sees either the old complete generation, both complete generations, or the new one; a partial
+ * target can only add fog over the globally fail-closed old generation.
  */
-private fun Style.installFogOverlay(
+private fun Style.installFogGeneration(
     mosaic: FogTileMosaic,
     fogAlpha: Int,
+    slot: FogGenerationSlot,
+    keepInstallGuardVisible: Boolean,
     installFaultForTesting: (() -> Unit)? = null,
 ) {
-    val installGuard = ensureFogInstallGuard()
-    installGuard.setProperties(PropertyFactory.visibility(Property.VISIBLE))
-    installFogSeamGuard(mosaic, fogAlpha)
+    val installGuard = ensureFogInstallGuard(initiallyVisible = true)
+    if (keepInstallGuardVisible) {
+        installGuard.setProperties(PropertyFactory.visibility(Property.VISIBLE))
+    }
     val spansWorld = FogBackdropGeometry.spansWorld(mosaic)
     // The copies are always installed when there is a world to copy. A camera-zoom opacity step is
     // attached before each layer enters the style, so the renderer — not a Handler-dispatched
     // camera callback — decides which mutually exclusive arrangement is drawn for the frame.
-    installFogMosaic(mosaic, spansWorld)
+    installFogMosaic(mosaic, spansWorld, slot)
     installFaultForTesting?.invoke()
     installFogBackdrop(
         mosaic,
         fogAlpha,
+        slot,
         // Only when the surround reaches all the way round is there a neighbouring world copy the
         // camera can see, and only then is a world-wide quad small enough to be drawn rather than
         // smeared over the map.
         repeatWorlds = FogBackdropGeometry.surroundSpansWorld(mosaic) && !spansWorld,
     )
-    installGuard.setProperties(PropertyFactory.visibility(Property.NONE))
+    installFogSeamAndExtentGuard(mosaic, fogAlpha, slot)
+    if (!keepInstallGuardVisible) {
+        installGuard.setProperties(PropertyFactory.visibility(Property.NONE))
+    }
 }
 
-/** A screen-pixel bridge over the four independently quantized ImageSource edges. */
-private fun Style.installFogSeamGuard(mosaic: FogTileMosaic, fogAlpha: Int) {
+/**
+ * Separate GeoJSON sources carry the local seam bridge and finite outside guard.
+ * Keeping the small seam geometry out of the world-sized complement source preserves the
+ * screen-pixel bridge's high-zoom tiling precision and its previously verified default tiling
+ * behavior. The extent source alone uses synchronous initial tile extraction in pinned MapLibre
+ * 13.4.1, so a future world-copy tile cannot briefly exist without that outside guard while this
+ * immutable generation is active.
+ */
+private fun Style.installFogSeamAndExtentGuard(
+    mosaic: FogTileMosaic,
+    fogAlpha: Int,
+    slot: FogGenerationSlot,
+) {
     val bands = FogBackdropGeometry.bands(mosaic)
-    val lines = if (FogBackdropGeometry.surroundSpansWorld(mosaic)) {
+    val seamLines = if (FogBackdropGeometry.surroundSpansWorld(mosaic)) {
         emptyList()
     } else {
         listOf(
@@ -1075,30 +1297,95 @@ private fun Style.installFogSeamGuard(mosaic: FogTileMosaic, fogAlpha: Int) {
             ),
         )
     }
-    installGeoJsonSource(
-        FogSeamGuardIds.Source,
-        FeatureCollection.fromFeatures(
-            lines.map { points -> Feature.fromGeometry(LineString.fromLngLats(points)) },
+    val guardRectangles = FogBackdropGeometry.extentGuard(FogBackdropGeometry.extent(mosaic)).rectangles
+    val seamSourceId = FogSeamGuardIds.source(slot)
+    check(getSource(seamSourceId) == null) { "$seamSourceId was not retired before slot reuse" }
+    addSource(
+        GeoJsonSource(
+            seamSourceId,
+            FeatureCollection.fromFeatures(
+                seamLines.map { points -> Feature.fromGeometry(LineString.fromLngLats(points)) },
+            ),
         ),
     )
-    val existing = getLayer(FogSeamGuardIds.Layer)
-    val layer = if (existing == null) {
-        LineLayer(FogSeamGuardIds.Layer, FogSeamGuardIds.Source).withProperties(
-            PropertyFactory.lineColor("#000000"),
-            PropertyFactory.lineWidth(FOG_SEAM_GUARD_WIDTH_PIXELS),
-        )
-    } else {
-        require(existing is LineLayer) { "${FogSeamGuardIds.Layer} is not a line layer" }
-        existing
+    val guardFeatures = buildList {
+        guardRectangles.forEach { bounds ->
+            val ring = bounds.toCanonicalRing()
+            add(
+                Feature.fromGeometry(Polygon.fromLngLats(listOf(ring))).apply {
+                    addStringProperty(FOG_GEOJSON_ROLE_PROPERTY, FOG_GEOJSON_ROLE_EXTENT_FILL)
+                },
+            )
+            add(
+                Feature.fromGeometry(LineString.fromLngLats(ring)).apply {
+                    addStringProperty(FOG_GEOJSON_ROLE_PROPERTY, FOG_GEOJSON_ROLE_EXTENT_BOUNDARY)
+                },
+            )
+        }
     }
-    layer.setProperties(
-        PropertyFactory.lineOpacity(fogAlpha / 255.0f),
-        PropertyFactory.visibility(if (lines.isEmpty()) Property.NONE else Property.VISIBLE),
+    val extentSourceId = FogSeamGuardIds.extentSource(slot)
+    check(getSource(extentSourceId) == null) {
+        "$extentSourceId was not retired before slot reuse"
+    }
+    addSource(
+        GeoJsonSource(
+            extentSourceId,
+            FeatureCollection.fromFeatures(guardFeatures),
+            GeoJsonOptions()
+                .withSynchronousUpdate(true)
+                .withTolerance(0f)
+                .withBuffer(FOG_GEOJSON_BUFFER),
+        ),
     )
-    if (existing == null) addLayerBelow(layer, FogOverlayIds.InstallGuardLayer)
+    val seamLayer = LineLayer(FogSeamGuardIds.layer(slot), seamSourceId).withProperties(
+        PropertyFactory.lineColor("#000000"),
+        PropertyFactory.lineWidth(FOG_SEAM_GUARD_WIDTH_PIXELS),
+        PropertyFactory.lineOpacity(fogAlpha / 255.0f),
+        PropertyFactory.visibility(if (seamLines.isEmpty()) Property.NONE else Property.VISIBLE),
+    )
+    val fillLayer = FillLayer(
+        FogSeamGuardIds.extentFillLayer(slot),
+        extentSourceId,
+    ).withProperties(
+        PropertyFactory.fillColor("#000000"),
+        PropertyFactory.fillOpacity(fogAlpha / 255.0f),
+        PropertyFactory.fillAntialias(false),
+    ).withFilter(
+        Expression.eq(
+            Expression.get(FOG_GEOJSON_ROLE_PROPERTY),
+            Expression.literal(FOG_GEOJSON_ROLE_EXTENT_FILL),
+        ),
+    )
+    val boundaryLayer = LineLayer(
+        FogSeamGuardIds.extentBoundaryLayer(slot),
+        extentSourceId,
+    ).withProperties(
+        PropertyFactory.lineColor("#000000"),
+        PropertyFactory.lineWidth(FOG_EXTENT_GUARD_BOUNDARY_WIDTH_PIXELS),
+        PropertyFactory.lineOpacity(fogAlpha / 255.0f),
+    ).withFilter(
+        Expression.eq(
+            Expression.get(FOG_GEOJSON_ROLE_PROPERTY),
+            Expression.literal(FOG_GEOJSON_ROLE_EXTENT_BOUNDARY),
+        ),
+    )
+    // Keep all renderer-native safety geometry above every raster fog quad, matching the original
+    // seam bridge's proven order. Adding the seam last places it closest to the top install guard,
+    // so an ImageSource tile boundary cannot composite over the line that bridges that boundary.
+    addLayerBelow(fillLayer, FogOverlayIds.InstallGuardLayer)
+    addLayerBelow(boundaryLayer, FogOverlayIds.InstallGuardLayer)
+    addLayerBelow(seamLayer, FogOverlayIds.InstallGuardLayer)
 }
 
-private fun Style.ensureFogInstallGuard(): BackgroundLayer {
+private fun FogTileBounds.toCanonicalRing(): List<Point> = listOf(
+    Point.fromLngLat(westLongitude, southLatitude),
+    Point.fromLngLat(eastLongitude, southLatitude),
+    Point.fromLngLat(eastLongitude, northLatitude),
+    Point.fromLngLat(westLongitude, northLatitude),
+    Point.fromLngLat(westLongitude, southLatitude),
+)
+
+private fun Style.ensureFogInstallGuard(initiallyVisible: Boolean): BackgroundLayer {
     val existing = getLayer(FogOverlayIds.InstallGuardLayer)
     if (existing != null) {
         require(existing is BackgroundLayer) {
@@ -1106,36 +1393,36 @@ private fun Style.ensureFogInstallGuard(): BackgroundLayer {
         }
         return existing
     }
-    return BackgroundLayer(FogOverlayIds.InstallGuardLayer).withProperties(
-        PropertyFactory.backgroundColor("#000000"),
-        PropertyFactory.backgroundOpacity(1.0f),
-        PropertyFactory.visibility(Property.NONE),
-    ).also(::addLayer)
+    return newFogInstallGuard(if (initiallyVisible) Property.VISIBLE else Property.NONE).also(::addLayer)
 }
 
-private fun Style.installFogMosaic(mosaic: FogTileMosaic, spansWorld: Boolean) {
+private fun Style.installFogMosaic(
+    mosaic: FogTileMosaic,
+    spansWorld: Boolean,
+    slot: FogGenerationSlot,
+) {
     val bitmap = mosaic.mask.toBitmap()
-    installFogMosaicQuad(FogOverlayIds.Source, FogOverlayIds.Layer, mosaic.bounds, bitmap)
+    installFogMosaicQuad(
+        FogOverlayIds.source(slot),
+        FogOverlayIds.layer(slot),
+        mosaic.bounds,
+        bitmap,
+    )
     if (spansWorld) {
         installFogMosaicQuad(
-            FogOverlayIds.WestRepeatSource,
-            FogOverlayIds.WestRepeatLayer,
+            FogOverlayIds.westRepeatSource(slot),
+            FogOverlayIds.westRepeatLayer(slot),
             mosaic.bounds.shiftedByWorlds(-1),
             bitmap,
             zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
         )
         installFogMosaicQuad(
-            FogOverlayIds.EastRepeatSource,
-            FogOverlayIds.EastRepeatLayer,
+            FogOverlayIds.eastRepeatSource(slot),
+            FogOverlayIds.eastRepeatLayer(slot),
             mosaic.bounds.shiftedByWorlds(1),
             bitmap,
             zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
         )
-    } else {
-        // A narrower mosaic is placed around the camera already, so repeats would be dead weight
-        // carrying a copy of the mask for nothing.
-        removeFogMosaicQuad(FogOverlayIds.WestRepeatSource, FogOverlayIds.WestRepeatLayer)
-        removeFogMosaicQuad(FogOverlayIds.EastRepeatSource, FogOverlayIds.EastRepeatLayer)
     }
 }
 
@@ -1147,23 +1434,13 @@ private fun Style.installFogMosaicQuad(
     zoomOpacity: Expression? = null,
 ) {
     val coordinates = bounds.toQuad()
-    val source = getSourceAs<ImageSource>(sourceId)
-    if (source == null) {
-        addSource(ImageSource(sourceId, coordinates, bitmap))
-    } else {
-        source.setCoordinates(coordinates)
-        source.setImage(bitmap)
-    }
-    val existingLayer = getLayer(layerId)
-    val layer = if (existingLayer == null) {
-        RasterLayer(layerId, sourceId).withProperties(
-            PropertyFactory.rasterFadeDuration(0f),
-            PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
-        )
-    } else {
-        require(existingLayer is RasterLayer) { "$layerId is not a raster layer" }
-        existingLayer
-    }
+    check(getSource(sourceId) == null) { "$sourceId was not retired before slot reuse" }
+    check(getLayer(layerId) == null) { "$layerId was not retired before slot reuse" }
+    addSource(ImageSource(sourceId, coordinates, bitmap))
+    val layer = RasterLayer(layerId, sourceId).withProperties(
+        PropertyFactory.rasterFadeDuration(0f),
+        PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
+    )
     layer.setProperties(
         if (zoomOpacity == null) {
             PropertyFactory.rasterOpacity(1.0f)
@@ -1171,19 +1448,78 @@ private fun Style.installFogMosaicQuad(
             PropertyFactory.rasterOpacity(zoomOpacity)
         },
     )
-    if (existingLayer == null) {
-        if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
-            addLayerBelow(layer, FogOverlayIds.InstallGuardLayer)
-        } else {
-            addLayerBelow(layer, CurrentLocationOverlayIds.Layer)
-        }
+    if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
+        addLayerBelow(layer, FogOverlayIds.InstallGuardLayer)
+    } else {
+        addLayerBelow(layer, CurrentLocationOverlayIds.Layer)
     }
 }
 
-private fun Style.removeFogMosaicQuad(sourceId: String, layerId: String) {
-    if (getLayer(layerId) != null) removeLayer(layerId)
-    if (getSource(sourceId) != null) removeSource(sourceId)
+private fun Style.removeFogGenerationInterior(slot: FogGenerationSlot): Boolean {
+    var changed = false
+    val layers = listOf(
+        FogOverlayIds.layer(slot),
+        FogOverlayIds.westRepeatLayer(slot),
+        FogOverlayIds.eastRepeatLayer(slot),
+        FogSeamGuardIds.layer(slot),
+    ) + FogBackdropIds.layers(slot)
+    layers.forEach { layerId ->
+        if (getLayer(layerId) != null) changed = removeLayer(layerId) || changed
+    }
+    val sources = listOf(
+        FogOverlayIds.source(slot),
+        FogOverlayIds.westRepeatSource(slot),
+        FogOverlayIds.eastRepeatSource(slot),
+        FogBackdropIds.northSource(slot),
+        FogBackdropIds.southSource(slot),
+        FogBackdropIds.westSource(slot),
+        FogBackdropIds.eastSource(slot),
+        FogBackdropIds.westWorldSource(slot),
+        FogBackdropIds.eastWorldSource(slot),
+        FogBackdropIds.wrappedSideSource(slot),
+        FogSeamGuardIds.source(slot),
+    )
+    sources.forEach { sourceId ->
+        if (getSource(sourceId) != null) changed = removeSource(sourceId) || changed
+    }
+    return changed
 }
+
+private fun Style.removeFogGenerationGuard(slot: FogGenerationSlot): Boolean {
+    var changed = false
+    listOf(
+        FogSeamGuardIds.extentFillLayer(slot),
+        FogSeamGuardIds.extentBoundaryLayer(slot),
+    ).forEach { layerId ->
+        if (getLayer(layerId) != null) changed = removeLayer(layerId) || changed
+    }
+    val sourceId = FogSeamGuardIds.extentSource(slot)
+    if (getSource(sourceId) != null) changed = removeSource(sourceId) || changed
+    return changed
+}
+
+private fun Style.removeFogGeneration(slot: FogGenerationSlot): Boolean {
+    val interior = removeFogGenerationInterior(slot)
+    val guard = removeFogGenerationGuard(slot)
+    return interior || guard
+}
+
+private fun Style.hasFogGeneration(slot: FogGenerationSlot): Boolean =
+    FogOverlayIds.generationLayers(slot).any { getLayer(it) != null } ||
+        listOf(
+            FogOverlayIds.source(slot),
+            FogOverlayIds.westRepeatSource(slot),
+            FogOverlayIds.eastRepeatSource(slot),
+            FogBackdropIds.northSource(slot),
+            FogBackdropIds.southSource(slot),
+            FogBackdropIds.westSource(slot),
+            FogBackdropIds.eastSource(slot),
+            FogBackdropIds.westWorldSource(slot),
+            FogBackdropIds.eastWorldSource(slot),
+            FogBackdropIds.wrappedSideSource(slot),
+            FogSeamGuardIds.source(slot),
+            FogSeamGuardIds.extentSource(slot),
+        ).any { getSource(it) != null }
 
 private fun FogTileBounds.shiftedByWorlds(worlds: Int): FogTileBounds = copy(
     westLongitude = westLongitude + worlds * WORLD_LONGITUDE_SPAN,
@@ -1193,68 +1529,69 @@ private fun FogTileBounds.shiftedByWorlds(worlds: Int): FogTileBounds = copy(
 private fun Style.installFogBackdrop(
     mosaic: FogTileMosaic,
     fogAlpha: Int,
+    slot: FogGenerationSlot,
     repeatWorlds: Boolean,
 ) {
     val bands = FogBackdropGeometry.bands(mosaic)
     val wrappedSide = FogBackdropGeometry.wrappedSideBand(mosaic)
     installFogBackdropBand(
-        FogBackdropIds.NorthSource,
-        FogBackdropIds.NorthLayer,
+        FogBackdropIds.northSource(slot),
+        FogBackdropIds.northLayer(slot),
         bands.north,
         fogAlpha,
+        slot,
     )
     installFogBackdropBand(
-        FogBackdropIds.SouthSource,
-        FogBackdropIds.SouthLayer,
+        FogBackdropIds.southSource(slot),
+        FogBackdropIds.southLayer(slot),
         bands.south,
         fogAlpha,
+        slot,
     )
     installFogBackdropBand(
-        FogBackdropIds.WestSource,
-        FogBackdropIds.WestLayer,
+        FogBackdropIds.westSource(slot),
+        FogBackdropIds.westLayer(slot),
         bands.west,
         fogAlpha,
+        slot,
         zoomOpacity = if (wrappedSide == null) null else visibleAtAndAboveWorldCopyZoom(),
     )
     installFogBackdropBand(
-        FogBackdropIds.EastSource,
-        FogBackdropIds.EastLayer,
+        FogBackdropIds.eastSource(slot),
+        FogBackdropIds.eastLayer(slot),
         bands.east,
         fogAlpha,
+        slot,
         zoomOpacity = if (wrappedSide == null) null else visibleAtAndAboveWorldCopyZoom(),
     )
-    if (wrappedSide == null) {
-        removeFogMosaicQuad(FogBackdropIds.WrappedSideSource, FogBackdropIds.WrappedSideLayer)
-    } else {
+    if (wrappedSide != null) {
         installFogBackdropBand(
-            FogBackdropIds.WrappedSideSource,
-            FogBackdropIds.WrappedSideLayer,
+            FogBackdropIds.wrappedSideSource(slot),
+            FogBackdropIds.wrappedSideLayer(slot),
             wrappedSide,
             fogAlpha,
+            slot,
             zoomOpacity = visibleBelowWorldCopyZoom(),
         )
     }
     if (repeatWorlds) {
         val (west, east) = FogBackdropGeometry.worldRepeats(mosaic)
         installFogBackdropBand(
-            FogBackdropIds.WestWorldSource,
-            FogBackdropIds.WestWorldLayer,
+            FogBackdropIds.westWorldSource(slot),
+            FogBackdropIds.westWorldLayer(slot),
             west,
             fogAlpha,
+            slot,
             zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
         )
         installFogBackdropBand(
-            FogBackdropIds.EastWorldSource,
-            FogBackdropIds.EastWorldLayer,
+            FogBackdropIds.eastWorldSource(slot),
+            FogBackdropIds.eastWorldLayer(slot),
             east,
             fogAlpha,
+            slot,
             zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
         )
-    } else {
-        // A mosaic that spans the world is repeated itself, and flat fog over those copies would
-        // bury the explored area they are there to show.
-        removeFogMosaicQuad(FogBackdropIds.WestWorldSource, FogBackdropIds.WestWorldLayer)
-        removeFogMosaicQuad(FogBackdropIds.EastWorldSource, FogBackdropIds.EastWorldLayer)
     }
 }
 
@@ -1263,25 +1600,17 @@ private fun Style.installFogBackdropBand(
     layerId: String,
     bounds: FogTileBounds,
     fogAlpha: Int,
+    slot: FogGenerationSlot,
     zoomOpacity: Expression? = null,
 ) {
     val coordinates = bounds.toQuad()
-    val source = getSourceAs<ImageSource>(sourceId)
-    if (source == null) {
-        addSource(ImageSource(sourceId, coordinates, fogBandBitmap(fogAlpha)))
-    } else {
-        source.setCoordinates(coordinates)
-    }
-    val existingLayer = getLayer(layerId)
-    val layer = if (existingLayer == null) {
-        RasterLayer(layerId, sourceId).withProperties(
-            PropertyFactory.rasterFadeDuration(0f),
-            PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
-        )
-    } else {
-        require(existingLayer is RasterLayer) { "$layerId is not a raster layer" }
-        existingLayer
-    }
+    check(getSource(sourceId) == null) { "$sourceId was not retired before slot reuse" }
+    check(getLayer(layerId) == null) { "$layerId was not retired before slot reuse" }
+    addSource(ImageSource(sourceId, coordinates, fogBandBitmap(fogAlpha)))
+    val layer = RasterLayer(layerId, sourceId).withProperties(
+        PropertyFactory.rasterFadeDuration(0f),
+        PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
+    )
     layer.setProperties(
         if (zoomOpacity == null) {
             PropertyFactory.rasterOpacity(1.0f)
@@ -1289,15 +1618,8 @@ private fun Style.installFogBackdropBand(
             PropertyFactory.rasterOpacity(zoomOpacity)
         },
     )
-    if (existingLayer == null) {
-        // Above the mosaic so any geometric overlap stays on the safe, over-fogged side. The
-        // screen-pixel seam guard separately covers the independent ImageSource vertex grids.
-        if (getLayer(FogOverlayIds.Layer) == null) {
-            addLayer(layer)
-        } else {
-            addLayerAbove(layer, FogOverlayIds.Layer)
-        }
-    }
+    // Above the same generation's mosaic so any geometric overlap stays on the safe side.
+    addLayerAbove(layer, FogOverlayIds.layer(slot))
 }
 
 private fun FogTileBounds.toQuad(): LatLngQuad = LatLngQuad(
@@ -1432,26 +1754,110 @@ private suspend fun <T> retryFogOperation(
     }
 }
 
-private suspend fun MapView.installFogOverlayAndAwait(
+private suspend fun MapView.installFogGenerationAndAwait(
+    map: MapLibreMap,
     style: Style,
     mosaic: FogTileMosaic,
     fogAlpha: Int,
+    activeSlot: FogGenerationSlot?,
     installFaultForTesting: (() -> Unit)? = null,
-) {
+): FogGenerationSlot {
+    val targetSlot = FogGenerationSlot.next(activeSlot)
+    check(targetSlot != activeSlot) { "A fog generation cannot replace itself in place" }
     val rendered = withTimeoutOrNull(FOG_FRAME_TIMEOUT_MILLIS) {
-        awaitFullyRenderedFrameAfter {
-            style.installFogOverlay(mosaic, fogAlpha, installFaultForTesting)
+        if (style.hasFogGeneration(targetSlot)) {
+            awaitRendererProgressAfter(map) {
+                style.removeFogGeneration(targetSlot)
+            }
+        }
+        awaitRendererProgressAfter(map) {
+            style.installFogGeneration(
+                mosaic = mosaic,
+                fogAlpha = fogAlpha,
+                slot = targetSlot,
+                keepInstallGuardVisible = activeSlot == null,
+                installFaultForTesting = installFaultForTesting,
+            )
         }
         true
     }
-    if (rendered != true) error("MapLibre did not fully render the fog frame in time")
+    if (rendered != true) error("MapLibre did not report renderer progress for the fog frame in time")
+    return targetSlot
 }
 
-private suspend fun MapView.awaitFullyRenderedFrameAfter(action: () -> Unit) {
+private suspend fun MapView.hideInitialFogGuardAndAwait(map: MapLibreMap, style: Style) {
+    retryRendererProgressUntilCancelled {
+        awaitRendererProgressAfter(map) {
+            style.ensureFogInstallGuard(initiallyVisible = true).setProperties(
+                PropertyFactory.visibility(Property.NONE),
+            )
+        }
+    }
+}
+
+private suspend fun MapView.retireFogGenerationAndAwait(
+    map: MapLibreMap,
+    style: Style,
+    retiredSlot: FogGenerationSlot,
+) {
+    retryRendererProgressUntilCancelled {
+        awaitRendererProgressAfter(map) {
+            style.removeFogGenerationInterior(retiredSlot)
+        }
+        // The outside guard is deliberately last. Until this second renderer update lands, either
+        // it or the newly committed generation still covers every point in every world copy.
+        // If a superseding request cancels this mid-retirement, the remains stay until the next
+        // install reuses the slot - a synchronous removal in a cancellation handler was tried and
+        // reverted, because a late-firing handler races the superseding effect's own install of
+        // this very slot and can delete its freshly installed layers.
+        awaitRendererProgressAfter(map) {
+            style.removeFogGenerationGuard(retiredSlot)
+        }
+    }
+}
+
+/**
+ * Repeats an idempotent fail-closed renderer transition after synchronous failures, but suspends
+ * without a wall-clock failure while a stopped MapView cannot produce frames. The owning
+ * LaunchedEffect is cancelled on disposal or style replacement, which removes the listener. A
+ * timeout here used to escape the retry boundary and could crash or strand an opaque guard merely
+ * because the Activity remained stopped for five seconds.
+ */
+private suspend fun retryRendererProgressUntilCancelled(operation: suspend () -> Unit) {
+    while (true) {
+        try {
+            operation()
+            return
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            delay(FOG_RETRY_DELAY_MILLIS)
+        }
+    }
+}
+
+/**
+ * Waits for renderer progress after [action], ignoring callbacks that arrive before the next view
+ * turn and explicitly requesting another repaint. Partial frames count as progress: basemap network
+ * work is unrelated to the locally complete fog Style snapshot, and requiring `fullyRendered` can
+ * otherwise stall forever while offline. This callback is a liveness fence, not a style mutation
+ * receipt: MapLibre does not expose a source-generation token with it, so an already in-flight frame
+ * can still finish after the fence is armed.
+ *
+ * Fog safety therefore never depends on this callback ordering. A complete old generation remains
+ * installed while a new slot is built; every partial initial install keeps the full-screen guard;
+ * and retirement removes the old outside guard only after the new complete slot is already present
+ * in the immutable Style snapshot. The callback merely bounds how quickly that safe state advances.
+ */
+private suspend fun MapView.awaitRendererProgressAfter(
+    map: MapLibreMap,
+    action: () -> Unit,
+) {
     suspendCancellableCoroutine { continuation ->
+        val armed = AtomicBoolean(false)
         lateinit var listener: MapView.OnDidFinishRenderingFrameListener
-        listener = MapView.OnDidFinishRenderingFrameListener { fullyRendered, _, _ ->
-            if (fullyRendered && continuation.isActive) {
+        listener = MapView.OnDidFinishRenderingFrameListener { _, _, _ ->
+            if (armed.get() && continuation.isActive) {
                 removeOnDidFinishRenderingFrameListener(listener)
                 continuation.resume(Unit)
             }
@@ -1462,6 +1868,13 @@ private suspend fun MapView.awaitFullyRenderedFrameAfter(action: () -> Unit) {
         }
         try {
             action()
+            val posted = post {
+                if (continuation.isActive) {
+                    armed.set(true)
+                    map.triggerRepaint()
+                }
+            }
+            if (!posted) error("MapView rejected the post-install repaint")
         } catch (failure: Exception) {
             removeOnDidFinishRenderingFrameListener(listener)
             if (continuation.isActive) continuation.resumeWithException(failure)
@@ -1477,6 +1890,11 @@ private const val VISIBLE_REGION_CORNERS = 4
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
 private const val FOG_SEAM_GUARD_WIDTH_PIXELS = 3.0f
+private const val FOG_EXTENT_GUARD_BOUNDARY_WIDTH_PIXELS = 4.0f
+private const val FOG_GEOJSON_BUFFER = 512
+private const val FOG_GEOJSON_ROLE_PROPERTY = "trailveil-fog-role"
+private const val FOG_GEOJSON_ROLE_EXTENT_FILL = "extent-fill"
+private const val FOG_GEOJSON_ROLE_EXTENT_BOUNDARY = "extent-boundary"
 
 private object StaleCanonicalFogInstallException : Exception()
 private const val TRACK_CAMERA_PADDING_PX = 72

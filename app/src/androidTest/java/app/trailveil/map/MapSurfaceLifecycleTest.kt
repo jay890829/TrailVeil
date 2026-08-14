@@ -7,6 +7,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
+import app.trailveil.R
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -79,11 +80,15 @@ class MapSurfaceLifecycleTest {
         val installed = AtomicBoolean(false)
         repeat(100) {
             scenario.onActivity { activity ->
-                activity.window.decorView.findMapView()?.getMapAsync { map ->
+                val mapView = activity.window.decorView.findMapView()
+                mapView?.getMapAsync { map ->
                     val style = map.style
+                    val slot = (mapView.getTag(R.id.map_fog_active_slot) as? String)
+                        ?.let(FogGenerationSlot::valueOf)
                     installed.set(
-                        style?.getSourceAs<ImageSource>(FogOverlayIds.Source) != null &&
-                            style.getLayerAs<RasterLayer>(FogOverlayIds.Layer) != null,
+                        slot != null &&
+                            style?.getSourceAs<ImageSource>(FogOverlayIds.source(slot)) != null &&
+                            style.getLayerAs<RasterLayer>(FogOverlayIds.layer(slot)) != null,
                     )
                 }
             }

@@ -108,6 +108,18 @@ data class FogSurroundExtent(
 }
 
 /**
+ * Canonical-world rectangles that fog everything outside one finite surround.
+ *
+ * Each rectangle stays inside `[-180, 180]`; none crosses the antimeridian. MapLibre can therefore
+ * tile and repeat these ordinary polygons without relying on an inverted polygon or a world-sized
+ * exterior ring with a hole. The renderer-specific repetition is verified separately because it is
+ * not a GeoJSON specification guarantee.
+ */
+data class FogExtentGuardGeometry(
+    val rectangles: List<FogTileBounds>,
+)
+
+/**
  * Builds the map-space surround of a rendered fog mosaic.
  *
  * The bands are geographic, so the renderer transforms them with the camera in the same frame
@@ -276,6 +288,85 @@ object FogBackdropGeometry {
     }
 
     /**
+     * Builds the canonical complement of [extent]. North and south own the corners; longitude
+     * complements only span the latitude interval that remains between them.
+     */
+    fun extentGuard(extent: FogSurroundExtent): FogExtentGuardGeometry {
+        val northLatitude = WebMercator.latitudeAtNormalizedY(extent.northNormalizedY)
+        val southLatitude = WebMercator.latitudeAtNormalizedY(extent.southNormalizedY)
+        val rectangles = buildList {
+            if (extent.northNormalizedY > GUARD_EDGE_EPSILON) {
+                add(
+                    FogTileBounds(
+                        westLongitude = -WORLD_LONGITUDE_SPAN / 2.0,
+                        southLatitude = northLatitude,
+                        eastLongitude = WORLD_LONGITUDE_SPAN / 2.0,
+                        northLatitude = WebMercator.MAX_LATITUDE,
+                    ),
+                )
+            }
+            if (extent.southNormalizedY < 1.0 - GUARD_EDGE_EPSILON) {
+                add(
+                    FogTileBounds(
+                        westLongitude = -WORLD_LONGITUDE_SPAN / 2.0,
+                        southLatitude = -WebMercator.MAX_LATITUDE,
+                        eastLongitude = WORLD_LONGITUDE_SPAN / 2.0,
+                        northLatitude = southLatitude,
+                    ),
+                )
+            }
+            if (!extent.wrapsWorld && northLatitude > southLatitude) {
+                addAll(
+                    longitudeGuardIntervals(extent).map { interval ->
+                        FogTileBounds(
+                            westLongitude = interval.first,
+                            southLatitude = southLatitude,
+                            eastLongitude = interval.second,
+                            northLatitude = northLatitude,
+                        )
+                    },
+                )
+            }
+        }
+        return FogExtentGuardGeometry(
+            rectangles.flatMap { rectangle -> rectangle.splitForCanonicalGeoJson() },
+        )
+    }
+
+    /**
+     * Splits a ring wider than half the canonical world into halves of at most
+     * [MAX_GUARD_RECTANGLE_DEGREES]. A span strictly wider than 180° is ambiguous to GeoJSON
+     * winding — the renderer may interpret it as the complementary short way round — while an
+     * exactly-180° ring is unambiguous and is deliberately emitted by this split; the unit gate
+     * pins that ceiling.
+     */
+    private fun FogTileBounds.splitForCanonicalGeoJson(): List<FogTileBounds> {
+        val width = eastLongitude - westLongitude
+        if (width <= MAX_GUARD_RECTANGLE_DEGREES + GUARD_EDGE_EPSILON) return listOf(this)
+        val middle = (westLongitude + eastLongitude) / 2.0
+        return listOf(
+            copy(eastLongitude = middle),
+            copy(westLongitude = middle),
+        ).flatMap { it.splitForCanonicalGeoJson() }
+    }
+
+    /** The longitude complement, split so every interval is canonical and non-wrapping. */
+    private fun longitudeGuardIntervals(extent: FogSurroundExtent): List<Pair<Double, Double>> {
+        val worldWest = -WORLD_LONGITUDE_SPAN / 2.0
+        val worldEast = WORLD_LONGITUDE_SPAN / 2.0
+        val center = WebMercator.wrapLongitude(extent.centerLongitude)
+        val halfDegrees = extent.halfWorlds * WORLD_LONGITUDE_SPAN
+        val safeWest = center - halfDegrees
+        val safeEast = center + halfDegrees
+        val intervals = when {
+            safeWest < worldWest -> listOf(safeEast to (safeWest + WORLD_LONGITUDE_SPAN))
+            safeEast > worldEast -> listOf((safeEast - WORLD_LONGITUDE_SPAN) to safeWest)
+            else -> listOf(worldWest to safeWest, safeEast to worldEast)
+        }
+        return intervals.filter { (west, east) -> east - west > GUARD_EDGE_EPSILON }
+    }
+
+    /**
      * The same quad, moved by whole worlds until its centre lies inside the canonical one.
      *
      * Below the zoom where the renderer repeats an image source across world copies by itself, a
@@ -428,4 +519,7 @@ object FogBackdropGeometry {
      * is only within [MAX_SURROUND_WORLD_PIXELS] at the zooms where the world itself is.
      */
     fun surroundSpansWorld(mosaic: FogTileMosaic): Boolean = surroundHalfWorlds(mosaic) >= 0.5
+
+    private const val GUARD_EDGE_EPSILON = 1e-12
+    private const val MAX_GUARD_RECTANGLE_DEGREES = 180.0
 }
