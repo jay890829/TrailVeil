@@ -1789,17 +1789,22 @@ class MapSurfaceTest {
         gesture = { map, onHold ->
             when (path) {
                 FiniteExtentPath.PAN -> panInSteps(map, onHold, auditEveryMove = true)
+                // More than one engagement attempt: the hosted emulator's input timing can
+                // reject a detector-perfect stream that the local AVD always accepts (the first
+                // hosted run of these gates lost the zoom control to exactly that, "never engaged
+                // in 1 attempts"). An unengaged stream moves no camera, so a retry re-runs from
+                // the same frozen pose; the residual risk is red-only.
                 FiniteExtentPath.TILT -> shoveInSteps(
                     map = map,
                     onHold = onHold,
                     onEngaged = onHold,
-                    attemptLimit = 1,
+                    attemptLimit = FINITE_EXTENT_ENGAGEMENT_ATTEMPTS,
                 )
                 FiniteExtentPath.BEARING -> rotateInSteps(
                     map = map,
                     onHold = onHold,
                     onEngaged = onHold,
-                    attemptLimit = 1,
+                    attemptLimit = FINITE_EXTENT_ENGAGEMENT_ATTEMPTS,
                 )
                 FiniteExtentPath.ZOOM -> pinchInSteps(
                     map = map,
@@ -1807,7 +1812,7 @@ class MapSurfaceTest {
                     zoomIn = false,
                     spanEdge = PinchSpanEdge.TALLEST,
                     auditEveryMove = true,
-                    attemptLimit = 1,
+                    attemptLimit = FINITE_EXTENT_ENGAGEMENT_ATTEMPTS,
                     onEngaged = onHold,
                 )
             }
@@ -6935,6 +6940,13 @@ class MapSurfaceTest {
          * costs a second and makes the suite deterministic.
          */
         const val PINCH_ATTEMPTS = 4
+
+        /**
+         * Engagement retries for the finite-extent crossing gates. An unengaged stream leaves the
+         * frozen camera untouched, so retrying from the same pose is sound; one attempt was a
+         * hosted-emulator engagement lottery.
+         */
+        const val FINITE_EXTENT_ENGAGEMENT_ATTEMPTS = 3
 
         /**
          * P4-035 gesture-injection geometry. The shove pair sits half a screen apart horizontally —
