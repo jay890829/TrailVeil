@@ -1340,8 +1340,25 @@ class MapSurfaceTest {
                     readyMap.hasOnlyPublishedFogGeneration(installed.slot)
             }
             Thread.sleep(ZOOM_SETTLE_MILLIS)
-            val initialCoverage = checkNotNull(installedCoverage.get()) {
+            // The settle window can admit one more canonical commit between the coverage snapshot
+            // and the published-slot read (the same timing-dependent premise the retains gate was
+            // hardened for): re-arm on the freshest commit until the pipeline holds still, then
+            // assert.
+            var initialCoverage = checkNotNull(installedCoverage.get()) {
                 "No initial canonical coverage was installed"
+            }
+            val armDeadline = SystemClock.uptimeMillis() + 30_000L
+            while (
+                SystemClock.uptimeMillis() < armDeadline &&
+                !(
+                    runCatching { publishedFogSlot() }.getOrNull() == initialCoverage.slot &&
+                    readyMap.hasOnlyPublishedFogGeneration(initialCoverage.slot)
+                    )
+            ) {
+                Thread.sleep(250L)
+                initialCoverage = checkNotNull(installedCoverage.get()) {
+                    "No initial canonical coverage was installed"
+                }
             }
             assertEquals(
                 "The initial slot changed before the cancellation probe was armed",
@@ -2623,9 +2640,32 @@ class MapSurfaceTest {
                     fogRendered.get() > renderedBefore
                 }
                 Thread.sleep(ZOOM_SETTLE_MILLIS)
-                val audit = map.auditFogCoverage(
+                // Transition-aware, like the world-copy-edge audit: every A/B fog transition
+                // legitimately renders both generations for its overlap window, and a settled
+                // double coat is bit-identically stable, so the stability pair alone cannot
+                // reject it. Capture only between transitions; discard a capture the pipeline
+                // moved under.
+                var audit = map.auditFogCoverage(
                     map.snapshotStableSettledPixels(view, "guarded seam cell z$zoom"),
                 )
+                val cellDeadline = SystemClock.uptimeMillis() + 30_000L
+                while (SystemClock.uptimeMillis() < cellDeadline) {
+                    val slotBefore = runCatching { publishedFogSlot() }.getOrNull()
+                    if (slotBefore == null || !map.hasOnlyPublishedFogGeneration(slotBefore)) {
+                        Thread.sleep(250L)
+                        continue
+                    }
+                    val candidate = map.auditFogCoverage(
+                        map.snapshotStableSettledPixels(view, "guarded seam cell z$zoom"),
+                    )
+                    if (
+                        runCatching { publishedFogSlot() }.getOrNull() == slotBefore &&
+                        map.hasOnlyPublishedFogGeneration(slotBefore)
+                    ) {
+                        audit = candidate
+                        break
+                    }
+                }
                 report.append(
                     "\n z=${"%.2f".format(java.util.Locale.US, map.cameraPosition.zoom)} " +
                         audit.report(),
@@ -2640,7 +2680,8 @@ class MapSurfaceTest {
                 // still below the old 0.2% seam budget. Merely raising the final threshold would
                 // let the original defect pass; this A/B keeps the regression sensitive to it.
                 if (zoom in SETTLED_SEAM_GUARD_AB_ZOOMS) {
-                    val seamLayerId = FogSeamGuardIds.layer(publishedFogSlot())
+                    val abSlot = publishedFogSlot()
+                    val seamLayerId = FogSeamGuardIds.layer(abSlot)
                     assertTrue(
                         "The seam guard was not renderer-selected at the original regression " +
                             "zoom $zoom",
@@ -2664,6 +2705,23 @@ class MapSurfaceTest {
                                 "observe the unguarded quads",
                             Property.NONE,
                             map.fogLayerVisibility(seamLayerId),
+                        )
+                        // The re-shown check above is slot-blind: an install into the OTHER slot
+                        // re-establishes full coverage with its own brand-new seam guard while
+                        // this slot's still reads NONE, and the guard-off capture then measures a
+                        // covered frame against the unguarded budget - a false pass. The slot
+                        // must not have moved under the capture.
+                        assertEquals(
+                            "A concurrent fog install replaced the published generation during " +
+                                "the guard-off capture at zoom $zoom; this measurement does not " +
+                                "observe the unguarded quads",
+                            abSlot,
+                            publishedFogSlot(),
+                        )
+                        assertTrue(
+                            "A concurrent fog install left two generations visible during the " +
+                                "guard-off capture at zoom $zoom",
+                            map.hasOnlyPublishedFogGeneration(abSlot),
                         )
                         map.auditFogCoverage(fogged)
                     } finally {
@@ -2780,6 +2838,8 @@ class MapSurfaceTest {
                 }
                 // Read before anything is hidden: which quads are drawn depends on the camera, so
                 // a reading taken afterwards would describe the harness rather than the app.
+                val holdSlot = runCatching { publishedFogSlot() }.getOrNull()
+                val holdGeneration = fogGeneration()
                 val visibility = ALL_FOG_LAYERS.associateWith { map.fogLayerVisibility(it) }
                 val renderedLayers = ALL_FOG_LAYERS.filter { map.fogLayerIsRendered(it) }
                 report.append("\n z=${"%.2f".format(java.util.Locale.US, zoom)}")
@@ -2809,6 +2869,20 @@ class MapSurfaceTest {
                     }
                 }
                 map.restoreFogLayerVisibility(visibility)
+                // A canonical install landing during this hold re-adds its generation's layers
+                // over the isolated quad and reads as a quad drawn twice; the isolation also
+                // deleted nothing the install owns. That hold measured the harness racing the
+                // pipeline, not the app - discard its verdict.
+                if (
+                    doubled != null &&
+                    (
+                        runCatching { publishedFogSlot() }.getOrNull() != holdSlot ||
+                        fogGeneration() != holdGeneration
+                        )
+                ) {
+                    report.append("\n  discarded: a concurrent install invalidated this hold")
+                    doubled = null
+                }
             }
             InstrumentationRegistry.getInstrumentation().sendStatus(
                 0,
@@ -4751,6 +4825,98 @@ class MapSurfaceTest {
 
             assertEquals(
                 "The zoom the recentre asked for was replaced by a follow step",
+                RECENTRE_TO_ZOOM,
+                map.cameraPosition.zoom,
+                ZOOM_TOLERANCE,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * The race the first verifier of the recentre work found and a later one confirmed: a location
+     * fix landing during the ~300 ms recentre flight used to relaunch the follow effect past its
+     * point-equality guard, and the follow step's zoom-less camera update cancelled the in-flight
+     * zoom with nothing to repair it. The in-flight latch stands the follow effect down for the
+     * whole flight; this drives exactly that interleaving and asserts the asked-for zoom survives.
+     */
+    @Test
+    fun aFixLandingMidRecentreDoesNotEatTheRequestedZoom() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            val revealed = GeoPoint(25.0330, 121.5654)
+            revealTrack(database, revealed)
+            val followLocation = mutableStateOf<GeoPoint?>(null)
+            val lookedAround = GeoPoint(
+                revealed.latitude + RECENTRE_LOOK_AWAY_DEGREES,
+                revealed.longitude + RECENTRE_LOOK_AWAY_DEGREES,
+            )
+            val cameraRequest = mutableStateOf(
+                MapCameraRequest(requestId = 1L, point = lookedAround, zoom = RECENTRE_FROM_ZOOM),
+            )
+
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-recentre-race-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-recentre-race",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-recentre-race-test",
+                    fogRuntime = stableFogRuntime,
+                    fogRequired = true,
+                    cameraRequest = cameraRequest.value,
+                    followLocation = followLocation.value,
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 20_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            composeRule.waitUntil(timeoutMillis = 20_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            // The press: following on plus the zoom-carrying request, same recomposition.
+            composeRule.runOnUiThread {
+                followLocation.value = revealed
+                cameraRequest.value = MapCameraRequest(
+                    requestId = 2L,
+                    point = revealed,
+                    zoom = RECENTRE_TO_ZOOM,
+                )
+            }
+            // Mid-flight, a DIFFERENT fix lands: the point-equality guard no longer matches, so
+            // without the latch the follow effect issues a zoom-less update here and the flight's
+            // zoom is lost. Delivered on the next frame so the request effect has launched.
+            composeRule.waitUntil(timeoutMillis = 5_000L) {
+                kotlin.math.abs(map.cameraPosition.zoom - RECENTRE_FROM_ZOOM) > 0.01
+            }
+            composeRule.runOnUiThread {
+                followLocation.value = GeoPoint(
+                    revealed.latitude + MID_FLIGHT_FIX_OFFSET_DEGREES,
+                    revealed.longitude,
+                )
+            }
+            runCatching {
+                composeRule.waitUntil(timeoutMillis = FOLLOW_ARRIVAL_TIMEOUT_MILLIS) {
+                    kotlin.math.abs(map.cameraPosition.zoom - RECENTRE_TO_ZOOM) < ZOOM_TOLERANCE
+                }
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            assertEquals(
+                "A fix landing mid-recentre replaced the requested zoom with a follow step",
                 RECENTRE_TO_ZOOM,
                 map.cameraPosition.zoom,
                 ZOOM_TOLERANCE,
@@ -6939,6 +7105,9 @@ class MapSurfaceTest {
          * of assumed: an attempt that has not moved the camera is lifted and made again, which
          * costs a second and makes the suite deterministic.
          */
+        /** Far enough that a follow step is a real EASE/JUMP, near enough to stay plausible. */
+        const val MID_FLIGHT_FIX_OFFSET_DEGREES = 0.5
+
         const val PINCH_ATTEMPTS = 4
 
         /**

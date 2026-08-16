@@ -18,6 +18,10 @@ import kotlinx.coroutines.flow.Flow
 internal data class StartedRecording(val sessionId: Long, val segmentId: Long)
 internal data class RecordingOperationResult(val receipt: RecordingOperationReceiptEntity, val replayed: Boolean)
 private const val LOCATION_COMMAND_KIND = "LOCATION"
+// The summary row is the NEWEST SESSION (its state drives the entry screen), but the joined
+// point is the newest accepted point ACROSS sessions: it answers "where is the user", and a
+// newest session with zero points (a failed start) must not blank that answer while an older
+// session still knows a location.
 internal const val LATEST_RECORDING_SUMMARY_QUERY = """
     SELECT
         s.*,
@@ -37,7 +41,6 @@ internal const val LATEST_RECORDING_SUMMARY_QUERY = """
     LEFT JOIN track_points p ON p.id = (
         SELECT latest.id
         FROM track_points latest
-        WHERE latest.session_id = s.id
         ORDER BY latest.id DESC
         LIMIT 1
     )

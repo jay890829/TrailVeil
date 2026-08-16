@@ -160,6 +160,38 @@ class RoomRecordingHistoryDataSourceTest {
     }
 
     @Test
+    fun latestSummaryStillKnowsWhereTheUserIsWhenTheNewestSessionHasNoPoints() = runBlocking {
+        // The summary row is the newest session, but "where is the user" must survive a newest
+        // session with zero points (a failed start): the joined point is the newest accepted
+        // point across sessions, not the newest session's own.
+        val walked = startActive(100)
+        dao.persistAcceptedPoint(
+            point = TrackPointEntity(
+                sessionId = walked.sessionId,
+                segmentId = walked.segmentId,
+                sequence = 0,
+                timestamp = 150,
+                latitude = 25.033,
+                longitude = 121.5654,
+                horizontalAccuracy = 5.0,
+            ),
+            distanceDeltaMeters = 0.0,
+            operationId = "known-location-point",
+            commandKind = "LOCATION_ACCEPTED",
+            outcome = "LOCATION_ACCEPTED",
+            createdAt = 150,
+        )
+        close(walked, 160, RecordingStatus.COMPLETED, "USER_STOP")
+        val failed = startActive(200)
+        close(failed, 200, RecordingStatus.FAILED_TO_START, "PERMISSION")
+
+        val latest = requireNotNull(history.latestSessionSummary().first())
+        assertEquals(failed.sessionId, latest.session.id)
+        assertEquals(25.033, latest.latestAcceptedPoint?.latitude ?: -1.0, 0.0)
+        assertEquals(121.5654, latest.latestAcceptedPoint?.longitude ?: -1.0, 0.0)
+    }
+
+    @Test
     fun latestSummaryPreservesDetailOrderingWhenTheWallClockMovesBackward() = runBlocking {
         val recording = startActive(100)
         dao.persistAcceptedPoint(

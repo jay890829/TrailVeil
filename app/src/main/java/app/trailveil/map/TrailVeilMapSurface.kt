@@ -458,6 +458,7 @@ internal fun TrailVeilMapSurface(
     // Set only around a follow step, whose reach is bounded by how far a person walked since the
     // last fix. Every other programmed move keeps hiding the overlay until its rebuild lands.
     val followingCameraMove = remember(mapView) { AtomicBoolean(false) }
+    val programmedCameraRequestInFlight = remember(mapView) { AtomicBoolean(false) }
     var fogViewportRequest by remember(mapView, fogRuntime) {
         mutableStateOf<FogViewportRequest?>(null)
     }
@@ -610,11 +611,26 @@ internal fun TrailVeilMapSurface(
         val map = readyMap ?: return@LaunchedEffect
         val request = cameraRequest ?: return@LaunchedEffect
         val target = LatLng(request.point.latitude, request.point.longitude)
+        // The latch stays up for the flight so a follow step cannot cancel the zoom this request
+        // carries: a fix landing mid-recentre used to relaunch the follow effect past its
+        // equality guard, and its zoom-less ease or jump ate the requested zoom with nothing to
+        // repair it. Finish and cancel both clear it; a gesture cancels the flight and turns
+        // following off anyway.
+        programmedCameraRequestInFlight.set(true)
         map.animateCamera(
             if (request.zoom == null) {
                 CameraUpdateFactory.newLatLng(target)
             } else {
                 CameraUpdateFactory.newLatLngZoom(target, request.zoom)
+            },
+            object : MapLibreMap.CancelableCallback {
+                override fun onFinish() {
+                    programmedCameraRequestInFlight.set(false)
+                }
+
+                override fun onCancel() {
+                    programmedCameraRequestInFlight.set(false)
+                }
             },
         )
     }
@@ -632,6 +648,10 @@ internal fun TrailVeilMapSurface(
         // replace the zoom with nothing and land the camera centred but no closer. That is what
         // made the recentre button take two presses to get back in.
         if (cameraRequest?.point == target) return@LaunchedEffect
+        // A different fix arriving while a programmed request is still flying must not interrupt
+        // it either - the follow effect stands down for the whole flight, and the next fix after
+        // landing follows normally.
+        if (programmedCameraRequestInFlight.get()) return@LaunchedEffect
         val destination = LatLng(target.latitude, target.longitude)
         val screen = map.projection.toScreenLocation(destination)
         when (
