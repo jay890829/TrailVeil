@@ -6862,7 +6862,14 @@ class MapSurfaceTest {
     private companion object {
         const val FOG_STATUS_SETTLE_MILLIS = 2_000L
         const val REVEALED_POINT_COUNT = 40
-        const val SNAPSHOT_TIMEOUT_SECONDS = 10L
+        /**
+         * Thirty, not ten: this bounds how long the hosted SwiftShader renderer may take to
+         * produce one fully rendered frame, and a tilted camera's frustum reaches the horizon,
+         * which is the most expensive frame this suite asks for. Ten seconds was a hosted-only
+         * red on a healthy product (run 31988143014). It bounds a hang, not a claim - no
+         * assertion's meaning depends on the value.
+         */
+        const val SNAPSHOT_TIMEOUT_SECONDS = 30L
         const val BARE_REFERENCE_STABILITY_ATTEMPTS = 12
         const val BARE_REFERENCE_STABILITY_RETRY_MILLIS = 50L
         const val UNFOGGED_LUMINANCE = 150
