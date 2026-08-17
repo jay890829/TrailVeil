@@ -515,6 +515,121 @@ class MapSurfaceTest {
     }
 
     /**
+     * The shape of the defect the user reported on 2026-08-07: reopen after a task removal while
+     * a recording is running and the map shows nothing revealed - not the current walk and not any
+     * previous exploration - until the session is stopped.
+     *
+     * The suspected mechanism is that every arriving point restarts the whole canonical chain, so
+     * a derived cache emptied by process death never finishes rebuilding while points keep coming.
+     * This drives exactly that: a cold surface over a populated history, a canonical render slowed
+     * so a restart-per-point would always win the race, and a writer committing points throughout.
+     * The claim is that canonical fog still arrives and still reveals ground.
+     *
+     * The equivalent gate was built twice during diagnosis, failed to reproduce the defect both
+     * times, and was deleted each time - which is why the behaviour reached this session bound by
+     * nothing. It is committed now: the user confirmed on 2026-08-18 that the symptom is gone on
+     * the current baseline, and a behaviour that is merely observed to work is one a later change
+     * can break in silence.
+     */
+    @Test
+    fun canonicalFogStillArrivesWhilePointsStreamIntoAnEmptyDerivedCache() {
+        val database = inMemoryDatabase()
+        try {
+            val center = GeoPoint(25.0330, 121.5654)
+            val recording = revealTrack(database, center)
+            val dao = database.recordingDao()
+            val renders = java.util.Collections.synchronizedList(mutableListOf<FogViewportRender>())
+            val writing = AtomicBoolean(true)
+            val committed = AtomicInteger(0)
+
+            // A canonical render slow enough that a chain restarting on every committed point
+            // could never finish one: points land every few milliseconds, this takes most of a
+            // second. If fog still arrives, the arrival did not depend on the stream pausing.
+            val stableFogRuntime = slowRenderingFogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(dao),
+            )
+            val writer = Thread {
+                var sequence = REVEALED_POINT_COUNT.toLong()
+                while (writing.get()) {
+                    runBlocking {
+                        dao.appendAcceptedPoint(
+                            point = TrackPointEntity(
+                                sessionId = recording.sessionId,
+                                segmentId = recording.segmentId,
+                                sequence = sequence,
+                                timestamp = 1_000L + sequence * 5_000L,
+                                latitude = center.latitude,
+                                longitude = center.longitude + sequence * 0.0002,
+                                horizontalAccuracy = 5.0,
+                            ),
+                            distanceDeltaMeters = 20.0,
+                        )
+                    }
+                    committed.incrementAndGet()
+                    sequence += 1
+                    SystemClock.sleep(STREAMING_POINT_INTERVAL_MILLIS)
+                }
+            }
+
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-streaming-points-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-streaming-points",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-streaming-points-test",
+                    fogRuntime = stableFogRuntime,
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = center,
+                        zoom = 16.0,
+                    ),
+                    onFogRendered = { render -> renders += render },
+                )
+            }
+
+            writer.start()
+            try {
+                // Canonical fog must arrive while the stream is still running, not after it stops.
+                composeRule.waitUntil(timeoutMillis = STREAMING_CANONICAL_TIMEOUT_MILLIS) {
+                    renders.isNotEmpty()
+                }
+                assertTrue(
+                    "no point was committed during the window, so nothing was under pressure",
+                    committed.get() > 0,
+                )
+            } finally {
+                writing.set(false)
+                writer.join(5_000L)
+            }
+
+            val readyMap = checkNotNull(awaitMap()) { "The map never became ready" }
+            val mapView = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            composeRule.waitUntil(timeoutMillis = 20_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            readyMap.awaitFullyRenderedFrame(mapView)
+
+            // Arriving is not enough: the mosaic must actually reveal the walked ground, which is
+            // what the user could not see. A blank canonical would satisfy a callback count.
+            val coverage = mapView.pixelCopyFogCoverage()
+            assertTrue(
+                "canonical fog arrived but revealed nothing over a walked track: " +
+                    coverage.report(),
+                coverage.revealedFraction > MINIMUM_STREAMED_REVEALED_FRACTION,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
      * A programmed camera move can cross any distance in one step, so it sits outside the
      * continuous-crossing guarantee the renderer-native extent guard owns: the guard's GeoJSON
      * tiles for a far-away region are extracted on demand, and a teleport can outrun them. For
@@ -6910,6 +7025,37 @@ class MapSurfaceTest {
             .addCallback(TrailVeilDatabase.invariantCallback)
             .build()
 
+    /**
+     * A runtime whose tile rendering is deliberately slow, so that a canonical chain restarting on
+     * every committed point could never finish one before the next point arrives.
+     *
+     * Without this the streaming gate proves little: rendering is fast enough that a restart-per-
+     * point defect might still slip a completed canonical through between two writes.
+     */
+    private fun slowRenderingFogRuntime(
+        database: TrailVeilDatabase,
+        pointChanges: PersistedTrackPointChangeFeed,
+    ): FogRuntime {
+        val dao = database.recordingDao()
+        val style = FogRenderStyle()
+        val renderer = FogTileRenderer(style)
+        return FogRuntime(
+            viewportCoordinator = FogViewportCoordinator(
+                trackDataSource = ViewportTrackDataSource(RoomViewportTrackPointReader(dao)),
+                pipeline = FogTilePipeline(
+                    memoryCache = FogMemoryTileCache(8L * 1024L * 1024L),
+                    diskCache = null,
+                    renderMask = { key, segments ->
+                        SystemClock.sleep(SLOWED_TILE_RENDER_MILLIS)
+                        renderer.render(key, segments)
+                    },
+                ),
+                style = style,
+            ),
+            pointChanges = pointChanges,
+        )
+    }
+
     private fun fogRuntime(
         database: TrailVeilDatabase,
         pointChanges: PersistedTrackPointChangeFeed,
@@ -7291,6 +7437,22 @@ class MapSurfaceTest {
 
         /** Far enough that a follow step is a real EASE/JUMP, near enough to stay plausible. */
         const val MID_FLIGHT_FIX_OFFSET_DEGREES = 0.5
+
+        /** Per tile; a nine-tile window therefore takes most of a second to render. */
+        const val SLOWED_TILE_RENDER_MILLIS = 80L
+
+        /** Points land far faster than a canonical render completes, which is the pressure. */
+        const val STREAMING_POINT_INTERVAL_MILLIS = 5L
+
+        /** Long enough for a canonical render on a loaded emulator, short enough to fail a stall. */
+        const val STREAMING_CANONICAL_TIMEOUT_MILLIS = 30_000L
+
+        /**
+         * The walked track covers a visible share of an exploration-zoom viewport; the defect this
+         * guards showed zero. A low floor keeps the gate about "revealed something real" rather
+         * than about the fixture's exact geometry.
+         */
+        const val MINIMUM_STREAMED_REVEALED_FRACTION = 0.001
 
         const val PINCH_ATTEMPTS = 4
 
