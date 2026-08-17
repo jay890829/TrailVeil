@@ -104,7 +104,9 @@ class FogCanonicalReadBoundsTest {
             readsAfterCold,
             reader.reads.size,
         )
-        assertEquals(cold.mosaic.bounds, warm.mosaic.bounds)
+        // Deliberately not asserting mosaic bounds here: they are a pure function of the request,
+        // so that comparison cannot fail for any read path. What the narrowing could break is the
+        // PIXELS, and that is asserted against a cold reference in the equivalence gate below.
     }
 
     @Test
@@ -146,17 +148,28 @@ class FogCanonicalReadBoundsTest {
             ),
         )
 
-        val bounds = requireNotNull(reader.reads.single().let { (south, north, interval) ->
+        val bounds = reader.reads.single().let { (south, north, interval) ->
             ViewportBounds(south = south, north = north, west = interval.west, east = interval.east)
-        })
-        // Three tiles across at zoom 16 is a few hundred metres of ground; the margin dominates.
-        assertTrue(
-            "the exploration settle read $bounds, which is not a neighbourhood",
-            bounds.east - bounds.west < 1.0 && bounds.north - bounds.south < 1.0,
+        }
+        // Three tiles across at zoom 16 is a few hundred metres of ground, so the 6.1 km margin
+        // dominates and the box is about a tenth of a degree. Asserted near its true size rather
+        // than "under a degree", which an eight-fold regression would still satisfy.
+        assertEquals(
+            "the exploration settle read a longitude span this wide",
+            0.124,
+            bounds.east - bounds.west,
+            0.02,
         )
-        assertTrue(
-            "the exploration settle pulled ${reader.pointsReturned} points from a world-wide table",
-            reader.pointsReturned <= 3,
+        assertEquals(
+            "the exploration settle read a latitude span this tall",
+            0.115,
+            bounds.north - bounds.south,
+            0.02,
+        )
+        assertEquals(
+            "the exploration settle pulled this many points from a world-wide table",
+            1,
+            reader.pointsReturned,
         )
     }
 
@@ -171,9 +184,9 @@ class FogCanonicalReadBoundsTest {
             mapZoom = 4.0,
         )
         coordinator.render(first)
-        val coldBounds = requireNotNull(reader.reads.last().let { (south, north, interval) ->
+        val coldBounds = reader.reads.last().let { (south, north, interval) ->
             ViewportBounds(south = south, north = north, west = interval.west, east = interval.east)
-        })
+        }
         val readsAfterFirst = reader.reads.size
 
         // One tile east at zoom 4 is 22.5 degrees of longitude.
@@ -197,6 +210,96 @@ class FogCanonicalReadBoundsTest {
             narrowed.east - narrowed.west,
             0.001,
         )
+    }
+
+    /**
+     * The gate the narrowing actually needs: a tile rendered from a read of its own sub-rectangle
+     * must come out identical to the same tile rendered from a cold read of the whole window.
+     *
+     * A narrowing that reads too small a box does not fail loudly - it draws MORE fog, which every
+     * leak audit accepts and every settled sweep passes, and the wrong mask is then cached to
+     * memory and disk. Only a comparison against a cold reference can see it. Zoom 16 because the
+     * reveal radius is 25 m and a mask pixel is about 2.4 m there; at low zooms every mask is
+     * uniformly opaque and this comparison would be vacuous. The track is spaced inside the
+     * accepted 6 km continuity ceiling that the query margin is sized for, and crosses a tile
+     * boundary so the shifted window's uncached column has capsules reaching into it.
+     */
+    @Test
+    fun aPartiallyCachedSettleDrawsTheSameFogAsAColdOne() = runTest {
+        val trackPoints = buildList {
+            var id = 1L
+            var longitude = 121.560
+            while (longitude <= 121.575) {
+                add(
+                    ViewportTrackPoint(
+                        pointId = id,
+                        sessionId = 1L,
+                        segmentId = 1L,
+                        segmentSequence = 0L,
+                        pointSequence = id,
+                        latitude = 25.0330,
+                        longitude = longitude,
+                    ),
+                )
+                id += 1
+                // About 100 m apart, far inside the accepted continuity ceiling.
+                longitude += 0.001
+            }
+        }
+        val warmRequest = FogViewportRequest(
+            center = GeoPoint(latitude = 25.0330, longitude = 121.5700),
+            mapZoom = 16.0,
+        )
+
+        val incremental = coordinator(RecordingReader(trackPoints))
+        // Settle next door first so the shifted window below is partly cached and partly not.
+        incremental.render(
+            FogViewportRequest(
+                center = GeoPoint(latitude = 25.0330, longitude = 121.5654),
+                mapZoom = 16.0,
+            ),
+        )
+        val partiallyCached = incremental.render(warmRequest)
+
+        val cold = coordinator(RecordingReader(trackPoints)).render(warmRequest)
+
+        assertEquals(
+            "the two settles did not even compose the same tiles",
+            cold.keys,
+            partiallyCached.keys,
+        )
+        val reference = cold.mosaic.mask
+        val measured = partiallyCached.mosaic.mask
+        assertEquals(reference.width, measured.width)
+        assertEquals(reference.height, measured.height)
+        var firstDifference: String? = null
+        var differing = 0
+        for (y in 0 until reference.height) {
+            for (x in 0 until reference.width) {
+                if (reference.alphaAt(x, y) != measured.alphaAt(x, y)) {
+                    differing += 1
+                    if (firstDifference == null) {
+                        firstDifference = "($x,$y) cold=${reference.alphaAt(x, y)} " +
+                            "partial=${measured.alphaAt(x, y)}"
+                    }
+                }
+            }
+        }
+        assertEquals(
+            "a partially cached settle drew different fog from a cold one at $differing pixels, " +
+                "first at $firstDifference",
+            0,
+            differing,
+        )
+        // Non-vacuity: the reference must actually contain revealed ground, or two blank masks
+        // would agree and prove nothing.
+        var revealed = 0
+        for (y in 0 until reference.height) {
+            for (x in 0 until reference.width) {
+                if (reference.alphaAt(x, y) < 255) revealed += 1
+            }
+        }
+        assertTrue("the cold reference revealed nothing, so this compared two blank masks", revealed > 0)
     }
 
     @Test

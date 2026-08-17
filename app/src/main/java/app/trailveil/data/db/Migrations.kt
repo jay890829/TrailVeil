@@ -244,6 +244,17 @@ internal val MIGRATION_3_4 = object : Migration(3, 4) {
 }
 
 /** Adds ordering indexes for the bounded newest-session presentation projection. */
+internal val MIGRATION_5_6 = object : Migration(5, 6) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS index_track_points_latitude_longitude
+            ON track_points(latitude, longitude)
+            """.trimIndent(),
+        )
+    }
+}
+
 internal val MIGRATION_4_5 = object : Migration(4, 5) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL(

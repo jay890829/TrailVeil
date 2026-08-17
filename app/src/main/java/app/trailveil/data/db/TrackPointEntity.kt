@@ -35,6 +35,13 @@ import androidx.room.PrimaryKey
             name = "index_track_points_segment_id_session_id",
             value = ["segment_id", "session_id"],
         ),
+        // The fog viewport read is a latitude/longitude box. Without this the box narrows nothing:
+        // every settle scans the whole table and only the returned rows differ, which is why a
+        // populated database was slow at zooms whose window was already small.
+        Index(
+            name = "index_track_points_latitude_longitude",
+            value = ["latitude", "longitude"],
+        ),
     ],
 )
 data class TrackPointEntity(

@@ -5,6 +5,7 @@ import androidx.room.testing.MigrationTestHelper
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Rule
 import org.junit.Test
@@ -290,6 +291,42 @@ class TrailVeilDatabaseMigrationTest {
         )
         migrated.close()
     }
+    @Test
+    fun migrate5To6AddsTheViewportBoxIndex() {
+        migrationHelper.createDatabase("migration-p4-020", 5).close()
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            "migration-p4-020",
+            6,
+            true,
+            MIGRATION_5_6,
+        )
+        val indexes = migrated.query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' " +
+                "AND name = 'index_track_points_latitude_longitude'",
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(cursor.getString(0))
+            }
+        }
+        assertEquals(listOf("index_track_points_latitude_longitude"), indexes)
+        // The index exists to be chosen: a viewport box that plans as a scan would leave the
+        // read unbounded however narrow the box is, which is the defect this migration answers.
+        val plan = migrated.query(
+            "EXPLAIN QUERY PLAN SELECT id FROM track_points " +
+                "WHERE latitude BETWEEN -1.0 AND 1.0 AND longitude BETWEEN -1.0 AND 1.0",
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(cursor.getString(cursor.columnCount - 1))
+            }
+        }.joinToString(" | ")
+        assertTrue(
+            "the viewport box still plans as a table scan: $plan",
+            plan.contains("index_track_points_latitude_longitude"),
+        )
+        migrated.close()
+    }
+
     private companion object {
         const val TEST_DATABASE = "migration-p2-001"
     }
