@@ -1361,9 +1361,18 @@ class MapSurfaceTest {
                     .isEmpty()
             }
             composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertDoesNotExist()
-            // Ninety seconds, not thirty: the hosted emulator's post-decision convergence chain
-            // (re-render, reinstall, two-step retirement, each behind 5 s renderer-progress
-            // retries) overran a 30 s settle once with the product perfectly healthy.
+            // Drive the convergence rather than wait for it. With the coverage predicate restored
+            // above, the pipeline still needs a viewport request to schedule the install that
+            // retires the superseded slot, and on a loaded host whatever would otherwise schedule
+            // one can take longer than any budget worth writing down: this settle overran 30 s,
+            // then 90 s, on a healthy product. Publishing a fresh request makes the retirement
+            // something this test causes instead of something it hopes for.
+            composeRule.runOnUiThread {
+                forcedRequest.value = FogViewportRequest(
+                    center = GeoPoint(target.latitude, target.longitude),
+                    mapZoom = INSTALL_GATE_WIDE_ZOOM,
+                )
+            }
             composeRule.waitUntil(timeoutMillis = 90_000L) {
                 val settledSlot = runCatching { publishedFogSlot() }.getOrNull()
                 settledSlot != null && readyMap.hasOnlyPublishedFogGeneration(settledSlot)
