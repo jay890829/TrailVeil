@@ -243,7 +243,9 @@ internal val MIGRATION_3_4 = object : Migration(3, 4) {
     }
 }
 
-/** Adds ordering indexes for the bounded newest-session presentation projection. */
+/**
+ * Indexes the box the fog viewport asks for, so a settle stops visiting every row to exclude it.
+ */
 internal val MIGRATION_5_6 = object : Migration(5, 6) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL(
@@ -255,6 +257,7 @@ internal val MIGRATION_5_6 = object : Migration(5, 6) {
     }
 }
 
+/** Adds ordering indexes for the bounded newest-session presentation projection. */
 internal val MIGRATION_4_5 = object : Migration(4, 5) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL(
