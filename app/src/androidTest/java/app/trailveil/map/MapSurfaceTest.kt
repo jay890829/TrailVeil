@@ -1246,7 +1246,10 @@ class MapSurfaceTest {
                     .isEmpty()
             }
             composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertDoesNotExist()
-            composeRule.waitUntil(timeoutMillis = 30_000L) {
+            // Ninety seconds, not thirty: the hosted emulator's post-decision convergence chain
+            // (re-render, reinstall, two-step retirement, each behind 5 s renderer-progress
+            // retries) overran a 30 s settle once with the product perfectly healthy.
+            composeRule.waitUntil(timeoutMillis = 90_000L) {
                 val settledSlot = runCatching { publishedFogSlot() }.getOrNull()
                 settledSlot != null && readyMap.hasOnlyPublishedFogGeneration(settledSlot)
             }
