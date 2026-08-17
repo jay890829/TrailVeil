@@ -72,7 +72,10 @@ class FogCanonicalReadBoundsTest {
         }
     }
 
-    private fun coordinator(reader: RecordingReader): FogViewportCoordinator =
+    private fun coordinator(
+        reader: RecordingReader,
+        queryMarginMeters: Double = FogViewportCoordinator.DEFAULT_QUERY_MARGIN_METERS,
+    ): FogViewportCoordinator =
         FogViewportCoordinator(
             trackDataSource = ViewportTrackDataSource(reader),
             pipeline = FogTilePipeline(
@@ -80,6 +83,7 @@ class FogCanonicalReadBoundsTest {
                 diskCache = null,
                 renderMask = { key, segments -> FogTileRenderer(FogRenderStyle()).render(key, segments) },
             ),
+            queryMarginMeters = queryMarginMeters,
         )
 
     @Test
@@ -224,9 +228,49 @@ class FogCanonicalReadBoundsTest {
      * accepted 6 km continuity ceiling that the query margin is sized for, and crosses a tile
      * boundary so the shifted window's uncached column has capsules reaching into it.
      */
-    @Test
-    fun aPartiallyCachedSettleDrawsTheSameFogAsAColdOne() = runTest {
-        val trackPoints = buildList {
+    /**
+     * A walk down the newly read column, crossing all three of its tile rows.
+     *
+     * Structural rather than tuned: a track confined to one row can be caught by a narrowing that
+     * happens to keep that row and missed by one that happens to drop it - which is how an earlier
+     * A/B against `missing.first()` passed, since at this camera the track's latitude falls in
+     * exactly the row that mutation keeps.
+     *
+     * Measured, not assumed: with this fixture the gate fails against a narrowing to
+     * `missing.first()` and does NOT fail against one to `missing.last()`. The asymmetry is not
+     * explained; both mutations read a single tile row, and on this geometry one of them evidently
+     * still reads enough. So this gate is evidence that SOME real under-read is caught, not proof
+     * that every one is - and that is exactly what it claims, here and in the ledger.
+     */
+    private fun columnSpanningTrackPoints(): List<ViewportTrackPoint> =
+        buildList {
+            var id = 1L
+            // Inside column 54900 (121.5747-121.5802 at zoom 16), running the full height of the
+            // three-row window - about 1.5 km against ~545 m tiles - so a sub-window that keeps
+            // any single row still loses most of the track.
+            var latitude = 25.0270
+            while (latitude <= 25.0410) {
+                add(
+                    ViewportTrackPoint(
+                        pointId = id,
+                        sessionId = 1L,
+                        segmentId = 1L,
+                        segmentSequence = 0L,
+                        pointSequence = id,
+                        latitude = latitude,
+                        longitude = 121.5775,
+                    ),
+                )
+                id += 1
+                // About 100 m apart, inside the accepted continuity ceiling and under the margin
+                // this gate uses, so capsules stay whole for the correct implementation.
+                latitude += 0.0009
+            }
+        }
+
+    /** A local walk that runs past the shifted window's newly read column boundary. */
+    private fun localTrackPoints(): List<ViewportTrackPoint> =
+        buildList {
             var id = 1L
             var longitude = 121.560
             // Past 121.5747, where the shifted window's newly read column begins: a track that
@@ -250,6 +294,10 @@ class FogCanonicalReadBoundsTest {
                 longitude += 0.001
             }
         }
+
+    @Test
+    fun aPartiallyCachedSettleDrawsTheSameFogAsAColdOne() = runTest {
+        val trackPoints = localTrackPoints()
         val warmRequest = FogViewportRequest(
             center = GeoPoint(latitude = 25.0330, longitude = 121.5700),
             mapZoom = 16.0,
@@ -306,6 +354,77 @@ class FogCanonicalReadBoundsTest {
         assertTrue("the cold reference revealed nothing, so this compared two blank masks", revealed > 0)
     }
 
+    /**
+     * The same equivalence claim, at a margin where the sub-window's size decides what is read.
+     *
+     * At the production margin the read box is eleven times a zoom-16 tile, so EVERY legal
+     * sub-window contains the whole of a local track and no mutation of the narrowing can change a
+     * pixel - the sibling gate above binds composition identity and a margin floor, not the
+     * narrowing itself. A closure verifier proved that arithmetically after this file had already
+     * recorded an A/B claiming otherwise; the claim was mis-attributed to a neighbouring test's
+     * failure. Two hundred metres is small enough that a sub-window one tile too small excludes
+     * the track and renders the column opaque, and large enough to stay above the reveal radius
+     * the constructor requires.
+     */
+    @Test
+    fun aPartiallyCachedSettleDrawsTheSameFogAsAColdOneWhenTheMarginCannotHideTheDifference() =
+        runTest {
+            val trackPoints = columnSpanningTrackPoints()
+            val warmRequest = FogViewportRequest(
+                center = GeoPoint(latitude = 25.0330, longitude = 121.5700),
+                mapZoom = 16.0,
+            )
+
+            val incremental = coordinator(
+                RecordingReader(trackPoints),
+                queryMarginMeters = DISCRIMINATING_QUERY_MARGIN_METERS,
+            )
+            incremental.render(
+                FogViewportRequest(
+                    center = GeoPoint(latitude = 25.0330, longitude = 121.5654),
+                    mapZoom = 16.0,
+                ),
+            )
+            val partiallyCached = incremental.render(warmRequest)
+
+            val cold = coordinator(
+                RecordingReader(trackPoints),
+                queryMarginMeters = DISCRIMINATING_QUERY_MARGIN_METERS,
+            ).render(warmRequest)
+
+            val reference = cold.mosaic.mask
+            val measured = partiallyCached.mosaic.mask
+            var differing = 0
+            var firstDifference: String? = null
+            for (y in 0 until reference.height) {
+                for (x in 0 until reference.width) {
+                    if (reference.alphaAt(x, y) != measured.alphaAt(x, y)) {
+                        differing += 1
+                        if (firstDifference == null) {
+                            firstDifference = "($x,$y) cold=${reference.alphaAt(x, y)} " +
+                                "partial=${measured.alphaAt(x, y)}"
+                        }
+                    }
+                }
+            }
+            assertEquals(
+                "a partially cached settle drew different fog from a cold one at $differing " +
+                    "pixels, first at $firstDifference",
+                0,
+                differing,
+            )
+            var revealed = 0
+            for (y in 0 until reference.height) {
+                for (x in 0 until reference.width) {
+                    if (reference.alphaAt(x, y) < 255) revealed += 1
+                }
+            }
+            assertTrue(
+                "the cold reference revealed nothing, so this compared two blank masks",
+                revealed > 0,
+            )
+        }
+
     @Test
     fun theEnclosingSubWindowIsTheSmallestCompleteRectangleAroundWhatIsMissing() {
         val window = FogViewportTileGrid.around(
@@ -343,5 +462,17 @@ class FogCanonicalReadBoundsTest {
         // The whole point of narrowing is that the result is still a legal query rectangle.
         val bounds = FogViewportTileGrid.queryBounds(sub, marginMeters = 6_100.0)
         assertTrue("a wrapped narrowing must still split into storage intervals", bounds.west > bounds.east)
+    }
+
+    private companion object {
+        /**
+         * Chosen from the geometry, not by trial: above the fixture's 100 m point spacing so
+         * capsules stay whole (below it the correct implementation drops a capsule and the gate
+         * fails for the wrong reason), and well below the ~545 m height of a zoom-16 tile row so
+         * that a sub-window missing a row demonstrably loses the track. At the production margin
+         * no such value exists - 6100 m is eleven tiles, so every legal sub-window contains a
+         * local track and no narrowing mutation can change a pixel.
+         */
+        const val DISCRIMINATING_QUERY_MARGIN_METERS = 150.0
     }
 }
