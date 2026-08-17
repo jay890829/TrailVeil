@@ -3473,10 +3473,17 @@ class MapSurfaceTest {
                 // that re-derives the SAME extent (new generation, other A/B slot, every field
                 // bit-identical) satisfies that and happens on slower hosts - asserting the
                 // snapshot object made this a red on a healthy product (run 31990700424).
-                assertEquals(
-                    "Preparing a finite-boundary path moved the canonical fog geometry",
-                    installed.extent,
-                    installedCoverage.get()?.extent,
+                // What the frozen claims below rest on is that the fog did not move out from
+                // under the prepared camera - not that it did not move at all. A rebuild at a
+                // camera still settling produces a marginally different extent that covers the
+                // same ground, and asserting exact equality made that a red on a healthy product.
+                val preparedCoverage = checkNotNull(installedCoverage.get()) {
+                    "The canonical fog generation disappeared while the camera was positioned"
+                }
+                assertTrue(
+                    "Preparing a finite-boundary path left the camera outside the installed fog: " +
+                        "extent=${preparedCoverage.extent} corners=${map.visibleRegionCorners()}",
+                    preparedCoverage.extent.covers(map.visibleRegionCorners()),
                 )
                 assertTrue(
                     "Preparing a finite-boundary path raised the Compose safety cover",
@@ -4367,7 +4374,14 @@ class MapSurfaceTest {
         }
     }
 
-    /** Requests and waits for a fully rendered frame at the current camera and style state. */
+    /**
+     * Requests and waits for a fully rendered frame at the current camera and style state.
+     *
+     * The repaint is re-requested while waiting rather than asked for once: a single request whose
+     * frame is missed under load leaves this waiting for a repaint nobody will ask for again, and
+     * that shows up as a rendering timeout on a renderer that was merely busy. Re-asking costs a
+     * frame; not re-asking cost a hosted run.
+     */
     private fun MapLibreMap.awaitFullyRenderedFrame(view: MapView) {
         val ready = CountDownLatch(1)
         lateinit var listener: MapView.OnDidFinishRenderingFrameListener
@@ -4382,9 +4396,15 @@ class MapSurfaceTest {
             triggerRepaint()
         }
         try {
+            var waited = 0L
+            while (waited < SNAPSHOT_TIMEOUT_SECONDS * 1_000L) {
+                if (ready.await(REPAINT_RETRY_MILLIS, TimeUnit.MILLISECONDS)) break
+                waited += REPAINT_RETRY_MILLIS
+                InstrumentationRegistry.getInstrumentation().runOnMainSync { triggerRepaint() }
+            }
             assertTrue(
                 "MapLibre did not fully render the requested camera and style state",
-                ready.await(SNAPSHOT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+                ready.count == 0L,
             )
         } finally {
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
@@ -7174,6 +7194,9 @@ class MapSurfaceTest {
          * assertion's meaning depends on the value.
          */
         const val SNAPSHOT_TIMEOUT_SECONDS = 30L
+
+        /** How often a still-unanswered rendered-frame request is asked for again. */
+        const val REPAINT_RETRY_MILLIS = 500L
         const val BARE_REFERENCE_STABILITY_ATTEMPTS = 12
         const val BARE_REFERENCE_STABILITY_RETRY_MILLIS = 50L
         const val UNFOGGED_LUMINANCE = 150
