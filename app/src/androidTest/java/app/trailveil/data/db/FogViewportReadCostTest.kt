@@ -3,7 +3,6 @@ package app.trailveil.data.db
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -20,8 +19,8 @@ import org.junit.runner.RunWith
  * bound depends on the data, and a real track table is spatially concentrated - which is exactly
  * the case where a latitude band can still contain everything.
  *
- * So this measures rather than argues: the production query, on a populated database, against both
- * the concentrated shape a real user produces and a spread shape, reading its plan and its work.
+ * So this measures rather than argues: the production query's plan, taken from the engine against a
+ * populated database holding the concentrated shape a real user produces.
  */
 @RunWith(AndroidJUnit4::class)
 class FogViewportReadCostTest {
@@ -46,7 +45,9 @@ class FogViewportReadCostTest {
     private fun productionQueryPlan(): String =
         database.openHelper.readableDatabase.query(
             "EXPLAIN QUERY PLAN " + FOG_POINTS_SQL,
-            arrayOf<Any>(25.0, 121.5, 25.1, 121.6),
+            // south, north, west, east - the order the DAO declares, so the plan is the plan of
+            // the call production makes.
+            arrayOf<Any>(25.020, 25.068, 121.470, 121.546),
         ).use { cursor ->
             buildList {
                 while (cursor.moveToNext()) add(cursor.getString(cursor.columnCount - 1))
@@ -55,87 +56,71 @@ class FogViewportReadCostTest {
 
     @Test
     fun theProductionViewportQueryPlansThroughTheBoxIndex() {
+        insertConcentratedTrack()
+
         val plan = productionQueryPlan()
 
         assertTrue(
             "the fog viewport read still plans as a table scan: $plan",
             plan.contains("index_track_points_latitude_longitude"),
         )
+        // The plan names track_points by its query alias, so a scan of it reads "SCAN p" - which
+        // is what a dropped index produces, and what an assertion looking for "SCAN track_points"
+        // would happily accept.
         assertTrue(
-            "the fog viewport read no longer searches track_points by an index: $plan",
-            plan.contains("SEARCH") && !plan.contains("SCAN track_points"),
+            "the fog viewport read scans the track points instead of searching them: $plan",
+            !plan.contains("SCAN p"),
         )
     }
 
     /**
-     * The honest shape of the bound: a concentrated table is bounded by the latitude band, and an
-     * exploration box is a narrow band, so the read stays proportional to the box in latitude. The
-     * longitude half of the box does NOT constrain the scan; this pins what is actually delivered
-     * so a future reader is not misled by the index's name.
+     * What the engine says it constrains the scan by, read from the plan of the production query
+     * against a populated table.
+     *
+     * SQLite names the bounding columns in the plan text itself, so this is the database's own
+     * account rather than the test's. It is written this way after two earlier attempts measured
+     * their own construction instead: one counted rows returned by an in-memory fake, the next
+     * counted rows matching a predicate the test had written. A plan string can do neither.
+     *
+     * Today the engine reports latitude alone, because SQLite stops applying index constraints at
+     * the first range predicate - so the longitude half of the viewport box narrows nothing, and
+     * the bound this entry delivers is the latitude band. When `P4-036` gives the table a spatial
+     * key, the constraint list changes and this assertion fails, which is the point: the successor
+     * work cannot land while the ledger still describes a one-dimensional bound.
      */
     @Test
-    fun aConcentratedTableIsBoundedByLatitudeAndNotByLongitude() = runBlocking {
-        // One neighbourhood, the shape the ledger's own probe describes: a dense walk across a few
-        // hundredths of a degree, repeated along a line of latitude so that longitude alone would
-        // exclude most of it and latitude alone would not.
+    fun theEngineReportsTheViewportScanBoundedByLatitudeAlone() {
+        insertConcentratedTrack()
+
+        val plan = productionQueryPlan()
+
+        assertTrue(
+            "the fog viewport read no longer searches through the box index: $plan",
+            plan.contains("USING INDEX index_track_points_latitude_longitude"),
+        )
+        assertTrue(
+            "the engine now reports a different constraint list for the viewport scan, so the " +
+                "one-dimensional bound this entry records is out of date: $plan",
+            plan.contains("(latitude>? AND latitude<?)"),
+        )
+    }
+
+    /** The shape a real user produces: one neighbourhood walked densely, per the ledger's probe. */
+    private fun insertConcentratedTrack() {
         val sessionId = insertSession()
         val segmentId = insertSegment(sessionId)
-        var id = 0L
+        var sequence = 0L
         val rows = buildList {
             repeat(CONCENTRATED_POINTS) { index ->
-                val latitude = 25.02 + (index % 48) * 0.001
-                val longitude = 121.47 + index * 0.0001
-                add(Triple(latitude, longitude, id++))
+                // lat 25.020-25.068, lon 121.470-121.546: about five kilometres square, which is
+                // the extent the entry's own probe measured on a populated database.
+                val latitude = 25.020 + (index % 480) * 0.0001
+                val longitude = 121.470 + (index / 480) * 0.0001
+                add(Triple(latitude, longitude, sequence++))
             }
         }
         insertPoints(sessionId, segmentId, rows)
-
-        val narrowLongitudeBox = countRowsVisited(
-            south = 25.02,
-            north = 25.068,
-            west = 121.47,
-            east = 121.475,
-        )
-        val narrowLatitudeBox = countRowsVisited(
-            south = 25.02,
-            north = 25.025,
-            west = 121.47,
-            east = 121.60,
-        )
-
-        // Latitude narrows the work; longitude does not. Both statements are asserted so that a
-        // future index change that makes longitude count would fail here and be noticed, rather
-        // than silently making this comment wrong.
-        assertTrue(
-            "a narrow latitude band did not reduce the rows visited: $narrowLatitudeBox of " +
-                "$CONCENTRATED_POINTS",
-            narrowLatitudeBox < CONCENTRATED_POINTS / 4,
-        )
-        assertTrue(
-            "a narrow longitude band unexpectedly reduced the rows visited to " +
-                "$narrowLongitudeBox; the delivered bound is latitude-only and this test's " +
-                "companion claim in the ledger needs revisiting",
-            narrowLongitudeBox >= CONCENTRATED_POINTS / 2,
-        )
     }
-
-    /**
-     * Counts how many rows the box actually has to consider, using the same index the production
-     * query uses. `COUNT(*)` over the latitude predicate alone is the scan the planner performs;
-     * the longitude predicate is applied afterwards to each visited row.
-     */
-    private fun countRowsVisited(south: Double, north: Double, west: Double, east: Double): Int =
-        database.openHelper.readableDatabase.query(
-            "SELECT COUNT(*) FROM track_points WHERE latitude BETWEEN ? AND ?",
-            arrayOf<Any>(south, north),
-        ).use { cursor ->
-            cursor.moveToFirst()
-            cursor.getInt(0)
-        }.also {
-            // Keep the unused box edges meaningful: the production call passes all four, and the
-            // point of this helper is that two of them do not narrow anything.
-            check(west <= east) { "west must not exceed east" }
-        }
 
     private fun insertSession(): Long =
         database.openHelper.writableDatabase.let { db ->
