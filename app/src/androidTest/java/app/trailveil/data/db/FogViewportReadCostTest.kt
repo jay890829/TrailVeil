@@ -4,6 +4,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -45,8 +46,9 @@ class FogViewportReadCostTest {
     private fun productionQueryPlan(): String =
         database.openHelper.readableDatabase.query(
             "EXPLAIN QUERY PLAN " + FOG_POINTS_SQL,
-            // south, north, west, east - the order the DAO declares, so the plan is the plan of
-            // the call production makes.
+            // south, north, west, east - the order Room binds the generated SQL's placeholders
+            // in, which is not the order the DAO's parameter list declares. The plan is unaffected
+            // by the values; the returned-row assertions below are not, so this order matters.
             arrayOf<Any>(25.020, 25.068, 121.470, 121.546),
         ).use { cursor ->
             buildList {
@@ -103,24 +105,76 @@ class FogViewportReadCostTest {
                 "one-dimensional bound this entry records is out of date: $plan",
             plan.contains("(latitude>? AND latitude<?)"),
         )
+        // And the band is narrowing real work, not merely named in a plan: half this table lies
+        // outside it and must not come back.
+        val returned = rowsReturnedForTheBox()
+        val total = totalRows()
+        assertEquals(
+            "the viewport box returned rows from outside the queried band: $returned of $total",
+            CONCENTRATED_POINTS,
+            returned,
+        )
+        assertTrue(
+            "the box returned $returned of $total rows, which is not a bounded slice of the table",
+            returned <= total / 2,
+        )
     }
 
-    /** The shape a real user produces: one neighbourhood walked densely, per the ledger's probe. */
+    /**
+     * A walked neighbourhood inside the queried band, and as many points again well outside it.
+     *
+     * The decoys are what make "populated" evidence rather than decoration: SQLite's plan for this
+     * query is identical on an empty table, so a fixture whose every row satisfies the box proves
+     * nothing about narrowing. With half the table outside the latitude band, the returned
+     * fraction is a fact about the engine's work, and a regression that stopped using the index
+     * would have to visit them all.
+     *
+     * Extents are stated as the arithmetic produces them: the walked block spans 0.0479 degrees of
+     * latitude (about 5.3 km) and 0.0479 of longitude (about 4.8 km at this latitude), a rough
+     * square; the decoys sit three to five degrees away, hundreds of kilometres north and south.
+     */
     private fun insertConcentratedTrack() {
         val sessionId = insertSession()
         val segmentId = insertSegment(sessionId)
         var sequence = 0L
         val rows = buildList {
             repeat(CONCENTRATED_POINTS) { index ->
-                // lat 25.020-25.068, lon 121.470-121.546: about five kilometres square, which is
-                // the extent the entry's own probe measured on a populated database.
-                val latitude = 25.020 + (index % 480) * 0.0001
-                val longitude = 121.470 + (index / 480) * 0.0001
-                add(Triple(latitude, longitude, sequence++))
+                add(
+                    Triple(
+                        25.020 + (index % 480) * 0.0001,
+                        121.470 + (index / 480) * 0.0001 * 12.0,
+                        sequence++,
+                    ),
+                )
+            }
+            repeat(DECOY_POINTS) { index ->
+                val northward = index % 2 == 0
+                val offset = 3.0 + (index % 400) * 0.005
+                add(
+                    Triple(
+                        if (northward) 25.020 + offset else 25.020 - offset,
+                        121.470 + (index % 480) * 0.0001,
+                        sequence++,
+                    ),
+                )
             }
         }
         insertPoints(sessionId, segmentId, rows)
     }
+
+    /** How many rows the production query actually returns for the queried box. */
+    private fun rowsReturnedForTheBox(): Int =
+        database.openHelper.readableDatabase.query(
+            FOG_POINTS_SQL,
+            arrayOf<Any>(25.020, 25.068, 121.470, 121.546),
+        ).use { cursor -> cursor.count }
+
+    private fun totalRows(): Int =
+        database.openHelper.readableDatabase.query("SELECT COUNT(*) FROM track_points")
+            .use { cursor ->
+                cursor.moveToFirst()
+                cursor.getInt(0)
+            }
 
     private fun insertSession(): Long =
         database.openHelper.writableDatabase.let { db ->
@@ -171,6 +225,9 @@ class FogViewportReadCostTest {
 
     private companion object {
         const val CONCENTRATED_POINTS = 20_000
+
+        /** As many again, far outside the queried latitude band, so the band has work to exclude. */
+        const val DECOY_POINTS = 20_000
         val FOG_POINTS_SQL = """
             SELECT
                 p.id AS point_id,

@@ -229,7 +229,11 @@ class FogCanonicalReadBoundsTest {
         val trackPoints = buildList {
             var id = 1L
             var longitude = 121.560
-            while (longitude <= 121.575) {
+            // Past 121.5747, where the shifted window's newly read column begins: a track that
+            // stops short of it leaves that column uniformly opaque in both renders, and the
+            // comparison then binds composition identity rather than read-box sizing. Float
+            // accumulation made an earlier <= 121.575 bound stop 71 m short of exactly that.
+            while (longitude <= 121.5800) {
                 add(
                     ViewportTrackPoint(
                         pointId = id,
