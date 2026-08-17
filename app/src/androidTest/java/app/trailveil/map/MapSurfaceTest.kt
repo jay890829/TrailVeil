@@ -2664,11 +2664,12 @@ class MapSurfaceTest {
                 // double coat is bit-identically stable, so the stability pair alone cannot
                 // reject it. Capture only between transitions; discard a capture the pipeline
                 // moved under.
-                var audit = map.auditFogCoverage(
-                    map.snapshotStableSettledPixels(view, "guarded seam cell z$zoom"),
-                )
-                val cellDeadline = SystemClock.uptimeMillis() + 30_000L
-                while (SystemClock.uptimeMillis() < cellDeadline) {
+                // No unvalidated fallback: a capture this loop never validated must not reach
+                // the assert wearing a validated capture's authority. The budget matches the
+                // measured hosted convergence time for this same predicate.
+                var validated: FogAudit? = null
+                val cellDeadline = SystemClock.uptimeMillis() + BETWEEN_TRANSITIONS_TIMEOUT_MILLIS
+                while (validated == null && SystemClock.uptimeMillis() < cellDeadline) {
                     val slotBefore = runCatching { publishedFogSlot() }.getOrNull()
                     if (slotBefore == null || !map.hasOnlyPublishedFogGeneration(slotBefore)) {
                         Thread.sleep(250L)
@@ -2681,9 +2682,12 @@ class MapSurfaceTest {
                         runCatching { publishedFogSlot() }.getOrNull() == slotBefore &&
                         map.hasOnlyPublishedFogGeneration(slotBefore)
                     ) {
-                        audit = candidate
-                        break
+                        validated = candidate
                     }
+                }
+                val audit = checkNotNull(validated) {
+                    "No between-transitions capture at zoom $zoom within " +
+                        "${BETWEEN_TRANSITIONS_TIMEOUT_MILLIS}ms; this cell measured nothing"
                 }
                 report.append(
                     "\n z=${"%.2f".format(java.util.Locale.US, map.cameraPosition.zoom)} " +
@@ -2700,6 +2704,14 @@ class MapSurfaceTest {
                 // let the original defect pass; this A/B keeps the regression sensitive to it.
                 if (zoom in SETTLED_SEAM_GUARD_AB_ZOOMS) {
                     val abSlot = publishedFogSlot()
+                    // Bracket the A/B on BOTH sides: an overlap already under way when the guard
+                    // goes down, retiring before the after-checks, would otherwise pass every
+                    // validity assert while the capture itself held two coats.
+                    assertTrue(
+                        "A fog transition was in flight when the guard-off A/B began at zoom " +
+                            "$zoom; this measurement does not observe the unguarded quads",
+                        map.hasOnlyPublishedFogGeneration(abSlot),
+                    )
                     val seamLayerId = FogSeamGuardIds.layer(abSlot)
                     assertTrue(
                         "The seam guard was not renderer-selected at the original regression " +
@@ -3088,11 +3100,11 @@ class MapSurfaceTest {
                 // carries both generations for its overlap window, which is not this settled
                 // claim's subject. Audit with a validity retry: capture only between transitions,
                 // and discard a capture the pipeline moved under.
-                var activeSlot = publishedFogSlot()
-                var styleReport = map.fogGenerationStyleReport(activeSlot)
-                var audit = map.auditFogCoverage()
-                val auditDeadline = SystemClock.uptimeMillis() + 30_000L
-                while (SystemClock.uptimeMillis() < auditDeadline) {
+                var validatedSlot: FogGenerationSlot? = null
+                var validatedReport: String? = null
+                var validatedAudit: FogAudit? = null
+                val auditDeadline = SystemClock.uptimeMillis() + BETWEEN_TRANSITIONS_TIMEOUT_MILLIS
+                while (validatedAudit == null && SystemClock.uptimeMillis() < auditDeadline) {
                     val slotBefore = runCatching { publishedFogSlot() }.getOrNull()
                     if (slotBefore == null || !map.hasOnlyPublishedFogGeneration(slotBefore)) {
                         Thread.sleep(250L)
@@ -3102,12 +3114,18 @@ class MapSurfaceTest {
                     val candidate = map.auditFogCoverage()
                     val slotAfter = runCatching { publishedFogSlot() }.getOrNull()
                     if (slotAfter == slotBefore && map.hasOnlyPublishedFogGeneration(slotBefore)) {
-                        activeSlot = slotBefore
-                        styleReport = candidateReport
-                        audit = candidate
-                        break
+                        validatedSlot = slotBefore
+                        validatedReport = candidateReport
+                        validatedAudit = candidate
                     }
                 }
+                // Fail closed rather than measure a frame no validity check ever cleared.
+                val audit = checkNotNull(validatedAudit) {
+                    "No between-transitions capture at zoom $settled within " +
+                        "${BETWEEN_TRANSITIONS_TIMEOUT_MILLIS}ms; this cell measured nothing"
+                }
+                val activeSlot = checkNotNull(validatedSlot)
+                val styleReport = checkNotNull(validatedReport)
                 report.append(
                     " z=${"%.2f".format(java.util.Locale.US, settled)} slot=$activeSlot " +
                         "$styleReport=${audit.report()}",
@@ -6867,6 +6885,12 @@ class MapSurfaceTest {
     private companion object {
         const val FOG_STATUS_SETTLE_MILLIS = 2_000L
         const val REVEALED_POINT_COUNT = 40
+        /**
+         * How long an audit may wait for a capture taken between A/B fog transitions. Matches the
+         * measured hosted convergence time for the same predicate the retains gate settles on.
+         */
+        const val BETWEEN_TRANSITIONS_TIMEOUT_MILLIS = 90_000L
+
         /**
          * Thirty, not ten: this bounds how long the hosted SwiftShader renderer may take to
          * produce one fully rendered frame, and a tilted camera's frustum reaches the horizon,
