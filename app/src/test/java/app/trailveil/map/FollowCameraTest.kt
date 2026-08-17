@@ -60,7 +60,8 @@ class FollowCameraTest {
     /**
      * The bound the smooth path relies on. A follow step is only made without raising the safety
      * cover because it cannot cross more than one viewport; anything further is not a step, and
-     * goes back through the ordinary programmed move that hides the map until fog is rebuilt.
+     * goes back through the ordinary programmed move, which since the A/B generations landed
+     * hides the map only when it leaves the committed surround.
      */
     @Test
     fun aLocationOffScreenIsAMoveRatherThanAFollowStep() {

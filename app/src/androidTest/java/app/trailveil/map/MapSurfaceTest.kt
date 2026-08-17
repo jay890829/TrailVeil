@@ -4941,8 +4941,12 @@ class MapSurfaceTest {
             // Mid-flight, a DIFFERENT fix lands: the point-equality guard no longer matches, so
             // without the latch the follow effect issues a zoom-less update here and the flight's
             // zoom is lost. Delivered on the next frame so the request effect has launched.
+            // Strictly mid-flight: "moved off the start" alone is also true after landing, and a
+            // post-landing delivery makes the whole gate vacuous - the follow update would have
+            // no zoom left to eat. Wait for a camera between the two zooms.
             composeRule.waitUntil(timeoutMillis = 5_000L) {
-                kotlin.math.abs(map.cameraPosition.zoom - RECENTRE_FROM_ZOOM) > 0.01
+                val zoom = map.cameraPosition.zoom
+                zoom > RECENTRE_FROM_ZOOM + 0.01 && zoom < RECENTRE_TO_ZOOM - MID_FLIGHT_ZOOM_MARGIN
             }
             composeRule.runOnUiThread {
                 followLocation.value = GeoPoint(
@@ -4959,6 +4963,122 @@ class MapSurfaceTest {
 
             assertEquals(
                 "A fix landing mid-recentre replaced the requested zoom with a follow step",
+                RECENTRE_TO_ZOOM,
+                map.cameraPosition.zoom,
+                ZOOM_TOLERANCE,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    /**
+     * The supersede case a closure verifier found in the first latch: MapLibre's
+     * `cancelTransitions` POSTS the superseded flight's `onCancel`, so a second press inside the
+     * first ~300 ms flight had the first flight's cancellation clear the latch while the second
+     * flight was still in the air - reopening the zoom-eating race for exactly the double press
+     * this feature exists to make unnecessary. Two presses, then a fix mid-second-flight.
+     */
+    @Test
+    fun aSecondPressDoesNotUnlatchTheFirstFlightsGuard() {
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            val revealed = GeoPoint(25.0330, 121.5654)
+            revealTrack(database, revealed)
+            val followLocation = mutableStateOf<GeoPoint?>(null)
+            val lookedAround = GeoPoint(
+                revealed.latitude + RECENTRE_LOOK_AWAY_DEGREES,
+                revealed.longitude + RECENTRE_LOOK_AWAY_DEGREES,
+            )
+            val cameraRequest = mutableStateOf(
+                MapCameraRequest(requestId = 1L, point = lookedAround, zoom = RECENTRE_FROM_ZOOM),
+            )
+
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-recentre-supersede-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-recentre-supersede",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-recentre-supersede-test",
+                    fogRuntime = stableFogRuntime,
+                    fogRequired = true,
+                    cameraRequest = cameraRequest.value,
+                    followLocation = followLocation.value,
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 20_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            composeRule.waitUntil(timeoutMillis = 20_000L) {
+                composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                    .fetchSemanticsNodes()
+                    .isEmpty()
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            composeRule.runOnUiThread {
+                followLocation.value = revealed
+                cameraRequest.value = MapCameraRequest(
+                    requestId = 2L,
+                    point = revealed,
+                    zoom = RECENTRE_TO_ZOOM,
+                )
+            }
+            // The second press lands inside the first flight, which is what posts the first
+            // flight's onCancel while the second is airborne.
+            // Strictly mid-flight: "moved off the start" alone is also true after landing, and a
+            // post-landing delivery makes the whole gate vacuous - the follow update would have
+            // no zoom left to eat. Wait for a camera between the two zooms.
+            composeRule.waitUntil(timeoutMillis = 5_000L) {
+                val zoom = map.cameraPosition.zoom
+                zoom > RECENTRE_FROM_ZOOM + 0.01 && zoom < RECENTRE_TO_ZOOM - MID_FLIGHT_ZOOM_MARGIN
+            }
+            composeRule.runOnUiThread {
+                cameraRequest.value = MapCameraRequest(
+                    requestId = 3L,
+                    point = revealed,
+                    zoom = RECENTRE_TO_ZOOM,
+                )
+            }
+            // The superseded flight's onCancel is POSTED, and that post is the whole mechanism:
+            // it must run before the fix arrives. A bare sleep does not achieve this - compose
+            // had not even recomposed the press yet, so both writes batched into one frame and
+            // the request effect (declared first) raised the latch before the follow effect ran.
+            // Idle first (drains the recomposition, the effect launch, and the posted cancel),
+            // then confirm the replacing flight is still climbing, then deliver.
+            composeRule.waitForIdle()
+            Thread.sleep(SUPERSEDED_CANCEL_DRAIN_MILLIS)
+            composeRule.waitForIdle()
+            assertTrue(
+                "The replacing flight had already landed, so nothing was left to interrupt",
+                map.cameraPosition.zoom < RECENTRE_TO_ZOOM - MID_FLIGHT_ZOOM_MARGIN,
+            )
+            // Then the fix, while the second flight is still climbing: with a stale cancellation
+            // having cleared a bare flag, the follow effect would issue its zoom-less update here.
+            composeRule.runOnUiThread {
+                followLocation.value = GeoPoint(
+                    revealed.latitude + MID_FLIGHT_FIX_OFFSET_DEGREES,
+                    revealed.longitude,
+                )
+            }
+            runCatching {
+                composeRule.waitUntil(timeoutMillis = FOLLOW_ARRIVAL_TIMEOUT_MILLIS) {
+                    kotlin.math.abs(map.cameraPosition.zoom - RECENTRE_TO_ZOOM) < ZOOM_TOLERANCE
+                }
+            }
+            Thread.sleep(ZOOM_SETTLE_MILLIS)
+
+            assertEquals(
+                "A superseded flight's cancellation unlatched the guard and a fix ate the zoom",
                 RECENTRE_TO_ZOOM,
                 map.cameraPosition.zoom,
                 ZOOM_TOLERANCE,
@@ -7160,6 +7280,15 @@ class MapSurfaceTest {
          * of assumed: an attempt that has not moved the camera is lifted and made again, which
          * costs a second and makes the suite deterministic.
          */
+        /**
+         * Long enough for a superseded flight's posted cancellation to run, short enough to stay
+         * inside the replacing flight.
+         */
+        const val SUPERSEDED_CANCEL_DRAIN_MILLIS = 40L
+
+        /** How far below the requested zoom still counts as in flight rather than landed. */
+        const val MID_FLIGHT_ZOOM_MARGIN = 0.5
+
         /** Far enough that a follow step is a real EASE/JUMP, near enough to stay plausible. */
         const val MID_FLIGHT_FIX_OFFSET_DEGREES = 0.5
 

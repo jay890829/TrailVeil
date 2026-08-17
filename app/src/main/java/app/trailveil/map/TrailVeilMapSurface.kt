@@ -52,6 +52,7 @@ import app.trailveil.map.fog.FogViewportRequest
 import app.trailveil.map.fog.FogViewportRender
 import app.trailveil.map.fog.GeoPoint
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -458,7 +459,11 @@ internal fun TrailVeilMapSurface(
     // Set only around a follow step, whose reach is bounded by how far a person walked since the
     // last fix. Every other programmed move keeps hiding the overlay until its rebuild lands.
     val followingCameraMove = remember(mapView) { AtomicBoolean(false) }
-    val programmedCameraRequestInFlight = remember(mapView) { AtomicBoolean(false) }
+    // A flight ticket, not a flag: MapLibre's `cancelTransitions` POSTS the superseded flight's
+    // `onCancel`, so it runs while the replacing flight is already in the air. A boolean would be
+    // cleared underneath the live flight and reopen the very race this closes; a ticket lets the
+    // stale callback fail its compare-and-set and leave the current flight's claim standing.
+    val programmedCameraFlight = remember(mapView) { AtomicLong(IDLE_CAMERA_FLIGHT) }
     var fogViewportRequest by remember(mapView, fogRuntime) {
         mutableStateOf<FogViewportRequest?>(null)
     }
@@ -616,7 +621,7 @@ internal fun TrailVeilMapSurface(
         // equality guard, and its zoom-less ease or jump ate the requested zoom with nothing to
         // repair it. Finish and cancel both clear it; a gesture cancels the flight and turns
         // following off anyway.
-        programmedCameraRequestInFlight.set(true)
+        val flight = programmedCameraFlight.incrementAndGet()
         map.animateCamera(
             if (request.zoom == null) {
                 CameraUpdateFactory.newLatLng(target)
@@ -625,11 +630,11 @@ internal fun TrailVeilMapSurface(
             },
             object : MapLibreMap.CancelableCallback {
                 override fun onFinish() {
-                    programmedCameraRequestInFlight.set(false)
+                    programmedCameraFlight.compareAndSet(flight, IDLE_CAMERA_FLIGHT)
                 }
 
                 override fun onCancel() {
-                    programmedCameraRequestInFlight.set(false)
+                    programmedCameraFlight.compareAndSet(flight, IDLE_CAMERA_FLIGHT)
                 }
             },
         )
@@ -651,7 +656,7 @@ internal fun TrailVeilMapSurface(
         // A different fix arriving while a programmed request is still flying must not interrupt
         // it either - the follow effect stands down for the whole flight, and the next fix after
         // landing follows normally.
-        if (programmedCameraRequestInFlight.get()) return@LaunchedEffect
+        if (programmedCameraFlight.get() != IDLE_CAMERA_FLIGHT) return@LaunchedEffect
         val destination = LatLng(target.latitude, target.longitude)
         val screen = map.projection.toScreenLocation(destination)
         when (
@@ -667,8 +672,9 @@ internal fun TrailVeilMapSurface(
                 followingCameraMove.set(true)
                 map.easeCamera(CameraUpdateFactory.newLatLng(destination), FOLLOW_EASE_MILLIS)
             }
-            // Off screen is not a step, it is a move — so it is made like any other one, with the
-            // cover raised until fog has been rebuilt around wherever the user turned out to be.
+            // Off screen is not a step, it is a move — so it is made like any other one. Since
+            // the A/B generations landed, the cover rises only if that move leaves the committed
+            // surround; within it the renderer-native guard already covers the ground.
             FollowCameraMove.JUMP ->
                 map.animateCamera(CameraUpdateFactory.newLatLng(destination))
         }
@@ -1908,6 +1914,9 @@ private const val WORLD_LONGITUDE_SPAN = 360.0
 private const val VISIBLE_REGION_CORNERS = 4
 
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
+
+/** No programmed camera flight is in the air. */
+private const val IDLE_CAMERA_FLIGHT = 0L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
 private const val FOG_SEAM_GUARD_WIDTH_PIXELS = 3.0f
 private const val FOG_EXTENT_GUARD_BOUNDARY_WIDTH_PIXELS = 4.0f
