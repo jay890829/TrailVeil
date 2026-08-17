@@ -35,6 +35,16 @@ class FogTilePipeline(
 ) {
     private var diskCacheEnabled = diskCache != null
 
+    /**
+     * The cached mask for [key], or null when it would have to be rendered.
+     *
+     * This exists so a caller can find out what is missing BEFORE it pays for the canonical read
+     * that rendering needs: at low zooms the tile window is the whole world, and reading the whole
+     * track table to satisfy tiles that were already cached is the cost this answers.
+     */
+    @Synchronized
+    fun loadCached(key: FogTileKey): FogTileLoad? = cached(key)
+
     @Synchronized
     fun load(key: FogTileKey, segments: List<TrackSegment>): FogTileLoad {
         cached(key)?.let { return it }

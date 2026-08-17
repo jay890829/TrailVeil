@@ -22,7 +22,8 @@ data class FogViewportRequest(
 data class FogViewportRender(
     val request: FogViewportRequest,
     val keys: List<FogTileKey>,
-    val queryBounds: ViewportBounds,
+    /** What was actually read from canonical storage, or null when nothing had to be. */
+    val queryBounds: ViewportBounds?,
     val mosaic: FogTileMosaic,
 )
 
@@ -71,16 +72,37 @@ class FogViewportCoordinator(
             zoom = renderZoom(request.mapZoom),
             renderVersion = renderVersion,
         )
-        val queryBounds = FogViewportTileGrid.queryBounds(
-            keys = keys,
-            marginMeters = queryMarginMeters,
-        )
-        val segments = trackDataSource.read(queryBounds).toFogTrackSegments()
-        val selected = FogPocSpatialSelection.select(keys, segments, style)
+        // Ask the caches what is actually missing before reading anything. A tile window at low
+        // zoom is the whole world, so reading for tiles that were already cached made every
+        // settle out there a full-table read - invisible against a test database of forty points,
+        // and the reason zooming all the way out on a real one is a problem. Masks taken here are
+        // held rather than looked up again, so nothing can be evicted between the two decisions.
+        val cachedMasks = keys.associateWith { key -> pipeline.loadCached(key)?.mask }
+        val missing = keys.filter { key -> cachedMasks[key] == null }
+        val queryBounds = if (missing.isEmpty()) {
+            null
+        } else {
+            // The smallest complete rectangle covering the misses, not the whole window: one
+            // uncached tile beside eight cached ones should cost one tile's worth of reading.
+            FogViewportTileGrid.queryBounds(
+                keys = FogViewportTileGrid.enclosingSubWindow(keys, missing.toSet()),
+                marginMeters = queryMarginMeters,
+            )
+        }
+        val selected = if (queryBounds == null) {
+            emptyMap()
+        } else {
+            FogPocSpatialSelection.select(
+                missing,
+                trackDataSource.read(queryBounds).toFogTrackSegments(),
+                style,
+            )
+        }
         val tiles = keys.map { key ->
             FogMosaicTile(
                 key = key,
-                mask = pipeline.load(key, selected.getValue(key)).mask,
+                mask = cachedMasks[key]
+                    ?: pipeline.load(key, selected[key].orEmpty()).mask,
             )
         }
         FogViewportRender(
@@ -98,10 +120,6 @@ class FogViewportCoordinator(
             zoom = renderZoom(request.mapZoom),
             renderVersion = renderVersion,
         )
-        val queryBounds = FogViewportTileGrid.queryBounds(
-            keys = keys,
-            marginMeters = queryMarginMeters,
-        )
         val tiles = keys.map { key ->
             FogMosaicTile(
                 key = key,
@@ -111,7 +129,8 @@ class FogViewportCoordinator(
         return FogViewportRender(
             request = request,
             keys = keys,
-            queryBounds = queryBounds,
+            // Nothing was read; a placeholder reports no bounds rather than bounds it never used.
+            queryBounds = null,
             mosaic = FogPocMosaic.compose(tiles).anchoredNear(request.center.longitude),
         )
     }
@@ -210,6 +229,37 @@ object FogViewportTileGrid {
                             renderVersion = renderVersion,
                         ),
                     )
+                }
+            }
+        }
+    }
+
+    /**
+     * The smallest complete sub-rectangle of [window] that contains every key in [wanted].
+     *
+     * [queryBounds] needs a complete row-major rectangle, so a caller holding an arbitrary subset
+     * cannot narrow its read by handing that subset over. Positions are taken within the window
+     * rather than from raw tile x, because a window that crosses the antimeridian has columns
+     * whose numbers wrap while their order does not.
+     */
+    fun enclosingSubWindow(
+        window: List<FogTileKey>,
+        wanted: Set<FogTileKey>,
+    ): List<FogTileKey> {
+        require(window.isNotEmpty()) { "window must not be empty" }
+        require(wanted.isNotEmpty()) { "wanted must not be empty" }
+        require(window.containsAll(wanted)) { "wanted must be a subset of the window" }
+        val rows = window.map(FogTileKey::y).distinct()
+        require(window.size % rows.size == 0) { "window must be row-major rectangular" }
+        val columnCount = window.size / rows.size
+        val positions = window.withIndex().associate { (index, key) -> key to index }
+        val indices = wanted.map { key -> positions.getValue(key) }
+        val rowRange = indices.minOf { it / columnCount }..indices.maxOf { it / columnCount }
+        val columnRange = indices.minOf { it % columnCount }..indices.maxOf { it % columnCount }
+        return buildList {
+            for (row in rowRange) {
+                for (column in columnRange) {
+                    add(window[row * columnCount + column])
                 }
             }
         }
