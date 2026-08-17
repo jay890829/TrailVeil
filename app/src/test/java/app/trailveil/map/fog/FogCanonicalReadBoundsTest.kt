@@ -236,11 +236,18 @@ class FogCanonicalReadBoundsTest {
      * A/B against `missing.first()` passed, since at this camera the track's latitude falls in
      * exactly the row that mutation keeps.
      *
-     * Measured, not assumed: with this fixture the gate fails against a narrowing to
-     * `missing.first()` and does NOT fail against one to `missing.last()`. The asymmetry is not
-     * explained; both mutations read a single tile row, and on this geometry one of them evidently
-     * still reads enough. So this gate is evidence that SOME real under-read is caught, not proof
-     * that every one is - and that is exactly what it claims, here and in the ledger.
+     * Measured: the gate fails against a narrowing to `missing.first()` and does not fail against
+     * one to `missing.last()`. That asymmetry is an artifact of how a mutation is applied, not a
+     * blind spot. A mutation compiles into the coordinator, so it changes BOTH sides of the
+     * comparison, and the cold side's missing set is the whole nine-tile window: its last missing
+     * key is the window's south-east tile, which is also the warm side's last missing key, so both
+     * sides under-read identically and an equivalence comparison has nothing to diverge on. The
+     * first missing key differs between the sides - west column cold, east column warm - so they
+     * diverge and the gate fires.
+     *
+     * What this gate therefore catches is every under-read that makes the partially cached path
+     * differ from a cold one, which is the risk the narrowing introduced. What no equivalence gate
+     * can catch is an under-read symmetric across both paths; that limit is named in the ledger.
      */
     private fun columnSpanningTrackPoints(): List<ViewportTrackPoint> =
         buildList {
@@ -262,8 +269,7 @@ class FogCanonicalReadBoundsTest {
                     ),
                 )
                 id += 1
-                // About 100 m apart, inside the accepted continuity ceiling and under the margin
-                // this gate uses, so capsules stay whole for the correct implementation.
+                // About 100 m apart, inside the accepted continuity ceiling.
                 latitude += 0.0009
             }
         }
@@ -362,9 +368,8 @@ class FogCanonicalReadBoundsTest {
      * pixel - the sibling gate above binds composition identity and a margin floor, not the
      * narrowing itself. A closure verifier proved that arithmetically after this file had already
      * recorded an A/B claiming otherwise; the claim was mis-attributed to a neighbouring test's
-     * failure. Two hundred metres is small enough that a sub-window one tile too small excludes
-     * the track and renders the column opaque, and large enough to stay above the reveal radius
-     * the constructor requires.
+     * failure. The margin here is a hundred and fifty metres, far below the 554 m height of a
+     * zoom-16 tile row, so a sub-window one row too small demonstrably drops part of the track.
      */
     @Test
     fun aPartiallyCachedSettleDrawsTheSameFogAsAColdOneWhenTheMarginCannotHideTheDifference() =
@@ -466,12 +471,13 @@ class FogCanonicalReadBoundsTest {
 
     private companion object {
         /**
-         * Chosen from the geometry, not by trial: above the fixture's 100 m point spacing so
-         * capsules stay whole (below it the correct implementation drops a capsule and the gate
-         * fails for the wrong reason), and well below the ~545 m height of a zoom-16 tile row so
-         * that a sub-window missing a row demonstrably loses the track. At the production margin
-         * no such value exists - 6100 m is eleven tiles, so every legal sub-window contains a
-         * local track and no narrowing mutation can change a pixel.
+         * Chosen from the geometry: well below the 554 m height of a zoom-16 tile row, so a
+         * sub-window missing a row demonstrably loses part of the track. There is no operative
+         * lower bound for this fixture - its track lies wholly inside the missing column's own
+         * rectangle, so the correct implementation reads all of it at any legal margin, and the
+         * real floor is the constructor's reveal-radius minimum. At the production margin no
+         * discriminating value exists at all: 6100 m is eleven tiles, so every legal sub-window
+         * contains a local track and no narrowing mutation can change a pixel.
          */
         const val DISCRIMINATING_QUERY_MARGIN_METERS = 150.0
     }

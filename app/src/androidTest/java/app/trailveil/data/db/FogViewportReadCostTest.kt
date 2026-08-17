@@ -130,7 +130,7 @@ class FogViewportReadCostTest {
      * would have to visit them all.
      *
      * Extents are stated as the arithmetic produces them: the walked block spans 0.0479 degrees of
-     * latitude (about 5.3 km) and 0.0479 of longitude (about 4.8 km at this latitude), a rough
+     * latitude (about 5.3 km) and 0.0492 of longitude (about 5.0 km at this latitude), a rough
      * square; the decoys sit three to five degrees away, hundreds of kilometres north and south.
      */
     private fun insertConcentratedTrack() {
