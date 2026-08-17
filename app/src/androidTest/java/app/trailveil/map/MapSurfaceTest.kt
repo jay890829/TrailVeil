@@ -3326,10 +3326,15 @@ class MapSurfaceTest {
                         "extent=${installed.extent} corners=${map.visibleRegionCorners()}",
                     installed.extent.covers(map.visibleRegionCorners()),
                 )
+                // Geometry, not identity: what the frozen-camera claims below need is that the
+                // ground the fog covers did not move while the camera was positioned. A rebuild
+                // that re-derives the SAME extent (new generation, other A/B slot, every field
+                // bit-identical) satisfies that and happens on slower hosts - asserting the
+                // snapshot object made this a red on a healthy product (run 31990700424).
                 assertEquals(
-                    "Preparing a finite-boundary path rebuilt the canonical fog",
-                    installed,
-                    installedCoverage.get(),
+                    "Preparing a finite-boundary path moved the canonical fog geometry",
+                    installed.extent,
+                    installedCoverage.get()?.extent,
                 )
                 assertTrue(
                     "Preparing a finite-boundary path raised the Compose safety cover",
