@@ -490,7 +490,11 @@ internal fun RecordingEntryRoute(
             notificationNotice = notificationNotice,
             startNotice = startNotice,
             startNoticeRaisedAt = startNoticeRaisedAt,
-            recordingActive = stopControlOffered(
+            stopOffered = stopControlOffered(
+                state = recordingPresentation.state,
+                activeSessionId = recordingPresentation.activeSessionId,
+            ),
+            startOffered = startControlOffered(
                 state = recordingPresentation.state,
                 activeSessionId = recordingPresentation.activeSessionId,
             ),

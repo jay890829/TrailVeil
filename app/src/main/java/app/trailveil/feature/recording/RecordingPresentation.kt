@@ -92,18 +92,31 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
 }
 
 /**
- * Whether the screen offers Stop rather than Start.
+ * Whether the screen offers to end the open exploration.
  *
- * An abandoned row is still `ACTIVE`, so identity alone would offer Stop — for a runtime that does
- * not exist, while the automatic re-arm is offered only once per process. A user whose re-arm was
- * blocked, who then grants the permission and comes back, would have found no way to ask again.
- * Start is offered instead: against a row that is still `ACTIVE` it reacquires ownership through the
- * same recovery transaction, and the abandoned exploration continues.
+ * An abandoned row is still `ACTIVE` and still stoppable — the in-app Stop starts the service purely
+ * to terminalize it — so it must stay reachable. It is the only way to end that row once the
+ * foreground notification has died with the process that posted it.
  */
 internal fun stopControlOffered(
     state: RecordingDisplayState,
     activeSessionId: Long?,
-): Boolean = activeSessionId != null && state != RecordingDisplayState.ABANDONED
+): Boolean = activeSessionId != null
+
+/**
+ * Whether the screen offers to begin an exploration, or to continue an abandoned one.
+ *
+ * Abandoned is the one state where both controls belong. Nothing is recording, so Start is what
+ * continues it — against a row that is still `ACTIVE` it reacquires ownership through the same
+ * recovery transaction — and the automatic re-arm is offered only once per process, so without this
+ * a user whose re-arm was blocked, who then grants the permission and comes back, would have no way
+ * to ask again. Offering only one of the two controls strands them either way: first this screen
+ * offered Stop for a runtime that did not exist, then it offered no way to end the row at all.
+ */
+internal fun startControlOffered(
+    state: RecordingDisplayState,
+    activeSessionId: Long?,
+): Boolean = activeSessionId == null || state == RecordingDisplayState.ABANDONED
 
 /**
  * Which abandoned exploration this process should offer to re-arm, or null for "leave it alone".

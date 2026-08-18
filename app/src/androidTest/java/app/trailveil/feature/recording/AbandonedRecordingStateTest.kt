@@ -1,34 +1,42 @@
 package app.trailveil.feature.recording
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
+import android.location.LocationManager
 import android.os.SystemClock
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
+import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import app.trailveil.MainActivity
 import app.trailveil.R
 import app.trailveil.TrailVeilApplication
-import app.trailveil.data.db.TrailVeilDatabase
 import app.trailveil.recording.RecordingForegroundService
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
 /**
- * The screen may never tell the user an exploration is being recorded by a runtime that is gone.
+ * An exploration whose owning runtime is gone must be taken back, not merely described.
  *
  * `P4-038`: on a HyperOS device the platform does not restart a killed foreground service, so an
- * `ACTIVE` row outlives the process that owned it. The unit tests bind the mapping function; this
- * one binds the wiring, which is a different claim — the mapping can be correct while the screen
- * hands it the wrong runtime token, and that is exactly what shipped.
+ * `ACTIVE` row outlives the process that owned it and only the app reopening can re-arm it. The unit
+ * tests bind the pure mapping; this binds the wiring, which is a different claim — the mapping can
+ * be correct while the screen hands it the wrong runtime token, and the re-arm can be missing
+ * entirely while every state shown is still honest.
+ *
+ * An earlier version of this test accepted either "resumed and owned" or "still abandoned", and a
+ * verifier showed that deleting the whole re-arm left it green: the abandoned branch was an escape
+ * hatch for exactly the half the task exists for. It now requires the recovery, and skips rather
+ * than weakens when the environment cannot permit one.
  *
  * A killed runtime is modelled by its durable trace rather than by killing this process, which a
  * test cannot survive: an `ACTIVE` row whose `location_owner_token` belongs to no live runtime is
- * precisely what a process death leaves behind, and it is the only thing the screen can read.
+ * precisely what a process death leaves behind, and it is all the screen can read.
  */
 @RunWith(AndroidJUnit4::class)
 class AbandonedRecordingStateTest {
@@ -36,51 +44,62 @@ class AbandonedRecordingStateTest {
     val composeRule = createAndroidComposeRule<MainActivity>()
 
     private val context: Context = ApplicationProvider.getApplicationContext()
+    private val container get() = (context as TrailVeilApplication).appContainer
 
     @Test
-    fun anExplorationOwnedByADeadRuntimeIsNeverPresentedAsRecording() {
-        val database = TrailVeilDatabase.open(context)
-        val sqlite = database.openHelper.writableDatabase
+    fun anExplorationOwnedByADeadRuntimeIsTakenBackWhenTheAppReturns() {
+        // Re-arming is a foreground-service start, so without these the run could only observe the
+        // blocked half and would say nothing about recovery. Skipping states that honestly.
+        assumeTrue(
+            "precise location is not granted, so no re-arm could be attempted",
+            context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED,
+        )
+        assumeTrue(
+            "location services are off, so no re-arm could be attempted",
+            requireNotNull(context.getSystemService(LocationManager::class.java)).isLocationEnabled,
+        )
+
+        val sqlite = container.databaseForTesting().openHelper.writableDatabase
         val deadRuntime = "runtime-of-a-process-that-died-$FIXTURE_SUFFIX"
+        val thisRuntime = container.recordingRuntimeToken
+        assertNotEquals(
+            "the fixture must not accidentally be owned by this process",
+            thisRuntime,
+            deadRuntime,
+        )
         val sessionId = seedAbandonedSession(sqlite, deadRuntime)
 
         try {
-            val thisRuntime =
-                (context as TrailVeilApplication).appContainer.recordingRuntimeToken
-            assertNotEquals(
-                "the fixture must not accidentally be owned by this process",
-                thisRuntime,
-                deadRuntime,
-            )
+            // Rebuild the screen over the seeded row, so what is measured is a presentation that
+            // started life with the abandoned exploration already there.
+            composeRule.activityRule.scenario.recreate()
 
-            val state = awaitPublishedState()
-            assertNotNull("the route never published a presentation state", state)
-
-            val owner = ownerToken(sqlite, sessionId)
-            if (state == RECORDING) {
-                // Recording may only be claimed once ownership has actually moved here, which is
-                // the re-arm doing its job rather than the screen assuming.
-                assertEquals(
-                    "the screen claimed RECORDING for a row this process does not own",
-                    thisRuntime,
-                    owner,
-                )
-                assertTrue(
-                    "recovery claimed the row without opening a recovery segment",
-                    hasRecoverySegment(sqlite, sessionId),
-                )
-            } else {
-                assertEquals(
-                    "an unowned ACTIVE row must be presented as abandoned",
-                    ABANDONED,
-                    state,
-                )
-                assertEquals(
-                    "nothing may take ownership without recovering",
-                    deadRuntime,
-                    owner,
-                )
+            var owner: String? = null
+            var recovered = false
+            var state: String? = null
+            var waited = 0L
+            while (waited < RECOVERY_TIMEOUT_MILLIS) {
+                composeRule.waitForIdle()
+                owner = ownerToken(sqlite, sessionId)
+                recovered = hasRecoverySegment(sqlite, sessionId)
+                state = publishedState()
+                if (owner == thisRuntime && recovered) break
+                SystemClock.sleep(POLL_MILLIS)
+                waited += POLL_MILLIS
             }
+
+            assertTrue(
+                "the abandoned exploration was never taken back: owner=$owner " +
+                    "(this runtime is $thisRuntime), recoverySegment=$recovered, shown state=$state",
+                owner == thisRuntime && recovered,
+            )
+            // Once it is genuinely owned again, saying so is the truth. Before that it never may be,
+            // which is what the ownership rule and its unit tests hold.
+            assertTrue(
+                "recovered the row but showed '$state'",
+                publishedState() in LIVE_STATES,
+            )
         } finally {
             RecordingForegroundService.stopFromVisibleActivity(context, sessionId)
             SystemClock.sleep(STOP_SETTLE_MILLIS)
@@ -89,10 +108,7 @@ class AbandonedRecordingStateTest {
     }
 
     /** The durable remains of a process death: an ACTIVE row with an owner that no longer exists. */
-    private fun seedAbandonedSession(
-        sqlite: androidx.sqlite.db.SupportSQLiteDatabase,
-        deadRuntime: String,
-    ): Long {
+    private fun seedAbandonedSession(sqlite: SupportSQLiteDatabase, deadRuntime: String): Long {
         val startedAt = System.currentTimeMillis()
         sqlite.execSQL(
             "INSERT INTO recording_sessions(" +
@@ -113,19 +129,11 @@ class AbandonedRecordingStateTest {
         return sessionId
     }
 
-    private fun ownerToken(
-        sqlite: androidx.sqlite.db.SupportSQLiteDatabase,
-        sessionId: Long,
-    ): String? = sqlite
+    private fun ownerToken(sqlite: SupportSQLiteDatabase, sessionId: Long): String? = sqlite
         .query("SELECT location_owner_token FROM recording_sessions WHERE id = $sessionId")
-        .use { cursor ->
-            if (cursor.moveToFirst()) cursor.getString(0) else null
-        }
+        .use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
 
-    private fun hasRecoverySegment(
-        sqlite: androidx.sqlite.db.SupportSQLiteDatabase,
-        sessionId: Long,
-    ): Boolean = sqlite
+    private fun hasRecoverySegment(sqlite: SupportSQLiteDatabase, sessionId: Long): Boolean = sqlite
         .query(
             "SELECT COUNT(*) FROM track_segments " +
                 "WHERE session_id = $sessionId AND start_reason = 'PROCESS_RECOVERY'",
@@ -139,30 +147,20 @@ class AbandonedRecordingStateTest {
      * The route publishes its presentation state onto the decor view, so what is read here is what
      * the production wiring decided rather than a value the test recomputed.
      */
-    private fun awaitPublishedState(): String? {
-        var waited = 0L
+    private fun publishedState(): String? {
         var published: String? = null
-        while (waited < STATE_TIMEOUT_MILLIS) {
-            composeRule.waitForIdle()
-            composeRule.activityRule.scenario.onActivity { activity ->
-                published = activity.window.decorView
-                    .getTag(R.id.recording_presentation_state) as? String
-            }
-            if (published != null && published != IDLE) return published
-            SystemClock.sleep(STATE_POLL_MILLIS)
-            waited += STATE_POLL_MILLIS
+        composeRule.activityRule.scenario.onActivity { activity ->
+            published = activity.window.decorView
+                .getTag(R.id.recording_presentation_state) as? String
         }
         return published
     }
 
     private companion object {
-        const val RECORDING = "RECORDING"
-        const val ABANDONED = "ABANDONED"
-
-        /** Published while the newest session is still being read; not an answer yet. */
-        const val IDLE = "IDLE"
-        const val STATE_TIMEOUT_MILLIS = 20_000L
-        const val STATE_POLL_MILLIS = 250L
+        /** Owned again, and saying so. A rejected fix on a bare emulator is still a live recording. */
+        val LIVE_STATES = setOf("RECORDING", "POOR_SIGNAL")
+        const val RECOVERY_TIMEOUT_MILLIS = 25_000L
+        const val POLL_MILLIS = 250L
         const val STOP_SETTLE_MILLIS = 1_500L
         const val FIXTURE_SUFFIX = "p4-038"
     }

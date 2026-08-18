@@ -225,7 +225,8 @@ class RecordingEntryScreenTest {
             RecordingEntryScreen(
                 state = RecordingEntryUiState(
                     firstVisit = false,
-                    recordingActive = true,
+                    stopOffered = true,
+                    startOffered = false,
                     notificationNotice = NotificationNotice.SETTINGS,
                 ),
                 onStart = {},
@@ -252,7 +253,8 @@ class RecordingEntryScreenTest {
             RecordingEntryScreen(
                 state = RecordingEntryUiState(
                     firstVisit = false,
-                    recordingActive = true,
+                    stopOffered = true,
+                    startOffered = false,
                     recordingState = RecordingDisplayState.POOR_SIGNAL,
                 ),
                 onStart = {},
@@ -316,7 +318,8 @@ class RecordingEntryScreenTest {
             RecordingEntryScreen(
                 state = RecordingEntryUiState(
                     firstVisit = false,
-                    recordingActive = true,
+                    stopOffered = true,
+                    startOffered = false,
                     recordingState = displayState.value,
                 ),
                 onStart = {},

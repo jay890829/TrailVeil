@@ -102,7 +102,10 @@ internal data class RecordingEntryUiState(
     val notificationNotice: NotificationNotice? = null,
     val startNotice: RecordingStartNotice? = null,
     val startNoticeRaisedAt: Long? = null,
-    val recordingActive: Boolean = false,
+    /** Whether the open exploration can be ended from here. */
+    val stopOffered: Boolean = false,
+    /** Whether an exploration can be begun - or an abandoned one continued - from here. */
+    val startOffered: Boolean = true,
     val starting: Boolean = false,
     val recordingState: RecordingDisplayState = RecordingDisplayState.IDLE,
     val latestSessionId: Long? = null,
@@ -350,7 +353,11 @@ private fun RecordingEntryMenu(
             expanded = expanded,
             onDismissRequest = { onExpandedChange(false) },
         ) {
-            if (state.recordingActive) {
+            // An abandoned exploration is the one state that offers both: nothing is recording, so
+            // Start is what continues it, while the row is still open, so Stop is what ends it.
+            // Offering only one of them strands the user - which is what shipped in each direction
+            // before this - because the foreground notification died with the process that owned it.
+            if (state.stopOffered) {
                 DropdownMenuItem(
                     text = { Text(text = stringResource(R.string.recording_entry_stop)) },
                     onClick = {
@@ -361,7 +368,8 @@ private fun RecordingEntryMenu(
                     enabled = !state.starting &&
                         state.recordingState != RecordingDisplayState.STOPPING,
                 )
-            } else {
+            }
+            if (state.startOffered) {
                 DropdownMenuItem(
                     text = {
                         Text(

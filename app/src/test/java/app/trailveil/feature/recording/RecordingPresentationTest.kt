@@ -411,27 +411,31 @@ class RecordingPresentationTest {
     }
 
     @Test
-    fun anAbandonedExplorationOffersStartRatherThanStopSoTheUserCanAskAgain() {
-        // The row is still ACTIVE, so identity alone would offer Stop for a runtime that no longer
-        // exists — and since the automatic re-arm is offered once per process, a user whose attempt
-        // was blocked, who then fixes the permission and returns, would have had no way to retry.
-        assertFalse(
-            stopControlOffered(
-                state = RecordingDisplayState.ABANDONED,
-                activeSessionId = 7L,
-            ),
+    fun anAbandonedExplorationOffersBothContinuingItAndEndingIt() {
+        // Offering only one of the two strands the user, and this screen has done it in both
+        // directions: Stop for a runtime that no longer exists, then — once the re-arm was offered
+        // once per process — no way to end the row at all when that one attempt was blocked.
+        assertTrue(
+            startControlOffered(state = RecordingDisplayState.ABANDONED, activeSessionId = 7L),
         )
         assertTrue(
-            stopControlOffered(
-                state = RecordingDisplayState.RECORDING,
-                activeSessionId = 7L,
-            ),
+            stopControlOffered(state = RecordingDisplayState.ABANDONED, activeSessionId = 7L),
+        )
+    }
+
+    @Test
+    fun aLiveRecordingOffersOnlyEndingItAndAnIdleScreenOnlyBeginning() {
+        assertTrue(
+            stopControlOffered(state = RecordingDisplayState.RECORDING, activeSessionId = 7L),
         )
         assertFalse(
-            stopControlOffered(
-                state = RecordingDisplayState.IDLE,
-                activeSessionId = null,
-            ),
+            startControlOffered(state = RecordingDisplayState.RECORDING, activeSessionId = 7L),
+        )
+        assertFalse(
+            stopControlOffered(state = RecordingDisplayState.IDLE, activeSessionId = null),
+        )
+        assertTrue(
+            startControlOffered(state = RecordingDisplayState.IDLE, activeSessionId = null),
         )
     }
 
