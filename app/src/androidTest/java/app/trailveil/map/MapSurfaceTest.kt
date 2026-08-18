@@ -548,6 +548,9 @@ class MapSurfaceTest {
             val renders = java.util.Collections.synchronizedList(mutableListOf<FogViewportRender>())
             val writing = AtomicBoolean(true)
             val committed = AtomicInteger(0)
+            // Rows reaching Room prove the writer ran; only a revision advancing proves the change
+            // feed carried them to the surface, which is the pressure this gate claims to apply.
+            val streamedRevisions = java.util.Collections.synchronizedList(mutableListOf<Long>())
 
             // A canonical render slow enough that many points commit before any of it can finish:
             // points land every few milliseconds, a cold nine-tile pass takes most of a second. If
@@ -569,7 +572,15 @@ class MapSurfaceTest {
                                 sequence = sequence,
                                 timestamp = 1_000L + sequence * 5_000L,
                                 latitude = center.latitude,
-                                longitude = center.longitude + sequence * 0.0002,
+                                // Cycled inside the rendered window on purpose. A monotonic step
+                                // put the very first streamed point about 0.008 degrees east of
+                                // centre - the edge of the nine-tile window at this zoom - so every
+                                // point after it landed outside, merged into nothing, and applied no
+                                // pressure at all. Measured while adding the feed assertion below:
+                                // revisions stayed at [2, 2] for the whole run.
+                                longitude = center.longitude +
+                                    ((sequence - REVEALED_POINT_COUNT) % STREAMED_WINDOW_STEPS) *
+                                    STREAMED_POINT_LONGITUDE_STEP,
                                 horizontalAccuracy = 5.0,
                             ),
                             distanceDeltaMeters = 20.0,
@@ -604,6 +615,9 @@ class MapSurfaceTest {
                         zoom = 16.0,
                     ),
                     onFogRendered = { render -> renders += render },
+                    canonicalFogInstallCheckpointForTesting = { checkpoint ->
+                        streamedRevisions += checkpoint.fogRevision
+                    },
                 )
             }
 
@@ -627,6 +641,26 @@ class MapSurfaceTest {
                     "only ${committed.get()} points were committed before fog arrived, which is " +
                         "too few to have pressured anything",
                     committed.get() >= MINIMUM_STREAMED_COMMITTED_POINTS,
+                )
+                // What the surface saw of the stream, reported rather than asserted - and that
+                // is a deliberate retreat. An assertion that a revision advances was written here
+                // and failed in three configurations: points streamed outside the rendered window
+                // (fixed above), points inside it, and after fifteen further seconds of streaming.
+                // Each time the installs seen carried the same revision. So either merge-driven
+                // restarts do not reach this seam or they do not happen in this fixture, and until
+                // that is settled the honest thing is to publish the measurement rather than assert
+                // a mechanism this gate has never demonstrated. `P4-029` records it as blocking.
+                val revisionsSeen = synchronized(streamedRevisions) { streamedRevisions.toList() }
+
+                // Measured with the writer still running, unlike the settled check below: this is
+                // the one that says ground was revealed *under* the stream rather than afterwards.
+                val streamingCoverage = requireNotNull(
+                    composeRule.runOnIdle { attachedMapView() },
+                ).pixelCopyFogCoverage()
+                assertTrue(
+                    "no ground was revealed while points were still streaming: " +
+                        streamingCoverage.report() + " revisionsSeen=$revisionsSeen",
+                    streamingCoverage.revealedFraction > MINIMUM_STREAMED_REVEALED_FRACTION,
                 )
             } finally {
                 writing.set(false)
@@ -7540,6 +7574,12 @@ class MapSurfaceTest {
          * the stream was effectively absent.
          */
         const val MINIMUM_STREAMED_COMMITTED_POINTS = 20
+        const val FEED_ADVANCE_TIMEOUT_MILLIS = 15_000L
+
+        /** Kept well inside the nine-tile window so a streamed point can merge into a cached tile. */
+        const val STREAMED_POINT_LONGITUDE_STEP = 0.0005
+        const val STREAMED_WINDOW_STEPS = 8
+        const val FEED_ADVANCE_POLL_MILLIS = 250L
 
         const val PINCH_ATTEMPTS = 4
 
