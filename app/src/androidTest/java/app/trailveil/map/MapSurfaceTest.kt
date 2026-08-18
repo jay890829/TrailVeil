@@ -3637,21 +3637,30 @@ class MapSurfaceTest {
                         "No canonical installed-coverage snapshot was published for the gesture"
                     }
                     var frozen = measuredCoverage ?: installed.also { measuredCoverage = it }
-                    if (!allowRebuildDuringGesture && installed != frozen) {
-                        // A rebuild mid-gesture is legitimate exactly when the camera has left the
-                        // geometry that was frozen: that is the A/B swap doing what it exists for,
-                        // and a quick zoom-out or an antimeridian crossing provokes it by design.
-                        // Freezing the first snapshot for the whole gesture also made every check
-                        // below compare against geometry the user had already left. So re-freeze on
-                        // what is installed now and let the per-frame rules judge that - and fail
-                        // only on the case this claim was really written for, a rebuild while the
-                        // camera never left the geometry it was given.
+                    if (!allowRebuildDuringGesture && installed.extent != frozen.extent) {
+                        // Only a change of GEOMETRY is examined, because geometry is all this
+                        // audit and everything below it uses; a new generation or slot carrying the
+                        // identical extent is an A/B swap that changed nothing the user can see.
+                        // Comparing whole snapshots failed hosted runs on exactly that: a coarse
+                        // world surround reinstalled with the same extent, generation 2 slot A to
+                        // generation 3 slot B.
+                        //
+                        // A geometry change mid-gesture is legitimate exactly when the camera has
+                        // left the geometry that was frozen: that is the A/B swap doing what it
+                        // exists for, and a quick zoom-out or an antimeridian crossing provokes it
+                        // by design. Freezing the first snapshot for the whole gesture also made
+                        // every check below compare against geometry the user had already left. So
+                        // re-freeze on what is installed now and let the per-frame rules judge that
+                        // - and fail only on the case this claim was really written for, a rebuild
+                        // that moved the geometry while the camera never left it.
                         assertFalse(
                             "The installed fog geometry changed while the camera stayed inside " +
                                 "it: $frozen -> $installed",
                             frozen.extent.covers(map.visibleRegionCorners()),
                         )
                         legitimateRebuilds += 1
+                    }
+                    if (installed != frozen) {
                         measuredCoverage = installed
                         frozen = installed
                     }
