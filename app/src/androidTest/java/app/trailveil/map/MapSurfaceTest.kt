@@ -548,9 +548,9 @@ class MapSurfaceTest {
             val writing = AtomicBoolean(true)
             val committed = AtomicInteger(0)
 
-            // A canonical render slow enough that a chain restarting on every committed point
-            // could never finish one: points land every few milliseconds, this takes most of a
-            // second. If fog still arrives, the arrival did not depend on the stream pausing.
+            // A canonical render slow enough that many points commit before any of it can finish:
+            // points land every few milliseconds, a cold nine-tile pass takes most of a second. If
+            // fog still arrives, the arrival did not depend on the stream pausing.
             val stableFogRuntime = slowRenderingFogRuntime(
                 database,
                 RoomPersistedTrackPointChangeFeed(dao),
@@ -7081,11 +7081,13 @@ class MapSurfaceTest {
             .build()
 
     /**
-     * A runtime whose tile rendering is deliberately slow, so that a canonical chain restarting on
-     * every committed point could never finish one before the next point arrives.
+     * A runtime whose tile rendering is deliberately slow, so that a cold canonical pass cannot
+     * complete before many points have committed against it.
      *
-     * Without this the streaming gate proves little: rendering is fast enough that a restart-per-
-     * point defect might still slip a completed canonical through between two writes.
+     * It does not make a restarting chain lose a race - `FogTilePipeline.load` is called from a
+     * non-suspending loop, so a cancelled attempt still fills the cache it reached, and the cost is
+     * paid only on the first pass. What it buys is pressure: without it the first canonical can
+     * finish between two writes, and an arrival would say nothing about arriving under a stream.
      */
     private fun slowRenderingFogRuntime(
         database: TrailVeilDatabase,
