@@ -571,7 +571,15 @@ class MapSurfaceTest {
                                 segmentId = recording.segmentId,
                                 sequence = sequence,
                                 timestamp = 1_000L + sequence * 5_000L,
-                                latitude = center.latitude,
+                                // Offset north of the seeded corridor, which lies along
+                                // `center.latitude` for 0.0078 degrees of longitude. Cycling inside
+                                // the window at the SAME latitude - the first fix for the problem
+                                // below - put every streamed point within the 25 m reveal radius of
+                                // ground the fixture had already revealed, so they could not reveal
+                                // anything and the streaming-reveal assertion was carried entirely
+                                // by the seeded history. 0.0006 degrees is about 67 m: clear of that
+                                // radius, still well inside the nine-tile window.
+                                latitude = center.latitude + STREAMED_POINT_LATITUDE_OFFSET,
                                 // Cycled inside the rendered window on purpose. A monotonic step
                                 // put the very first streamed point about 0.008 degrees east of
                                 // centre - the edge of the nine-tile window at this zoom - so every
@@ -7587,6 +7595,7 @@ class MapSurfaceTest {
 
         /** Kept well inside the nine-tile window so a streamed point can merge into a cached tile. */
         const val STREAMED_POINT_LONGITUDE_STEP = 0.0005
+        const val STREAMED_POINT_LATITUDE_OFFSET = 0.0006
         const val STREAMED_WINDOW_STEPS = 8
         const val FEED_ADVANCE_POLL_MILLIS = 250L
 
