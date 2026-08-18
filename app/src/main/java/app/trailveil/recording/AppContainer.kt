@@ -41,6 +41,9 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     )
     val recordingHistory: RecordingHistoryDataSource =
         RoomRecordingHistoryDataSource(database.recordingDao())
+
+    /** Ownership token of this process, so the screen can tell a live ACTIVE row from an orphaned one. */
+    val recordingRuntimeToken: String get() = recordingRepository.runtimeToken
     private val platformLocationEngine: LocationEngine = PlatformLocationEngine(
         requireNotNull(context.applicationContext.getSystemService(LocationManager::class.java)),
     )

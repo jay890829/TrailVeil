@@ -14,7 +14,7 @@ import org.junit.Test
 class RecordingPresentationTest {
     @Test
     fun missingHistoryIsIdleWithoutAnActiveSession() {
-        val presentation = null.toRecordingPresentation(stoppingSessionId = null)
+        val presentation = null.toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
 
         assertEquals(RecordingDisplayState.IDLE, presentation.state)
         assertNull(presentation.activeSessionId)
@@ -26,7 +26,7 @@ class RecordingPresentationTest {
     @Test
     fun terminalOutcomesStillCarryTheirSessionIdentity() {
         val presentation = detail(RecordingHistoryStatus.COMPLETED)
-            .toRecordingPresentation(stoppingSessionId = null)
+            .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
 
         // `activeSessionId` is deliberately null once a session ends, so identity for an
         // acknowledgement has to come from somewhere that survives the ending.
@@ -40,11 +40,11 @@ class RecordingPresentationTest {
         val rejected = detail(
             status = RecordingHistoryStatus.ACTIVE,
             outcome = "LOCATION_REJECTED_ACCURACY",
-        ).toRecordingPresentation(stoppingSessionId = null)
+        ).toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
         val accepted = detail(
             status = RecordingHistoryStatus.ACTIVE,
             outcome = "LOCATION_ACCEPTED_CONTINUOUS_NONE",
-        ).toRecordingPresentation(stoppingSessionId = null)
+        ).toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
 
         assertEquals(RecordingDisplayState.POOR_SIGNAL, rejected.state)
         assertEquals(RecordingDisplayState.RECORDING, accepted.state)
@@ -58,11 +58,11 @@ class RecordingPresentationTest {
 
         assertEquals(
             RecordingDisplayState.STOPPING,
-            detail.toRecordingPresentation(stoppingSessionId = 7L).state,
+            detail.toRecordingPresentation(stoppingSessionId = 7L, runtimeToken = THIS_RUNTIME).state,
         )
         assertEquals(
             RecordingDisplayState.RECORDING,
-            detail.toRecordingPresentation(stoppingSessionId = 8L).state,
+            detail.toRecordingPresentation(stoppingSessionId = 8L, runtimeToken = THIS_RUNTIME).state,
         )
     }
 
@@ -71,19 +71,19 @@ class RecordingPresentationTest {
         assertEquals(
             RecordingDisplayState.COMPLETED,
             detail(RecordingHistoryStatus.COMPLETED)
-                .toRecordingPresentation(stoppingSessionId = 7L)
+                .toRecordingPresentation(stoppingSessionId = 7L, runtimeToken = THIS_RUNTIME)
                 .state,
         )
         assertEquals(
             RecordingDisplayState.INTERRUPTED,
             detail(RecordingHistoryStatus.INTERRUPTED)
-                .toRecordingPresentation(stoppingSessionId = null)
+                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
                 .state,
         )
         assertEquals(
             RecordingDisplayState.FAILED_TO_START,
             detail(RecordingHistoryStatus.FAILED_TO_START)
-                .toRecordingPresentation(stoppingSessionId = null)
+                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
                 .state,
         )
     }
@@ -265,9 +265,155 @@ class RecordingPresentationTest {
         )
     }
 
+    @Test
+    fun anActiveRowOwnedByARuntimeThatIsGoneIsNotReportedAsRecording() {
+        // Measured on a POCO F7 Ultra: kill the process mid-session and this OEM never restarts the
+        // foreground service, so the ACTIVE row outlives the runtime that claimed it. The screen used
+        // to read that row and say "recording" while nothing was subscribed to location at all.
+        val orphaned = detail(
+            status = RecordingHistoryStatus.ACTIVE,
+            ownerToken = "runtime-of-a-process-that-died",
+        ).toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+
+        assertEquals(RecordingDisplayState.ABANDONED, orphaned.state)
+        // The same row owned by this process is the ordinary live case and must be unaffected.
+        assertEquals(
+            RecordingDisplayState.RECORDING,
+            detail(status = RecordingHistoryStatus.ACTIVE)
+                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+                .state,
+        )
+    }
+
+    @Test
+    fun ownershipIsDecidedBeforeAnythingThatDescribesALiveRuntime() {
+        val orphaned = detail(
+            status = RecordingHistoryStatus.ACTIVE,
+            outcome = "LOCATION_REJECTED_ACCURACY",
+            ownerToken = "runtime-of-a-process-that-died",
+        )
+
+        // Poor signal and stopping both describe a runtime that is still there. Neither may outrank
+        // the fact that no runtime owns this row.
+        assertEquals(
+            RecordingDisplayState.ABANDONED,
+            orphaned.toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME).state,
+        )
+        assertEquals(
+            RecordingDisplayState.ABANDONED,
+            orphaned.toRecordingPresentation(stoppingSessionId = 7L, runtimeToken = THIS_RUNTIME).state,
+        )
+    }
+
+    @Test
+    fun anActiveRowWithNoOwnerAtAllIsAbandonedRatherThanTrusted() {
+        // The database invariants keep an ACTIVE row's token non-null, and a migrated row carries a
+        // sentinel. Whatever produced it, an unowned row is not a live recording, and the mapping
+        // must fail closed rather than treat "no token" as "mine".
+        assertEquals(
+            RecordingDisplayState.ABANDONED,
+            detail(status = RecordingHistoryStatus.ACTIVE, ownerToken = null)
+                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+                .state,
+        )
+    }
+
+    @Test
+    fun anAbandonedExplorationWaitsToBeReadInsteadOfExpiring() {
+        // It is not a persisted terminal status, so it has no ended-at to expire against; if it were
+        // treated as transient the one message telling the user they stopped being recorded could
+        // disappear before they saw it.
+        assertTrue(
+            terminalNoticeVisible(
+                state = RecordingDisplayState.ABANDONED,
+                sessionId = 7L,
+                endedAt = null,
+                nowMillis = TRANSIENT_NOTICE_WINDOW_MILLIS * 100L,
+                acknowledgedSessionId = null,
+            ),
+        )
+    }
+
+    @Test
+    fun anAbandonedExplorationIsOfferedToRecoveryExactlyOncePerProcess() {
+        assertEquals(
+            7L,
+            abandonedSessionToResume(
+                state = RecordingDisplayState.ABANDONED,
+                activeSessionId = 7L,
+                attemptedSessionId = null,
+                startupReconciled = true,
+                activityResumed = true,
+            ),
+        )
+        // Already offered. A blocked attempt leaves the state abandoned, and retrying on every
+        // recomposition would turn one refusal into a loop of them.
+        assertNull(
+            abandonedSessionToResume(
+                state = RecordingDisplayState.ABANDONED,
+                activeSessionId = 7L,
+                attemptedSessionId = 7L,
+                startupReconciled = true,
+                activityResumed = true,
+            ),
+        )
+        // A different exploration is a different question.
+        assertEquals(
+            8L,
+            abandonedSessionToResume(
+                state = RecordingDisplayState.ABANDONED,
+                activeSessionId = 8L,
+                attemptedSessionId = 7L,
+                startupReconciled = true,
+                activityResumed = true,
+            ),
+        )
+    }
+
+    @Test
+    fun nothingIsResumedWhileTheScreenCannotStartOrHasNotRepairedStartup() {
+        assertNull(
+            abandonedSessionToResume(
+                state = RecordingDisplayState.ABANDONED,
+                activeSessionId = 7L,
+                attemptedSessionId = null,
+                startupReconciled = false,
+                activityResumed = true,
+            ),
+        )
+        assertNull(
+            abandonedSessionToResume(
+                state = RecordingDisplayState.ABANDONED,
+                activeSessionId = 7L,
+                attemptedSessionId = null,
+                startupReconciled = true,
+                activityResumed = false,
+            ),
+        )
+    }
+
+    @Test
+    fun onlyAnAbandonedExplorationIsEverResumed() {
+        RecordingDisplayState.entries
+            .filter { it != RecordingDisplayState.ABANDONED }
+            .forEach { state ->
+                assertNull(
+                    "$state must not trigger a recovery attempt",
+                    abandonedSessionToResume(
+                        state = state,
+                        activeSessionId = 7L,
+                        attemptedSessionId = null,
+                        startupReconciled = true,
+                        activityResumed = true,
+                    ),
+                )
+            }
+    }
+
     private fun detail(
         status: RecordingHistoryStatus,
         outcome: String = "START_ACTIVATED",
+        ownerToken: String? = THIS_RUNTIME,
     ) = RecordingLatestSessionSummary(
         session = RecordingHistorySession(
             id = 7L,
@@ -293,5 +439,10 @@ class RecordingPresentationTest {
             latitude = 25.0330,
             longitude = 121.5654,
         ),
+        locationOwnerToken = ownerToken,
     )
+
+    private companion object {
+        const val THIS_RUNTIME = "runtime-of-the-process-under-test"
+    }
 }

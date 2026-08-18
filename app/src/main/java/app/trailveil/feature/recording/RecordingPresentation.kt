@@ -16,6 +16,9 @@ internal val TerminalRecordingStates = setOf(
     RecordingDisplayState.COMPLETED,
     RecordingDisplayState.INTERRUPTED,
     RecordingDisplayState.FAILED_TO_START,
+    // Not durably terminal — the row is still ACTIVE — but terminal to the user, who is no longer
+    // being recorded and needs to be told so rather than have it expire unread.
+    RecordingDisplayState.ABANDONED,
 )
 
 /**
@@ -38,8 +41,14 @@ internal val ExpiringStartNotices = setOf(
     RecordingStartNotice.STOP_REQUESTED,
 )
 
+/**
+ * @param runtimeToken this process's durable ownership token. It is required rather than defaulted
+ *   because a caller that omitted it would be claiming a recording is live without checking, which
+ *   is the exact defect this parameter exists to prevent.
+ */
 internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
     stoppingSessionId: Long?,
+    runtimeToken: String,
 ): RecordingPresentation {
     if (this == null) {
         return RecordingPresentation(
@@ -58,6 +67,10 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
     val state = when (session.status) {
         RecordingHistoryStatus.STARTING -> RecordingDisplayState.STARTING
         RecordingHistoryStatus.ACTIVE -> when {
+            // Ownership is asked first because it decides whether anything is recording at all. A
+            // row this process does not own is not stopping and has no signal quality to report —
+            // both of those would describe a runtime that no longer exists.
+            locationOwnerToken != runtimeToken -> RecordingDisplayState.ABANDONED
             stoppingSessionId == session.id -> RecordingDisplayState.STOPPING
             latestOperationOutcome?.value?.startsWith(LOCATION_REJECTED_PREFIX) == true ->
                 RecordingDisplayState.POOR_SIGNAL
@@ -76,6 +89,36 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
         latestEndedAt = session.endedAt,
         latestAcceptedPoint = latestAcceptedPoint,
     )
+}
+
+/**
+ * Which abandoned exploration this process should offer to re-arm, or null for "leave it alone".
+ *
+ * The platform normally restarts a killed foreground service, and the service recovers the session
+ * itself; measured on a POCO F7 Ultra, some OEM builds never do that unless the user has granted a
+ * background-start permission that is off by default. This is a second trigger for the recovery that
+ * already exists — the ordinary start path reaches it, because a start against a row that is already
+ * `ACTIVE` reacquires ownership through the durable recovery transaction rather than creating a
+ * session — and not a second way of recovering.
+ *
+ * Attempting is deliberately once per session per process. A blocked attempt (no permission, or
+ * location switched off) must not become a loop, and the honest [RecordingDisplayState.ABANDONED]
+ * card it leaves on screen is already the correct thing for the user to see.
+ */
+internal fun abandonedSessionToResume(
+    state: RecordingDisplayState,
+    activeSessionId: Long?,
+    attemptedSessionId: Long?,
+    startupReconciled: Boolean,
+    activityResumed: Boolean,
+): Long? = activeSessionId.takeIf {
+    state == RecordingDisplayState.ABANDONED &&
+        // Startup repair owns any still-STARTING row; re-arming across it would race that decision.
+        startupReconciled &&
+        // A start is only permitted from a visible activity, so asking earlier would spend the one
+        // attempt on a refusal that says nothing about whether recovery was possible.
+        activityResumed &&
+        attemptedSessionId != activeSessionId
 }
 
 /**

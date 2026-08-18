@@ -248,6 +248,13 @@ internal class RecordingRepository(
     private var locationDeliveryEnabled = false
     private var locationOwnerToken: RecordingRuntimeId? = null
 
+    /**
+     * This process's ownership token — the same value written into an `ACTIVE` row by activation and
+     * by recovery. A row carrying it is owned by a runtime that still exists; a row carrying any
+     * other value was claimed by a process that is gone.
+     */
+    val runtimeToken: String get() = runtimeId.value
+
     suspend fun state(): RecordingRepositoryState = mutex.withLock {
         val previousSessionId = cachedState.sessionId
         val previousOpenSegmentId = cachedState.openSegmentId

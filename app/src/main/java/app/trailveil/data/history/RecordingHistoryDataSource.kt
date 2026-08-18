@@ -111,6 +111,14 @@ data class RecordingLatestSessionSummary(
     val session: RecordingHistorySession,
     val latestOperationOutcome: RecordingHistoryOperationOutcome?,
     val latestAcceptedPoint: RecordingHistoryAcceptedPoint?,
+    /**
+     * Which app runtime durably owns an `ACTIVE` row, carried through as data.
+     *
+     * The comparison against the running process is made above this layer, so this contract keeps
+     * its promise of having no service or runtime dependency: it reports who the database says owns
+     * the row, not whether that owner still exists.
+     */
+    val locationOwnerToken: String?,
 )
 
 /** Read-only persisted history contract; it intentionally has no service/runtime dependency. */

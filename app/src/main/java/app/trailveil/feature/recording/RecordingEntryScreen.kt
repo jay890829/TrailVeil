@@ -82,6 +82,17 @@ internal enum class RecordingDisplayState {
     COMPLETED,
     INTERRUPTED,
     FAILED_TO_START,
+
+    /**
+     * An `ACTIVE` row whose durable owner is not this process: no runtime is collecting for it.
+     *
+     * Distinct from [INTERRUPTED], which is a persisted terminal status. This one is a live
+     * contradiction — the database still says the exploration is running while the runtime that
+     * claimed it is gone — and the user must not be shown [RECORDING] for it. Ownership proves the
+     * owning process still exists, not that its collector is still subscribed, so this catches
+     * process death rather than every possible way a runtime can stop delivering.
+     */
+    ABANDONED,
 }
 
 internal data class RecordingEntryUiState(
@@ -445,6 +456,7 @@ private fun RecordingStateCard(
         RecordingDisplayState.COMPLETED -> R.string.recording_state_completed
         RecordingDisplayState.INTERRUPTED -> R.string.recording_state_interrupted
         RecordingDisplayState.FAILED_TO_START -> R.string.recording_state_failed
+        RecordingDisplayState.ABANDONED -> R.string.recording_state_abandoned
     }
     Card(
         modifier = Modifier

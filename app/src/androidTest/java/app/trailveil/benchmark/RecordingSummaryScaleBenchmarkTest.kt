@@ -325,7 +325,10 @@ class RecordingSummaryScaleBenchmarkTest {
                         } while (candidate.session.acceptedPointCount != pointCount + 1L)
                         candidate
                     }
-                    val presentation = updated.toRecordingPresentation(stoppingSessionId = null)
+                    val presentation = updated.toRecordingPresentation(
+                        stoppingSessionId = null,
+                        runtimeToken = SESSION_OWNER_TOKEN,
+                    )
                     UpdateMeasurement(
                         summary = updated,
                         presentationState = presentation.state,
@@ -397,7 +400,7 @@ class RecordingSummaryScaleBenchmarkTest {
                     "id, started_at, ended_at, status, stop_reason, distance_meters, " +
                     "accepted_point_count, rejected_point_count, created_app_version, active_slot, " +
                     "location_owner_token) VALUES($SESSION_ID, 1, NULL, 'ACTIVE', NULL, 0, " +
-                    "$pointCount, 0, 'summary-benchmark', 1, 'summary-benchmark-owner')",
+                    "$pointCount, 0, 'summary-benchmark', 1, '$SESSION_OWNER_TOKEN')",
             )
             sqlite.execSQL(
                 "INSERT INTO track_segments(" +
@@ -493,6 +496,13 @@ class RecordingSummaryScaleBenchmarkTest {
         const val DEDICATED_PROCESS_ARGUMENT = "trailveilDedicatedRecordingSummaryScale"
         val POINT_COUNTS = listOf(10_000, 100_000)
         const val SESSION_ID = 1L
+
+        /**
+         * The seeded row's durable owner. The mapping only reports a live recording for a row this
+         * runtime owns, so the benchmark has to present itself as that owner or it would measure the
+         * abandoned branch instead of the one the app spends its time in.
+         */
+        const val SESSION_OWNER_TOKEN = "summary-benchmark-owner"
         const val SEGMENT_ID = 1L
         const val SUMMARY_UI_RUNTIME_ID = "00000000-0000-0000-0000-000000000033"
         const val NANOS_PER_MILLISECOND = 1_000_000L

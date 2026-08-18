@@ -92,6 +92,7 @@ internal class RoomRecordingHistoryDataSource(
             session = session.toHistory(),
             latestOperationOutcome = latestOperationOutcome?.let(::RecordingHistoryOperationOutcome),
             latestAcceptedPoint = latestPoint,
+            locationOwnerToken = session.locationOwnerToken,
         )
     }
 

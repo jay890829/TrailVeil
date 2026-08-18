@@ -96,6 +96,9 @@ internal fun RecordingEntryRoute(
     var starting by remember { mutableStateOf(false) }
     var fogRuntime by remember { mutableStateOf<FogRuntime?>(null) }
     var startupReconciled by remember(appContainer) { mutableStateOf(false) }
+    // Which abandoned exploration this process has already offered to re-arm. Process-scoped on
+    // purpose: a fresh process is a fresh chance, and one that keeps failing must not keep trying.
+    var resumeAttemptedSessionId by remember(appContainer) { mutableStateOf<Long?>(null) }
 
     LaunchedEffect(historyStore) {
         historyStore.history.collectLatest { history = it }
@@ -187,6 +190,27 @@ internal fun RecordingEntryRoute(
     fun raiseStartNotice(notice: RecordingStartNotice?) {
         startNotice = notice
         startNoticeRaisedAt = notice?.let { System.currentTimeMillis() }
+    }
+
+    suspend fun resumeAbandonedRecording() {
+        // Deliberately quiet: the user pressed nothing, so this raises no start notice. Success shows
+        // itself when the row is owned again and the card stops saying the exploration was abandoned;
+        // a failure leaves that card in place, which is already the truth. Only a blocker the user can
+        // act on is surfaced, and through the same notice the Start button would have raised.
+        val outcome = controller.startFromVisibleActivity(
+            activityVisible = activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
+        )
+        if (outcome is RecordingStartOutcome.Blocked) {
+            when (outcome.blocker) {
+                RecordingStartBlocker.MISSING_LOCATION_PERMISSION ->
+                    locationNotice = LocationNotice.PERMISSION_SETTINGS
+                RecordingStartBlocker.MISSING_FINE_LOCATION ->
+                    locationNotice = LocationNotice.PRECISE_SETTINGS
+                RecordingStartBlocker.LOCATION_DISABLED ->
+                    locationNotice = LocationNotice.LOCATION_SERVICES
+                RecordingStartBlocker.ACTIVITY_NOT_VISIBLE -> Unit
+            }
+        }
     }
 
     suspend fun startRecording(beginOperationId: RecordingOperationId? = null) {
@@ -378,7 +402,29 @@ internal fun RecordingEntryRoute(
         }
     }
 
-    val recordingPresentation = latestSessionSummary.toRecordingPresentation(stoppingSessionId)
+    val recordingPresentation = latestSessionSummary.toRecordingPresentation(
+        stoppingSessionId = stoppingSessionId,
+        runtimeToken = appContainer.recordingRuntimeToken,
+    )
+
+    LaunchedEffect(
+        recordingPresentation.state,
+        recordingPresentation.activeSessionId,
+        startupReconciled,
+        activityResumed,
+    ) {
+        val resumable = abandonedSessionToResume(
+            state = recordingPresentation.state,
+            activeSessionId = recordingPresentation.activeSessionId,
+            attemptedSessionId = resumeAttemptedSessionId,
+            startupReconciled = startupReconciled,
+            activityResumed = activityResumed,
+        ) ?: return@LaunchedEffect
+        // Claimed before the attempt, not after, so a cancelled composition cannot turn one offer
+        // into a stream of them.
+        resumeAttemptedSessionId = resumable
+        resumeAbandonedRecording()
+    }
     // A view-tree diagnostic makes the production presentation boundary observable to scale and
     // frame tests without exposing canonical coordinates or adding a second data subscription.
     SideEffect {
