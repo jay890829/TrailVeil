@@ -8,14 +8,16 @@ import android.os.SystemClock
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
+import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import app.trailveil.MainActivity
 import app.trailveil.R
 import app.trailveil.TrailVeilApplication
 import app.trailveil.recording.RecordingForegroundService
+import java.io.FileInputStream
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
-import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -31,8 +33,10 @@ import org.junit.runner.RunWith
  *
  * An earlier version of this test accepted either "resumed and owned" or "still abandoned", and a
  * verifier showed that deleting the whole re-arm left it green: the abandoned branch was an escape
- * hatch for exactly the half the task exists for. It now requires the recovery, and skips rather
- * than weakens when the environment cannot permit one.
+ * hatch for exactly the half the task exists for. It now requires the recovery. The version after
+ * that guarded the requirement with `assumeTrue` on location permission, which a second verifier
+ * showed skipped the whole test on every CI shard - so the preconditions are established here
+ * instead, the way the sibling classes in this package establish theirs.
  *
  * A killed runtime is modelled by its durable trace rather than by killing this process, which a
  * test cannot survive: an `ACTIVE` row whose `location_owner_token` belongs to no live runtime is
@@ -48,15 +52,16 @@ class AbandonedRecordingStateTest {
 
     @Test
     fun anExplorationOwnedByADeadRuntimeIsTakenBackWhenTheAppReturns() {
-        // Re-arming is a foreground-service start, so without these the run could only observe the
-        // blocked half and would say nothing about recovery. Skipping states that honestly.
-        assumeTrue(
-            "precise location is not granted, so no re-arm could be attempted",
-            context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
-                PackageManager.PERMISSION_GRANTED,
-        )
-        assumeTrue(
-            "location services are off, so no re-arm could be attempted",
+        // Establish the preconditions rather than assume them. An earlier version skipped when the
+        // permission was missing, which sounds conservative and is not: a shard installs the app
+        // without runtime permissions, so the gate would have skipped in CI every time and been
+        // indistinguishable from the assumption skips already reported there. Its three sibling
+        // classes in this package grant and enable the same way.
+        grant(Manifest.permission.ACCESS_COARSE_LOCATION)
+        grant(Manifest.permission.ACCESS_FINE_LOCATION)
+        shell("cmd location set-location-enabled true")
+        assertTrue(
+            "location services could not be enabled, so no re-arm could be attempted",
             requireNotNull(context.getSystemService(LocationManager::class.java)).isLocationEnabled,
         )
 
@@ -95,16 +100,38 @@ class AbandonedRecordingStateTest {
                 owner == thisRuntime && recovered,
             )
             // Once it is genuinely owned again, saying so is the truth. Before that it never may be,
-            // which is what the ownership rule and its unit tests hold.
-            assertTrue(
-                "recovered the row but showed '$state'",
-                publishedState() in LIVE_STATES,
-            )
+            // which is what the ownership rule and its unit tests hold. The loop above broke on a
+            // database condition, so give the screen its own chance to catch up rather than reading
+            // it in the same breath.
+            var shown = publishedState()
+            var settling = 0L
+            while (shown !in LIVE_STATES && settling < STATE_SETTLE_MILLIS) {
+                composeRule.waitForIdle()
+                SystemClock.sleep(POLL_MILLIS)
+                settling += POLL_MILLIS
+                shown = publishedState()
+            }
+            assertTrue("recovered the row but showed '$shown'", shown in LIVE_STATES)
         } finally {
             RecordingForegroundService.stopFromVisibleActivity(context, sessionId)
             SystemClock.sleep(STOP_SETTLE_MILLIS)
             sqlite.execSQL("DELETE FROM recording_sessions WHERE id = $sessionId")
         }
+    }
+
+    private fun grant(permission: String) {
+        if (context.checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
+            InstrumentationRegistry.getInstrumentation().uiAutomation
+                .grantRuntimePermission(context.packageName, permission)
+        }
+        assertEquals(PackageManager.PERMISSION_GRANTED, context.checkSelfPermission(permission))
+    }
+
+    private fun shell(command: String) {
+        val descriptor = InstrumentationRegistry.getInstrumentation().uiAutomation
+            .executeShellCommand(command)
+        FileInputStream(descriptor.fileDescriptor).use { it.readBytes() }
+        descriptor.close()
     }
 
     /** The durable remains of a process death: an ACTIVE row with an owner that no longer exists. */
@@ -160,6 +187,7 @@ class AbandonedRecordingStateTest {
         /** Owned again, and saying so. A rejected fix on a bare emulator is still a live recording. */
         val LIVE_STATES = setOf("RECORDING", "POOR_SIGNAL")
         const val RECOVERY_TIMEOUT_MILLIS = 25_000L
+        const val STATE_SETTLE_MILLIS = 5_000L
         const val POLL_MILLIS = 250L
         const val STOP_SETTLE_MILLIS = 1_500L
         const val FIXTURE_SUFFIX = "p4-038"

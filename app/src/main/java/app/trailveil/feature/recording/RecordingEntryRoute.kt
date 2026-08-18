@@ -97,9 +97,6 @@ internal fun RecordingEntryRoute(
     var starting by remember { mutableStateOf(false) }
     var fogRuntime by remember { mutableStateOf<FogRuntime?>(null) }
     var startupReconciled by remember(appContainer) { mutableStateOf(false) }
-    // Which abandoned exploration this process has already offered to re-arm. Process-scoped on
-    // purpose: a fresh process is a fresh chance, and one that keeps failing must not keep trying.
-    var resumeAttemptedSessionId by remember(appContainer) { mutableStateOf<Long?>(null) }
 
     LaunchedEffect(historyStore) {
         historyStore.history.collectLatest { history = it }
@@ -418,13 +415,14 @@ internal fun RecordingEntryRoute(
         val resumable = abandonedSessionToResume(
             state = recordingPresentation.state,
             activeSessionId = recordingPresentation.activeSessionId,
-            attemptedSessionId = resumeAttemptedSessionId,
             startupReconciled = startupReconciled,
             activityResumed = activityResumed,
         ) ?: return@LaunchedEffect
-        // Claimed before the attempt, not after, so a cancelled composition cannot turn one offer
-        // into a stream of them.
-        resumeAttemptedSessionId = resumable
+        // The claim lives in the process-scoped container, not in this composition: a history round
+        // trip rebuilds the route, and a `remember` here would have handed out a fresh attempt each
+        // time. Claimed before the attempt, so a cancelled composition cannot turn one offer into a
+        // stream of them.
+        if (!appContainer.claimAbandonedResumeAttempt(resumable)) return@LaunchedEffect
         resumeAbandonedRecording(resumable)
     }
     // A view-tree diagnostic makes the production presentation boundary observable to scale and

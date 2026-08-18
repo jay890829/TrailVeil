@@ -335,35 +335,12 @@ class RecordingPresentationTest {
     }
 
     @Test
-    fun anAbandonedExplorationIsOfferedToRecoveryExactlyOncePerProcess() {
+    fun anAbandonedExplorationIsDueAnOfferOnceTheScreenCanMakeOne() {
         assertEquals(
             7L,
             abandonedSessionToResume(
                 state = RecordingDisplayState.ABANDONED,
                 activeSessionId = 7L,
-                attemptedSessionId = null,
-                startupReconciled = true,
-                activityResumed = true,
-            ),
-        )
-        // Already offered. A blocked attempt leaves the state abandoned, and retrying on every
-        // recomposition would turn one refusal into a loop of them.
-        assertNull(
-            abandonedSessionToResume(
-                state = RecordingDisplayState.ABANDONED,
-                activeSessionId = 7L,
-                attemptedSessionId = 7L,
-                startupReconciled = true,
-                activityResumed = true,
-            ),
-        )
-        // A different exploration is a different question.
-        assertEquals(
-            8L,
-            abandonedSessionToResume(
-                state = RecordingDisplayState.ABANDONED,
-                activeSessionId = 8L,
-                attemptedSessionId = 7L,
                 startupReconciled = true,
                 activityResumed = true,
             ),
@@ -372,11 +349,15 @@ class RecordingPresentationTest {
 
     @Test
     fun nothingIsResumedWhileTheScreenCannotStartOrHasNotRepairedStartup() {
+        // Asking before startup repair races the decision it owns; asking before the activity is
+        // resumed spends the offer on a refusal that says nothing about whether recovery was
+        // possible. Whether an offer was already made is not this function's business - it is held
+        // for the whole process by AppContainer, because a `remember` here was reset by every
+        // history round trip and quietly turned one attempt into one per return.
         assertNull(
             abandonedSessionToResume(
                 state = RecordingDisplayState.ABANDONED,
                 activeSessionId = 7L,
-                attemptedSessionId = null,
                 startupReconciled = false,
                 activityResumed = true,
             ),
@@ -385,7 +366,6 @@ class RecordingPresentationTest {
             abandonedSessionToResume(
                 state = RecordingDisplayState.ABANDONED,
                 activeSessionId = 7L,
-                attemptedSessionId = null,
                 startupReconciled = true,
                 activityResumed = false,
             ),
@@ -402,7 +382,6 @@ class RecordingPresentationTest {
                     abandonedSessionToResume(
                         state = state,
                         activeSessionId = 7L,
-                        attemptedSessionId = null,
                         startupReconciled = true,
                         activityResumed = true,
                     ),

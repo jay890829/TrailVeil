@@ -128,14 +128,14 @@ internal fun startControlOffered(
  * `ACTIVE` reacquires ownership through the durable recovery transaction rather than creating a
  * session — and not a second way of recovering.
  *
- * Attempting is deliberately once per session per process. A blocked attempt (no permission, or
- * location switched off) must not become a loop, and the honest [RecordingDisplayState.ABANDONED]
+ * This decides only whether an offer is due. Whether one has already been made for that session is
+ * held for the whole process by `AppContainer`, because a blocked attempt (no permission, or
+ * location switched off) must not become a loop - and the honest [RecordingDisplayState.ABANDONED]
  * card it leaves on screen is already the correct thing for the user to see.
  */
 internal fun abandonedSessionToResume(
     state: RecordingDisplayState,
     activeSessionId: Long?,
-    attemptedSessionId: Long?,
     startupReconciled: Boolean,
     activityResumed: Boolean,
 ): Long? = activeSessionId.takeIf {
@@ -144,8 +144,7 @@ internal fun abandonedSessionToResume(
         startupReconciled &&
         // A start is only permitted from a visible activity, so asking earlier would spend the one
         // attempt on a refusal that says nothing about whether recovery was possible.
-        activityResumed &&
-        attemptedSessionId != activeSessionId
+        activityResumed
 }
 
 /**

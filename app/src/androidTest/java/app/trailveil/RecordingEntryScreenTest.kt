@@ -219,6 +219,34 @@ class RecordingEntryScreenTest {
     }
 
     @Test
+    fun anAbandonedExplorationOffersBothContinuingAndEndingIt() {
+        // The route decides both flags, and a verifier showed the screen could quietly drop one:
+        // reinstating the old exclusive `else if` branch - which strands a user who can neither
+        // resume nor end an ACTIVE row whose runtime is gone - left every other test green.
+        val startCalls = AtomicInteger()
+        val stopCalls = AtomicInteger()
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    firstVisit = false,
+                    stopOffered = true,
+                    startOffered = true,
+                    recordingState = RecordingDisplayState.ABANDONED,
+                ),
+                onStart = startCalls::incrementAndGet,
+                onStop = stopCalls::incrementAndGet,
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Stop).assertIsDisplayed()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Start).assertIsDisplayed()
+    }
+
+    @Test
     fun activeRecordingHasAnInAppStopWhenNotificationIsHidden() {
         val stopCalls = AtomicInteger()
         composeRule.setContent {
