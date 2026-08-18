@@ -38,3 +38,7 @@ internal-signing-record.*
 internal-signing-fingerprint.*
 internal-signing-custody.*
 internal-signing-recovery.*
+
+# Local device-capture helpers for a specific investigation; never part of the product.
+capture-p4-029.ps1
+build-debug-apk.ps1

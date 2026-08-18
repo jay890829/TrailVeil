@@ -75,6 +75,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume
 import org.junit.Rule
@@ -515,15 +516,20 @@ class MapSurfaceTest {
     }
 
     /**
-     * The shape of the defect the user reported on 2026-08-07: reopen after a task removal while
-     * a recording is running and the map shows nothing revealed - not the current walk and not any
-     * previous exploration - until the session is stopped.
+     * Canonical fog must arrive, and reveal ground, while points are still streaming into a cache
+     * that starts empty. The user's symptom on 2026-08-07 was the opposite: a map that revealed
+     * nothing at all - not the current walk, not older exploration - until the session was stopped.
      *
-     * The suspected mechanism is that every arriving point restarts the whole canonical chain, so
-     * a derived cache emptied by process death never finishes rebuilding while points keep coming.
-     * This drives exactly that: a cold surface over a populated history, a canonical render slowed
-     * so a restart-per-point would always win the race, and a writer committing points throughout.
-     * The claim is that canonical fog still arrives and still reveals ground.
+     * This is deliberately harsher than the reproduction that was reported, and the difference is
+     * worth stating. Device evidence on 2026-08-18 showed the reported swipe destroys the Activity
+     * but not the process, so `FogRuntime` survives it and the derived cache stays warm. Here the
+     * cache is genuinely cold, which is the state a real process death would leave.
+     *
+     * What the slowed renderer buys is pressure, not a won race: `FogTilePipeline.load` is called
+     * from a non-suspending loop, so a cancelled attempt still fills the cache it reached. At 80 ms
+     * a tile a nine-tile window takes most of a second, which guarantees that many points commit
+     * before any canonical can arrive - so an arrival cannot be explained by the stream having
+     * quietly stopped.
      *
      * The equivalent gate was built twice during diagnosis, failed to reproduce the defect both
      * times, and was deleted each time - which is why the behaviour reached this session bound by
@@ -549,9 +555,11 @@ class MapSurfaceTest {
                 database,
                 RoomPersistedTrackPointChangeFeed(dao),
             )
+            val writerFailure = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
             val writer = Thread {
                 var sequence = REVEALED_POINT_COUNT.toLong()
                 while (writing.get()) {
+                    try {
                     runBlocking {
                         dao.appendAcceptedPoint(
                             point = TrackPointEntity(
@@ -565,6 +573,12 @@ class MapSurfaceTest {
                             ),
                             distanceDeltaMeters = 20.0,
                         )
+                    }
+                    } catch (failure: Throwable) {
+                        // A writer that dies silently would leave a green gate with no stream behind
+                        // it, which is the vacuous pass this test exists to avoid.
+                        writerFailure.compareAndSet(null, failure)
+                        return@Thread
                     }
                     committed.incrementAndGet()
                     sequence += 1
@@ -594,18 +608,30 @@ class MapSurfaceTest {
 
             writer.start()
             try {
-                // Canonical fog must arrive while the stream is still running, not after it stops.
+                // Canonical fog must arrive while the stream is still running, not after it stops -
+                // and it must be the requested local window. `onFogRendered` also fires for the
+                // attach-time world mosaic, whose arrival says nothing about whether a cold local
+                // read can finish under a live stream.
                 composeRule.waitUntil(timeoutMillis = STREAMING_CANONICAL_TIMEOUT_MILLIS) {
-                    renders.isNotEmpty()
+                    synchronized(renders) { renders.toList() }.any { render ->
+                        val bounds = render.mosaic.bounds
+                        bounds.eastLongitude - bounds.westLongitude < LOCAL_MOSAIC_MAX_SPAN_DEGREES
+                    }
                 }
+                assertNull(
+                    "the writer died, so the canonical arrived without a stream to arrive under",
+                    writerFailure.get(),
+                )
                 assertTrue(
-                    "no point was committed during the window, so nothing was under pressure",
-                    committed.get() > 0,
+                    "only ${committed.get()} points were committed before fog arrived, which is " +
+                        "too few to have pressured anything",
+                    committed.get() >= MINIMUM_STREAMED_COMMITTED_POINTS,
                 )
             } finally {
                 writing.set(false)
                 writer.join(5_000L)
             }
+            assertNull("the writer failed while streaming", writerFailure.get())
 
             val readyMap = checkNotNull(awaitMap()) { "The map never became ready" }
             val mapView = requireNotNull(composeRule.runOnIdle { attachedMapView() })
@@ -7485,6 +7511,19 @@ class MapSurfaceTest {
          * than about the fixture's exact geometry.
          */
         const val MINIMUM_STREAMED_REVEALED_FRACTION = 0.001
+
+        /**
+         * Wide enough to accept any nine-tile local window at an exploration zoom, far too narrow
+         * for the world mosaic the attach-time default camera publishes.
+         */
+        const val LOCAL_MOSAIC_MAX_SPAN_DEGREES = 1.0
+
+        /**
+         * A floor, not the expected count. The render takes most of a second and points are offered
+         * every few milliseconds, so a healthy run commits far more; this only rules out a run where
+         * the stream was effectively absent.
+         */
+        const val MINIMUM_STREAMED_COMMITTED_POINTS = 20
 
         const val PINCH_ATTEMPTS = 4
 

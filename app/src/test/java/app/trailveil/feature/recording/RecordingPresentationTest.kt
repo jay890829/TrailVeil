@@ -410,6 +410,31 @@ class RecordingPresentationTest {
             }
     }
 
+    @Test
+    fun anAbandonedExplorationOffersStartRatherThanStopSoTheUserCanAskAgain() {
+        // The row is still ACTIVE, so identity alone would offer Stop for a runtime that no longer
+        // exists — and since the automatic re-arm is offered once per process, a user whose attempt
+        // was blocked, who then fixes the permission and returns, would have had no way to retry.
+        assertFalse(
+            stopControlOffered(
+                state = RecordingDisplayState.ABANDONED,
+                activeSessionId = 7L,
+            ),
+        )
+        assertTrue(
+            stopControlOffered(
+                state = RecordingDisplayState.RECORDING,
+                activeSessionId = 7L,
+            ),
+        )
+        assertFalse(
+            stopControlOffered(
+                state = RecordingDisplayState.IDLE,
+                activeSessionId = null,
+            ),
+        )
+    }
+
     private fun detail(
         status: RecordingHistoryStatus,
         outcome: String = "START_ACTIVATED",

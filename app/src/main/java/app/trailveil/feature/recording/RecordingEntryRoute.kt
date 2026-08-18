@@ -37,6 +37,7 @@ import app.trailveil.map.MapCameraRequest
 import app.trailveil.map.fog.GeoPoint
 import app.trailveil.recording.RecordingForegroundService
 import app.trailveil.recording.RecordingStartBlocker
+import app.trailveil.recording.RecordingResumeOutcome
 import app.trailveil.recording.RecordingStartOutcome
 import app.trailveil.recording.RecordingServiceLocation
 import app.trailveil.map.fog.FogRuntime
@@ -192,15 +193,16 @@ internal fun RecordingEntryRoute(
         startNoticeRaisedAt = notice?.let { System.currentTimeMillis() }
     }
 
-    suspend fun resumeAbandonedRecording() {
+    suspend fun resumeAbandonedRecording(sessionId: Long) {
         // Deliberately quiet: the user pressed nothing, so this raises no start notice. Success shows
         // itself when the row is owned again and the card stops saying the exploration was abandoned;
         // a failure leaves that card in place, which is already the truth. Only a blocker the user can
         // act on is surfaced, and through the same notice the Start button would have raised.
-        val outcome = controller.startFromVisibleActivity(
+        val outcome = controller.resumeAbandonedFromVisibleActivity(
             activityVisible = activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
+            sessionId = sessionId,
         )
-        if (outcome is RecordingStartOutcome.Blocked) {
+        if (outcome is RecordingResumeOutcome.Blocked) {
             when (outcome.blocker) {
                 RecordingStartBlocker.MISSING_LOCATION_PERMISSION ->
                     locationNotice = LocationNotice.PERMISSION_SETTINGS
@@ -423,7 +425,7 @@ internal fun RecordingEntryRoute(
         // Claimed before the attempt, not after, so a cancelled composition cannot turn one offer
         // into a stream of them.
         resumeAttemptedSessionId = resumable
-        resumeAbandonedRecording()
+        resumeAbandonedRecording(resumable)
     }
     // A view-tree diagnostic makes the production presentation boundary observable to scale and
     // frame tests without exposing canonical coordinates or adding a second data subscription.
@@ -435,6 +437,13 @@ internal fun RecordingEntryRoute(
         activity.window.decorView.setTag(
             R.id.recording_presentation_latest_outcome,
             latestSessionSummary?.latestOperationOutcome?.value,
+        )
+        // The state the user is actually being told, published from the production wiring rather
+        // than recomputed by a test. Without it a test can only check the mapping function, and the
+        // mapping can be correct while the screen passes it the wrong runtime token.
+        activity.window.decorView.setTag(
+            R.id.recording_presentation_state,
+            recordingPresentation.state.name,
         )
         // Without this, a missing runtime prompt is ambiguous: the request may never have been
         // launched, or it may have launched and the dialog not appeared. Only the first is a
@@ -481,7 +490,10 @@ internal fun RecordingEntryRoute(
             notificationNotice = notificationNotice,
             startNotice = startNotice,
             startNoticeRaisedAt = startNoticeRaisedAt,
-            recordingActive = recordingPresentation.activeSessionId != null,
+            recordingActive = stopControlOffered(
+                state = recordingPresentation.state,
+                activeSessionId = recordingPresentation.activeSessionId,
+            ),
             starting = starting || notificationStartContinuation.keepsStartPending,
             recordingState = recordingPresentation.state,
             latestSessionId = recordingPresentation.latestSessionId,

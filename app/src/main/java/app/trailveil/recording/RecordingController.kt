@@ -24,6 +24,34 @@ internal class RecordingController(
     private val operationIds: RecordingControllerOperationIds = UuidRecordingControllerOperationIds,
     private val createdAppVersion: String,
 ) {
+    /**
+     * Re-arm an exploration this process found abandoned — an `ACTIVE` row whose owning runtime is
+     * gone because the platform declined to restart the service after a process death.
+     *
+     * Unlike [startFromVisibleActivity] this reserves nothing, and that is the point. The row
+     * already exists, while `prepareStart` inserts a fresh session whenever it finds nothing active
+     * or reserved, so a resume routed through a reservation would silently record an exploration the
+     * user never started if the row terminalized between the screen reading it and the transaction
+     * running. The service is asked directly instead: an `ACTION_START` it cannot activate falls
+     * through to the durable recovery transaction, and a row that no longer needs recovering simply
+     * leaves the service with nothing to recover.
+     */
+    suspend fun resumeAbandonedFromVisibleActivity(
+        activityVisible: Boolean,
+        sessionId: Long,
+    ): RecordingResumeOutcome {
+        require(sessionId > 0L) { "sessionId must be positive" }
+        preflight.blocker(activityVisible)?.let {
+            return RecordingResumeOutcome.Blocked(it)
+        }
+        return try {
+            launcher.start(sessionId)
+            RecordingResumeOutcome.ServiceRequested(sessionId)
+        } catch (failure: RuntimeException) {
+            RecordingResumeOutcome.LaunchFailure(sessionId, failure.toRecordingStartFailureKind())
+        }
+    }
+
     suspend fun startFromVisibleActivity(
         activityVisible: Boolean,
         beginOperationId: RecordingOperationId? = null,
@@ -80,6 +108,17 @@ internal class RecordingController(
             }
         }
     }
+}
+
+internal sealed interface RecordingResumeOutcome {
+    data class Blocked(val blocker: RecordingStartBlocker) : RecordingResumeOutcome
+
+    data class ServiceRequested(val sessionId: Long) : RecordingResumeOutcome
+
+    data class LaunchFailure(
+        val sessionId: Long,
+        val kind: RecordingStartFailureKind,
+    ) : RecordingResumeOutcome
 }
 
 internal fun interface RecordingStartPreflight {

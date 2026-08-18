@@ -35,6 +35,55 @@ class RecordingControllerTest {
     }
 
     @Test
+    fun `resuming an abandoned exploration reserves nothing`() = runBlocking {
+        // `prepareStart` inserts a fresh session whenever it finds nothing active or reserved, so a
+        // resume that went through a reservation would record an exploration the user never started
+        // if the abandoned row terminalized between the screen reading it and the transaction.
+        val commands = FakeCommands()
+        val launcher = FakeLauncher()
+
+        val outcome = controller(commands = commands, launcher = launcher)
+            .resumeAbandonedFromVisibleActivity(activityVisible = true, sessionId = 12L)
+
+        assertEquals(RecordingResumeOutcome.ServiceRequested(12L), outcome)
+        assertEquals(0, commands.beginCalls)
+        assertEquals(0, commands.failCalls)
+        // The service is asked about the row that already exists, not about a new one.
+        assertEquals(listOf(12L), launcher.sessions)
+    }
+
+    @Test
+    fun `a blocked resume launches nothing and names the blocker`() = runBlocking {
+        val commands = FakeCommands()
+        val launcher = FakeLauncher()
+        val controller = controller(
+            preflight = RecordingStartPreflight { RecordingStartBlocker.LOCATION_DISABLED },
+            commands = commands,
+            launcher = launcher,
+        )
+
+        assertEquals(
+            RecordingResumeOutcome.Blocked(RecordingStartBlocker.LOCATION_DISABLED),
+            controller.resumeAbandonedFromVisibleActivity(activityVisible = true, sessionId = 12L),
+        )
+        assertEquals(0, commands.beginCalls)
+        assertEquals(emptyList<Long>(), launcher.sessions)
+    }
+
+    @Test
+    fun `a refused foreground start is reported without inventing persistence`() = runBlocking {
+        val commands = FakeCommands()
+        val launcher = FakeLauncher(failure = IllegalStateException("refused"))
+
+        val outcome = controller(commands = commands, launcher = launcher)
+            .resumeAbandonedFromVisibleActivity(activityVisible = true, sessionId = 12L)
+
+        assertTrue(outcome is RecordingResumeOutcome.LaunchFailure)
+        // Nothing durable was attempted, so nothing durable may be recorded as failed either.
+        assertEquals(0, commands.failCalls)
+    }
+
+    @Test
     fun `prepared reservation is persisted before service launch`() = runBlocking {
         val events = mutableListOf<String>()
         val commands = FakeCommands(events = events)

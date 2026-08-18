@@ -92,6 +92,20 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
 }
 
 /**
+ * Whether the screen offers Stop rather than Start.
+ *
+ * An abandoned row is still `ACTIVE`, so identity alone would offer Stop — for a runtime that does
+ * not exist, while the automatic re-arm is offered only once per process. A user whose re-arm was
+ * blocked, who then grants the permission and comes back, would have found no way to ask again.
+ * Start is offered instead: against a row that is still `ACTIVE` it reacquires ownership through the
+ * same recovery transaction, and the abandoned exploration continues.
+ */
+internal fun stopControlOffered(
+    state: RecordingDisplayState,
+    activeSessionId: Long?,
+): Boolean = activeSessionId != null && state != RecordingDisplayState.ABANDONED
+
+/**
  * Which abandoned exploration this process should offer to re-arm, or null for "leave it alone".
  *
  * The platform normally restarts a killed foreground service, and the service recovers the session
