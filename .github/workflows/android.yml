@@ -46,12 +46,34 @@ jobs:
         run: ./gradlew clean assembleDebug lintDebug testDebugUnitTest
 
   instrumentation:
-    name: Compose instrumentation test
+    name: Compose instrumentation test (${{ matrix.shard.name }})
     runs-on: ubuntu-latest
-    # Two emulator-fresh shards (map package, then the rest), each with a hang-triggered retry
-    # and an emulator reboot between attempts and between shards. Worst case is four shard
-    # attempts plus reboots; the green path is well under an hour.
-    timeout-minutes: 170
+    # One emulator-fresh shard per job, each with a hang-triggered retry on a rebooted emulator.
+    # Sharding is a correctness requirement before a speed one: the hosted SwiftShader emulator
+    # accumulates GL corruption and wedges deterministically after roughly 75 heavy map tests, so
+    # no single emulator can carry the suite. Running the shards as parallel jobs rather than in
+    # sequence also hands each one a genuinely fresh emulator instead of a rebooted one, and takes
+    # the map package - 40 of the 51 minutes a sequential run cost - down to two halves.
+    timeout-minutes: 90
+    strategy:
+      # Every shard reports. A failure in one must not hide the state of the others, which is the
+      # information a red run is for.
+      fail-fast: false
+      matrix:
+        shard:
+          - name: map-0
+            args: >-
+              -Pandroid.testInstrumentationRunnerArguments.package=app.trailveil.map
+              -Pandroid.testInstrumentationRunnerArguments.numShards=2
+              -Pandroid.testInstrumentationRunnerArguments.shardIndex=0
+          - name: map-1
+            args: >-
+              -Pandroid.testInstrumentationRunnerArguments.package=app.trailveil.map
+              -Pandroid.testInstrumentationRunnerArguments.numShards=2
+              -Pandroid.testInstrumentationRunnerArguments.shardIndex=1
+          - name: rest
+            args: >-
+              -Pandroid.testInstrumentationRunnerArguments.notPackage=app.trailveil.map
 
     steps:
       - name: Check out repository
@@ -86,6 +108,9 @@ jobs:
 
       - name: Run connected instrumentation tests
         uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        env:
+          SHARD_NAME: ${{ matrix.shard.name }}
+          SHARD_ARGS: ${{ matrix.shard.args }}
         with:
           api-level: 36
           target: google_apis
@@ -95,4 +120,4 @@ jobs:
             adb shell cmd overlay enable-exclusive --user 0 --category com.android.internal.systemui.navbar.threebutton
             adb shell cmd overlay list | grep -F '[x] com.android.internal.systemui.navbar.threebutton'
             adb shell cmd overlay list | grep -F '[ ] com.android.internal.systemui.navbar.gestural'
-            bash .github/scripts/run-instrumentation-with-hang-retry.sh
+            bash .github/scripts/run-instrumentation-shard.sh
