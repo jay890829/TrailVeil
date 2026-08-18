@@ -45,18 +45,9 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     /** Ownership token of this process, so the screen can tell a live ACTIVE row from an orphaned one. */
     val recordingRuntimeToken: String get() = recordingRepository.runtimeToken
 
-    /**
-     * Which abandoned exploration this process has already offered to re-arm.
-     *
-     * Process-scoped on purpose, and here rather than in the screen because a `remember` in a
-     * navigation destination is reset by a history round trip or an activity recreation - which
-     * would silently turn "one attempt" into one per return. A fresh process is a fresh chance; a
-     * blocked attempt inside one process must not keep retrying.
-     */
-    private val resumeAttempted = AtomicLong(0L)
+    private val resumeClaims = AbandonedResumeClaims()
 
-    fun claimAbandonedResumeAttempt(sessionId: Long): Boolean =
-        sessionId > 0L && resumeAttempted.getAndSet(sessionId) != sessionId
+    fun claimAbandonedResumeAttempt(sessionId: Long): Boolean = resumeClaims.claim(sessionId)
 
     private val platformLocationEngine: LocationEngine = PlatformLocationEngine(
         requireNotNull(context.applicationContext.getSystemService(LocationManager::class.java)),
