@@ -11,6 +11,7 @@ import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
@@ -124,7 +125,12 @@ class AbandonedRecordingStateTest {
             // dismiss click binds the route's clearing wiring in the same pass.
             composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
                 .assertIsDisplayed()
-            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartDismiss).performClick()
+            // Scrolled into view first: the notice column scrolls, and on the hosted emulator the
+            // card's bottom - where the dismiss button lives - sat below the screen edge, so the
+            // click landed on nothing and the card survived its own dismissal (CI run 32258321818).
+            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartDismiss)
+                .performScrollTo()
+                .performClick()
             composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
                 .assertDoesNotExist()
             // The controls the route offers for a live recording, checked here because this is the
@@ -331,7 +337,7 @@ class AbandonedRecordingStateTest {
 
             val notNow = InstrumentationRegistry.getInstrumentation()
                 .targetContext.getString(app.trailveil.R.string.permission_not_now)
-            composeRule.onNodeWithText(notNow).performClick()
+            composeRule.onNodeWithText(notNow).performScrollTo().performClick()
             composeRule.waitForIdle()
             composeRule.onNodeWithTag(RecordingEntryTestTags.LocationNotice).assertDoesNotExist()
             composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
