@@ -58,14 +58,24 @@ internal class RecordingController(
      * Deliberately without preflight: this starts no service and subscribes to no location, so a user
      * who has since revoked the permission or switched location off must still get the row closed —
      * refusing here would leave exactly the open row `PLAN.md` requires be marked interrupted.
+     *
+     * [stoppedRecordingAtEpochMillis] is when recording actually stopped being real — the last
+     * accepted point, or the session's own start if it never recorded one — and **not** now. The row
+     * is discovered whenever the user next opens the app, which may be hours or days later, and
+     * dating the ending from that moment would publish an exploration whose duration is mostly time
+     * the phone spent switched off. The store clamps it up to the session and segment starts, so a
+     * past instant cannot produce a row that ends before it began.
      */
-    suspend fun interruptAbandonedAcrossRestart(sessionId: Long): Boolean {
+    suspend fun interruptAbandonedAcrossRestart(
+        sessionId: Long,
+        stoppedRecordingAtEpochMillis: Long?,
+    ): Boolean {
         require(sessionId > 0L) { "sessionId must be positive" }
         return try {
             commands.interrupt(
                 operationIds.next("restart-interrupt"),
                 sessionId,
-                clock.epochMillis(),
+                stoppedRecordingAtEpochMillis ?: clock.epochMillis(),
                 DEVICE_RESTARTED,
             )
             true

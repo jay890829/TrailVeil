@@ -212,11 +212,14 @@ internal fun RecordingEntryRoute(
         }
     }
 
-    suspend fun interruptAbandonedRecording(sessionId: Long) {
+    suspend fun interruptAbandonedRecording(sessionId: Long, stoppedRecordingAt: Long?) {
         // Also quiet, and for a different reason than the resume: the row is being closed, so what
         // the user needs to see is the interrupted exploration itself, which the card already
         // becomes the moment the terminal row lands.
-        controller.interruptAbandonedAcrossRestart(sessionId)
+        controller.interruptAbandonedAcrossRestart(
+            sessionId = sessionId,
+            stoppedRecordingAtEpochMillis = stoppedRecordingAt,
+        )
     }
 
     suspend fun startRecording(beginOperationId: RecordingOperationId? = null) {
@@ -436,7 +439,14 @@ internal fun RecordingEntryRoute(
             null -> Unit
             is AbandonedExplorationAction.Resume -> resumeAbandonedRecording(action.sessionId)
             is AbandonedExplorationAction.Interrupt ->
-                interruptAbandonedRecording(action.sessionId)
+                interruptAbandonedRecording(
+                    sessionId = action.sessionId,
+                    // The last thing actually recorded, falling back to the session's own start when
+                    // it never recorded one. Dating the ending from now instead would publish the
+                    // hours the phone spent switched off as part of the exploration.
+                    stoppedRecordingAt = recordingPresentation.latestAcceptedPoint?.timestamp
+                        ?: recordingPresentation.activeSessionStartedAt,
+                )
         }
     }
     // A view-tree diagnostic makes the production presentation boundary observable to scale and

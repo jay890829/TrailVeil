@@ -173,6 +173,14 @@ class AbandonedRecordingStateTest {
                 status,
             )
             assertEquals("INTERRUPT:device_restarted", reason)
+            // Dated from when recording actually stopped, not from when the user happened to reopen
+            // the app. This fixture recorded no points, so that is the session's own start; dating
+            // it from now would publish the hours the device spent switched off as exploration time.
+            assertEquals(
+                "the ending was dated from the discovery rather than from the recording",
+                (bootedAt - AN_HOUR).toString(),
+                sessionColumn(sqlite, sessionId, "ended_at"),
+            )
             // The half that matters most: no collector was ever armed for it.
             assertTrue(
                 "the exploration was resumed before it was ended",

@@ -58,10 +58,13 @@ class RecordingControllerTest {
         val launcher = FakeLauncher()
 
         val ended = controller(commands = commands, launcher = launcher)
-            .interruptAbandonedAcrossRestart(sessionId = 12L)
+            .interruptAbandonedAcrossRestart(
+                sessionId = 12L,
+                stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+            )
 
         assertTrue(ended)
-        assertEquals(listOf(12L to "device_restarted"), commands.interruptCalls)
+        assertEquals(listOf(Triple(12L, LAST_POINT_AT, "device_restarted")), commands.interruptCalls)
         // The whole point of this path is that nothing starts collecting: the row is being closed.
         assertEquals(emptyList<Long>(), launcher.sessions)
         assertEquals(0, commands.beginCalls)
@@ -78,8 +81,13 @@ class RecordingControllerTest {
             launcher = FakeLauncher(),
         )
 
-        assertTrue(controller.interruptAbandonedAcrossRestart(sessionId = 12L))
-        assertEquals(listOf(12L to "device_restarted"), commands.interruptCalls)
+        assertTrue(
+            controller.interruptAbandonedAcrossRestart(
+                sessionId = 12L,
+                stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+            ),
+        )
+        assertEquals(listOf(Triple(12L, LAST_POINT_AT, "device_restarted")), commands.interruptCalls)
     }
 
     @Test
@@ -88,8 +96,41 @@ class RecordingControllerTest {
 
         assertFalse(
             controller(commands = commands, launcher = FakeLauncher())
-                .interruptAbandonedAcrossRestart(sessionId = 12L),
+                .interruptAbandonedAcrossRestart(
+                    sessionId = 12L,
+                    stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+                ),
         )
+    }
+
+    @Test
+    fun `an exploration that recorded nothing is dated from its own start, not from now`() = runBlocking {
+        // The caller passes null only when the session never accepted a point. Falling back to now
+        // is safe because the store clamps the terminal instant up to the session start anyway, but
+        // the caller is expected to supply the start itself so the ending is not dated from whenever
+        // the user happened to reopen the app.
+        val commands = FakeCommands()
+
+        controller(commands = commands, launcher = FakeLauncher(), clock = { FIXED_NOW })
+            .interruptAbandonedAcrossRestart(sessionId = 12L, stoppedRecordingAtEpochMillis = null)
+
+        assertEquals(listOf(Triple(12L, FIXED_NOW, "device_restarted")), commands.interruptCalls)
+    }
+
+    @Test
+    fun `the ending is dated from the last recorded point, however late it is discovered`() = runBlocking {
+        // A row abandoned by a reboot is found whenever the user next opens the app. Dating it from
+        // that moment publishes an exploration whose duration is mostly the hours the phone was off.
+        val commands = FakeCommands()
+
+        controller(commands = commands, launcher = FakeLauncher(), clock = { FIXED_NOW })
+            .interruptAbandonedAcrossRestart(
+                sessionId = 12L,
+                stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+            )
+
+        assertEquals(listOf(Triple(12L, LAST_POINT_AT, "device_restarted")), commands.interruptCalls)
+        assertTrue("the fixture must model a late discovery", FIXED_NOW - LAST_POINT_AT > 8 * 3_600_000L)
     }
 
     @Test
@@ -271,14 +312,23 @@ class RecordingControllerTest {
         operationIds: RecordingControllerOperationIds = RecordingControllerOperationIds { purpose ->
             RecordingOperationId("$purpose:test")
         },
+        clock: RecordingControllerClock = RecordingControllerClock { 123L },
     ) = RecordingController(
         preflight = preflight,
         commands = commands,
         launcher = launcher,
-        clock = RecordingControllerClock { 123L },
+        clock = clock,
         operationIds = operationIds,
         createdAppVersion = "test",
     )
+
+    private companion object {
+        /** A walk that stopped recording in the morning. */
+        const val LAST_POINT_AT = 1_700_000_000_000L
+
+        /** Discovered when the user reopened the app that evening, nine hours later. */
+        const val FIXED_NOW = LAST_POINT_AT + 9 * 3_600_000L
+    }
 }
 
 private class FakeCommands(
@@ -291,7 +341,7 @@ private class FakeCommands(
     var beginCalls = 0
     var failCalls = 0
     val beginOperationIds = mutableListOf<RecordingOperationId>()
-    val interruptCalls = mutableListOf<Pair<Long, String>>()
+    val interruptCalls = mutableListOf<Triple<Long, Long, String>>()
 
     override suspend fun beginStart(
         operationId: RecordingOperationId,
@@ -334,7 +384,7 @@ private class FakeCommands(
         interruptedAtEpochMillis: Long,
         reason: String,
     ) {
-        interruptCalls += sessionId to reason
+        interruptCalls += Triple(sessionId, interruptedAtEpochMillis, reason)
         events += "interrupt:$sessionId"
         interruptFailure?.let { throw it }
     }
