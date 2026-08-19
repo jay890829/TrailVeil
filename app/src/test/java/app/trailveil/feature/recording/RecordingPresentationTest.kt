@@ -5,6 +5,7 @@ import app.trailveil.data.history.RecordingLatestSessionSummary
 import app.trailveil.data.history.RecordingHistoryOperationOutcome
 import app.trailveil.data.history.RecordingHistorySession
 import app.trailveil.data.history.RecordingHistoryStatus
+import app.trailveil.recording.AbandonedResumeClaims
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -335,59 +336,119 @@ class RecordingPresentationTest {
     }
 
     @Test
-    fun anAbandonedExplorationIsDueAnOfferOnceTheScreenCanMakeOne() {
+    fun anExplorationAbandonedInsideThisBootIsResumed() {
         assertEquals(
-            7L,
-            abandonedSessionToResume(
-                state = RecordingDisplayState.ABANDONED,
-                activeSessionId = 7L,
-                startupReconciled = true,
-                activityResumed = true,
-            ),
+            AbandonedExplorationAction.Resume(7L),
+            abandonedAction(startedAt = BOOTED_AT + AN_HOUR),
         )
     }
 
     @Test
-    fun nothingIsResumedWhileTheScreenCannotStartOrHasNotRepairedStartup() {
-        // Asking before startup repair races the decision it owns; asking before the activity is
+    fun anExplorationTheDeviceRestartedUnderIsEndedRatherThanResumed() {
+        // PLAN.md: 「裝置重開機後不靜默恢復定位；下次開啟時將未正常結束的 session 標示為中斷。」
+        // Both clauses live here. Nothing else in the tree can enforce either: the durable row
+        // survives a reboot untouched, startup reconciliation reaches only a still-STARTING row, and
+        // the runtime token is regenerated per process — so a reboot is indistinguishable from a
+        // process death by the time this decision is made, and without the start-time comparison the
+        // first open after a restart re-arms location collection on a session of any age.
+        assertEquals(
+            AbandonedExplorationAction.Interrupt(7L),
+            abandonedAction(startedAt = BOOTED_AT - AN_HOUR),
+        )
+    }
+
+    @Test
+    fun theBootBoundaryIsSpentOnNotRecordingSomeoneWhoDidNotAsk() {
+        // Wall clock minus uptime moves when the clock is corrected, so the boundary is approximate.
+        // Which way it errs is not: inside the tolerance the exploration is ended, because the cost
+        // is that the user starts a new one, while the cost of erring the other way is collecting
+        // location without being asked.
+        assertEquals(
+            AbandonedExplorationAction.Interrupt(7L),
+            abandonedAction(startedAt = BOOTED_AT + BOOT_BOUNDARY_TOLERANCE_MILLIS - 1L),
+        )
+        assertEquals(
+            AbandonedExplorationAction.Resume(7L),
+            abandonedAction(startedAt = BOOTED_AT + BOOT_BOUNDARY_TOLERANCE_MILLIS),
+        )
+    }
+
+    @Test
+    fun anExplorationWithNoKnownStartTimeIsNeverSilentlyResumed() {
+        assertEquals(
+            AbandonedExplorationAction.Interrupt(7L),
+            abandonedAction(startedAt = null),
+        )
+    }
+
+    @Test
+    fun nothingHappensWhileTheScreenCannotStartOrHasNotRepairedStartup() {
+        // Acting before startup repair races the decision it owns; acting before the activity is
         // resumed spends the offer on a refusal that says nothing about whether recovery was
-        // possible. Whether an offer was already made is not this function's business - it is held
-        // for the whole process by AppContainer, because a `remember` here was reset by every
-        // history round trip and quietly turned one attempt into one per return.
-        assertNull(
-            abandonedSessionToResume(
-                state = RecordingDisplayState.ABANDONED,
-                activeSessionId = 7L,
-                startupReconciled = false,
-                activityResumed = true,
-            ),
-        )
-        assertNull(
-            abandonedSessionToResume(
-                state = RecordingDisplayState.ABANDONED,
-                activeSessionId = 7L,
-                startupReconciled = true,
-                activityResumed = false,
-            ),
-        )
+        // possible.
+        assertNull(abandonedAction(startupReconciled = false))
+        assertNull(abandonedAction(activityResumed = false))
     }
 
     @Test
-    fun onlyAnAbandonedExplorationIsEverResumed() {
+    fun onlyAnAbandonedExplorationIsEverActedOn() {
         RecordingDisplayState.entries
             .filter { it != RecordingDisplayState.ABANDONED }
             .forEach { state ->
                 assertNull(
                     "$state must not trigger a recovery attempt",
-                    abandonedSessionToResume(
-                        state = state,
-                        activeSessionId = 7L,
-                        startupReconciled = true,
-                        activityResumed = true,
-                    ),
+                    abandonedAction(state = state),
                 )
             }
     }
+
+    @Test
+    fun theDecisionIsMadeOncePerSessionPerProcessAndTheClaimIsPartOfIt() {
+        // The claim is taken inside the decision rather than beside it at the call site. That seam
+        // is the one this task has broken twice: the guard was correct in isolation both times,
+        // while the wiring that reached it was bound by nothing, so deleting or relocating it broke
+        // no test at all. Passing the real claims object through the real function is what makes
+        // that impossible to do quietly.
+        val claims = AbandonedResumeClaims()
+
+        assertEquals(
+            AbandonedExplorationAction.Resume(7L),
+            abandonedAction(startedAt = BOOTED_AT + AN_HOUR, claim = claims::claim),
+        )
+        assertNull(abandonedAction(startedAt = BOOTED_AT + AN_HOUR, claim = claims::claim))
+    }
+
+    @Test
+    fun aRefusedClaimStopsTheEndingTooAndNotOnlyTheResuming() {
+        // Otherwise a failing interrupt retries on every recomposition for as long as the screen is
+        // open, which is the loop the claim exists to prevent, just on the other branch.
+        assertNull(abandonedAction(startedAt = BOOTED_AT - AN_HOUR, claim = { false }))
+    }
+
+    @Test
+    fun theBootInstantIsWallClockMinusUptime() {
+        assertEquals(
+            1_000L,
+            bootInstantEpochMillis(epochMillis = 61_000L, elapsedRealtimeNanos = 60_000_000_000L),
+        )
+    }
+
+    private fun abandonedAction(
+        state: RecordingDisplayState = RecordingDisplayState.ABANDONED,
+        activeSessionId: Long? = 7L,
+        startedAt: Long? = BOOTED_AT + AN_HOUR,
+        startupReconciled: Boolean = true,
+        activityResumed: Boolean = true,
+        claim: (Long) -> Boolean = { true },
+    ): AbandonedExplorationAction? = abandonedExplorationAction(
+        state = state,
+        activeSessionId = activeSessionId,
+        activeSessionStartedAt = startedAt,
+        bootedAtEpochMillis = BOOTED_AT,
+        startupReconciled = startupReconciled,
+        activityResumed = activityResumed,
+        claim = claim,
+    )
 
     @Test
     fun anAbandonedExplorationOffersBothContinuingItAndEndingIt() {
@@ -452,5 +513,9 @@ class RecordingPresentationTest {
 
     private companion object {
         const val THIS_RUNTIME = "runtime-of-the-process-under-test"
+
+        /** An arbitrary but plausible boot instant; only its distance from a start time matters. */
+        const val BOOTED_AT = 1_700_000_000_000L
+        const val AN_HOUR = 3_600_000L
     }
 }

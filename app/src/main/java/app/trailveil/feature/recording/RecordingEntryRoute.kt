@@ -212,6 +212,13 @@ internal fun RecordingEntryRoute(
         }
     }
 
+    suspend fun interruptAbandonedRecording(sessionId: Long) {
+        // Also quiet, and for a different reason than the resume: the row is being closed, so what
+        // the user needs to see is the interrupted exploration itself, which the card already
+        // becomes the moment the terminal row lands.
+        controller.interruptAbandonedAcrossRestart(sessionId)
+    }
+
     suspend fun startRecording(beginOperationId: RecordingOperationId? = null) {
         starting = true
         locationNotice = null
@@ -412,18 +419,25 @@ internal fun RecordingEntryRoute(
         startupReconciled,
         activityResumed,
     ) {
-        val resumable = abandonedSessionToResume(
+        // Every part of this decision — including the once-per-process claim, whose home is the
+        // container rather than this composition because a `remember` here handed out a fresh
+        // attempt on each history round trip — is made inside the function, so that the route holds
+        // no rule of its own that a test could not reach.
+        val action = abandonedExplorationAction(
             state = recordingPresentation.state,
             activeSessionId = recordingPresentation.activeSessionId,
+            activeSessionStartedAt = recordingPresentation.activeSessionStartedAt,
+            bootedAtEpochMillis = appContainer.bootedAtEpochMillis(),
             startupReconciled = startupReconciled,
             activityResumed = activityResumed,
-        ) ?: return@LaunchedEffect
-        // The claim lives in the process-scoped container, not in this composition: a history round
-        // trip rebuilds the route, and a `remember` here would have handed out a fresh attempt each
-        // time. Claimed before the attempt, so a cancelled composition cannot turn one offer into a
-        // stream of them.
-        if (!appContainer.claimAbandonedResumeAttempt(resumable)) return@LaunchedEffect
-        resumeAbandonedRecording(resumable)
+            claim = appContainer::claimAbandonedResumeAttempt,
+        )
+        when (action) {
+            null -> Unit
+            is AbandonedExplorationAction.Resume -> resumeAbandonedRecording(action.sessionId)
+            is AbandonedExplorationAction.Interrupt ->
+                interruptAbandonedRecording(action.sessionId)
+        }
     }
     // A view-tree diagnostic makes the production presentation boundary observable to scale and
     // frame tests without exposing canonical coordinates or adding a second data subscription.

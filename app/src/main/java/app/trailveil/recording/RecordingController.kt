@@ -52,6 +52,32 @@ internal class RecordingController(
         }
     }
 
+    /**
+     * End an abandoned exploration the device restarted under, marking it interrupted.
+     *
+     * Deliberately without preflight: this starts no service and subscribes to no location, so a user
+     * who has since revoked the permission or switched location off must still get the row closed —
+     * refusing here would leave exactly the open row `PLAN.md` requires be marked interrupted.
+     */
+    suspend fun interruptAbandonedAcrossRestart(sessionId: Long): Boolean {
+        require(sessionId > 0L) { "sessionId must be positive" }
+        return try {
+            commands.interrupt(
+                operationIds.next("restart-interrupt"),
+                sessionId,
+                clock.epochMillis(),
+                DEVICE_RESTARTED,
+            )
+            true
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (_: Exception) {
+            // The row stays ACTIVE and the screen keeps saying the exploration was abandoned, which
+            // is still true; the next open tries again.
+            false
+        }
+    }
+
     suspend fun startFromVisibleActivity(
         activityVisible: Boolean,
         beginOperationId: RecordingOperationId? = null,
@@ -107,6 +133,11 @@ internal class RecordingController(
                 )
             }
         }
+    }
+
+    private companion object {
+        /** Terminal reason for a row the device restarted under; stored as `INTERRUPT:` + this. */
+        const val DEVICE_RESTARTED = "device_restarted"
     }
 }
 
@@ -201,6 +232,13 @@ internal interface RecordingStartCommands {
         failedAtEpochMillis: Long,
         message: String,
     )
+
+    suspend fun interrupt(
+        operationId: RecordingOperationId,
+        sessionId: Long,
+        interruptedAtEpochMillis: Long,
+        reason: String,
+    )
 }
 
 internal class RepositoryRecordingStartCommands(
@@ -223,6 +261,15 @@ internal class RepositoryRecordingStartCommands(
         message: String,
     ) {
         repository.failStart(operationId, sessionId, failedAtEpochMillis, message)
+    }
+
+    override suspend fun interrupt(
+        operationId: RecordingOperationId,
+        sessionId: Long,
+        interruptedAtEpochMillis: Long,
+        reason: String,
+    ) {
+        repository.interrupt(operationId, sessionId, interruptedAtEpochMillis, reason)
     }
 }
 

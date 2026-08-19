@@ -15,6 +15,7 @@ import app.trailveil.data.recording.ReconcileStartingResult
 import app.trailveil.data.recording.RecordingRepository
 import app.trailveil.data.recording.LocationOperationSequence
 import app.trailveil.data.recording.RoomRecordingStore
+import app.trailveil.feature.recording.bootInstantEpochMillis
 import app.trailveil.map.fog.FogDiskTileCache
 import app.trailveil.map.fog.FogMemoryTileCache
 import app.trailveil.map.fog.FogRenderStyle
@@ -48,6 +49,10 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     private val resumeClaims = AbandonedResumeClaims()
 
     fun claimAbandonedResumeAttempt(sessionId: Long): Boolean = resumeClaims.claim(sessionId)
+
+    /** Wall-clock instant this boot began, so a session older than the boot can be told apart. */
+    fun bootedAtEpochMillis(): Long =
+        bootInstantEpochMillis(clock.epochMillis(), clock.elapsedRealtimeNanos())
 
     private val platformLocationEngine: LocationEngine = PlatformLocationEngine(
         requireNotNull(context.applicationContext.getSystemService(LocationManager::class.java)),

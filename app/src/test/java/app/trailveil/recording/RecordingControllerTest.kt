@@ -53,6 +53,46 @@ class RecordingControllerTest {
     }
 
     @Test
+    fun `ending an exploration the device restarted under starts no service`() = runBlocking {
+        val commands = FakeCommands()
+        val launcher = FakeLauncher()
+
+        val ended = controller(commands = commands, launcher = launcher)
+            .interruptAbandonedAcrossRestart(sessionId = 12L)
+
+        assertTrue(ended)
+        assertEquals(listOf(12L to "device_restarted"), commands.interruptCalls)
+        // The whole point of this path is that nothing starts collecting: the row is being closed.
+        assertEquals(emptyList<Long>(), launcher.sessions)
+        assertEquals(0, commands.beginCalls)
+    }
+
+    @Test
+    fun `ending is not gated on permission or a visible activity`() = runBlocking {
+        // A user who revoked location, or switched it off, must still get the row closed - refusing
+        // here would leave open exactly the session PLAN.md requires be marked interrupted.
+        val commands = FakeCommands()
+        val controller = controller(
+            preflight = RecordingStartPreflight { RecordingStartBlocker.MISSING_LOCATION_PERMISSION },
+            commands = commands,
+            launcher = FakeLauncher(),
+        )
+
+        assertTrue(controller.interruptAbandonedAcrossRestart(sessionId = 12L))
+        assertEquals(listOf(12L to "device_restarted"), commands.interruptCalls)
+    }
+
+    @Test
+    fun `a failed ending is reported rather than assumed`() = runBlocking {
+        val commands = FakeCommands(interruptFailure = IOException("disk"))
+
+        assertFalse(
+            controller(commands = commands, launcher = FakeLauncher())
+                .interruptAbandonedAcrossRestart(sessionId = 12L),
+        )
+    }
+
+    @Test
     fun `a blocked resume launches nothing and names the blocker`() = runBlocking {
         val commands = FakeCommands()
         val launcher = FakeLauncher()
@@ -245,11 +285,13 @@ private class FakeCommands(
     private val disposition: StartDisposition = StartDisposition.PREPARED,
     private val beginFailure: Exception? = null,
     private val failFailure: Exception? = null,
+    private val interruptFailure: Exception? = null,
     private val events: MutableList<String> = mutableListOf(),
 ) : RecordingStartCommands {
     var beginCalls = 0
     var failCalls = 0
     val beginOperationIds = mutableListOf<RecordingOperationId>()
+    val interruptCalls = mutableListOf<Pair<Long, String>>()
 
     override suspend fun beginStart(
         operationId: RecordingOperationId,
@@ -284,6 +326,17 @@ private class FakeCommands(
     ) {
         failCalls++
         failFailure?.let { throw it }
+    }
+
+    override suspend fun interrupt(
+        operationId: RecordingOperationId,
+        sessionId: Long,
+        interruptedAtEpochMillis: Long,
+        reason: String,
+    ) {
+        interruptCalls += sessionId to reason
+        events += "interrupt:$sessionId"
+        interruptFailure?.let { throw it }
     }
 }
 

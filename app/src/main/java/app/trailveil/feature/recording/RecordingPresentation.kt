@@ -7,6 +7,11 @@ import app.trailveil.data.history.RecordingHistoryStatus
 internal data class RecordingPresentation(
     val state: RecordingDisplayState,
     val activeSessionId: Long?,
+    /**
+     * When the open exploration began, in wall-clock millis, so a caller can tell whether it
+     * predates the running boot. Null exactly when [activeSessionId] is null.
+     */
+    val activeSessionStartedAt: Long?,
     val latestSessionId: Long?,
     val latestEndedAt: Long?,
     val latestAcceptedPoint: RecordingHistoryAcceptedPoint?,
@@ -54,6 +59,7 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
         return RecordingPresentation(
             state = RecordingDisplayState.IDLE,
             activeSessionId = null,
+            activeSessionStartedAt = null,
             latestSessionId = null,
             latestEndedAt = null,
             latestAcceptedPoint = null,
@@ -83,6 +89,7 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
     return RecordingPresentation(
         state = state,
         activeSessionId = activeSessionId,
+        activeSessionStartedAt = activeSessionId?.let { session.startedAt },
         // Unlike `activeSessionId`, this identifies the newest session whatever its status, which
         // is what lets an acknowledgement be bound to the one outcome it was made for.
         latestSessionId = session.id,
@@ -118,33 +125,86 @@ internal fun startControlOffered(
     activeSessionId: Long?,
 ): Boolean = activeSessionId == null || state == RecordingDisplayState.ABANDONED
 
+/** What this process should do about an exploration it found abandoned. */
+internal sealed interface AbandonedExplorationAction {
+    val sessionId: Long
+
+    /** Re-arm it: the row outlived a process death inside one boot, so continuing it is honest. */
+    data class Resume(override val sessionId: Long) : AbandonedExplorationAction
+
+    /** End it as interrupted: the device restarted under it, and PLAN forbids resuming across that. */
+    data class Interrupt(override val sessionId: Long) : AbandonedExplorationAction
+}
+
 /**
- * Which abandoned exploration this process should offer to re-arm, or null for "leave it alone".
+ * When the running boot began, in wall-clock millis.
+ *
+ * Wall clock minus uptime. Both reads come from the same clock source a moment apart, so the result
+ * is stable to within the cost of the two calls; it moves when the wall clock is corrected, which is
+ * why callers compare against it with [BOOT_BOUNDARY_TOLERANCE_MILLIS] rather than exactly.
+ */
+internal fun bootInstantEpochMillis(
+    epochMillis: Long,
+    elapsedRealtimeNanos: Long,
+): Long = epochMillis - elapsedRealtimeNanos / 1_000_000L
+
+/**
+ * How far either side of the computed boot instant a session's start time is treated as ambiguous.
+ *
+ * The comparison decides whether to collect location without being asked, so the tolerance is spent
+ * on the side that does not: a session inside this window of the boot instant is interrupted rather
+ * than resumed. The cost of being wrong that way is that the user starts a new exploration instead
+ * of continuing one that is at most this old; the cost of being wrong the other way is silently
+ * recording someone who did not ask, which is what `PLAN.md` forbids.
+ */
+internal const val BOOT_BOUNDARY_TOLERANCE_MILLIS = 5_000L
+
+/**
+ * What to do about an abandoned exploration, or null for "leave it alone".
  *
  * The platform normally restarts a killed foreground service, and the service recovers the session
  * itself; measured on a POCO F7 Ultra, some OEM builds never do that unless the user has granted a
- * background-start permission that is off by default. This is a second trigger for the recovery that
- * already exists — the ordinary start path reaches it, because a start against a row that is already
- * `ACTIVE` reacquires ownership through the durable recovery transaction rather than creating a
- * session — and not a second way of recovering.
+ * background-start permission that is off by default. Re-arming is a second trigger for the recovery
+ * that already exists — the ordinary start path reaches it, because a start against a row that is
+ * already `ACTIVE` reacquires ownership through the durable recovery transaction rather than
+ * creating a session — and not a second way of recovering.
  *
- * This decides only whether an offer is due. Whether one has already been made for that session is
- * held for the whole process by `AppContainer`, because a blocked attempt (no permission, or
- * location switched off) must not become a loop - and the honest [RecordingDisplayState.ABANDONED]
- * card it leaves on screen is already the correct thing for the user to see.
+ * **A restart is not a process death, and only one of them may be resumed.** `PLAN.md` requires that
+ * the app not silently resume location after the device reboots, and that an improperly ended session
+ * be marked interrupted on the next open. Nothing else in the tree enforces that: the durable row
+ * survives a reboot untouched, startup reconciliation only reaches a still-`STARTING` row, and the
+ * runtime token is regenerated per process, so without this branch a reboot is indistinguishable from
+ * a process death and the first open after one would re-arm collection on a session of any age.
+ *
+ * [claim] is taken rather than consulted by the caller so that "once per session per process" is part
+ * of this decision instead of a line beside it — the guard has twice been correct in isolation while
+ * the wiring that reaches it was bound by nothing.
  */
-internal fun abandonedSessionToResume(
+internal fun abandonedExplorationAction(
     state: RecordingDisplayState,
     activeSessionId: Long?,
+    activeSessionStartedAt: Long?,
+    bootedAtEpochMillis: Long,
     startupReconciled: Boolean,
     activityResumed: Boolean,
-): Long? = activeSessionId.takeIf {
-    state == RecordingDisplayState.ABANDONED &&
-        // Startup repair owns any still-STARTING row; re-arming across it would race that decision.
-        startupReconciled &&
-        // A start is only permitted from a visible activity, so asking earlier would spend the one
-        // attempt on a refusal that says nothing about whether recovery was possible.
-        activityResumed
+    claim: (Long) -> Boolean,
+): AbandonedExplorationAction? {
+    if (state != RecordingDisplayState.ABANDONED) return null
+    val sessionId = activeSessionId ?: return null
+    // Startup repair owns any still-STARTING row; acting across it would race that decision.
+    if (!startupReconciled) return null
+    // A start is only permitted from a visible activity, so asking earlier would spend the one
+    // attempt on a refusal that says nothing about whether recovery was possible.
+    if (!activityResumed) return null
+    if (!claim(sessionId)) return null
+    // An unknown start time cannot be shown to postdate the boot, so it takes the safe branch.
+    val predatesThisBoot = activeSessionStartedAt == null ||
+        activeSessionStartedAt < bootedAtEpochMillis + BOOT_BOUNDARY_TOLERANCE_MILLIS
+    return if (predatesThisBoot) {
+        AbandonedExplorationAction.Interrupt(sessionId)
+    } else {
+        AbandonedExplorationAction.Resume(sessionId)
+    }
 }
 
 /**
