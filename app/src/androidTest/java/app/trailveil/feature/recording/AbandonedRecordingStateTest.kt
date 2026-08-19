@@ -147,6 +147,13 @@ class AbandonedRecordingStateTest {
             deadRuntime = "runtime-from-before-the-restart-$FIXTURE_SUFFIX",
             startedAt = bootedAt - AN_HOUR,
         )
+        // A session that actually recorded something, because the fallback and the real anchor are
+        // different values and a fixture with no points asserts only the fallback: with no point
+        // seeded, deleting the last-point lookup entirely leaves this test green while every real
+        // walk publishes as a zero-duration exploration. This timestamp is strictly between the
+        // session's start and now, so only the session's own last point can produce it.
+        val lastPointAt = bootedAt - AN_HOUR + A_QUARTER_HOUR
+        seedAcceptedPoint(sqlite, sessionId, timestamp = lastPointAt)
 
         try {
             composeRule.activityRule.scenario.recreate()
@@ -178,7 +185,7 @@ class AbandonedRecordingStateTest {
             // it from now would publish the hours the device spent switched off as exploration time.
             assertEquals(
                 "the ending was dated from the discovery rather than from the recording",
-                (bootedAt - AN_HOUR).toString(),
+                lastPointAt.toString(),
                 sessionColumn(sqlite, sessionId, "ended_at"),
             )
             // The half that matters most: no collector was ever armed for it.
@@ -289,6 +296,26 @@ class AbandonedRecordingStateTest {
         return sessionId
     }
 
+    /** One accepted point on the session's open segment, so the session has a last-recorded time. */
+    private fun seedAcceptedPoint(
+        sqlite: SupportSQLiteDatabase,
+        sessionId: Long,
+        timestamp: Long,
+    ) {
+        val segmentId = sqlite
+            .query("SELECT id FROM track_segments WHERE session_id = $sessionId ORDER BY id DESC LIMIT 1")
+            .use { cursor ->
+                cursor.moveToFirst()
+                cursor.getLong(0)
+            }
+        sqlite.execSQL(
+            "INSERT INTO track_points(" +
+                "session_id, segment_id, sequence, timestamp, latitude, longitude, " +
+                "horizontal_accuracy" +
+                ") VALUES($sessionId, $segmentId, 0, $timestamp, 25.0, 121.5, 5.0)",
+        )
+    }
+
     /**
      * An id no row holds yet, so it can be claimed on the container before the row exists. Claiming
      * afterwards would race the route, which reacts to the insert on its own.
@@ -344,6 +371,7 @@ class AbandonedRecordingStateTest {
         const val STOP_SETTLE_MILLIS = 1_500L
         const val FIXTURE_SUFFIX = "p4-038"
         const val AN_HOUR = 3_600_000L
+        const val A_QUARTER_HOUR = 900_000L
 
         /** Wide enough that a session inserted concurrently cannot land on the reserved id. */
         const val ID_GAP = 1_000L

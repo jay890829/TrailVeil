@@ -441,10 +441,10 @@ internal fun RecordingEntryRoute(
             is AbandonedExplorationAction.Interrupt ->
                 interruptAbandonedRecording(
                     sessionId = action.sessionId,
-                    // The last thing actually recorded, falling back to the session's own start when
-                    // it never recorded one. Dating the ending from now instead would publish the
+                    // When THIS session last recorded, falling back to its own start when it
+                    // never recorded at all. Dating the ending from now instead would publish the
                     // hours the phone spent switched off as part of the exploration.
-                    stoppedRecordingAt = recordingPresentation.latestAcceptedPoint?.timestamp
+                    stoppedRecordingAt = recordingPresentation.activeSessionLastPointAt
                         ?: recordingPresentation.activeSessionStartedAt,
                 )
         }

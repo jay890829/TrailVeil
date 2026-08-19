@@ -119,6 +119,11 @@ data class RecordingLatestSessionSummary(
      * the row, not whether that owner still exists.
      */
     val locationOwnerToken: String?,
+    /**
+     * When [session] itself last recorded a point, unlike [latestAcceptedPoint], which is the newest
+     * point across all sessions because it answers "where is the user". This one dates the session.
+     */
+    val sessionLastAcceptedPointAt: Long? = null,
 )
 
 /** Read-only persisted history contract; it intentionally has no service/runtime dependency. */

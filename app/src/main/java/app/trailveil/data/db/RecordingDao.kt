@@ -22,6 +22,10 @@ private const val LOCATION_COMMAND_KIND = "LOCATION"
 // point is the newest accepted point ACROSS sessions: it answers "where is the user", and a
 // newest session with zero points (a failed start) must not blank that answer while an older
 // session still knows a location.
+// `own_last_point_timestamp` is the separate, SESSION-SCOPED answer to "when did this session last
+// record anything", which is what dates a terminal row. They are two different questions and were
+// briefly answered by one column: reading the cross-session point as a terminal instant is correct
+// only while the abandoned row happens to be the newest session, which is an accident to rely on.
 internal const val LATEST_RECORDING_SUMMARY_QUERY = """
     SELECT
         s.*,
@@ -36,7 +40,14 @@ internal const val LATEST_RECORDING_SUMMARY_QUERY = """
         p.sequence AS latest_point_sequence,
         p.timestamp AS latest_point_timestamp,
         p.latitude AS latest_point_latitude,
-        p.longitude AS latest_point_longitude
+        p.longitude AS latest_point_longitude,
+        (
+            SELECT own.timestamp
+            FROM track_points own
+            WHERE own.session_id = s.id
+            ORDER BY own.id DESC
+            LIMIT 1
+        ) AS own_last_point_timestamp
     FROM recording_sessions s
     LEFT JOIN track_points p ON p.id = (
         SELECT latest.id
@@ -56,6 +67,7 @@ internal data class LatestRecordingSummaryRow(
     @ColumnInfo(name = "latest_point_timestamp") val latestPointTimestamp: Long?,
     @ColumnInfo(name = "latest_point_latitude") val latestPointLatitude: Double?,
     @ColumnInfo(name = "latest_point_longitude") val latestPointLongitude: Double?,
+    @ColumnInfo(name = "own_last_point_timestamp") val ownLastPointTimestamp: Long?,
 )
 internal data class ViewportTrackPointRow(
     @ColumnInfo(name = "point_id") val pointId: Long,

@@ -104,11 +104,11 @@ class RecordingControllerTest {
     }
 
     @Test
-    fun `an exploration that recorded nothing is dated from its own start, not from now`() = runBlocking {
-        // The caller passes null only when the session never accepted a point. Falling back to now
-        // is safe because the store clamps the terminal instant up to the session start anyway, but
-        // the caller is expected to supply the start itself so the ending is not dated from whenever
-        // the user happened to reopen the app.
+    fun `a caller that supplies no instant at all falls back to now`() = runBlocking {
+        // Named for what it asserts, after a verifier found the previous name claiming the opposite.
+        // The production caller never reaches this branch: it passes the session's last point or,
+        // failing that, the session's own start, which is non-null whenever an Interrupt is decided.
+        // The fallback exists so the signature cannot lie about being total, not as a behaviour.
         val commands = FakeCommands()
 
         controller(commands = commands, launcher = FakeLauncher(), clock = { FIXED_NOW })

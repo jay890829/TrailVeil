@@ -12,6 +12,12 @@ internal data class RecordingPresentation(
      * predates the running boot. Null exactly when [activeSessionId] is null.
      */
     val activeSessionStartedAt: Long?,
+    /**
+     * When the open exploration itself last recorded a point, so a terminal row can be dated from
+     * when recording actually stopped. Null when it recorded none — and deliberately not
+     * [latestAcceptedPoint], which is the newest point across every session.
+     */
+    val activeSessionLastPointAt: Long?,
     val latestSessionId: Long?,
     val latestEndedAt: Long?,
     val latestAcceptedPoint: RecordingHistoryAcceptedPoint?,
@@ -60,6 +66,7 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
             state = RecordingDisplayState.IDLE,
             activeSessionId = null,
             activeSessionStartedAt = null,
+            activeSessionLastPointAt = null,
             latestSessionId = null,
             latestEndedAt = null,
             latestAcceptedPoint = null,
@@ -90,6 +97,7 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
         state = state,
         activeSessionId = activeSessionId,
         activeSessionStartedAt = activeSessionId?.let { session.startedAt },
+        activeSessionLastPointAt = activeSessionId?.let { sessionLastAcceptedPointAt },
         // Unlike `activeSessionId`, this identifies the newest session whatever its status, which
         // is what lets an acknowledgement be bound to the one outcome it was made for.
         latestSessionId = session.id,
