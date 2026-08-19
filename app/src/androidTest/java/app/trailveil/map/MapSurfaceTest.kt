@@ -549,7 +549,14 @@ class MapSurfaceTest {
             val writing = AtomicBoolean(true)
             val committed = AtomicInteger(0)
             // Rows reaching Room prove the writer ran; only a revision advancing proves the change
-            // feed carried them to the surface, which is the pressure this gate claims to apply.
+            // feed carried them to the surface. Worth stating precisely what that is: revisions
+            // advance once per merged PAGE (a whole batch after `synchronizeTo` returns), never per
+            // point - a faster writer produces larger pages and therefore FEWER restarts - so this
+            // gate exercises batch-merge liveness under a live stream, not per-point restart
+            // pressure. A seven-agent read established the arithmetic: one streamed point costs
+            // 137-484 candidate tile keys across zooms 0-22, so a page can never merge at the 5 ms
+            // write cadence, and three verification rounds passed before anyone noticed the gate's
+            // own description claimed a mechanism it cannot produce.
             val streamedRevisions = java.util.Collections.synchronizedList(mutableListOf<Long>())
 
             // A canonical render slow enough that many points commit before any of it can finish:

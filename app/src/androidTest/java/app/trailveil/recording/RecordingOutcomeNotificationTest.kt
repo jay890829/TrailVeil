@@ -10,10 +10,16 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
 import app.trailveil.TrailVeilApplication
+import app.trailveil.data.location.LocationEngine
+import app.trailveil.data.location.LocationUpdateRequest
+import app.trailveil.data.location.RawLocationFix
 import app.trailveil.data.recording.RecordingLifecycle
 import app.trailveil.data.recording.RecordingOperationId
 import java.util.UUID
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
@@ -93,6 +99,95 @@ class RecordingOutcomeNotificationTest {
         } finally {
             activity.close()
             notificationManager.cancelAll()
+        }
+    }
+
+    @Test
+    fun anInjectedStreamFailureInterruptsAndPostsExactlyOneOutcomeNotification() = runBlocking {
+        // Binds two halves that were inspection-only. Failure isolation: a location stream that
+        // throws mid-recording must interrupt the exploration, not kill the process - the thrown
+        // exception is injected through the same production seam the backpressure test uses, so
+        // nothing here is simulated at the assertion layer. And the interruption half of the
+        // outcome-notification criterion: exactly one notification on the outcome id, the same
+        // shape the completion test binds for its half.
+        enableSystemLocation()
+        grant(Manifest.permission.ACCESS_COARSE_LOCATION)
+        grant(Manifest.permission.ACCESS_FINE_LOCATION)
+        grant(Manifest.permission.POST_NOTIFICATIONS)
+        val notificationManager = context.getSystemService(NotificationManager::class.java)
+        notificationManager.cancelAll()
+
+        val application = context.applicationContext as TrailVeilApplication
+        val container = application.appContainer
+        val repository = container.recordingRepository
+        container.reconcileRecordingStartup()
+        container.setLocationEngineOverrideForTesting(ThrowingLocationEngine())
+        val activity = ActivityScenario.launch(MainActivity::class.java)
+        try {
+            val sessionId = repository.beginStart(
+                operationId("stream-failure-begin"),
+                System.currentTimeMillis(),
+                "instrumentation",
+            ).sessionId
+            activity.onActivity {
+                RecordingForegroundService.startFromVisibleActivity(it, sessionId)
+            }
+            withTimeout(11_000) {
+                while (repository.state().lifecycle != RecordingLifecycle.ACTIVE) {
+                    delay(50)
+                }
+            }
+            // The engine now emits its two fixes and throws. The service must interrupt.
+            withTimeout(12_000) {
+                while (repository.state().lifecycle != RecordingLifecycle.STOPPED) {
+                    delay(50)
+                }
+            }
+            val detail = withTimeout(5_000) {
+                container.recordingHistory.sessionDetail(sessionId).first()
+            }
+            assertEquals(
+                "INTERRUPT:location_stream_failure",
+                requireNotNull(detail).session.stopReason,
+            )
+            withTimeout(13_000) {
+                while (
+                    notificationManager.activeNotifications.none {
+                        it.id == RecordingForegroundNotifier.OUTCOME_NOTIFICATION_ID
+                    }
+                ) {
+                    delay(50)
+                }
+            }
+            assertEquals(
+                1,
+                notificationManager.activeNotifications.count {
+                    it.id == RecordingForegroundNotifier.OUTCOME_NOTIFICATION_ID
+                },
+            )
+        } finally {
+            container.setLocationEngineOverrideForTesting(null)
+            activity.close()
+            notificationManager.cancelAll()
+        }
+    }
+
+    /** Two honest fixes, then the stream dies the way a provider bug would kill it. */
+    private class ThrowingLocationEngine : LocationEngine {
+        override fun fixes(request: LocationUpdateRequest): Flow<RawLocationFix> = flow {
+            repeat(2) { index ->
+                emit(
+                    RawLocationFix(
+                        latitude = 25.0330 + index * 0.00001,
+                        longitude = 121.5654,
+                        horizontalAccuracyMeters = 5.0,
+                        capturedAtElapsedRealtimeNanos = android.os.SystemClock.elapsedRealtimeNanos(),
+                        epochMillis = System.currentTimeMillis(),
+                    ),
+                )
+                delay(150)
+            }
+            throw IllegalStateException("injected location stream failure")
         }
     }
 

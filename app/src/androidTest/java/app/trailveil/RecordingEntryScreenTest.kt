@@ -566,14 +566,21 @@ class RecordingEntryScreenTest {
 
     @Test
     fun anAcknowledgementOfAUserActionDoesNotLingerOrRestart() {
+        // Driven entirely from the screen's injectable clock. The previous version anchored the
+        // notice on System.currentTimeMillis() at state construction and then waited out the real
+        // window - but the anchor was stamped before the first MapView composition, which takes
+        // real seconds of its own, so a slow composition ate the window and the test raced the
+        // wall clock. With the clock injected, composition time cannot touch the window and the
+        // expiry is exercised by advancing time, not by spending it.
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val started = context.getString(R.string.recording_started)
         val launchFailure = context.getString(R.string.recording_launch_failure)
+        var fakeNow = 0L
         val published = mutableStateOf(
             RecordingEntryUiState(
                 firstVisit = false,
                 startNotice = RecordingStartNotice.STARTED,
-                startNoticeRaisedAt = System.currentTimeMillis(),
+                startNoticeRaisedAt = 0L,
             ),
         )
         composeRule.setContent {
@@ -584,11 +591,16 @@ class RecordingEntryScreenTest {
                 onLocationAction = {},
                 onDismissLocationNotice = {},
                 onNotificationAction = {},
+                clockMillis = { fakeNow },
             )
         }
 
         composeRule.onNodeWithText(started).assertIsDisplayed()
-        composeRule.waitUntil(TRANSIENT_NOTICE_WINDOW_MILLIS * 2) {
+        // Advance past the window: the screen's own expiry delay fires on the test frame clock and
+        // resamples the injected time.
+        fakeNow = TRANSIENT_NOTICE_WINDOW_MILLIS + 1L
+        composeRule.mainClock.advanceTimeBy(TRANSIENT_NOTICE_WINDOW_MILLIS + 100L)
+        composeRule.waitUntil(TRANSIENT_NOTICE_WINDOW_MILLIS) {
             composeRule.onAllNodesWithText(started).fetchSemanticsNodes().isEmpty()
         }
 
@@ -600,8 +612,7 @@ class RecordingEntryScreenTest {
             published.value = RecordingEntryUiState(
                 firstVisit = false,
                 startNotice = RecordingStartNotice.STARTED,
-                startNoticeRaisedAt = System.currentTimeMillis() -
-                    TRANSIENT_NOTICE_WINDOW_MILLIS * 10L,
+                startNoticeRaisedAt = 0L,
             )
         }
         composeRule.onNodeWithText(started).assertDoesNotExist()
@@ -611,8 +622,7 @@ class RecordingEntryScreenTest {
             published.value = RecordingEntryUiState(
                 firstVisit = false,
                 startNotice = RecordingStartNotice.LAUNCH_FAILURE,
-                startNoticeRaisedAt = System.currentTimeMillis() -
-                    TRANSIENT_NOTICE_WINDOW_MILLIS * 10L,
+                startNoticeRaisedAt = 0L,
             )
         }
         composeRule.onNodeWithText(launchFailure).assertIsDisplayed()
