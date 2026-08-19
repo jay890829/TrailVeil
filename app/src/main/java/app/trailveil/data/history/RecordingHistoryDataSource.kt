@@ -122,8 +122,11 @@ data class RecordingLatestSessionSummary(
     /**
      * When [session] itself last recorded a point, unlike [latestAcceptedPoint], which is the newest
      * point across all sessions because it answers "where is the user". This one dates the session.
+     * Required rather than defaulted for the same reason as the presentation's `runtimeToken`: a
+     * defaulted null let every existing constructor site skip it silently, which is why no JVM test
+     * was ever forced to say what it should be.
      */
-    val sessionLastAcceptedPointAt: Long? = null,
+    val sessionLastAcceptedPointAt: Long?,
 )
 
 /** Read-only persisted history contract; it intentionally has no service/runtime dependency. */

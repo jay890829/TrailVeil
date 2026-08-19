@@ -23,9 +23,15 @@ private const val LOCATION_COMMAND_KIND = "LOCATION"
 // newest session with zero points (a failed start) must not blank that answer while an older
 // session still knows a location.
 // `own_last_point_timestamp` is the separate, SESSION-SCOPED answer to "when did this session last
-// record anything", which is what dates a terminal row. They are two different questions and were
-// briefly answered by one column: reading the cross-session point as a terminal instant is correct
-// only while the abandoned row happens to be the newest session, which is an accident to rely on.
+// record anything", which is what dates a terminal row. They are two different questions that were
+// briefly answered by one column. In every state the schema can reach today the answers coincide -
+// the summary row IS the newest session, and points only append to the one active session, so
+// whenever the newest session has a point it is the globally newest point (an eighth verifier
+// established this; an earlier comment here called the coincidence an accident, which overstated
+// it). The scoped column exists because the terminal-dating read should say what it means, and so
+// that the coincidence is load-bearing nowhere. Both readings order by id, which is insertion
+// order: a provider whose wall clock steps backwards can make timestamp non-monotonic in id, and
+// then "last point" means last RECORDED, not latest-stamped - a recorded decision, not an oversight.
 internal const val LATEST_RECORDING_SUMMARY_QUERY = """
     SELECT
         s.*,

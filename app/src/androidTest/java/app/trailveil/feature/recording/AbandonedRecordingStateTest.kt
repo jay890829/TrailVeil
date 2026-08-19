@@ -142,6 +142,16 @@ class AbandonedRecordingStateTest {
 
         val sqlite = container.databaseForTesting().openHelper.writableDatabase
         val bootedAt = System.currentTimeMillis() - SystemClock.elapsedRealtime()
+        // An older, finished exploration seeded FIRST so its session id is lower, whose one point is
+        // seeded LAST so its point id is higher. The schema cannot produce this state - points only
+        // ever append to the one active session, so the newest session's points always hold the
+        // largest ids - and that is exactly why it is seeded: it is the only state in which "this
+        // session's last point" and "the newest point in the table" disagree, so it is the only
+        // fixture that can tell the session-scoped anchor from the cross-session one. An eighth
+        // verifier proved that without it, un-scoping the anchor - or reverting the scoping commit
+        // outright - left every test green, because a lone seeded point necessarily holds the
+        // table's max id and the two anchors coincide.
+        val strangerSessionId = seedCompletedSession(sqlite, startedAt = bootedAt - THREE_HOURS)
         val sessionId = seedAbandonedSession(
             sqlite,
             deadRuntime = "runtime-from-before-the-restart-$FIXTURE_SUFFIX",
@@ -154,6 +164,9 @@ class AbandonedRecordingStateTest {
         // session's start and now, so only the session's own last point can produce it.
         val lastPointAt = bootedAt - AN_HOUR + A_QUARTER_HOUR
         seedAcceptedPoint(sqlite, sessionId, timestamp = lastPointAt)
+        // The stranger's point: higher point id, later timestamp, wrong session. Any anchor that
+        // reads "newest point in the table" now produces this value instead of lastPointAt.
+        seedAcceptedPoint(sqlite, strangerSessionId, timestamp = lastPointAt + A_QUARTER_HOUR)
 
         try {
             composeRule.activityRule.scenario.recreate()
@@ -180,9 +193,10 @@ class AbandonedRecordingStateTest {
                 status,
             )
             assertEquals("INTERRUPT:device_restarted", reason)
-            // Dated from when recording actually stopped, not from when the user happened to reopen
-            // the app. This fixture recorded no points, so that is the session's own start; dating
-            // it from now would publish the hours the device spent switched off as exploration time.
+            // Dated from when THIS session last recorded - not from the session's start (the
+            // fallback, which a fixture with no points cannot tell apart from the anchor), not from
+            // the stranger's later point (the cross-session anchor), and not from now (the
+            // discovery, which publishes the hours the device spent off as exploration time).
             assertEquals(
                 "the ending was dated from the discovery rather than from the recording",
                 lastPointAt.toString(),
@@ -199,6 +213,7 @@ class AbandonedRecordingStateTest {
             RecordingForegroundService.stopFromVisibleActivity(context, sessionId)
             SystemClock.sleep(STOP_SETTLE_MILLIS)
             sqlite.execSQL("DELETE FROM recording_sessions WHERE id = $sessionId")
+            sqlite.execSQL("DELETE FROM recording_sessions WHERE id = $strangerSessionId")
         }
     }
 
@@ -296,7 +311,29 @@ class AbandonedRecordingStateTest {
         return sessionId
     }
 
-    /** One accepted point on the session's open segment, so the session has a last-recorded time. */
+    /** A finished exploration from earlier in the day, so the table holds points that are nobody's. */
+    private fun seedCompletedSession(sqlite: SupportSQLiteDatabase, startedAt: Long): Long {
+        val endedAt = startedAt + AN_HOUR
+        sqlite.execSQL(
+            "INSERT INTO recording_sessions(" +
+                "started_at, ended_at, status, stop_reason, distance_meters, accepted_point_count, " +
+                "rejected_point_count, created_app_version, active_slot, location_owner_token" +
+                ") VALUES($startedAt, $endedAt, 'COMPLETED', 'STOP:user', 0, 0, 0, " +
+                "'abandoned-state-test', NULL, NULL)",
+        )
+        val sessionId = sqlite.query("SELECT MAX(id) FROM recording_sessions").use { cursor ->
+            cursor.moveToFirst()
+            cursor.getLong(0)
+        }
+        sqlite.execSQL(
+            "INSERT INTO track_segments(" +
+                "session_id, sequence, started_at, ended_at, start_reason, end_reason, open_slot" +
+                ") VALUES($sessionId, 0, $startedAt, $endedAt, 'SESSION_START', 'STOP:user', NULL)",
+        )
+        return sessionId
+    }
+
+    /** One accepted point on the session's newest segment, so the session has a last-recorded time. */
     private fun seedAcceptedPoint(
         sqlite: SupportSQLiteDatabase,
         sessionId: Long,
@@ -372,6 +409,7 @@ class AbandonedRecordingStateTest {
         const val FIXTURE_SUFFIX = "p4-038"
         const val AN_HOUR = 3_600_000L
         const val A_QUARTER_HOUR = 900_000L
+        const val THREE_HOURS = 3 * AN_HOUR
 
         /** Wide enough that a session inserted concurrently cannot land on the reserved id. */
         const val ID_GAP = 1_000L

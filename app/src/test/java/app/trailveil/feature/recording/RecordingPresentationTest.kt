@@ -464,6 +464,20 @@ class RecordingPresentationTest {
     }
 
     @Test
+    fun theSessionsOwnLastPointRidesThePresentationAndOnlyForAnOpenSession() {
+        // The terminal-dating anchor. It must be the session's own value - not the cross-session
+        // latestAcceptedPoint, whose fixture timestamp here is deliberately different - and it must
+        // vanish with the active session, because dating anything else with it would be a lie.
+        val active = detail(RecordingHistoryStatus.ACTIVE)
+            .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+        assertEquals(SESSION_LAST_POINT_AT, active.activeSessionLastPointAt)
+
+        val completed = detail(RecordingHistoryStatus.COMPLETED)
+            .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+        assertNull(completed.activeSessionLastPointAt)
+    }
+
+    @Test
     fun aLiveRecordingOffersOnlyEndingItAndAnIdleScreenOnlyBeginning() {
         assertTrue(
             stopControlOffered(state = RecordingDisplayState.RECORDING, activeSessionId = 7L),
@@ -483,6 +497,7 @@ class RecordingPresentationTest {
         status: RecordingHistoryStatus,
         outcome: String = "START_ACTIVATED",
         ownerToken: String? = THIS_RUNTIME,
+        sessionLastPointAt: Long? = SESSION_LAST_POINT_AT,
     ) = RecordingLatestSessionSummary(
         session = RecordingHistorySession(
             id = 7L,
@@ -509,6 +524,7 @@ class RecordingPresentationTest {
             longitude = 121.5654,
         ),
         locationOwnerToken = ownerToken,
+        sessionLastAcceptedPointAt = sessionLastPointAt,
     )
 
     private companion object {
@@ -517,5 +533,11 @@ class RecordingPresentationTest {
         /** An arbitrary but plausible boot instant; only its distance from a start time matters. */
         const val BOOTED_AT = 1_700_000_000_000L
         const val AN_HOUR = 3_600_000L
+
+        /**
+         * Distinct from every other timestamp in the fixture, so a presentation that carried the
+         * wrong field would be caught by value rather than by luck.
+         */
+        const val SESSION_LAST_POINT_AT = 1_700L
     }
 }
