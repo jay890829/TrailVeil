@@ -115,6 +115,16 @@ class AbandonedRecordingStateTest {
                 shown = publishedState()
             }
             assertTrue("recovered the row but showed '$shown'", shown in LIVE_STATES)
+            // The background-start guidance must SURVIVE the successful re-arm - by this point the
+            // state is RECORDING, so any implementation that hangs the card on ABANDONED (including
+            // the cheap answer of editing that state's string) shows nothing here. Asserted before
+            // the menu is opened so the card's presence does not depend on menu state, and the
+            // dismiss click binds the route's clearing wiring in the same pass.
+            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
+                .assertIsDisplayed()
+            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartDismiss).performClick()
+            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
+                .assertDoesNotExist()
             // The controls the route offers for a live recording, checked here because this is the
             // only place a real one exists. Without it, swapping which control function feeds which
             // flag in the route — Start offered mid-recording, Stop gone — passes every test.
@@ -208,6 +218,11 @@ class AbandonedRecordingStateTest {
                 "the exploration was resumed before it was ended",
                 !hasRecoverySegment(sqlite, sessionId),
             )
+            // And it is never blamed on background start: no platform restarts a service across a
+            // reboot, so the guidance would be a lie about the device here. This is the widening a
+            // raise placed anywhere the Interrupt arm also reaches would silently commit.
+            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
+                .assertDoesNotExist()
         } finally {
             // Nothing should have started, but a failing run means something did, and leaving a live
             // collector behind would fail the sibling tests for a reason that is not their own.
@@ -259,6 +274,10 @@ class AbandonedRecordingStateTest {
                 waited += POLL_MILLIS
             }
             assertEquals("the screen never settled on the abandoned row", "ABANDONED", shown)
+            // No resume was attempted - the claim was spent before the row existed - so no guidance:
+            // the card reports an event, not a state, and this fixture is the state without the event.
+            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
+                .assertDoesNotExist()
 
             composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
             composeRule.onNodeWithTag(RecordingEntryTestTags.Start).assertIsDisplayed()

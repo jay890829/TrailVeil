@@ -100,6 +100,12 @@ internal data class RecordingEntryUiState(
     val firstVisit: Boolean = true,
     val locationNotice: LocationNotice? = null,
     val notificationNotice: NotificationNotice? = null,
+    /**
+     * The app itself just re-armed an exploration the platform had left abandoned - evidence this
+     * device does not restart the recording service on its own, which some systems gate behind a
+     * background-start permission the app can neither read nor request.
+     */
+    val backgroundStartNotice: Boolean = false,
     val startNotice: RecordingStartNotice? = null,
     val startNoticeRaisedAt: Long? = null,
     /** Whether the open exploration can be ended from here. */
@@ -131,6 +137,9 @@ internal object RecordingEntryTestTags {
     const val PrivacySheet = "recording_entry_privacy_sheet"
     const val PrivacyDismiss = "recording_entry_privacy_dismiss"
     const val RecordingStateDismiss = "recording_entry_recording_state_dismiss"
+    const val BackgroundStartNotice = "recording_entry_background_start_notice"
+    const val BackgroundStartAction = "recording_entry_background_start_action"
+    const val BackgroundStartDismiss = "recording_entry_background_start_dismiss"
 }
 
 @Composable
@@ -145,6 +154,8 @@ internal fun RecordingEntryScreen(
     onRecenter: () -> Unit = {},
     onOpenHistory: () -> Unit = {},
     onUserMovedCamera: () -> Unit = {},
+    onBackgroundStartAction: () -> Unit = {},
+    onDismissBackgroundStartNotice: () -> Unit = {},
     fogRuntime: FogRuntime? = null,
     fogRequired: Boolean = false,
     cameraRequest: MapCameraRequest? = null,
@@ -296,6 +307,16 @@ internal fun RecordingEntryScreen(
                             } else {
                                 null
                             },
+                        )
+                    }
+
+                    // Last on purpose: it is advice beside a recording that is running again, so it
+                    // must never outrank a blocker above it - and once the state card retires, the
+                    // guidance stands alone next to the live recording, which is the intended read.
+                    if (state.backgroundStartNotice) {
+                        BackgroundStartNoticeCard(
+                            onAction = onBackgroundStartAction,
+                            onDismiss = onDismissBackgroundStartNotice,
                         )
                     }
                 }
@@ -605,6 +626,56 @@ private fun PrivacySheet(
             }
         },
     )
+}
+
+@Composable
+private fun BackgroundStartNoticeCard(
+    onAction: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    // tertiaryContainer, not errorContainer: nothing has failed - the recording is running again
+    // and this is advice, the same register as the notification notice. The action is outlined and
+    // the dismiss plain so the guidance never outranks a blocker card sharing the column. The
+    // action deliberately does not clear the card: the app cannot confirm the user reached the
+    // switch, so clearing on the press would assert a success it cannot know. Only the dismiss
+    // clears it.
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag(RecordingEntryTestTags.BackgroundStartNotice),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+        ),
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(
+                text = stringResource(R.string.background_start_title),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+            )
+            Text(text = stringResource(R.string.background_start_body))
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                OutlinedButton(
+                    onClick = onAction,
+                    modifier = Modifier.testTag(RecordingEntryTestTags.BackgroundStartAction),
+                ) {
+                    Text(text = stringResource(R.string.permission_open_app_settings))
+                }
+                TextButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.testTag(RecordingEntryTestTags.BackgroundStartDismiss),
+                ) {
+                    Text(text = stringResource(R.string.recording_entry_privacy_acknowledge))
+                }
+            }
+        }
+    }
 }
 
 @Composable

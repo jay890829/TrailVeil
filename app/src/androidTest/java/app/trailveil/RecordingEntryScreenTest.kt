@@ -193,6 +193,61 @@ class RecordingEntryScreenTest {
     }
 
     @Test
+    fun backgroundStartGuidanceOffersSettingsAndCanBeDismissed() {
+        // Holds the screen and not the route - it feeds itself the flag, which is exactly the
+        // escape hatch verifiers caught twice in this task family. It is worth having only because
+        // the three AbandonedRecordingStateTest assertions bind the route's raising and clearing.
+        val actions = AtomicInteger()
+        val dismissals = AtomicInteger()
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    firstVisit = false,
+                    backgroundStartNotice = true,
+                ),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+                onBackgroundStartAction = actions::incrementAndGet,
+                onDismissBackgroundStartNotice = dismissals::incrementAndGet,
+            )
+        }
+
+        val settingsLabel = InstrumentationRegistry.getInstrumentation()
+            .targetContext
+            .getString(R.string.permission_open_app_settings)
+        composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice).assertIsDisplayed()
+        // Composition alone fires nothing - the guarantee the other cards already make.
+        assertEquals(0, actions.get())
+        assertEquals(0, dismissals.get())
+        composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartAction)
+            .assertTextEquals(settingsLabel)
+            .performClick()
+        assertEquals(1, actions.get())
+        assertEquals(0, dismissals.get())
+        composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartDismiss).performClick()
+        assertEquals(1, dismissals.get())
+    }
+
+    @Test
+    fun theBackgroundStartCardIsNotRenderedUnlessEarned() {
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(firstVisit = false),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice).assertDoesNotExist()
+    }
+
+    @Test
     fun notificationDenialIsInformationalAndStartRemainsEnabled() {
         val startCalls = AtomicInteger()
         composeRule.setContent {

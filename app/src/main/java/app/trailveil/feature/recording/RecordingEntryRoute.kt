@@ -79,6 +79,10 @@ internal fun RecordingEntryRoute(
     val notificationStartContinuation =
         NotificationStartContinuation.valueOf(notificationStartContinuationName)
     var locationNotice by rememberSaveable { mutableStateOf<LocationNotice?>(null) }
+    // Earned, not shown: visibility is decided at the screen call through a pure function, because a
+    // location notice raised later must win the space. rememberSaveable and not a DataStore key,
+    // deliberately - this reports an event (one card per lost walk), not an onboarding fact.
+    var backgroundStartNotice by rememberSaveable { mutableStateOf(false) }
     var startNotice by rememberSaveable { mutableStateOf<RecordingStartNotice?>(null) }
     // When the user's action produced the notice, so an acknowledgement expires on its own age
     // rather than on how long this screen has been drawn.
@@ -190,14 +194,14 @@ internal fun RecordingEntryRoute(
         startNoticeRaisedAt = notice?.let { System.currentTimeMillis() }
     }
 
-    suspend fun resumeAbandonedRecording(sessionId: Long) {
+    suspend fun resumeAbandonedRecording(action: AbandonedExplorationAction.Resume) {
         // Deliberately quiet: the user pressed nothing, so this raises no start notice. Success shows
         // itself when the row is owned again and the card stops saying the exploration was abandoned;
         // a failure leaves that card in place, which is already the truth. Only a blocker the user can
         // act on is surfaced, and through the same notice the Start button would have raised.
         val outcome = controller.resumeAbandonedFromVisibleActivity(
             activityVisible = activity.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED),
-            sessionId = sessionId,
+            sessionId = action.sessionId,
         )
         if (outcome is RecordingResumeOutcome.Blocked) {
             when (outcome.blocker) {
@@ -209,6 +213,11 @@ internal fun RecordingEntryRoute(
                     locationNotice = LocationNotice.LOCATION_SERVICES
                 RecordingStartBlocker.ACTIVITY_NOT_VISIBLE -> Unit
             }
+        }
+        // Having to re-arm at all is the evidence: a platform that restarts the service recovers
+        // under the live token in seconds and this path is never reached.
+        if (backgroundStartNoticeEarned(action = action, resumeOutcome = outcome)) {
+            backgroundStartNotice = true
         }
     }
 
@@ -438,7 +447,7 @@ internal fun RecordingEntryRoute(
         )
         when (action) {
             null -> Unit
-            is AbandonedExplorationAction.Resume -> resumeAbandonedRecording(action.sessionId)
+            is AbandonedExplorationAction.Resume -> resumeAbandonedRecording(action)
             is AbandonedExplorationAction.Interrupt ->
                 // The action carries its own terminal instant; the route computes nothing, so there
                 // is no inline expression here for a fixture to miss.
@@ -511,6 +520,10 @@ internal fun RecordingEntryRoute(
             notificationNotice = notificationNotice,
             startNotice = startNotice,
             startNoticeRaisedAt = startNoticeRaisedAt,
+            backgroundStartNotice = backgroundStartNoticeVisible(
+                earned = backgroundStartNotice,
+                locationNotice = locationNotice,
+            ),
             stopOffered = stopControlOffered(
                 state = recordingPresentation.state,
                 activeSessionId = recordingPresentation.activeSessionId,
@@ -658,6 +671,10 @@ internal fun RecordingEntryRoute(
             }
         },
         onUserMovedCamera = { requestedFollowing = false },
+        // The action does not clear the card: the app cannot confirm the user reached the switch,
+        // so clearing on the press would assert a success it cannot know. Only the dismiss clears.
+        onBackgroundStartAction = { activity.openAppDetailsSettings() },
+        onDismissBackgroundStartNotice = { backgroundStartNotice = false },
         onOpenHistory = onOpenHistory,
         fogRuntime = fogRuntime,
         fogRequired = true,
@@ -720,12 +737,42 @@ private fun Activity.openNotificationSettings() {
     )
 }
 
+/** How a settings launch resolved; LAUNCHED means only that the call did not throw. */
+internal enum class SettingsLaunchOutcome { LAUNCHED, FELL_BACK, UNREACHABLE }
+
+/**
+ * Launch a settings screen, degrading to [fallback] rather than throwing.
+ *
+ * Lambdas rather than intents so the decision is testable on the JVM. The previous shape caught only
+ * [ActivityNotFoundException] - a component that exists but is unexported or permission-guarded
+ * throws [SecurityException] instead, which went straight through and killed the activity - and its
+ * fallback `startActivity` sat outside the try, unguarded. LAUNCHED does not mean the user reached
+ * anything: a component that opens the wrong page throws nothing and cannot be detected, which is
+ * why every card carries its instruction in the body text rather than trusting the destination.
+ */
+internal fun launchSettingsWithFallback(
+    primary: () -> Unit,
+    fallback: () -> Unit,
+): SettingsLaunchOutcome = when {
+    launchedWithoutThrowing(primary) -> SettingsLaunchOutcome.LAUNCHED
+    launchedWithoutThrowing(fallback) -> SettingsLaunchOutcome.FELL_BACK
+    else -> SettingsLaunchOutcome.UNREACHABLE
+}
+
+private fun launchedWithoutThrowing(start: () -> Unit): Boolean = try {
+    start()
+    true
+} catch (_: ActivityNotFoundException) {
+    false
+} catch (_: SecurityException) {
+    false
+}
+
 private fun Activity.openSafely(intent: Intent) {
-    try {
-        startActivity(intent)
-    } catch (_: ActivityNotFoundException) {
-        startActivity(Intent(Settings.ACTION_SETTINGS))
-    }
+    launchSettingsWithFallback(
+        primary = { startActivity(intent) },
+        fallback = { startActivity(Intent(Settings.ACTION_SETTINGS)) },
+    )
 }
 
 /**

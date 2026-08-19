@@ -6,6 +6,9 @@ import app.trailveil.data.history.RecordingHistoryOperationOutcome
 import app.trailveil.data.history.RecordingHistorySession
 import app.trailveil.data.history.RecordingHistoryStatus
 import app.trailveil.recording.AbandonedResumeClaims
+import app.trailveil.recording.RecordingResumeOutcome
+import app.trailveil.recording.RecordingStartBlocker
+import app.trailveil.recording.RecordingStartFailureKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -462,6 +465,77 @@ class RecordingPresentationTest {
             1_000L,
             bootInstantEpochMillis(epochMillis = 61_000L, elapsedRealtimeNanos = 60_000_000_000L),
         )
+    }
+
+    @Test
+    fun aResumedExplorationThePlatformDidNotRestartEarnsTheBackgroundStartGuidance() {
+        // The one input combination that is the whole feature: the app itself re-armed an abandoned
+        // exploration and the service start was actually requested. On a platform that restarts the
+        // sticky service this pair is unreachable, so reaching it is evidence about this device.
+        assertTrue(
+            backgroundStartNoticeEarned(
+                action = AbandonedExplorationAction.Resume(7L),
+                resumeOutcome = RecordingResumeOutcome.ServiceRequested(7L),
+            ),
+        )
+    }
+
+    @Test
+    fun anExplorationEndedForADeviceRestartIsNeverBlamedOnBackgroundStart() {
+        // No platform restarts a service across a reboot, so naming the setting there is a lie
+        // about the device.
+        assertFalse(
+            backgroundStartNoticeEarned(
+                action = AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = 1_000L),
+                resumeOutcome = RecordingResumeOutcome.ServiceRequested(7L),
+            ),
+        )
+        assertFalse(
+            backgroundStartNoticeEarned(
+                action = null,
+                resumeOutcome = RecordingResumeOutcome.ServiceRequested(7L),
+            ),
+        )
+    }
+
+    @Test
+    fun aResumeTheUserMustFixFirstSaysNothingAboutBackgroundStart() {
+        // Exhaustive over the outcome type, so a new variant cannot slip in as earned silently. A
+        // blocked resume is explained by its blocker, which raises its own notice pointing at the
+        // same settings button; stacking a second card behind it strands the user twice.
+        val resume = AbandonedExplorationAction.Resume(7L)
+        RecordingStartBlocker.entries.forEach { blocker ->
+            assertFalse(
+                "$blocker must not earn the guidance",
+                backgroundStartNoticeEarned(
+                    action = resume,
+                    resumeOutcome = RecordingResumeOutcome.Blocked(blocker),
+                ),
+            )
+        }
+        assertFalse(
+            backgroundStartNoticeEarned(
+                action = resume,
+                resumeOutcome = RecordingResumeOutcome.LaunchFailure(
+                    7L,
+                    RecordingStartFailureKind.BACKGROUND_START_NOT_ALLOWED,
+                ),
+            ),
+        )
+        assertFalse(backgroundStartNoticeEarned(action = resume, resumeOutcome = null))
+    }
+
+    @Test
+    fun theBackgroundStartGuidanceYieldsToAnActionableLocationNotice() {
+        // Both cards point at the same settings button; only the one the user must act on may show.
+        assertTrue(backgroundStartNoticeVisible(earned = true, locationNotice = null))
+        LocationNotice.entries.forEach { notice ->
+            assertFalse(
+                "$notice must displace the guidance",
+                backgroundStartNoticeVisible(earned = true, locationNotice = notice),
+            )
+        }
+        assertFalse(backgroundStartNoticeVisible(earned = false, locationNotice = null))
     }
 
     private fun abandonedAction(

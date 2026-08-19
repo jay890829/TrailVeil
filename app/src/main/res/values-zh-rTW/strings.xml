@@ -33,6 +33,8 @@
     <string name="location_services_body">請在 Android 設定中開啟裝置定位，返回後再按一次「開始探索」。</string>
     <string name="notification_permission_title">仍可記錄，但通知會被隱藏</string>
     <string name="notification_permission_body">TrailVeil 仍可透過前景服務記錄。開啟通知後，通知列會顯示持續記錄狀態與停止按鈕。</string>
+    <string name="background_start_title">這次記錄沒有在系統關閉 App 後自動接續</string>
+    <string name="background_start_body">部分裝置需要另外允許「後台啟動」（有些系統寫成「自動啟動」或「背景啟動」），系統才會在關閉 TrailVeil 之後把記錄接回來；這個選項通常在 TrailVeil 的應用程式資訊頁裡，若你的裝置沒有這一項就不需要調整。無論如何，TrailVeil 都只在你按下「開始探索」之後才記錄位置。</string>
     <string name="permission_try_again">再試一次</string>
     <string name="permission_request_precise">請求精確位置</string>
     <string name="permission_open_app_settings">開啟應用程式設定</string>

@@ -33,6 +33,8 @@
     <string name="location_services_body">Turn on device location in Android Settings, then return and press Start again.</string>
     <string name="notification_permission_title">Recording works, but its notification is hidden</string>
     <string name="notification_permission_body">TrailVeil can still record through a foreground service. Enable notifications if you want the persistent recording status and Stop action in the notification drawer.</string>
+    <string name="background_start_title">The recording did not resume by itself</string>
+    <string name="background_start_body">Some devices need background start — often called autostart — to be allowed separately before the system will bring a recording back after closing TrailVeil. It is usually on TrailVeil’s app info page; if your device has no such option, nothing needs changing. Either way, TrailVeil records location only after you press Start exploration.</string>
     <string name="permission_try_again">Try again</string>
     <string name="permission_request_precise">Request precise location</string>
     <string name="permission_open_app_settings">Open app settings</string>

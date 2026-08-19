@@ -3,6 +3,7 @@ package app.trailveil.feature.recording
 import app.trailveil.data.history.RecordingHistoryAcceptedPoint
 import app.trailveil.data.history.RecordingLatestSessionSummary
 import app.trailveil.data.history.RecordingHistoryStatus
+import app.trailveil.recording.RecordingResumeOutcome
 
 internal data class RecordingPresentation(
     val state: RecordingDisplayState,
@@ -230,6 +231,34 @@ internal fun abandonedExplorationAction(
         AbandonedExplorationAction.Resume(sessionId)
     }
 }
+
+/**
+ * Whether this device has earned the background-start guidance.
+ *
+ * Earned by one event only: the app itself re-armed an exploration the platform had left abandoned
+ * (`Resume`, and the service start was actually requested). On a platform that restarts the sticky
+ * service this state is unreachable - recovery happens in seconds under the live token and the row
+ * never presents as abandoned - so reaching it is evidence about THIS device, not a guess about
+ * vendors. `Interrupt` must never earn it: no platform restarts a service across a reboot, so naming
+ * a background-start setting there would be a lie about the device. A `Blocked` resume is explained
+ * by its blocker, which raises its own notice the user must act on first.
+ */
+internal fun backgroundStartNoticeEarned(
+    action: AbandonedExplorationAction?,
+    resumeOutcome: RecordingResumeOutcome?,
+): Boolean = action is AbandonedExplorationAction.Resume &&
+    resumeOutcome is RecordingResumeOutcome.ServiceRequested
+
+/**
+ * Whether an earned card may be on screen right now.
+ *
+ * A location notice can be raised after the card was earned - a permission revoked while it is up -
+ * and both point at the same settings button, so only the actionable one may show.
+ */
+internal fun backgroundStartNoticeVisible(
+    earned: Boolean,
+    locationNotice: LocationNotice?,
+): Boolean = earned && locationNotice == null
 
 /**
  * Whether a terminal outcome is still news.
