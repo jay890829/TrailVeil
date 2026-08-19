@@ -24,7 +24,7 @@ private const val LOCATION_COMMAND_KIND = "LOCATION"
 // session still knows a location.
 // `own_last_point_timestamp` is the separate, SESSION-SCOPED answer to "when did this session last
 // record anything", which is what dates a terminal row. They are two different questions that were
-// briefly answered by one column. In every state the schema can reach today the answers coincide -
+// briefly answered by one column. In every state the app's write path can reach the answers coincide -
 // the summary row IS the newest session, and points only append to the one active session, so
 // whenever the newest session has a point it is the globally newest point (an eighth verifier
 // established this; an earlier comment here called the coincidence an accident, which overstated

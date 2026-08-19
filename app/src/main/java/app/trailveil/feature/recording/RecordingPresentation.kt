@@ -140,8 +140,20 @@ internal sealed interface AbandonedExplorationAction {
     /** Re-arm it: the row outlived a process death inside one boot, so continuing it is honest. */
     data class Resume(override val sessionId: Long) : AbandonedExplorationAction
 
-    /** End it as interrupted: the device restarted under it, and PLAN forbids resuming across that. */
-    data class Interrupt(override val sessionId: Long) : AbandonedExplorationAction
+    /**
+     * End it as interrupted: the device restarted under it, and PLAN forbids resuming across that.
+     *
+     * Carries its own terminal instant so the route forwards a decision instead of computing one —
+     * the session's last recorded point, or the session's start when it recorded none, and null only
+     * when even the start is unknown. A ninth check found the previous shape (an inline `?:` in the
+     * route's effect) bound by nothing once the device fixture began seeding a point: deleting the
+     * fallback compiled and left every test green, while a zero-point abandoned session — start
+     * pressed, no fix accepted, reboot — went back to being dated from its discovery.
+     */
+    data class Interrupt(
+        override val sessionId: Long,
+        val stoppedRecordingAt: Long?,
+    ) : AbandonedExplorationAction
 }
 
 /**
@@ -192,6 +204,7 @@ internal fun abandonedExplorationAction(
     state: RecordingDisplayState,
     activeSessionId: Long?,
     activeSessionStartedAt: Long?,
+    activeSessionLastPointAt: Long?,
     bootedAtEpochMillis: Long,
     startupReconciled: Boolean,
     activityResumed: Boolean,
@@ -209,7 +222,10 @@ internal fun abandonedExplorationAction(
     val predatesThisBoot = activeSessionStartedAt == null ||
         activeSessionStartedAt < bootedAtEpochMillis + BOOT_BOUNDARY_TOLERANCE_MILLIS
     return if (predatesThisBoot) {
-        AbandonedExplorationAction.Interrupt(sessionId)
+        AbandonedExplorationAction.Interrupt(
+            sessionId = sessionId,
+            stoppedRecordingAt = activeSessionLastPointAt ?: activeSessionStartedAt,
+        )
     } else {
         AbandonedExplorationAction.Resume(sessionId)
     }

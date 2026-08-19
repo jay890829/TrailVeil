@@ -245,6 +245,11 @@ class RoomRecordingHistoryDataSourceTest {
         val summary = requireNotNull(history.latestSessionSummary().first())
         assertEquals(requireNotNull(laterInsertedPoint.receipt.pointId), summary.latestAcceptedPoint?.id)
         assertEquals(detail.latestAcceptedPoint, summary.latestAcceptedPoint)
+        // The session-scoped terminal-dating anchor follows insertion order, not timestamp order:
+        // the later-INSERTED point carries the earlier timestamp, and "last point" means last
+        // recorded. This is also the only fixture with two points on one session, so it is what
+        // catches the subquery's DESC flipping to ASC - the single-point device gate cannot.
+        assertEquals(100L, summary.sessionLastAcceptedPointAt)
         assertEquals("OUTCOME_NEWER_EVENT", summary.latestOperationOutcome?.value)
         assertEquals(detail.latestOperationOutcome, summary.latestOperationOutcome)
     }

@@ -352,7 +352,7 @@ class RecordingPresentationTest {
         // process death by the time this decision is made, and without the start-time comparison the
         // first open after a restart re-arms location collection on a session of any age.
         assertEquals(
-            AbandonedExplorationAction.Interrupt(7L),
+            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = BOOTED_AT - AN_HOUR),
             abandonedAction(startedAt = BOOTED_AT - AN_HOUR),
         )
     }
@@ -364,7 +364,10 @@ class RecordingPresentationTest {
         // is that the user starts a new one, while the cost of erring the other way is collecting
         // location without being asked.
         assertEquals(
-            AbandonedExplorationAction.Interrupt(7L),
+            AbandonedExplorationAction.Interrupt(
+                7L,
+                stoppedRecordingAt = BOOTED_AT + BOOT_BOUNDARY_TOLERANCE_MILLIS - 1L,
+            ),
             abandonedAction(startedAt = BOOTED_AT + BOOT_BOUNDARY_TOLERANCE_MILLIS - 1L),
         )
         assertEquals(
@@ -376,8 +379,36 @@ class RecordingPresentationTest {
     @Test
     fun anExplorationWithNoKnownStartTimeIsNeverSilentlyResumed() {
         assertEquals(
-            AbandonedExplorationAction.Interrupt(7L),
+            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = null),
             abandonedAction(startedAt = null),
+        )
+    }
+
+    @Test
+    fun theEndingIsDatedFromTheSessionsLastPointWhenItRecordedOne() {
+        // The instant rides the action, so the route forwards a decision rather than computing one.
+        // A ninth check found the previous inline `?:` in the route bound by nothing once the device
+        // fixture began seeding a point: deleting the fallback left every test green while a
+        // zero-point abandoned session went back to being dated from its discovery.
+        assertEquals(
+            AbandonedExplorationAction.Interrupt(
+                7L,
+                stoppedRecordingAt = BOOTED_AT - AN_HOUR + 900_000L,
+            ),
+            abandonedAction(
+                startedAt = BOOTED_AT - AN_HOUR,
+                lastPointAt = BOOTED_AT - AN_HOUR + 900_000L,
+            ),
+        )
+    }
+
+    @Test
+    fun anEndingWithNoRecordedPointIsDatedFromTheSessionsOwnStart() {
+        // Start pressed, no fix ever accepted, reboot: dating from anything later than the start
+        // publishes time the exploration never covered.
+        assertEquals(
+            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = BOOTED_AT - AN_HOUR),
+            abandonedAction(startedAt = BOOTED_AT - AN_HOUR, lastPointAt = null),
         )
     }
 
@@ -437,6 +468,7 @@ class RecordingPresentationTest {
         state: RecordingDisplayState = RecordingDisplayState.ABANDONED,
         activeSessionId: Long? = 7L,
         startedAt: Long? = BOOTED_AT + AN_HOUR,
+        lastPointAt: Long? = null,
         startupReconciled: Boolean = true,
         activityResumed: Boolean = true,
         claim: (Long) -> Boolean = { true },
@@ -444,6 +476,7 @@ class RecordingPresentationTest {
         state = state,
         activeSessionId = activeSessionId,
         activeSessionStartedAt = startedAt,
+        activeSessionLastPointAt = lastPointAt,
         bootedAtEpochMillis = BOOTED_AT,
         startupReconciled = startupReconciled,
         activityResumed = activityResumed,

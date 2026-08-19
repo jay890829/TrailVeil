@@ -143,11 +143,12 @@ class AbandonedRecordingStateTest {
         val sqlite = container.databaseForTesting().openHelper.writableDatabase
         val bootedAt = System.currentTimeMillis() - SystemClock.elapsedRealtime()
         // An older, finished exploration seeded FIRST so its session id is lower, whose one point is
-        // seeded LAST so its point id is higher. The schema cannot produce this state - points only
-        // ever append to the one active session, so the newest session's points always hold the
-        // largest ids - and that is exactly why it is seeded: it is the only state in which "this
-        // session's last point" and "the newest point in the table" disagree, so it is the only
-        // fixture that can tell the session-scoped anchor from the cross-session one. An eighth
+        // seeded LAST so its point id is higher. The app's write path cannot produce this state -
+        // persistAcceptedPoint only appends to the one active session, so the newest session's
+        // points always hold the largest ids; nothing in the schema itself forbids it, which is how
+        // this raw SQL creates it - and that is exactly why it is seeded: it is the only state in
+        // which "this session's last point" and "the newest point in the table" disagree, so it is
+        // the only fixture that can tell the session-scoped anchor from the cross-session one. An eighth
         // verifier proved that without it, un-scoping the anchor - or reverting the scoping commit
         // outright - left every test green, because a lone seeded point necessarily holds the
         // table's max id and the two anchors coincide.

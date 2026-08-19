@@ -430,6 +430,7 @@ internal fun RecordingEntryRoute(
             state = recordingPresentation.state,
             activeSessionId = recordingPresentation.activeSessionId,
             activeSessionStartedAt = recordingPresentation.activeSessionStartedAt,
+            activeSessionLastPointAt = recordingPresentation.activeSessionLastPointAt,
             bootedAtEpochMillis = appContainer.bootedAtEpochMillis(),
             startupReconciled = startupReconciled,
             activityResumed = activityResumed,
@@ -439,13 +440,11 @@ internal fun RecordingEntryRoute(
             null -> Unit
             is AbandonedExplorationAction.Resume -> resumeAbandonedRecording(action.sessionId)
             is AbandonedExplorationAction.Interrupt ->
+                // The action carries its own terminal instant; the route computes nothing, so there
+                // is no inline expression here for a fixture to miss.
                 interruptAbandonedRecording(
                     sessionId = action.sessionId,
-                    // When THIS session last recorded, falling back to its own start when it
-                    // never recorded at all. Dating the ending from now instead would publish the
-                    // hours the phone spent switched off as part of the exploration.
-                    stoppedRecordingAt = recordingPresentation.activeSessionLastPointAt
-                        ?: recordingPresentation.activeSessionStartedAt,
+                    stoppedRecordingAt = action.stoppedRecordingAt,
                 )
         }
     }
