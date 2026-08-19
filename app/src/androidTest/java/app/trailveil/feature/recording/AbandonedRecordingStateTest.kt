@@ -7,7 +7,9 @@ import android.location.LocationManager
 import android.os.SystemClock
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
+import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.sqlite.db.SupportSQLiteDatabase
 import androidx.test.core.app.ApplicationProvider
@@ -283,6 +285,59 @@ class AbandonedRecordingStateTest {
             composeRule.onNodeWithTag(RecordingEntryTestTags.Start).assertIsDisplayed()
             composeRule.onNodeWithTag(RecordingEntryTestTags.Stop).assertIsDisplayed()
         } finally {
+            sqlite.execSQL("DELETE FROM recording_sessions WHERE id = $sessionId")
+        }
+    }
+
+    @Test
+    fun aBlockedResumeRaisesItsBlockerAndNeverTheBackgroundStartGuidance() {
+        // A verifier proved the route seam this binds was otherwise bound by nothing: making the
+        // guidance raise unconditional - before the outcome, or ignoring it - was caught by no test,
+        // because no fixture ever produced a blocked resume. Location services are disabled before
+        // the screen rebuilds, so the route's own resume attempt is refused by preflight; the
+        // blocker's notice must show, and the guidance must not - not even after the blocker's
+        // notice is dismissed, which is the assertion that catches an unconditional raise (while the
+        // notice is up, visibility would mask it).
+        grant(Manifest.permission.ACCESS_COARSE_LOCATION)
+        grant(Manifest.permission.ACCESS_FINE_LOCATION)
+        shell("cmd location set-location-enabled false")
+
+        val sqlite = container.databaseForTesting().openHelper.writableDatabase
+        val sessionId = seedAbandonedSession(
+            sqlite,
+            deadRuntime = "runtime-behind-a-blocked-resume-$FIXTURE_SUFFIX",
+        )
+
+        try {
+            composeRule.activityRule.scenario.recreate()
+
+            var shown: String? = null
+            var waited = 0L
+            while (waited < STATE_SETTLE_MILLIS) {
+                composeRule.waitForIdle()
+                shown = publishedState()
+                if (shown == "ABANDONED") break
+                SystemClock.sleep(POLL_MILLIS)
+                waited += POLL_MILLIS
+            }
+            assertEquals("the blocked row must stay abandoned", "ABANDONED", shown)
+
+            composeRule.waitUntil(RECOVERY_TIMEOUT_MILLIS) {
+                composeRule.onAllNodesWithTag(RecordingEntryTestTags.LocationNotice)
+                    .fetchSemanticsNodes().isNotEmpty()
+            }
+            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
+                .assertDoesNotExist()
+
+            val notNow = InstrumentationRegistry.getInstrumentation()
+                .targetContext.getString(app.trailveil.R.string.permission_not_now)
+            composeRule.onNodeWithText(notNow).performClick()
+            composeRule.waitForIdle()
+            composeRule.onNodeWithTag(RecordingEntryTestTags.LocationNotice).assertDoesNotExist()
+            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
+                .assertDoesNotExist()
+        } finally {
+            shell("cmd location set-location-enabled true")
             sqlite.execSQL("DELETE FROM recording_sessions WHERE id = $sessionId")
         }
     }

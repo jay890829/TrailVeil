@@ -470,8 +470,9 @@ class RecordingPresentationTest {
     @Test
     fun aResumedExplorationThePlatformDidNotRestartEarnsTheBackgroundStartGuidance() {
         // The one input combination that is the whole feature: the app itself re-armed an abandoned
-        // exploration and the service start was actually requested. On a platform that restarts the
-        // sticky service this pair is unreachable, so reaching it is evidence about this device.
+        // exploration and the service start was actually requested. After an ordinary kill on a
+        // restarting platform this pair does not occur; force-stop, APK replacement, and the
+        // open-before-restart race can still produce it anywhere, which the card's wording carries.
         assertTrue(
             backgroundStartNoticeEarned(
                 action = AbandonedExplorationAction.Resume(7L),

@@ -237,9 +237,13 @@ internal fun abandonedExplorationAction(
  *
  * Earned by one event only: the app itself re-armed an exploration the platform had left abandoned
  * (`Resume`, and the service start was actually requested). On a platform that restarts the sticky
- * service this state is unreachable - recovery happens in seconds under the live token and the row
- * never presents as abandoned - so reaching it is evidence about THIS device, not a guess about
- * vendors. `Interrupt` must never earn it: no platform restarts a service across a reboot, so naming
+ * service, an ordinary kill never reaches this state - recovery happens in seconds under the live
+ * token and the row never presents as abandoned. Stock Android can still reach it three ways: a
+ * force-stop from app info cancels the sticky restart on every build, replacing the APK mid-recording
+ * leaves no restart (this app declares no receiver, so no MY_PACKAGE_REPLACED path), and opening the
+ * app in the seconds between a kill and the platform's restart wins a race. The card's wording
+ * carries those cases - it hedges with 部分裝置 and offers an exit for devices without the option -
+ * so the trigger is strong evidence, not proof, about this device. `Interrupt` must never earn it: no platform restarts a service across a reboot, so naming
  * a background-start setting there would be a lie about the device. A `Blocked` resume is explained
  * by its blocker, which raises its own notice the user must act on first.
  */

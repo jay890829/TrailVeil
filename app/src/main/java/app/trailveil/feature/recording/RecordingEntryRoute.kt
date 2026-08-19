@@ -215,7 +215,9 @@ internal fun RecordingEntryRoute(
             }
         }
         // Having to re-arm at all is the evidence: a platform that restarts the service recovers
-        // under the live token in seconds and this path is never reached.
+        // under the live token in seconds after an ordinary kill. Force-stop, an APK replacement,
+        // and the open-before-restart race reach here on any platform, which the card's hedged
+        // wording deliberately survives.
         if (backgroundStartNoticeEarned(action = action, resumeOutcome = outcome)) {
             backgroundStartNotice = true
         }
