@@ -52,8 +52,9 @@ jobs:
     # Sharding is a correctness requirement before a speed one: the hosted SwiftShader emulator
     # accumulates GL corruption and wedges deterministically after roughly 75 heavy map tests, so
     # no single emulator can carry the suite. Running the shards as parallel jobs rather than in
-    # sequence also hands each one a genuinely fresh emulator instead of a rebooted one, and takes
-    # the map package - 40 of the 51 minutes a sequential run cost - down to two halves.
+    # sequence also hands each one a genuinely fresh emulator instead of a rebooted one. The
+    # recording fixture is isolated for the same reason: its Compose hierarchy must not be measured
+    # after the rest shard has entered the cumulative GL-degradation zone.
     timeout-minutes: 90
     strategy:
       # Every shard reports. A failure in one must not hide the state of the others, which is the
@@ -71,9 +72,13 @@ jobs:
               -Pandroid.testInstrumentationRunnerArguments.package=app.trailveil.map
               -Pandroid.testInstrumentationRunnerArguments.numShards=2
               -Pandroid.testInstrumentationRunnerArguments.shardIndex=1
+          - name: recording-fixture
+            args: >-
+              -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.feature.recording.AbandonedRecordingStateTest
           - name: rest
             args: >-
               -Pandroid.testInstrumentationRunnerArguments.notPackage=app.trailveil.map
+              -Pandroid.testInstrumentationRunnerArguments.notClass=app.trailveil.feature.recording.AbandonedRecordingStateTest
 
     steps:
       - name: Check out repository
