@@ -79,6 +79,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assume
 import org.junit.Rule
@@ -6217,6 +6218,70 @@ class MapSurfaceTest {
      * deliberate seam guard from a filled region.
      */
     @Test
+    fun aDeadCaptureIsReportedAsEnvironmentRatherThanAsFogCoverage() {
+        // P4-042: the hosted emulator's GL surface dies under cumulative load and captures as pure
+        // black. Twice that reached the gesture audit as `overFogged=100.0000%` with the dark block
+        // spanning the whole frame - a fog verdict pronounced on a frame that contains no map at
+        // all. The comparator must name the environment instead, the same discipline P4-030
+        // established for bare references: prove the frame was painted before judging it.
+        val width = 16
+        val height = 16
+        fun coats(bare: Int, count: Int): Int {
+            var value = bare.toDouble()
+            repeat(count) { value *= FOG_TRANSMISSION }
+            return gray(value.toInt())
+        }
+
+        val brightBare = IntArray(width * height) { gray(200) }
+        val deadCapture = IntArray(width * height) { gray(0) }
+        val failure = assertThrows(AssertionError::class.java) {
+            compareFogCoverage(deadCapture, brightBare, width)
+        }
+        assertTrue(
+            "A dead capture was not named as an environment failure: ${failure.message}",
+            failure.message.orEmpty().contains("ENVIRONMENT"),
+        )
+
+        // The other direction, which is the point: a REAL double coat over the same bright bare
+        // still transmits light, so it must still be judged as fog rather than swallowed by the
+        // liveness guard. Without this half the guard could silently disarm the detector it
+        // protects.
+        val genuineDoubleCoat = IntArray(width * height) { coats(200, 2) }
+        assertEquals(
+            "The liveness guard swallowed a genuine full-frame double coat",
+            1.0,
+            compareFogCoverage(genuineDoubleCoat, brightBare, width).overFoggedFraction,
+            0.0,
+        )
+
+        // And a frame that is dark because the MAP is dark - ocean at night, no bright bare pixels
+        // to judge - must not be mistaken for a dead surface: the guard requires bright bare
+        // pixels, so this stays a fog measurement (the dark-block measure below owns it).
+        val oceanBare = IntArray(width * height) { gray(22) }
+        val oceanTwoCoats = IntArray(width * height) { coats(22, 2) }
+        assertEquals(
+            "A legitimately dark scene was misclassified as a dead capture",
+            1.0,
+            compareFogCoverage(oceanTwoCoats, oceanBare, width).darkBlockOverFoggedFraction,
+            0.0,
+        )
+
+        // The guard's arithmetic on a TINY fixture, pinned because the first draft got it wrong:
+        // `bare.size / DIVISOR` integer-divides to zero on a 4-pixel frame, so an all-dark
+        // reference satisfied `0 >= 0` and the guard fired where it has no bright pixel to reason
+        // from. The sibling calibration test caught that; this pins it here too, next to the guard
+        // it belongs to.
+        val tinyDarkBare = intArrayOf(gray(18), gray(22), gray(26), gray(28))
+        val tinyFogged = intArrayOf(gray(5), gray(6), tinyDarkBare[2], gray(8))
+        assertEquals(
+            "The dead-capture guard fired on a tiny all-dark fixture with no bright bare pixel",
+            0.25,
+            compareFogCoverage(tinyFogged, tinyDarkBare, width = 2).uncoveredFraction,
+            0.0,
+        )
+    }
+
+    @Test
     fun theOverFogDetectorFiresOnADoubleCoatIncludingOverDarkOcean() {
         val width = 16
         val height = 16
@@ -6524,6 +6589,41 @@ class MapSurfaceTest {
 
     private fun compareFogCoverage(fogged: IntArray, bare: IntArray, width: Int): FogAudit {
         assertEquals("Snapshot sizes differ", bare.size, fogged.size)
+        // P4-042: a dead GL surface (the hosted emulator's cumulative ColorBuffer death) captures as
+        // pure black, which the over-fog arithmetic then reads as the whole screen under two coats -
+        // twice it produced overFogged=100% with the dark block spanning the full frame. A capture
+        // with NO light at all where the bare reference is bright is not a fog verdict: two coats
+        // over a bright pixel still transmit ~FOG_TRANSMISSION^2 (>=10 luminance over bare 128; ~20
+        // over 255), so a max under DEAD_CAPTURE_MAX_LUMINANCE across every bright-bare pixel has no
+        // fog explanation. (Boundary owned and documented: a uniform TRIPLE coat over a dim scene
+        // could in principle land near ~5 - that class has never occurred, and naming it as
+        // environment would still stop the run for a human, which is the correct failure mode.)
+        var brightBare = 0L
+        var maxFoggedOverBrightBare = 0
+        bare.indices.forEach { index ->
+            if (luminance(bare[index]) >= DEAD_CAPTURE_BRIGHT_BARE_FLOOR) {
+                brightBare += 1L
+                val fogLuminance = luminance(fogged[index])
+                if (fogLuminance > maxFoggedOverBrightBare) maxFoggedOverBrightBare = fogLuminance
+            }
+        }
+        // Multiplied rather than divided, and gated on there being ANY bright pixel at all: the
+        // first draft wrote `brightBare >= bare.size / DIVISOR`, which integer-divides to 0 on the
+        // small synthetic fixtures in this file, so a 4-pixel dark-ocean case satisfied `0 >= 0`
+        // and the guard fired on a frame it has nothing to say about. The sibling calibration test
+        // caught it immediately, which is the whole reason that test exists.
+        if (
+            brightBare > 0L &&
+            brightBare * DEAD_CAPTURE_MINIMUM_BRIGHT_FRACTION_DIVISOR >= bare.size &&
+            maxFoggedOverBrightBare <= DEAD_CAPTURE_MAX_LUMINANCE
+        ) {
+            throw AssertionError(
+                "ENVIRONMENT, not a fog verdict: the capture contains no light at all over " +
+                    "$brightBare bright bare pixels (max fogged luminance " +
+                    "$maxFoggedOverBrightBare) - a dead GL surface, the hosted emulator's " +
+                    "ColorBuffer death (P4-042), cannot be judged for fog coverage",
+            )
+        }
         var uncovered = 0L
         var drawn = 0L
         var worstRatio = 0.0
@@ -7583,6 +7683,16 @@ class MapSurfaceTest {
          * is exactly the range that produced scattered false positives before this bound.
          */
         const val MINIMUM_BARE_FOR_OVER_FOG = 30
+
+        /**
+         * P4-042 dead-capture detection: over bare pixels at least this bright, any real fog stack
+         * still transmits light (two coats over 128 >= ~10), so a maximum at or below
+         * [DEAD_CAPTURE_MAX_LUMINANCE] across at least 1/[DEAD_CAPTURE_MINIMUM_BRIGHT_FRACTION_DIVISOR]
+         * of the frame is a dead GL surface, not fog.
+         */
+        const val DEAD_CAPTURE_BRIGHT_BARE_FLOOR = 128
+        const val DEAD_CAPTURE_MAX_LUMINANCE = 3
+        const val DEAD_CAPTURE_MINIMUM_BRIGHT_FRACTION_DIVISOR = 100
 
         /**
          * Block edge for the floor-free over-fog measure. Sixteen samples average away the one-level
