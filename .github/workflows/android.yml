@@ -52,9 +52,10 @@ jobs:
     # Sharding is a correctness requirement before a speed one: the hosted SwiftShader emulator
     # accumulates GL corruption and wedges deterministically after roughly 75 heavy map tests, so
     # no single emulator can carry the suite. Running the shards as parallel jobs rather than in
-    # sequence also hands each one a genuinely fresh emulator instead of a rebooted one. The
-    # recording fixture is isolated for the same reason: its Compose hierarchy must not be measured
-    # after the rest shard has entered the cumulative GL-degradation zone.
+    # sequence also hands each one a genuinely fresh emulator instead of a rebooted one. The single
+    # recording fixture is isolated for a different causal requirement: it establishes platform and
+    # Room preconditions before this process launches its first Activity, then audits that first
+    # composition. Running it after any auto-launched Activity would invalidate that fixture.
     timeout-minutes: 90
     strategy:
       # Every shard reports. A failure in one must not hide the state of the others, which is the
@@ -74,11 +75,11 @@ jobs:
               -Pandroid.testInstrumentationRunnerArguments.shardIndex=1
           - name: recording-fixture
             args: >-
-              -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.feature.recording.AbandonedRecordingStateTest
+              -Pandroid.testInstrumentationRunnerArguments.class=app.trailveil.feature.recording.BlockedResumeComposeTest
           - name: rest
             args: >-
               -Pandroid.testInstrumentationRunnerArguments.notPackage=app.trailveil.map
-              -Pandroid.testInstrumentationRunnerArguments.notClass=app.trailveil.feature.recording.AbandonedRecordingStateTest
+              -Pandroid.testInstrumentationRunnerArguments.notClass=app.trailveil.feature.recording.BlockedResumeComposeTest
 
     steps:
       - name: Check out repository
