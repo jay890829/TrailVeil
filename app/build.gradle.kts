@@ -204,6 +204,16 @@ val activeInstrumentationSelectionArguments = gradle.startParameter.projectPrope
     .filter { name -> name in instrumentationSelectionArgumentNames }
     .toSet()
 var connectedDebugRunStartedAtMillis: Long? = null
+// P4-039: the JVM drift test reads the instrumentation manifest and the androidTest sources at
+// runtime. Declared as inputs so the unit-test task re-runs when they change - without this, adding
+// an undeclared @Test left the task UP-TO-DATE and the detector silently never looked.
+tasks.withType<Test>().configureEach {
+    inputs.file("$projectDir/src/androidTest/instrumentation-test-manifest.txt")
+        .withPropertyName("instrumentationTestManifestForDriftCheck")
+    inputs.dir("$projectDir/src/androidTest/java")
+        .withPropertyName("androidTestSourcesForDriftCheck")
+}
+
 val verifyDebugAndroidTestManifest = tasks.register("verifyDebugAndroidTestManifest") {
     group = "verification"
     description = "Fails when the unfiltered debug instrumentation run omits or adds a declared test"
