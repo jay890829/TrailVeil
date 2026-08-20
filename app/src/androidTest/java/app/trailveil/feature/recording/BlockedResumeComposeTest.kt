@@ -147,9 +147,23 @@ class BlockedResumeComposeTest {
         }
         throw AssertionError(
             "Timed out waiting for $label: lifecycle=$lifecycleState " +
-                "publishedState=$publishedState decor=$decorState lastError=$lastError",
+                "publishedState=$publishedState decor=$decorState lastError=$lastError " +
+                "focus=[${currentWindowFocus()}]",
         )
     }
+
+    /** Who actually holds window focus, so a stuck-below-RESUMED red names its occluder itself. */
+    private fun currentWindowFocus(): String = runCatching {
+        val descriptor = InstrumentationRegistry.getInstrumentation().uiAutomation
+            .executeShellCommand("dumpsys window")
+        FileInputStream(descriptor.fileDescriptor).use { stream ->
+            stream.bufferedReader().lineSequence()
+                .filter { line ->
+                    "mCurrentFocus" in line || "mFocusedApp" in line || "mHoldingScreen" in line
+                }
+                .joinToString(" | ") { it.trim() }
+        }
+    }.getOrElse { failure -> "unavailable: $failure" }
 
     private fun awaitPublishedState(
         scenario: ActivityScenario<MainActivity>,
@@ -238,6 +252,11 @@ class BlockedResumeComposeTest {
     }
 
     private fun wakeAndUnlockDevice() {
+        // Stay-awake, not only wake: the hosted run after the one-time wake still lost the activity
+        // to STARTED mid-test (run 32369871624) - consistent with the fresh AVD's short display
+        // timeout re-sleeping the screen while the fixture polls. Charger stay-awake is a device
+        // debug setting scoped to the emulator instance, appropriate for a test precondition.
+        shell("svc power stayon true")
         shell("input keyevent 224") // KEYCODE_WAKEUP
         shell("wm dismiss-keyguard")
         shell("input keyevent 82") // Emulator-compatible KEYCODE_MENU unlock fallback.
