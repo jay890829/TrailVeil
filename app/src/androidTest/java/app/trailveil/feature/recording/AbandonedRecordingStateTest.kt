@@ -299,24 +299,29 @@ class AbandonedRecordingStateTest {
     fun aBlockedResumeRaisesItsBlockerAndNeverTheBackgroundStartGuidance() {
         // A verifier proved the route seam this binds was otherwise bound by nothing: making the
         // guidance raise unconditional - before the outcome, or ignoring it - was caught by no test,
-        // because no fixture ever produced a blocked resume. Location services are disabled before
-        // the screen rebuilds, so the route's own resume attempt is refused by preflight; the
-        // blocker's notice must show, and the guidance must not - not even after the blocker's
-        // notice is dismissed, which is the assertion that catches an unconditional raise (while the
+        // because no fixture ever produced a blocked resume. Location services are disabled while
+        // the already-visible screen is settling, so the route's own resume attempt is refused by
+        // the preflight; the blocker's notice must show, and the guidance must not - not even after
+        // the notice is dismissed, which is the assertion that catches an unconditional raise (while the
         // notice is up, visibility would mask it).
         grant(Manifest.permission.ACCESS_COARSE_LOCATION)
         grant(Manifest.permission.ACCESS_FINE_LOCATION)
         shell("cmd location set-location-enabled false")
 
         val sqlite = container.databaseForTesting().openHelper.writableDatabase
-        val sessionId = seedAbandonedSession(
-            sqlite,
-            deadRuntime = "runtime-behind-a-blocked-resume-$FIXTURE_SUFFIX",
-        )
+        // ActivityScenarioRule has already launched this Activity before the test method. Seed the
+        // orphan atomically so Room invalidates after both the ACTIVE session and its open segment
+        // exist; the history flow then drives the same ABANDONED presentation without a lifecycle
+        // round-trip on a degraded emulator.
+        var sessionId = 0L
+        container.databaseForTesting().runInTransaction {
+            sessionId = seedAbandonedSession(
+                sqlite,
+                deadRuntime = "runtime-behind-a-blocked-resume-$FIXTURE_SUFFIX",
+            )
+        }
 
         try {
-            composeRule.activityRule.scenario.recreate()
-
             var shown: String? = null
             var waited = 0L
             while (waited < STATE_SETTLE_MILLIS) {
@@ -328,18 +333,28 @@ class AbandonedRecordingStateTest {
             }
             assertEquals("the blocked row must stay abandoned", "ABANDONED", shown)
 
-            // The route's own automatic attempt has already run and been refused by now - the row
-            // settled on ABANDONED - but WHICH blocker refused it is a race on the hosted emulator:
-            // a slow recreate can lose to the visibility check (ACTIVITY_NOT_VISIBLE raises no
-            // notice at all, CI runs 32334497740 and 32336297314), while a fast one reaches the
-            // location check. The guidance card must be absent under either blocker, so that is
-            // asserted directly; the notice half is then driven by a USER start, whose timing the
-            // test owns - it reaches the same preflight and the same LOCATION_DISABLED refusal.
-            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
-                .assertDoesNotExist()
+            // The decor tag above is intentionally independent of Compose semantics. After the
+            // platform-wide location toggle, the Activity can publish the new state a beat before
+            // the test owner sees its hierarchy. Prove that a real screen root is present before
+            // any absence assertion; otherwise `assertDoesNotExist` could pass without observing
+            // the production UI at all.
+            var screenReady = false
+            var screenWaited = 0L
+            while (screenWaited < RECOVERY_TIMEOUT_MILLIS) {
+                composeRule.waitForIdle()
+                screenReady = runCatching {
+                    composeRule.onAllNodesWithTag(RecordingEntryTestTags.Menu)
+                        .fetchSemanticsNodes().isNotEmpty()
+                }.getOrDefault(false)
+                if (screenReady) break
+                SystemClock.sleep(POLL_MILLIS)
+                screenWaited += POLL_MILLIS
+            }
+            assertTrue("the blocked screen never exposed a Compose hierarchy", screenReady)
 
-            composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
-            composeRule.onNodeWithTag(RecordingEntryTestTags.Start).performClick()
+            // No user input has occurred. Requiring this notice therefore proves that the route's
+            // automatic Abandoned Resume ran and returned LOCATION_DISABLED; ABANDONED alone would
+            // prove only presentation, and a later user Start would exercise a different function.
             var noticeShown = false
             var noticeWaited = 0L
             while (noticeWaited < RECOVERY_TIMEOUT_MILLIS) {
@@ -352,7 +367,7 @@ class AbandonedRecordingStateTest {
                 SystemClock.sleep(POLL_MILLIS)
                 noticeWaited += POLL_MILLIS
             }
-            assertTrue("the blocker's notice never appeared after a user start", noticeShown)
+            assertTrue("the automatic blocked resume never raised its location notice", noticeShown)
             composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
                 .assertDoesNotExist()
 
