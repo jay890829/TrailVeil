@@ -14,8 +14,9 @@ import org.junit.Test
  *
  * Parsing contract, kept in step with the sources by the assertions themselves: every `@Test` in
  * `app/src/androidTest/java` sits inside a single top-level class per file whose name matches the
- * file name, packages mirror directories, and functions are declared as `fun name(` on the line
- * after (or the same line as) the annotation. A parse miss shows up as a set difference, so the
+ * file name, packages mirror directories, and the annotation binds to the next `fun name(` match -
+ * on the same line or any later line (so interleaved annotations are fine; an interleaved comment
+ * containing `fun x(` would over-match, which no source file does). A parse miss shows up as a set difference, so the
  * failure message names exactly which side is wrong.
  */
 class InstrumentationManifestDriftTest {

@@ -32,20 +32,32 @@ class RecordingPlatformContractTest {
         )
         val permissions = packageInfo.requestedPermissions.orEmpty().toSet()
 
-        assertTrue(Manifest.permission.FOREGROUND_SERVICE in permissions)
-        assertTrue(Manifest.permission.FOREGROUND_SERVICE_LOCATION in permissions)
-        assertTrue(Manifest.permission.ACCESS_COARSE_LOCATION in permissions)
-        assertTrue(Manifest.permission.ACCESS_FINE_LOCATION in permissions)
-        assertTrue(Manifest.permission.POST_NOTIFICATIONS in permissions)
-        // P4-041: declared so the Allow-all-the-time grade exists, letting a sticky restart re-arm
-        // location from the background (measured: refused at While-in-use, recovered at all-the-time
-        // on the reference device). PLAN's privacy section names this single purpose; the app never
-        // shows a prompt for it, and recording still starts only from a visible activity. This
-        // contract test fired on the declaration exactly as designed - it pins the posture, and the
-        // posture changed with a recorded PLAN entry rather than silently.
-        assertTrue(Manifest.permission.ACCESS_BACKGROUND_LOCATION in permissions)
-        assertFalse(Manifest.permission.RECEIVE_BOOT_COMPLETED in permissions)
-        assertFalse(Manifest.permission.WAKE_LOCK in permissions)
+        // Set-equality, so the name's "exactly" is what the assertion holds: any permission added
+        // to or removed from the manifest fails here by name, not only the two the old denylist
+        // happened to watch. ACCESS_BACKGROUND_LOCATION is P4-041's: declared so the
+        // Allow-all-the-time grade exists, letting a sticky restart re-arm location from the
+        // background (measured: refused at While-in-use, recovered at all-the-time on the reference
+        // device). PLAN's privacy section names its single purpose; the app never prompts for it,
+        // and recording still starts only from a visible activity. This test fired on the
+        // declaration exactly as designed - the posture changed with a recorded PLAN entry rather
+        // than silently.
+        assertEquals(
+            setOf(
+                Manifest.permission.FOREGROUND_SERVICE,
+                Manifest.permission.FOREGROUND_SERVICE_LOCATION,
+                Manifest.permission.ACCESS_COARSE_LOCATION,
+                Manifest.permission.ACCESS_FINE_LOCATION,
+                Manifest.permission.ACCESS_BACKGROUND_LOCATION,
+                Manifest.permission.POST_NOTIFICATIONS,
+                Manifest.permission.INTERNET,
+                Manifest.permission.ACCESS_NETWORK_STATE,
+                // Injected by the build toolchain for apps registering non-exported dynamic
+                // receivers on targetSdk 34+; not declared in our manifest. Listed so the equality
+                // stays strict - if the toolchain stops injecting it, this fires and says why.
+                "app.trailveil.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION",
+            ).filterTo(sortedSetOf()) { true },
+            permissions.toSortedSet(),
+        )
 
         val service = context.packageManager.getServiceInfo(
             ComponentName(context, RecordingForegroundService::class.java),
