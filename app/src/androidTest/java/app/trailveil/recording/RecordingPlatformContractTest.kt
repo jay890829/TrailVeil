@@ -23,7 +23,7 @@ class RecordingPlatformContractTest {
     private val context: Context = ApplicationProvider.getApplicationContext()
 
     @Test
-    fun manifestDeclaresOnlyForegroundLocationCapabilitiesAndPrivateService() {
+    fun manifestDeclaresExactlyTheLocationCapabilitiesPlanNamesAndAPrivateService() {
         val packageInfo = context.packageManager.getPackageInfo(
             context.packageName,
             PackageManager.PackageInfoFlags.of(
@@ -37,7 +37,13 @@ class RecordingPlatformContractTest {
         assertTrue(Manifest.permission.ACCESS_COARSE_LOCATION in permissions)
         assertTrue(Manifest.permission.ACCESS_FINE_LOCATION in permissions)
         assertTrue(Manifest.permission.POST_NOTIFICATIONS in permissions)
-        assertFalse(Manifest.permission.ACCESS_BACKGROUND_LOCATION in permissions)
+        // P4-041: declared so the Allow-all-the-time grade exists, letting a sticky restart re-arm
+        // location from the background (measured: refused at While-in-use, recovered at all-the-time
+        // on the reference device). PLAN's privacy section names this single purpose; the app never
+        // shows a prompt for it, and recording still starts only from a visible activity. This
+        // contract test fired on the declaration exactly as designed - it pins the posture, and the
+        // posture changed with a recorded PLAN entry rather than silently.
+        assertTrue(Manifest.permission.ACCESS_BACKGROUND_LOCATION in permissions)
         assertFalse(Manifest.permission.RECEIVE_BOOT_COMPLETED in permissions)
         assertFalse(Manifest.permission.WAKE_LOCK in permissions)
 
