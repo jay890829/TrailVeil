@@ -191,3 +191,42 @@ internal fun createDatabaseInvariantTriggers(database: SupportSQLiteDatabase) {
     createSessionInvariantTriggers(database)
     segmentInvariantTriggerSql.forEach(database::execSQL)
 }
+
+/**
+ * `P4-036`'s derived column, kept honest by the database rather than by every writer remembering.
+ *
+ * Deliberately NOT part of [createDatabaseInvariantTriggers]: that function is called from a
+ * pre-v7 migration, where `lat_bucket` does not exist yet. SQLite resolves trigger columns lazily,
+ * so such a trigger is ACCEPTED at CREATE time and fails only later when it fires — a latent break
+ * instead of a loud one. This is called from the open callback and from `MIGRATION_6_7` only.
+ *
+ * The failure it prevents is silent in the worst way: a row whose bucket disagrees with its
+ * latitude drops out of the fog viewport read, which draws MORE fog than it should, and every leak
+ * audit in the suite accepts extra fog.
+ */
+internal fun createTrackPointInvariantTriggers(database: SupportSQLiteDatabase) {
+    trackPointBucketTriggerSql.forEach(database::execSQL)
+}
+
+private val trackPointBucketTriggerSql = listOf(
+    """
+    CREATE TRIGGER IF NOT EXISTS track_points_lat_bucket_insert
+    AFTER INSERT ON track_points
+    FOR EACH ROW WHEN NEW.lat_bucket != CAST((NEW.latitude + 90.0) * 500.0 AS INTEGER)
+    BEGIN
+        UPDATE track_points
+        SET lat_bucket = CAST((NEW.latitude + 90.0) * 500.0 AS INTEGER)
+        WHERE id = NEW.id;
+    END
+    """.trimIndent(),
+    """
+    CREATE TRIGGER IF NOT EXISTS track_points_lat_bucket_update
+    AFTER UPDATE OF latitude, lat_bucket ON track_points
+    FOR EACH ROW WHEN NEW.lat_bucket != CAST((NEW.latitude + 90.0) * 500.0 AS INTEGER)
+    BEGIN
+        UPDATE track_points
+        SET lat_bucket = CAST((NEW.latitude + 90.0) * 500.0 AS INTEGER)
+        WHERE id = NEW.id;
+    END
+    """.trimIndent(),
+)

@@ -29,11 +29,19 @@ class FogViewportReadCostTest {
 
     @Before
     fun setUp() {
+        // Opened with the invariant callback, exactly as production opens it. This matters twice
+        // over. The fixture writes raw SQL, so `P4-036`'s derived bucket arrives only if the
+        // trigger repairs it - built without the callback, every seeded row kept an unset bucket
+        // and the bucketed read returned nothing at all, which is precisely the silent shape the
+        // trigger exists to prevent. And the callback also holds the session and segment
+        // invariants to the real rules, which caught this fixture seeding a COMPLETED session that
+        // had never ended: rows in a shape the app cannot produce are not evidence about the app.
         database = Room.inMemoryDatabaseBuilder(
             ApplicationProvider.getApplicationContext(),
             TrailVeilDatabase::class.java,
         )
             .allowMainThreadQueries()
+            .addCallback(TrailVeilDatabase.invariantCallback)
             .build()
     }
 
@@ -42,14 +50,34 @@ class FogViewportReadCostTest {
         database.close()
     }
 
-    /** The production query's plan, read from the database it will actually run against. */
-    private fun productionQueryPlan(): String =
+    /**
+     * The production query's plan, read from the database it will actually run against.
+     *
+     * The bucket list is expanded into placeholders the way Room expands `IN (:latitudeBuckets)`,
+     * so the plan measured here is the plan the app gets rather than a hand-written approximation.
+     */
+    private fun productionQueryPlan(): String {
+        val buckets = requireNotNull(LatitudeBuckets.covering(BOX_SOUTH, BOX_NORTH))
+        val sql = "EXPLAIN QUERY PLAN " + FOG_POINTS_SQL.format(buckets.joinToString(",") { "?" })
+        val arguments = buildList<Any> {
+            buckets.forEach { add(it) }
+            add(BOX_WEST)
+            add(BOX_EAST)
+            add(BOX_SOUTH)
+            add(BOX_NORTH)
+        }.toTypedArray()
+        return database.openHelper.readableDatabase.query(sql, arguments).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(cursor.getString(cursor.columnCount - 1))
+            }
+        }.joinToString(" | ")
+    }
+
+    /** The fallback's plan, for the band too tall to spell as equalities. */
+    private fun fallbackQueryPlan(): String =
         database.openHelper.readableDatabase.query(
-            "EXPLAIN QUERY PLAN " + FOG_POINTS_SQL,
-            // south, north, west, east - the order Room binds the generated SQL's placeholders
-            // in, which is not the order the DAO's parameter list declares. The plan is unaffected
-            // by the values; the returned-row assertions below are not, so this order matters.
-            arrayOf<Any>(25.020, 25.068, 121.470, 121.546),
+            "EXPLAIN QUERY PLAN " + FOG_POINTS_RANGE_SQL,
+            arrayOf<Any>(BOX_SOUTH, BOX_NORTH, BOX_WEST, BOX_EAST),
         ).use { cursor ->
             buildList {
                 while (cursor.moveToNext()) add(cursor.getString(cursor.columnCount - 1))
@@ -64,7 +92,7 @@ class FogViewportReadCostTest {
 
         assertTrue(
             "the fog viewport read still plans as a table scan: $plan",
-            plan.contains("index_track_points_latitude_longitude"),
+            plan.contains("index_track_points_lat_bucket_longitude"),
         )
         // The plan names track_points by its query alias, so a scan of it reads "SCAN p" - which
         // is what a dropped index produces, and what an assertion looking for "SCAN track_points"
@@ -91,24 +119,53 @@ class FogViewportReadCostTest {
      * work cannot land while the ledger still describes a one-dimensional bound.
      */
     @Test
-    fun theEngineReportsTheViewportScanBoundedByLatitudeAlone() {
+    fun theEngineReportsTheViewportScanBoundedByBothDimensions() {
         insertConcentratedTrack()
 
         val plan = productionQueryPlan()
 
         assertTrue(
-            "the fog viewport read no longer searches through the box index: $plan",
-            plan.contains("USING INDEX index_track_points_latitude_longitude"),
+            "the fog viewport read no longer searches through the spatial index: $plan",
+            plan.contains("USING INDEX index_track_points_lat_bucket_longitude"),
+        )
+        // P4-036 delivered the two-dimensional bound this assertion used to record the absence of.
+        // The engine now names BOTH columns in its own constraint list - the latitude band arrives
+        // as an equality (an IN list is a set of equalities, which is why the next index column can
+        // still be range-bounded) and the longitude box narrows the scan inside it. If a future
+        // change loses either half, this fails and says which.
+        assertTrue(
+            "the engine no longer reports the latitude bucket as an equality: $plan",
+            plan.contains("lat_bucket=?"),
         )
         assertTrue(
-            "the engine now reports a different constraint list for the viewport scan, so the " +
-                "one-dimensional bound this entry records is out of date: $plan",
-            plan.contains("(latitude>? AND latitude<?)"),
+            "the engine no longer constrains the scan by longitude, so the read is one-dimensional " +
+                "again: $plan",
+            plan.contains("longitude>? AND longitude<?"),
+        )
+        // The fallback DOES plan as a scan now, and that is the deliberate trade rather than an
+        // oversight: `P4-036` retired the `(latitude, longitude)` index because keeping both cost
+        // a measured +15.3% on every write, and dropping it paid for the new one exactly. The
+        // fallback only runs for a band taller than about 1.3 degrees, which is coarser than any
+        // zoom where an index helps at all - the box already contains the whole table there, and
+        // all candidate designs measured 1.00x. Asserted rather than assumed so the trade stays
+        // visible: if the fallback ever starts running at an exploration zoom, this says so.
+        val fallback = fallbackQueryPlan()
+        assertTrue(
+            "the fallback viewport read unexpectedly found an index: $fallback",
+            fallback.contains("SCAN p"),
         )
         // And the band is narrowing real work, not merely named in a plan: half this table lies
         // outside it and must not come back.
         val returned = rowsReturnedForTheBox()
         val total = totalRows()
+        // The bucket narrows the scan; it must never decide the answer. Both routes carry the same
+        // latitude and longitude predicates, so a disagreement here means the equality set dropped
+        // a stripe - an under-read, which draws MORE fog and so passes every leak audit.
+        assertEquals(
+            "the bucketed read and its fallback disagree about the box's contents",
+            rowsReturnedByTheFallback(),
+            returned,
+        )
         assertEquals(
             "the viewport box returned rows from outside the queried band: $returned of $total",
             CONCENTRATED_POINTS,
@@ -163,10 +220,25 @@ class FogViewportReadCostTest {
     }
 
     /** How many rows the production query actually returns for the queried box. */
-    private fun rowsReturnedForTheBox(): Int =
+    private fun rowsReturnedForTheBox(): Int {
+        val buckets = requireNotNull(LatitudeBuckets.covering(BOX_SOUTH, BOX_NORTH))
+        val sql = FOG_POINTS_SQL.format(buckets.joinToString(",") { "?" })
+        val arguments = buildList<Any> {
+            buckets.forEach { add(it) }
+            add(BOX_WEST)
+            add(BOX_EAST)
+            add(BOX_SOUTH)
+            add(BOX_NORTH)
+        }.toTypedArray()
+        return database.openHelper.readableDatabase.query(sql, arguments)
+            .use { cursor -> cursor.count }
+    }
+
+    /** The same rows by the fallback route, so "the bucket never changes the answer" is measured. */
+    private fun rowsReturnedByTheFallback(): Int =
         database.openHelper.readableDatabase.query(
-            FOG_POINTS_SQL,
-            arrayOf<Any>(25.020, 25.068, 121.470, 121.546),
+            FOG_POINTS_RANGE_SQL,
+            arrayOf<Any>(BOX_SOUTH, BOX_NORTH, BOX_WEST, BOX_EAST),
         ).use { cursor -> cursor.count }
 
     private fun totalRows(): Int =
@@ -179,9 +251,13 @@ class FogViewportReadCostTest {
     private fun insertSession(): Long =
         database.openHelper.writableDatabase.let { db ->
             db.execSQL(
-                "INSERT INTO recording_sessions (started_at, status, distance_meters, " +
+                // A finished session as the invariants define one: COMPLETED carries an ended_at
+                // and holds no active slot. The counts stay at zero deliberately - this fixture
+                // measures the fog read's plan, and the summary columns are another entry's
+                // subject; the triggers require only that they be non-negative.
+                "INSERT INTO recording_sessions (started_at, status, ended_at, distance_meters, " +
                     "accepted_point_count, rejected_point_count, created_app_version) " +
-                    "VALUES (1, 'COMPLETED', 0.0, 0, 0, 'test')",
+                    "VALUES (1, 'COMPLETED', 2, 0.0, 0, 0, 'test')",
             )
             db.query("SELECT last_insert_rowid()").use { cursor ->
                 cursor.moveToFirst()
@@ -192,8 +268,10 @@ class FogViewportReadCostTest {
     private fun insertSegment(sessionId: Long): Long =
         database.openHelper.writableDatabase.let { db ->
             db.execSQL(
-                "INSERT INTO track_segments (session_id, sequence, started_at, start_reason) " +
-                    "VALUES ($sessionId, 0, 1, 'test')",
+                // Closed to match its session: a segment is either open (no ended_at, no
+                // end_reason, open_slot 1) or closed with both - the invariants reject the halves.
+                "INSERT INTO track_segments (session_id, sequence, started_at, start_reason, " +
+                    "ended_at, end_reason) VALUES ($sessionId, 0, 1, 'test', 2, 'test')",
             )
             db.query("SELECT last_insert_rowid()").use { cursor ->
                 cursor.moveToFirst()
@@ -226,9 +304,36 @@ class FogViewportReadCostTest {
     private companion object {
         const val CONCENTRATED_POINTS = 20_000
 
+        /** The viewport box every measurement here uses; the concentrated track sits inside it. */
+        const val BOX_SOUTH = 25.020
+        const val BOX_NORTH = 25.068
+        const val BOX_WEST = 121.470
+        const val BOX_EAST = 121.546
+
         /** As many again, far outside the queried latitude band, so the band has work to exclude. */
         const val DECOY_POINTS = 20_000
+        /** The bucketed production query `P4-036` shipped; see [FOG_POINTS_RANGE_SQL] for its
+         *  fallback twin, which is the same answer by the older, one-dimensional route. */
         val FOG_POINTS_SQL = """
+            SELECT
+                p.id AS point_id,
+                p.session_id AS session_id,
+                p.segment_id AS segment_id,
+                s.sequence AS segment_sequence,
+                p.sequence AS point_sequence,
+                p.latitude AS latitude,
+                p.longitude AS longitude
+            FROM track_points p
+            INNER JOIN track_segments s
+                ON s.id = p.segment_id AND s.session_id = p.session_id
+            WHERE p.lat_bucket IN (%s)
+                AND p.longitude BETWEEN ? AND ?
+                AND p.latitude BETWEEN ? AND ?
+            ORDER BY p.session_id ASC, s.sequence ASC, p.sequence ASC, p.id ASC
+        """.trimIndent()
+
+        /** The fallback for a band too tall to spell as equalities: identical predicates, older plan. */
+        val FOG_POINTS_RANGE_SQL = """
             SELECT
                 p.id AS point_id,
                 p.session_id AS session_id,

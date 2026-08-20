@@ -291,6 +291,86 @@ class TrailVeilDatabaseMigrationTest {
         )
         migrated.close()
     }
+
+    @Test
+    fun migrate6To7BackfillsTheLatitudeBucketAndSwapsTheIndex() {
+        // P4-036. Three things must hold together, and the third is the one a migration usually
+        // forgets: the column exists, EXISTING rows carry a correct value rather than the DEFAULT,
+        // and the superseded index is gone so nothing can silently keep planning through it.
+        migrationHelper.createDatabase("migration-p4-036", 6).use { old ->
+            old.execSQL(
+                "INSERT INTO recording_sessions(id, started_at, status, distance_meters, " +
+                    "accepted_point_count, rejected_point_count, created_app_version, active_slot) " +
+                    "VALUES(1, 1000, 'ACTIVE', 0, 0, 0, 'migration-test', 1)",
+            )
+            old.execSQL(
+                "INSERT INTO track_segments(id, session_id, sequence, started_at, start_reason, " +
+                    "open_slot) VALUES(1, 1, 0, 1000, 'SESSION_START', 1)",
+            )
+            listOf(25.0330, -33.8688, 0.0, 89.9).forEachIndexed { index, latitude ->
+                old.execSQL(
+                    "INSERT INTO track_points(id, session_id, segment_id, sequence, timestamp, " +
+                        "latitude, longitude, horizontal_accuracy) VALUES(" +
+                        "${index + 1}, 1, 1, $index, ${1000 + index}, $latitude, 121.5, 5.0)",
+                )
+            }
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            "migration-p4-036",
+            7,
+            true,
+            MIGRATION_6_7,
+        )
+
+        // Backfilled, not defaulted: a row left at 0 would silently vanish from the fog read, which
+        // draws MORE fog and therefore passes every leak audit in the suite.
+        val buckets = migrated.query(
+            "SELECT latitude, lat_bucket FROM track_points ORDER BY id",
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(cursor.getDouble(0) to cursor.getInt(1))
+            }
+        }
+        buckets.forEach { (latitude, bucket) ->
+            assertEquals(
+                "row at latitude $latitude kept the column default instead of its bucket",
+                LatitudeBuckets.of(latitude),
+                bucket,
+            )
+        }
+        val indexes = migrated.query(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN " +
+                "('index_track_points_lat_bucket_longitude', " +
+                "'index_track_points_latitude_longitude') ORDER BY name",
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(cursor.getString(0))
+            }
+        }
+        assertEquals(listOf("index_track_points_lat_bucket_longitude"), indexes)
+
+        // And the trigger the migration installs actually fires, so a writer that forgets the
+        // column cannot leave the database inconsistent.
+        migrated.execSQL(
+            "INSERT INTO track_points(id, session_id, segment_id, sequence, timestamp, latitude, " +
+                "longitude, horizontal_accuracy, lat_bucket) VALUES(" +
+                "99, 1, 1, 99, 9999, 51.5074, -0.1278, 5.0, 0)",
+        )
+        val repaired = migrated.query(
+            "SELECT lat_bucket FROM track_points WHERE id = 99",
+        ).use { cursor ->
+            cursor.moveToFirst()
+            cursor.getInt(0)
+        }
+        assertEquals(
+            "the migration's trigger did not repair a row inserted with a wrong bucket",
+            LatitudeBuckets.of(51.5074),
+            repaired,
+        )
+        migrated.close()
+    }
+
     @Test
     fun migrate5To6AddsTheViewportBoxIndex() {
         migrationHelper.createDatabase("migration-p4-020", 5).close()

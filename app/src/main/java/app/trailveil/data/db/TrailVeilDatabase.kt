@@ -16,7 +16,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         LocationReceiptWindowEntity::class,
         LocationReceiptRetentionStateEntity::class,
     ],
-    version = 6,
+    version = 7,
     exportSchema = true,
 )
 @TypeConverters(RecordingStatusConverters::class)
@@ -29,12 +29,14 @@ internal abstract class TrailVeilDatabase : RoomDatabase() {
         internal val invariantCallback = object : Callback() {
             override fun onCreate(db: SupportSQLiteDatabase) {
                 createDatabaseInvariantTriggers(db)
+                createTrackPointInvariantTriggers(db)
             }
 
             override fun onOpen(db: SupportSQLiteDatabase) {
                 // Self-heal a database created by an early v2 development build that
                 // predates the callbacks; CREATE TRIGGER IF NOT EXISTS is idempotent.
                 createDatabaseInvariantTriggers(db)
+                createTrackPointInvariantTriggers(db)
             }
         }
 
@@ -50,6 +52,7 @@ internal abstract class TrailVeilDatabase : RoomDatabase() {
                     MIGRATION_3_4,
                     MIGRATION_4_5,
                     MIGRATION_5_6,
+                    MIGRATION_6_7,
                 )
                 .addCallback(invariantCallback)
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)

@@ -157,7 +157,23 @@ internal object RecordingReceiptOutcome {
 internal abstract class RecordingDao {
     @Insert(onConflict = OnConflictStrategy.ABORT) protected abstract suspend fun insertSessionRow(session: RecordingSessionEntity): Long
     @Insert(onConflict = OnConflictStrategy.ABORT) protected abstract suspend fun insertSegmentRow(segment: TrackSegmentEntity): Long
-    @Insert(onConflict = OnConflictStrategy.ABORT) protected abstract suspend fun insertPointRow(point: TrackPointEntity): Long
+    @Insert(onConflict = OnConflictStrategy.ABORT) protected abstract suspend fun insertPointRowUnbucketed(point: TrackPointEntity): Long
+
+    /**
+     * `P4-036`: the one door every stored point goes through, so the derived bucket is derived once.
+     *
+     * The bucket is a function of the latitude, which means no constructor default can be right and
+     * no caller should be trusted to remember - there are four insert paths through this DAO and
+     * the first version of this change fixed only the one its failing test named. Deriving it here
+     * makes the remaining three correct by construction rather than by review, and the database
+     * trigger stays as the backstop for the raw SQL that never reaches this method at all.
+     *
+     * A wrong bucket fails silently in the worst direction: the row drops out of the fog viewport
+     * read, so the map draws MORE fog than it earned, and every leak audit in the suite accepts
+     * extra fog.
+     */
+    protected suspend fun insertPointRow(point: TrackPointEntity): Long =
+        insertPointRowUnbucketed(point.copy(latBucket = LatitudeBuckets.of(point.latitude)))
     @Insert(onConflict = OnConflictStrategy.ABORT) protected abstract suspend fun insertReceiptRow(receipt: RecordingOperationReceiptEntity)
 
     @Query("SELECT * FROM recording_operation_receipts WHERE operation_id = :operationId")
@@ -539,6 +555,43 @@ internal abstract class RecordingDao {
         """,
     )
     abstract suspend fun fogPointsInLongitudeInterval(
+        south: Double,
+        west: Double,
+        north: Double,
+        east: Double,
+    ): List<ViewportTrackPointRow>
+
+    /**
+     * `P4-036`: the same viewport box, with the latitude band expressed as EQUALITIES so SQLite can
+     * still constrain the longitude range — `SEARCH p USING INDEX
+     * index_track_points_lat_bucket_longitude (lat_bucket=? AND longitude>? AND longitude<?)`.
+     *
+     * The exact `latitude BETWEEN` predicate is kept and still decides membership: the bucket is
+     * coarse (about 223 m), so it admits at most two extra bucket heights of span and never changes
+     * the answer. Callers that cannot express the band within [LatitudeBuckets.MAX_BUCKETS] use
+     * [fogPointsInLongitudeInterval] instead, which is the same query without the narrowing.
+     */
+    @Query(
+        """
+        SELECT
+            p.id AS point_id,
+            p.session_id AS session_id,
+            p.segment_id AS segment_id,
+            s.sequence AS segment_sequence,
+            p.sequence AS point_sequence,
+            p.latitude AS latitude,
+            p.longitude AS longitude
+        FROM track_points p
+        INNER JOIN track_segments s
+            ON s.id = p.segment_id AND s.session_id = p.session_id
+        WHERE p.lat_bucket IN (:latitudeBuckets)
+            AND p.longitude BETWEEN :west AND :east
+            AND p.latitude BETWEEN :south AND :north
+        ORDER BY p.session_id ASC, s.sequence ASC, p.sequence ASC, p.id ASC
+        """,
+    )
+    abstract suspend fun fogPointsInBucketedBox(
+        latitudeBuckets: IntArray,
         south: Double,
         west: Double,
         north: Double,
