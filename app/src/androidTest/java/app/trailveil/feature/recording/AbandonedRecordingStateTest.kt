@@ -328,10 +328,24 @@ class AbandonedRecordingStateTest {
             }
             assertEquals("the blocked row must stay abandoned", "ABANDONED", shown)
 
-            composeRule.waitUntil(RECOVERY_TIMEOUT_MILLIS) {
-                composeRule.onAllNodesWithTag(RecordingEntryTestTags.LocationNotice)
-                    .fetchSemanticsNodes().isNotEmpty()
+            // The class's manual poll shape rather than waitUntil{fetchSemanticsNodes}: on the
+            // hosted emulator the recreated activity's composition can register a beat after the
+            // decor tag is readable, and fetchSemanticsNodes THROWS on that transient ("No compose
+            // hierarchies found", CI run 32334497740) instead of returning empty - a lambda that
+            // throws fails waitUntil outright rather than polling through the window.
+            var noticeShown = false
+            var noticeWaited = 0L
+            while (noticeWaited < RECOVERY_TIMEOUT_MILLIS) {
+                composeRule.waitForIdle()
+                noticeShown = runCatching {
+                    composeRule.onAllNodesWithTag(RecordingEntryTestTags.LocationNotice)
+                        .fetchSemanticsNodes().isNotEmpty()
+                }.getOrDefault(false)
+                if (noticeShown) break
+                SystemClock.sleep(POLL_MILLIS)
+                noticeWaited += POLL_MILLIS
             }
+            assertTrue("the blocker's notice never appeared", noticeShown)
             composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
                 .assertDoesNotExist()
 
