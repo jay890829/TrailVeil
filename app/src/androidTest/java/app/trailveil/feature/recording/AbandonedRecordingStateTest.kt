@@ -328,11 +328,18 @@ class AbandonedRecordingStateTest {
             }
             assertEquals("the blocked row must stay abandoned", "ABANDONED", shown)
 
-            // The class's manual poll shape rather than waitUntil{fetchSemanticsNodes}: on the
-            // hosted emulator the recreated activity's composition can register a beat after the
-            // decor tag is readable, and fetchSemanticsNodes THROWS on that transient ("No compose
-            // hierarchies found", CI run 32334497740) instead of returning empty - a lambda that
-            // throws fails waitUntil outright rather than polling through the window.
+            // The route's own automatic attempt has already run and been refused by now - the row
+            // settled on ABANDONED - but WHICH blocker refused it is a race on the hosted emulator:
+            // a slow recreate can lose to the visibility check (ACTIVITY_NOT_VISIBLE raises no
+            // notice at all, CI runs 32334497740 and 32336297314), while a fast one reaches the
+            // location check. The guidance card must be absent under either blocker, so that is
+            // asserted directly; the notice half is then driven by a USER start, whose timing the
+            // test owns - it reaches the same preflight and the same LOCATION_DISABLED refusal.
+            composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
+                .assertDoesNotExist()
+
+            composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+            composeRule.onNodeWithTag(RecordingEntryTestTags.Start).performClick()
             var noticeShown = false
             var noticeWaited = 0L
             while (noticeWaited < RECOVERY_TIMEOUT_MILLIS) {
@@ -345,7 +352,7 @@ class AbandonedRecordingStateTest {
                 SystemClock.sleep(POLL_MILLIS)
                 noticeWaited += POLL_MILLIS
             }
-            assertTrue("the blocker's notice never appeared", noticeShown)
+            assertTrue("the blocker's notice never appeared after a user start", noticeShown)
             composeRule.onNodeWithTag(RecordingEntryTestTags.BackgroundStartNotice)
                 .assertDoesNotExist()
 
