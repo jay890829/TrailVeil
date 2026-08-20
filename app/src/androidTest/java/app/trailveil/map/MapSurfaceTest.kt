@@ -5668,13 +5668,6 @@ class MapSurfaceTest {
      * flings run on their own thread while this one keeps reading back what MapLibre drew.
      */
     @Test
-    @Ignore(
-        "P4-043: this journey finds a real west-edge band on the current tree (about one run in " +
-            "three; 1.15% revealed at x=0..201 with no safety cover raised). The test itself is " +
-            "A/B-proven - deleting the east band's installation measures 43% - so it is committed " +
-            "here rather than deleted, and stays @Ignore'd until P4-043 fixes the product, per the " +
-            "convention P4-030 established for a gate whose failure belongs to another task.",
-    )
     fun backToBackEastwardFlingsNeverExposeAMissingSideBand() {
         // P4-026: no committed pixel test travels far enough east-west WITHOUT an intervening idle
         // to see a missing side band. Every gesture that ends triggers a rebuild that re-centres a
@@ -5737,6 +5730,17 @@ class MapSurfaceTest {
             val visible = composeRule.runOnIdle { map.projection.visibleRegion.latLngBounds }
             val degreesPerScreenWidth = abs(visible.longitudeEast - visible.longitudeWest)
             assertTrue("Could not measure a screen width", degreesPerScreenWidth > 0.0)
+            // Where the fixture's OWN revealed ground ends, computed rather than assumed. The
+            // corridor runs east from `revealed` (revealTrack writes longitude + index * 0.0002),
+            // the camera travels east along it, and the reveal radius extends it further - so a
+            // frame is only judgeable once the camera's WEST edge has cleared all of it. A first
+            // version used a bare 2.0-screen constant and measured the corridor itself as a leak,
+            // then opened a product task on it (withdrawn as P4-043): the fixture's own ground
+            // reaches 1.82 screens, and the west edge trails the centre by half a screen.
+            val corridorEastEdgeDegrees = (REVEALED_POINT_COUNT - 1) * REVEALED_POINT_SPACING_DEGREES +
+                REVEAL_RADIUS_DEGREES
+            val exitScreenWidths = corridorEastEdgeDegrees / degreesPerScreenWidth +
+                0.5 + EASTWEST_EXIT_CLEARANCE_SCREEN_WIDTHS
             bestEffortClearStuckInjectedPointers()
             val y = view.height * 0.5f
             val fromX = view.width * 0.88f
@@ -5786,9 +5790,20 @@ class MapSurfaceTest {
                         if (target != null) {
                             val eastwardScreens = abs(target.longitude - revealed.longitude) /
                                 degreesPerScreenWidth
-                            if (eastwardScreens >= EASTWEST_EXIT_SCREEN_WIDTHS) exited = true
+                            if (eastwardScreens >= exitScreenWidths) exited = true
                         }
-                        val coverage = map.renderedFogCoverage()
+                        // One bitmap for both readings: a first version took a second snapshot to
+                        // describe the shape, so the failure message could report `none` for a
+                        // frame whose coverage had just measured 18% - two different frames.
+                        val bitmap = map.snapshotBitmap()
+                        val coverage: FogCoverage
+                        val shape: String
+                        try {
+                            coverage = bitmap.fogCoverage()
+                            shape = bitmap.revealedShape()
+                        } finally {
+                            bitmap.recycle()
+                        }
                         // The contract has two halves and a frame satisfies either: fog covers the
                         // unexplored ground, OR the opaque safety cover is up because the camera has
                         // outrun the installed surround (P4-034's fail-closed answer, which a
@@ -5805,12 +5820,7 @@ class MapSurfaceTest {
                             } else if (coverage.revealedFraction > worstRevealed) {
                                 worstRevealed = coverage.revealedFraction
                                 worstReport = coverage
-                                val bitmap = map.snapshotBitmap()
-                                worstShape = try {
-                                    bitmap.revealedShape()
-                                } finally {
-                                    bitmap.recycle()
-                                }
+                                worstShape = shape
                             }
                         }
                     }
@@ -5822,8 +5832,8 @@ class MapSurfaceTest {
             // The journey has to actually leave the explored ground, or the assertion below is
             // measuring nothing - the same vacuity guard the sustained-gesture test carries.
             assertTrue(
-                "The camera never travelled $EASTWEST_EXIT_SCREEN_WIDTHS screen widths east-west, " +
-                    "so no unexplored map was ever judged",
+                "The camera never travelled $exitScreenWidths screen widths east-west, so no " +
+                    "unexplored map was ever judged",
                 exited,
             )
             assertTrue(
@@ -6198,6 +6208,19 @@ class MapSurfaceTest {
                 "Too few rendered frames were sampled after leaving the revealed area: " +
                     "$postExitFrames",
                 postExitFrames >= MINIMUM_POST_EXIT_FRAMES,
+            )
+            // P4-042's other half, and this gate was the hole: `revealedFraction` is an absolute
+            // luminance count, so an ALL-BLACK frame - the hosted emulator's dead GL surface -
+            // measures zero revealed, sets `exited`, contributes no leak, and passes. The already
+            // computed post-exit maximum settles it: fog over a drawn map still transmits light,
+            // so a maximum below the fogged-surface floor means the frames judged here had no map
+            // in them at all. (`compareFogCoverage`'s guard cannot reach this path: it judges a
+            // fogged capture against a bare reference, and this gate takes no bare reference.)
+            assertTrue(
+                "The judged frames contained no light at all (maxLuminance=$postExitMaxLuminance " +
+                    "over $postExitFrames post-exit frames): a dead rendering surface, not a fog " +
+                    "verdict - see P4-042",
+                postExitFrames == 0 || postExitMaxLuminance >= MINIMUM_FOGGED_SURFACE_LUMINANCE,
             )
             assertTrue(
                 "Unexplored map was drawn unfogged during gestures: $leaks",
@@ -7890,11 +7913,15 @@ class MapSurfaceTest {
         const val EASTWEST_SAMPLES_PER_STROKE = 3
 
         /**
-         * How far the camera must travel before its frames are judged. Beyond this the revealed
-         * track cannot be on screen, so anything measured as revealed is a leak - and unlike a
-         * pixel-based exit test, this stays true when the defect under test is present.
+         * Margin beyond the fixture's own revealed ground before a frame is judged. The threshold
+         * itself is computed from the corridor rather than fixed, so a change to `revealTrack`
+         * cannot silently make this test measure its own track again.
          */
-        const val EASTWEST_EXIT_SCREEN_WIDTHS = 2.0
+        const val EASTWEST_EXIT_CLEARANCE_SCREEN_WIDTHS = 0.5
+        const val REVEALED_POINT_SPACING_DEGREES = 0.0002
+
+        /** 25 m of reveal radius in degrees of longitude, near enough at this latitude. */
+        const val REVEAL_RADIUS_DEGREES = 0.00025
         const val MINIMUM_EASTWEST_POST_EXIT_FRAMES = 12
 
         /**
