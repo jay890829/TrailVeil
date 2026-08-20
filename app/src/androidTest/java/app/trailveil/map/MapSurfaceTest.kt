@@ -82,6 +82,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Assume
+import org.junit.Ignore
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -5667,6 +5668,195 @@ class MapSurfaceTest {
      * flings run on their own thread while this one keeps reading back what MapLibre drew.
      */
     @Test
+    @Ignore(
+        "P4-043: this journey finds a real west-edge band on the current tree (about one run in " +
+            "three; 1.15% revealed at x=0..201 with no safety cover raised). The test itself is " +
+            "A/B-proven - deleting the east band's installation measures 43% - so it is committed " +
+            "here rather than deleted, and stays @Ignore'd until P4-043 fixes the product, per the " +
+            "convention P4-030 established for a gate whose failure belongs to another task.",
+    )
+    fun backToBackEastwardFlingsNeverExposeAMissingSideBand() {
+        // P4-026: no committed pixel test travels far enough east-west WITHOUT an intervening idle
+        // to see a missing side band. Every gesture that ends triggers a rebuild that re-centres a
+        // mosaic about 3.7 screens wide, so a journey punctuated by settles is always re-covered
+        // before it can leak - `P4-024`'s round-2 verifier measured 0.0000% across 7.7 screen widths
+        // of drags-with-settles WITH the defect present, and only twelve back-to-back flings that
+        // deny the camera an idle exposed it, at 82.5%. This travels that way on purpose: one
+        // continuous westward drag chain, no settle between strokes, sampling every frame.
+        val database = inMemoryDatabase()
+        try {
+            val fogRendered = AtomicBoolean(false)
+            val revealed = GeoPoint(25.0330, 121.5654)
+            revealTrack(database, revealed)
+            val stableFogRuntime = fogRuntime(
+                database,
+                RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+            )
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration(
+                        providerName = "fog-eastwest-test-provider",
+                        styleUri = "https://tiles.invalid/styles/fog-eastwest",
+                    ),
+                    fallbackTimeoutMillis = 100L,
+                    savedStateKey = "trailveil.map.fog-eastwest-test",
+                    fogRuntime = stableFogRuntime,
+                    fogRequired = true,
+                    cameraRequest = MapCameraRequest(
+                        requestId = 1L,
+                        point = revealed,
+                        zoom = 16.0,
+                    ),
+                    onFogRendered = { fogRendered.set(true) },
+                )
+            }
+
+            composeRule.waitUntil(timeoutMillis = 15_000L) { fogRendered.get() }
+            val map = checkNotNull(awaitMap()) { "The map never became ready" }
+            val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+            var explored = map.renderedFogCoverage()
+            composeRule.waitUntil(timeoutMillis = 20_000L) {
+                explored = map.renderedFogCoverage()
+                explored.revealedFraction > MINIMUM_REVEALED_FRACTION
+            }
+
+            var exited = false
+            var postExitFrames = 0
+            var coveredFrames = 0
+            var worstRevealed = 0.0
+            var worstReport: FogCoverage? = null
+            var worstShape = "none"
+            // One screen width in degrees at this camera, so "how far have we travelled" is
+            // expressed in screens rather than in a latitude-dependent degree count.
+            val visible = composeRule.runOnIdle { map.projection.visibleRegion.latLngBounds }
+            val degreesPerScreenWidth = abs(visible.longitudeEast - visible.longitudeWest)
+            assertTrue("Could not measure a screen width", degreesPerScreenWidth > 0.0)
+            bestEffortClearStuckInjectedPointers()
+            val y = view.height * 0.5f
+            val fromX = view.width * 0.88f
+            val toX = view.width * 0.12f
+
+            // Back-to-back FLINGS, not one continuous stream: each stroke lifts (so its velocity
+            // carries the camera onward) and the next presses immediately, before the deceleration
+            // can reach OnCameraIdle. A first draft chained strokes inside one pointer stream by
+            // jumping the finger back to the start without lifting - but that jump is itself a drag
+            // the other way, so the net travel was nil and the vacuity guard below caught it. Flings
+            // are also what the P4-024 round-2 verifier actually needed.
+            var pointerDown = false
+            try {
+                repeat(EASTWEST_STROKES) { stroke ->
+                    val strokeDown = SystemClock.uptimeMillis()
+                    fun sendAt(action: Int, x: Float) {
+                        injectTouch(
+                            MotionEvent.obtain(
+                                strokeDown,
+                                SystemClock.uptimeMillis(),
+                                action,
+                                x,
+                                y,
+                                0,
+                            ).apply { source = InputDevice.SOURCE_TOUCHSCREEN },
+                        )
+                    }
+                    sendAt(MotionEvent.ACTION_DOWN, fromX)
+                    pointerDown = true
+                    repeat(EASTWEST_MOVES_PER_STROKE) { move ->
+                        val progress = (move + 1).toFloat() / EASTWEST_MOVES_PER_STROKE
+                        sendAt(MotionEvent.ACTION_MOVE, fromX + (toX - fromX) * progress)
+                        SystemClock.sleep(EASTWEST_MOVE_INTERVAL_MILLIS)
+                    }
+                    sendAt(MotionEvent.ACTION_UP, toX)
+                    pointerDown = false
+                    // Sample while the fling is still carrying, and press again without waiting for
+                    // it to settle. No waitForIdle anywhere in this loop, on purpose.
+                    repeat(EASTWEST_SAMPLES_PER_STROKE) {
+                        // Exit is judged by CAMERA DISPLACEMENT, not by pixels. A first draft used
+                        // `revealedFraction == 0.0` - the sustained-gesture test's shape - and the
+                        // A/B exposed why that cannot work here: with the side band missing, bare
+                        // map keeps counting as revealed, so the exit condition never fires and the
+                        // vacuity guard reports "never left the track" for a run that is leaking.
+                        // The two signals must not share a source.
+                        val target = composeRule.runOnIdle { map.cameraPosition.target }
+                        if (target != null) {
+                            val eastwardScreens = abs(target.longitude - revealed.longitude) /
+                                degreesPerScreenWidth
+                            if (eastwardScreens >= EASTWEST_EXIT_SCREEN_WIDTHS) exited = true
+                        }
+                        val coverage = map.renderedFogCoverage()
+                        // The contract has two halves and a frame satisfies either: fog covers the
+                        // unexplored ground, OR the opaque safety cover is up because the camera has
+                        // outrun the installed surround (P4-034's fail-closed answer, which a
+                        // no-idle journey is exactly the way to provoke). Judging pixels alone made
+                        // this test unstable across runs - 0.02% then 0.955% on the same correct
+                        // tree - because it was counting legitimately covered frames as leaks.
+                        val covered = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
+                            .fetchSemanticsNodes()
+                            .isNotEmpty()
+                        if (exited) {
+                            postExitFrames += 1
+                            if (covered) {
+                                coveredFrames += 1
+                            } else if (coverage.revealedFraction > worstRevealed) {
+                                worstRevealed = coverage.revealedFraction
+                                worstReport = coverage
+                                val bitmap = map.snapshotBitmap()
+                                worstShape = try {
+                                    bitmap.revealedShape()
+                                } finally {
+                                    bitmap.recycle()
+                                }
+                            }
+                        }
+                    }
+                }
+            } finally {
+                if (pointerDown) bestEffortClearStuckInjectedPointers()
+            }
+
+            // The journey has to actually leave the explored ground, or the assertion below is
+            // measuring nothing - the same vacuity guard the sustained-gesture test carries.
+            assertTrue(
+                "The camera never travelled $EASTWEST_EXIT_SCREEN_WIDTHS screen widths east-west, " +
+                    "so no unexplored map was ever judged",
+                exited,
+            )
+            assertTrue(
+                "Too few post-exit frames to judge an east-west band: $postExitFrames",
+                postExitFrames >= MINIMUM_EASTWEST_POST_EXIT_FRAMES,
+            )
+            // And the cover must not be the whole answer: if every judged frame were covered, the
+            // pixel assertion below would be vacuous - the same escape hatch this project has been
+            // failed for before.
+            assertTrue(
+                "Every post-exit frame was covered, so no frame actually judged the fog: " +
+                    "$coveredFrames of $postExitFrames",
+                coveredFrames < postExitFrames,
+            )
+            // Judged against the file's existing settled allowance rather than an exact zero: a
+            // mid-fling frame carries the same sub-pixel seam residue every other gate tolerates
+            // (measured here at 0.02% on the correct tree). The A/B leaves no room for doubt about
+            // what this separates - removing the east band measures 43%, three orders of magnitude
+            // above the allowance and 2,000x the clean reading.
+            assertTrue(
+                "An east-west journey without an idle presented unexplored map as revealed: " +
+                    "worst=${worstRevealed * 100.0}% (limit " +
+                    "${MAXIMUM_SETTLED_REVEALED_FRACTION * 100.0}%) $worstReport after " +
+                    "$postExitFrames post-exit frames, $coveredFrames of them covered; " +
+                    "shape=[$worstShape]",
+                worstRevealed <= MAXIMUM_SETTLED_REVEALED_FRACTION,
+            )
+        } finally {
+            database.close()
+        }
+    }
+
+    @Test
     fun sustainedGesturesNeverExposeUnexploredMap() {
         val database = inMemoryDatabase()
         try {
@@ -6153,6 +6343,42 @@ class MapSurfaceTest {
             ready.await(SNAPSHOT_TIMEOUT_SECONDS, TimeUnit.SECONDS),
         )
         return requireNotNull(captured.get())
+    }
+
+    /**
+     * Where the revealed pixels are, as `x0..x1 / y0..y1` plus the fraction sitting in the leftmost
+     * and rightmost eighths. `P4-026` needs to tell a SIDE BAND (a coverage gap at the east or west
+     * edge) from scattered residue, and a fraction alone cannot.
+     */
+    private fun Bitmap.revealedShape(): String {
+        val pixels = IntArray(width * height)
+        getPixels(pixels, 0, width, 0, 0, width, height)
+        var minX = Int.MAX_VALUE
+        var maxX = Int.MIN_VALUE
+        var minY = Int.MAX_VALUE
+        var maxY = Int.MIN_VALUE
+        var edgeEighths = 0L
+        var total = 0L
+        pixels.forEachIndexed { index, pixel ->
+            val luminance = (
+                77 * ((pixel shr 16) and 0xff) +
+                    150 * ((pixel shr 8) and 0xff) +
+                    29 * (pixel and 0xff)
+                ) shr 8
+            if (luminance >= UNFOGGED_LUMINANCE) {
+                val x = index % width
+                val y = index / width
+                if (x < minX) minX = x
+                if (x > maxX) maxX = x
+                if (y < minY) minY = y
+                if (y > maxY) maxY = y
+                if (x < width / 8 || x >= width - width / 8) edgeEighths += 1L
+                total += 1L
+            }
+        }
+        if (total == 0L) return "none"
+        return "x=$minX..$maxX y=$minY..$maxY total=$total inEdgeEighths=$edgeEighths " +
+            "(${"%.1f".format(java.util.Locale.US, edgeEighths * 100.0 / total)}%)"
     }
 
     private fun Bitmap.fogCoverage(): FogCoverage {
@@ -7650,6 +7876,26 @@ class MapSurfaceTest {
         const val BARE_REFERENCE_STABILITY_RETRY_MILLIS = 50L
         const val UNFOGGED_LUMINANCE = 150
         const val MINIMUM_REVEALED_FRACTION = 0.01
+
+        /**
+         * P4-026: strokes chained inside one pointer stream, so the camera never idles and never
+         * rebuilds the mosaic. Twelve is what the `P4-024` round-2 verifier needed to expose the
+         * missing side band; the same count is used here rather than a tuned-down number.
+         */
+        const val EASTWEST_STROKES = 12
+
+        /** Fast strokes: few moves, short gaps, so each lift carries real fling velocity. */
+        const val EASTWEST_MOVES_PER_STROKE = 8
+        const val EASTWEST_MOVE_INTERVAL_MILLIS = 8L
+        const val EASTWEST_SAMPLES_PER_STROKE = 3
+
+        /**
+         * How far the camera must travel before its frames are judged. Beyond this the revealed
+         * track cannot be on screen, so anything measured as revealed is a leak - and unlike a
+         * pixel-based exit test, this stays true when the defect under test is present.
+         */
+        const val EASTWEST_EXIT_SCREEN_WIDTHS = 2.0
+        const val MINIMUM_EASTWEST_POST_EXIT_FRAMES = 12
 
         /**
          * A settled camera over unexplored ground should be entirely fogged. The allowance is for
