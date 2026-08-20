@@ -96,6 +96,13 @@ class RecordingOutcomeNotificationTest {
                 it.id == RecordingForegroundNotifier.OUTCOME_NOTIFICATION_ID
             }
             assertEquals(1, outcomeNotifications.size)
+            // Which outcome, not just that one posted: both outcomes share the id, so without this
+            // a service that told an interrupted user their walk was saved passed the whole suite.
+            assertEquals(
+                context.getString(app.trailveil.R.string.recording_completed_title),
+                outcomeNotifications.single().notification.extras
+                    .getString(android.app.Notification.EXTRA_TITLE),
+            )
         } finally {
             activity.close()
             notificationManager.cancelAll()
@@ -159,11 +166,16 @@ class RecordingOutcomeNotificationTest {
                     delay(50)
                 }
             }
+            val outcomeNotifications = notificationManager.activeNotifications.filter {
+                it.id == RecordingForegroundNotifier.OUTCOME_NOTIFICATION_ID
+            }
+            assertEquals(1, outcomeNotifications.size)
+            // The interrupted text specifically - a swap to showCompleted() here told the user an
+            // interrupted walk was saved, and no committed test failed.
             assertEquals(
-                1,
-                notificationManager.activeNotifications.count {
-                    it.id == RecordingForegroundNotifier.OUTCOME_NOTIFICATION_ID
-                },
+                context.getString(app.trailveil.R.string.recording_interrupted_title),
+                outcomeNotifications.single().notification.extras
+                    .getString(android.app.Notification.EXTRA_TITLE),
             )
         } finally {
             container.setLocationEngineOverrideForTesting(null)

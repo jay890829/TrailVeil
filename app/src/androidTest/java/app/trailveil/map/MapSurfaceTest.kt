@@ -662,9 +662,10 @@ class MapSurfaceTest {
                 // and failed in three configurations: points streamed outside the rendered window
                 // (fixed above), points inside it, and after fifteen further seconds of streaming.
                 // Each time the installs seen carried the same revision. So either merge-driven
-                // restarts do not reach this seam or they do not happen in this fixture, and until
-                // that is settled the honest thing is to publish the measurement rather than assert
-                // a mechanism this gate has never demonstrated. `P4-029` records it as blocking.
+                // restarts do not reach this seam or they do not happen in this fixture, and the
+                // honest thing is to publish the measurement rather than assert a mechanism this
+                // gate has never demonstrated. `P4-029`'s disposition accepts the feed-liveness
+                // residual as disclosed-unbound - named there with the mutation that would expose it.
                 val revisionsSeen = synchronized(streamedRevisions) { streamedRevisions.toList() }
 
                 // Measured with the writer still running, unlike the settled check below: this is
