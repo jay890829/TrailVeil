@@ -28,6 +28,7 @@ import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import app.trailveil.BuildConfig
 import app.trailveil.R
 import app.trailveil.data.history.RecordingHistoryDetail
 import app.trailveil.data.history.RecordingHistorySegment
@@ -51,6 +52,7 @@ internal object RecordingHistoryTestTags {
     const val TrackMap = "recording_history_track_map"
     const val ItemPrefix = "recording_history_item_"
     const val SegmentPrefix = "recording_history_segment_"
+    const val BuildIdentity = "recording_history_build_identity"
 
     fun item(sessionId: Long) = "$ItemPrefix$sessionId"
 
@@ -96,7 +98,35 @@ internal fun RecordingHistoryListScreen(
                 }
             }
         }
+        BuildIdentityLine()
     }
+}
+
+/**
+ * `P5-002`: which build is this, answered on screen.
+ *
+ * An internal test installs `0.1.0-internal` many times from different commits, so the version
+ * name alone cannot identify a build - and a field report that cannot name its build cannot be
+ * reproduced. It sits at the foot of the history screen rather than behind a settings page the app
+ * does not have: this is the only non-map screen, and a tester already comes here to look at what
+ * was recorded.
+ *
+ * Deliberately not a debug-only surface. The whole point is that the person walking outside with a
+ * shipped internal APK can read it back to us.
+ */
+@Composable
+private fun BuildIdentityLine() {
+    Text(
+        text = stringResource(
+            R.string.history_build_identity,
+            BuildConfig.VERSION_NAME,
+            BuildConfig.VERSION_CODE,
+            BuildConfig.GIT_COMMIT,
+        ),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.testTag(RecordingHistoryTestTags.BuildIdentity),
+    )
 }
 
 @Composable

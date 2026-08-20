@@ -4,6 +4,7 @@ import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
@@ -14,6 +15,7 @@ import androidx.compose.ui.test.swipeUp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
 import androidx.test.runner.lifecycle.Stage
+import app.trailveil.BuildConfig
 import app.trailveil.data.history.RecordingHistoryAcceptedPoint
 import app.trailveil.data.history.RecordingHistoryAcceptedPointSegment
 import app.trailveil.data.history.RecordingHistoryDetail
@@ -35,6 +37,68 @@ import org.maplibre.android.maps.MapView
 
 @RunWith(AndroidJUnit4::class)
 class RecordingHistoryScreensTest {
+    /**
+     * `P5-002`: the installed build identifies itself, and it does so on EVERY state of the screen.
+     *
+     * An internal tester's report is only reproducible if it can name the build it came from, and
+     * the state where that matters most is the one where something went wrong - an empty history
+     * after a walk that should have recorded. A first version of this line sat inside the
+     * populated-list branch, so exactly that report would have carried no build at all. Both
+     * states are asserted here for that reason.
+     *
+     * The text is compared against `BuildConfig` rather than a literal, so the assertion cannot
+     * drift from what the app actually shows; the shape of the fields is `BuildIdentityTest`'s job.
+     */
+    @Test
+    fun everyHistoryStateNamesTheBuildItIsRunning() {
+        val expected = "Build ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) " +
+            "· ${BuildConfig.GIT_COMMIT}"
+        composeRule.setContent {
+            TrailVeilTheme {
+                RecordingHistoryListScreen(
+                    sessions = emptyList(),
+                    onOpenSession = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag(RecordingHistoryTestTags.Empty).assertIsDisplayed()
+        composeRule.onNodeWithTag(RecordingHistoryTestTags.BuildIdentity)
+            .assertIsDisplayed()
+            .assertTextEquals(expected)
+    }
+
+    @Test
+    fun aPopulatedHistoryAlsoNamesTheBuildItIsRunning() {
+        composeRule.setContent {
+            TrailVeilTheme {
+                RecordingHistoryListScreen(
+                    sessions = listOf(
+                        RecordingHistorySession(
+                            id = 1L,
+                            startedAt = 1_000L,
+                            endedAt = 2_000L,
+                            status = RecordingHistoryStatus.COMPLETED,
+                            stopReason = "USER_STOP",
+                            distanceMeters = 12.0,
+                            acceptedPointCount = 3,
+                            rejectedPointCount = 0,
+                        ),
+                    ),
+                    onOpenSession = {},
+                )
+            }
+        }
+
+        composeRule.onNodeWithTag(RecordingHistoryTestTags.List).assertIsDisplayed()
+        composeRule.onNodeWithTag(RecordingHistoryTestTags.BuildIdentity)
+            .assertIsDisplayed()
+            .assertTextEquals(
+                "Build ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) " +
+                    "· ${BuildConfig.GIT_COMMIT}",
+            )
+    }
+
     @Test
     fun loadingListDoesNotClaimHistoryIsEmpty() {
         composeRule.setContent {

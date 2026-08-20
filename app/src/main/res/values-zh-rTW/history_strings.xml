@@ -42,4 +42,5 @@
     <string name="history_segment_start_reason">開始原因</string>
     <string name="history_segment_end_reason">結束原因</string>
     <string name="history_label_value">%1$s：%2$s</string>
+    <string name="history_build_identity">版本 %1$s（%2$d）· %3$s</string>
 </resources>

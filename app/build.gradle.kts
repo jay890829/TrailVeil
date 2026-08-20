@@ -38,6 +38,33 @@ val internalStoreFile = internalSigningProperties
     }
 val repositoryRoot = rootProject.projectDir.canonicalFile
 
+/**
+ * `P5-002`: the commit an installed build was made from, so a field report can name it.
+ *
+ * A version name alone cannot answer "which build is this?" during an internal test - the same
+ * `0.1.0-internal` will be installed many times from different commits. This asks git, through
+ * `providers.exec` so the answer participates in Gradle's configuration cache rather than being
+ * read eagerly at configuration time.
+ *
+ * `unknown` is a real answer, not a failure: a source archive without `.git` still has to build.
+ * The dirty marker matters more than it looks - an internal APK built from uncommitted work is
+ * exactly the build whose field evidence cannot be reproduced later, so it says so on screen.
+ */
+val gitCommit: Provider<String> = providers.exec {
+    workingDir = repositoryRoot
+    commandLine("git", "rev-parse", "--short=12", "HEAD")
+    isIgnoreExitValue = true
+}.standardOutput.asText.zip(
+    providers.exec {
+        workingDir = repositoryRoot
+        commandLine("git", "status", "--porcelain")
+        isIgnoreExitValue = true
+    }.standardOutput.asText,
+) { head, status ->
+    val sha = head.trim().ifEmpty { "unknown" }
+    if (sha != "unknown" && status.isNotBlank()) "$sha-dirty" else sha
+}
+
 fun File.isInsideRepository(): Boolean {
     var candidate: File? = canonicalFile
     while (candidate != null) {
@@ -118,6 +145,10 @@ android {
         versionCode = 1
         versionName = "0.1.0"
 
+        // P5-002. Read on screen by the About row; also the only way a field report can name the
+        // exact tree an installed internal APK came from.
+        buildConfigField("String", "GIT_COMMIT", "\"${gitCommit.get()}\"")
+
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -143,6 +174,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     sourceSets {

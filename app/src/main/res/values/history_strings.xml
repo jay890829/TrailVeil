@@ -44,4 +44,5 @@
     <string name="history_segment_start_reason">Start reason</string>
     <string name="history_segment_end_reason">End reason</string>
     <string name="history_label_value">%1$s: %2$s</string>
+    <string name="history_build_identity">Build %1$s (%2$d) · %3$s</string>
 </resources>
