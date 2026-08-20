@@ -323,11 +323,19 @@ class RecordingForegroundService : Service() {
         try {
             val state = dependencies.recordingRepository.state()
             when {
-                state.sessionId != null && state.lifecycle == RecordingLifecycle.ACTIVE ->
+                state.sessionId != null && state.lifecycle == RecordingLifecycle.ACTIVE -> {
                     dependencies.recordingRepository.interrupt(
                         dependencies.operationIds.next("foreground-restart-interrupt"), state.sessionId,
                         dependencies.clock.epochMillis(), TerminalReason.FOREGROUND_RESTART_FAILURE,
                     )
+                    // This was the one interrupt arm that told nobody (P4-015's named exception).
+                    // Notifying needs no location permission and no foreground elevation, and this
+                    // is exactly the moment the user is not looking - a restarted process whose
+                    // startForeground was refused because the permission grade cannot re-arm
+                    // location from the background (measured on the POCO: sessions 39 and 43
+                    // refused at 使用時允許; session 44 recovered at 一律允許, P4-041).
+                    notifier.showInterrupted()
+                }
                 command.action == ACTION_START && command.sessionId != null ->
                     dependencies.recordingRepository.failStart(
                         dependencies.operationIds.next("foreground-fail-start"), command.sessionId,
