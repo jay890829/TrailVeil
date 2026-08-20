@@ -67,11 +67,13 @@ import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -1131,6 +1133,84 @@ class MapSurfaceTest {
         savedStateKey = "trailveil.map.fog-quick-zoom-test",
         gesture = ::frameAuditedQuickZoomOutInSteps,
     )
+
+    /**
+     * Deterministically exercises the rejected quick-zoom retry boundary. The first engaged stream
+     * is lifted on purpose while the post-idle canonical install is held longer than the historical
+     * fixed settle; the next stream is allowed to open only after the published generation and its
+     * sole renderer slot recover.
+     */
+    @Test
+    fun aQuickZoomRetryWaitsForCanonicalFogBeforeReopening() {
+        val forceRejectEngagedAttempt = AtomicBoolean(true)
+        val delayArmed = AtomicBoolean(false)
+        val delayHit = AtomicBoolean(false)
+        val baselineGeneration = AtomicReference<Long?>(null)
+        val delayedGeneration = AtomicReference<Long?>(null)
+
+        sweepGesture(
+            provider = MapProviderConfiguration(
+                providerName = "fog-quick-zoom-retry-test-provider",
+                styleUri = "https://tiles.invalid/styles/fog-quick-zoom-retry",
+            ),
+            requireOnlineStyle = false,
+            savedStateKey = "trailveil.map.fog-quick-zoom-retry-test",
+            gesture = { map, onHold ->
+                checkNotNull(fogGeneration() as? Long) {
+                    "No canonical generation was published before the forced retry"
+                }
+                val slot = publishedFogSlot()
+                assertTrue(
+                    "The forced retry did not start from a sole published fog generation",
+                    map.hasOnlyPublishedFogGeneration(slot),
+                )
+                frameAuditedQuickZoomOutWithForcedRetry(
+                    map = map,
+                    onHold = onHold,
+                    forceRejectEngagedAttempt = forceRejectEngagedAttempt,
+                    onForcedRejectBeforeLift = { baseline ->
+                        baselineGeneration.set(baseline)
+                        delayArmed.set(true)
+                    },
+                )
+                assertFalse(
+                    "The deterministic retry driver never forced an engaged rejection",
+                    forceRejectEngagedAttempt.get(),
+                )
+            },
+            canonicalFogInstallCheckpointForTesting = { checkpoint ->
+                val baseline = baselineGeneration.get()
+                if (
+                    delayArmed.get() &&
+                    checkpoint.phase == CanonicalFogInstallCheckpointPhase.BEFORE_STYLE_INSTALL &&
+                    baseline != null &&
+                    checkpoint.generation > baseline &&
+                    delayedGeneration.compareAndSet(null, checkpoint.generation) &&
+                    delayArmed.compareAndSet(true, false)
+                ) {
+                    delayHit.set(true)
+                    withContext(Dispatchers.Default) {
+                        Thread.sleep(QUICK_ZOOM_RETRY_FORCED_DELAY_MILLIS)
+                    }
+                }
+            },
+        )
+
+        assertTrue(
+            "The forced post-idle canonical-install delay seam was never reached",
+            delayHit.get(),
+        )
+        val liftGeneration = checkNotNull(baselineGeneration.get()) {
+            "The forced engaged rejection never armed its lift baseline"
+        }
+        val delayed = checkNotNull(delayedGeneration.get()) {
+            "The forced post-idle canonical generation was never delayed"
+        }
+        assertTrue(
+            "The delayed canonical install did not follow the forced rejected lift",
+            delayed > liftGeneration,
+        )
+    }
 
     /**
      * Tilt the map, then zoom out. The camera sees ground the viewport's own size does not describe.
@@ -3443,6 +3523,8 @@ class MapSurfaceTest {
         allowRebuildDuringGesture: Boolean = false,
         onFogCoverageStateComposedForTesting:
             ((ComposedFogCoverageSnapshot) -> Unit)? = null,
+        canonicalFogInstallCheckpointForTesting:
+            (suspend (CanonicalFogInstallCheckpoint) -> Unit)? = null,
         allowFiniteExtentCrossing: Boolean = false,
         suppressFogCameraReactionsForTesting: Boolean = false,
         prepareFrozenCamera:
@@ -3483,6 +3565,8 @@ class MapSurfaceTest {
                     onFogCoverageInstalledForTesting = installedCoverage::set,
                     onFogCoverageStateComposedForTesting =
                         onFogCoverageStateComposedForTesting,
+                    canonicalFogInstallCheckpointForTesting =
+                        canonicalFogInstallCheckpointForTesting,
                     suppressFogCameraReactionsForTesting =
                         fogCameraReactionsSuppressed.value,
                 )
@@ -4591,6 +4675,20 @@ class MapSurfaceTest {
             maximumUnmeasuredZoom = null,
         )
 
+    private fun frameAuditedQuickZoomOutWithForcedRetry(
+        map: MapLibreMap,
+        onHold: () -> Unit,
+        forceRejectEngagedAttempt: AtomicBoolean,
+        onForcedRejectBeforeLift: (Long) -> Unit,
+    ) = frameAuditedQuickZoomInSteps(
+        map = map,
+        onHold = onHold,
+        zoomIn = false,
+        maximumUnmeasuredZoom = null,
+        forceRejectEngagedAttempt = forceRejectEngagedAttempt,
+        onForcedRejectBeforeLift = onForcedRejectBeforeLift,
+    )
+
     /**
      * Reverse zoom-1 transition through MapLibre's one-finger double-tap-hold detector.
      *
@@ -4612,6 +4710,8 @@ class MapSurfaceTest {
         onHold: () -> Unit,
         zoomIn: Boolean,
         maximumUnmeasuredZoom: Double?,
+        forceRejectEngagedAttempt: AtomicBoolean? = null,
+        onForcedRejectBeforeLift: ((Long) -> Unit)? = null,
     ) {
         repeat(QUICK_ZOOM_ATTEMPTS) {
             if (
@@ -4620,6 +4720,8 @@ class MapSurfaceTest {
                     onHold = onHold,
                     zoomIn = zoomIn,
                     maximumUnmeasuredZoom = maximumUnmeasuredZoom,
+                    forceRejectEngagedAttempt = forceRejectEngagedAttempt,
+                    onForcedRejectBeforeLift = onForcedRejectBeforeLift,
                 )
             ) {
                 return
@@ -4636,6 +4738,8 @@ class MapSurfaceTest {
         onHold: () -> Unit,
         zoomIn: Boolean,
         maximumUnmeasuredZoom: Double?,
+        forceRejectEngagedAttempt: AtomicBoolean? = null,
+        onForcedRejectBeforeLift: ((Long) -> Unit)? = null,
     ): Boolean {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         bestEffortClearStuckInjectedPointers()
@@ -4656,7 +4760,31 @@ class MapSurfaceTest {
         }
 
         var streamEnded = false
+        val idleEventCount = AtomicInteger(0)
+        val moveStartedEventCount = AtomicInteger(0)
+        val idleListener = MapLibreMap.OnCameraIdleListener {
+            idleEventCount.incrementAndGet()
+        }
+        val moveStartedListener = MapLibreMap.OnCameraMoveStartedListener {
+            moveStartedEventCount.incrementAndGet()
+        }
+        var listenersAttached = false
         try {
+            // A rejected detector attempt that moved ends in a camera idle. Production responds to
+            // that idle by publishing a new viewport request, which withdraws the old tag until the
+            // canonical render is installed again. The listeners are armed for this entire attempt
+            // so a no-move detector rejection can be distinguished from a move whose idle must be
+            // awaited after lift.
+            listenersAttached = true
+            InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                map.addOnCameraIdleListener(idleListener)
+                map.addOnCameraMoveStartedListener(moveStartedListener)
+            }
+            // Capture the generation before opening the stream so a retry cannot begin on the old
+            // tag (or in the null publication window).
+            checkNotNull(fogGeneration() as? Long) {
+                "Canonical fog was not published before the quick-zoom attempt"
+            }
             val zoomAtTouchDown = map.cameraPosition.zoom
             val tapDown = SystemClock.uptimeMillis()
             send(tapDown, MotionEvent.ACTION_DOWN, centerY)
@@ -4665,6 +4793,9 @@ class MapSurfaceTest {
             streamEnded = true
             SystemClock.sleep(DOUBLE_TAP_GAP_MILLIS)
 
+            // The first tap owns a separate detector phase. Baseline the move count after its gap
+            // so a delayed first-tap callback cannot authorize readiness for the rejected hold.
+            val moveEventsBeforeHold = moveStartedEventCount.get()
             val holdDown = SystemClock.uptimeMillis()
             streamEnded = false
             send(holdDown, MotionEvent.ACTION_DOWN, centerY)
@@ -4686,10 +4817,59 @@ class MapSurfaceTest {
             } else {
                 zoomAtTouchDown - map.cameraPosition.zoom
             }
-            if (engagement < MINIMUM_QUICK_ZOOM_ENGAGEMENT) {
+            val forceReject = engagement >= MINIMUM_QUICK_ZOOM_ENGAGEMENT &&
+                forceRejectEngagedAttempt?.compareAndSet(true, false) == true
+            if (engagement < MINIMUM_QUICK_ZOOM_ENGAGEMENT || forceReject) {
+                val baselineGeneration = checkNotNull(fogGeneration() as? Long) {
+                    "Canonical fog was withdrawn before the rejected quick-zoom lift"
+                }
+                val idleEventsBeforeLift = idleEventCount.get()
+                if (forceReject) onForcedRejectBeforeLift?.invoke(baselineGeneration)
                 send(holdDown, MotionEvent.ACTION_UP, currentY)
                 streamEnded = true
+                // A detector can reject without moving the camera, so retain the original reset
+                // settle for every rejection but only await canonical work when this attempt
+                // actually observed a move or an idle that withdrew/published a newer generation.
                 Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+                val movedDuringAttempt = moveStartedEventCount.get() > moveEventsBeforeHold
+                val publishedAfterSettle = fogGeneration() as? Long
+                val idleTriggeredRebuild =
+                    movedDuringAttempt ||
+                        (
+                            idleEventCount.get() > idleEventsBeforeLift &&
+                                (publishedAfterSettle == null ||
+                                    publishedAfterSettle > baselineGeneration)
+                            )
+                if (idleTriggeredRebuild) {
+                    // Under a loaded hosted renderer the idle-triggered canonical rebuild can
+                    // outlive the fixed settle; a retry must observe the causally newer published
+                    // generation, a parsed active slot, and completed A/B retirement before its
+                    // first measured hold. A timeout is a real liveness failure, not permission to
+                    // measure null.
+                    awaitQuickZoomRetryFogReadiness(
+                        map = map,
+                        baselineGeneration = baselineGeneration,
+                        idleEventCount = idleEventCount,
+                        idleEventsBeforeLift = idleEventsBeforeLift,
+                    )
+                } else {
+                    val settledGeneration = fogGeneration()
+                    assertEquals(
+                        "A no-move quick-zoom rejection changed canonical generation without " +
+                            "an observed idle",
+                        baselineGeneration,
+                        settledGeneration,
+                    )
+                    val settledSlot = runCatching { publishedFogSlot() }.getOrNull()
+                    assertNotNull(
+                        "A no-move quick-zoom rejection left no published active slot",
+                        settledSlot,
+                    )
+                    assertTrue(
+                        "A no-move quick-zoom rejection left a fog generation transition in flight",
+                        map.hasOnlyPublishedFogGeneration(checkNotNull(settledSlot)),
+                    )
+                }
                 return false
             }
             if (maximumUnmeasuredZoom != null) {
@@ -4732,6 +4912,12 @@ class MapSurfaceTest {
             streamEnded = true
             return true
         } finally {
+            if (listenersAttached) {
+                InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    map.removeOnCameraIdleListener(idleListener)
+                    map.removeOnCameraMoveStartedListener(moveStartedListener)
+                }
+            }
             if (!streamEnded) {
                 bestEffortClearStuckInjectedPointers()
             }
@@ -4740,6 +4926,68 @@ class MapSurfaceTest {
 
     private fun fogGeneration(): Any? = composeRule.runOnIdle {
         attachedMapView()?.getTag(R.id.map_fog_canonical_generation)
+    }
+
+    /**
+     * Waits for the idle caused by a rejected stream to produce one complete, stable canonical A/B
+     * generation. The generation and slot are read from Compose publication, while layer presence
+     * proves the renderer has retired the other slot before another pointer stream opens.
+     */
+    private fun awaitQuickZoomRetryFogReadiness(
+        map: MapLibreMap,
+        baselineGeneration: Long,
+        idleEventCount: AtomicInteger,
+        idleEventsBeforeLift: Int,
+    ) {
+        val deadline = SystemClock.uptimeMillis() + GESTURE_RETRY_CANONICAL_TIMEOUT_MILLIS
+        while (SystemClock.uptimeMillis() < deadline) {
+            if (idleEventCount.get() <= idleEventsBeforeLift) {
+                SystemClock.sleep(GESTURE_RETRY_READINESS_POLL_MILLIS)
+                continue
+            }
+            val generation = fogGeneration() as? Long
+            val slot = runCatching { publishedFogSlot() }.getOrNull()
+            if (
+                generation == null ||
+                generation <= baselineGeneration ||
+                slot == null ||
+                !map.hasOnlyPublishedFogGeneration(slot)
+            ) {
+                SystemClock.sleep(GESTURE_RETRY_READINESS_POLL_MILLIS)
+                continue
+            }
+
+            val stableGeneration = generation
+            val stableSlot = slot
+            val stableIdleCount = idleEventCount.get()
+            val stableUntil = minOf(
+                deadline,
+                SystemClock.uptimeMillis() + GESTURE_RETRY_CANONICAL_STABILITY_MILLIS,
+            )
+            var stable = true
+            while (SystemClock.uptimeMillis() < stableUntil) {
+                SystemClock.sleep(GESTURE_RETRY_READINESS_POLL_MILLIS)
+                val currentGeneration = fogGeneration() as? Long
+                val currentSlot = runCatching { publishedFogSlot() }.getOrNull()
+                if (
+                    idleEventCount.get() != stableIdleCount ||
+                    currentGeneration != stableGeneration ||
+                    currentSlot != stableSlot ||
+                    !map.hasOnlyPublishedFogGeneration(currentSlot)
+                ) {
+                    stable = false
+                    break
+                }
+            }
+            if (stable) return
+        }
+        val publishedGeneration = fogGeneration()
+        val publishedSlot = runCatching { publishedFogSlot() }.getOrNull()
+        throw AssertionError(
+            "The rejected quick-zoom idle never reached a stable canonical generation: " +
+                "baseline=$baselineGeneration idleEvents=${idleEventCount.get()} " +
+                "publishedGeneration=$publishedGeneration publishedSlot=$publishedSlot",
+        )
     }
 
     private fun MapLibreMap.visibleRegionCorners(): List<GeoPoint> =
@@ -7669,6 +7917,10 @@ class MapSurfaceTest {
         const val QUICK_ZOOM_REOPEN_MOVES = 8
         const val QUICK_ZOOM_ENGAGE_TRAVEL = 0.30f
         const val MINIMUM_QUICK_ZOOM_ENGAGEMENT = 0.03
+        const val GESTURE_RETRY_CANONICAL_TIMEOUT_MILLIS = 25_000L
+        const val GESTURE_RETRY_CANONICAL_STABILITY_MILLIS = 500L
+        const val GESTURE_RETRY_READINESS_POLL_MILLIS = 50L
+        const val QUICK_ZOOM_RETRY_FORCED_DELAY_MILLIS = 3_500L
         const val TAP_DURATION_MILLIS = 60L
         const val DOUBLE_TAP_GAP_MILLIS = 80L
 
