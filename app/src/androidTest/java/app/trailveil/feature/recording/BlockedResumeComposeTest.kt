@@ -1,9 +1,11 @@
 package app.trailveil.feature.recording
 
 import android.Manifest
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.pm.PackageManager
 import android.location.LocationManager
+import android.os.PowerManager
 import android.os.SystemClock
 import androidx.compose.ui.test.junit4.v2.createEmptyComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -22,6 +24,7 @@ import app.trailveil.TrailVeilApplication
 import java.io.FileInputStream
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -63,6 +66,12 @@ class BlockedResumeComposeTest {
                     deadRuntime = "runtime-behind-a-blocked-resume-p4-040",
                 ).also { sessionId = it }
             }
+            // The hosted emulator can time out its display while Gradle builds the APK. A launch
+            // behind that keyguard stops at STARTED/CREATED, where Compose correctly exposes no
+            // RESUMED semantics root and the automatic route action correctly refuses to run.
+            // Establish this device precondition before the process's first Activity rather than
+            // retrying a route assertion against an Activity the platform never made interactive.
+            wakeAndUnlockDevice()
             ActivityScenario.launch(MainActivity::class.java).use { scenario ->
                 awaitSemanticsTag(
                     scenario = scenario,
@@ -228,6 +237,26 @@ class BlockedResumeComposeTest {
         assertEquals(PackageManager.PERMISSION_GRANTED, context.checkSelfPermission(permission))
     }
 
+    private fun wakeAndUnlockDevice() {
+        shell("input keyevent 224") // KEYCODE_WAKEUP
+        shell("wm dismiss-keyguard")
+        shell("input keyevent 82") // Emulator-compatible KEYCODE_MENU unlock fallback.
+        val power = requireNotNull(context.getSystemService(PowerManager::class.java))
+        val keyguard = requireNotNull(context.getSystemService(KeyguardManager::class.java))
+        val deadline = SystemClock.uptimeMillis() + DEVICE_READY_TIMEOUT_MILLIS
+        while (
+            SystemClock.uptimeMillis() < deadline &&
+            (!power.isInteractive || keyguard.isKeyguardLocked)
+        ) {
+            SystemClock.sleep(POLL_MILLIS)
+        }
+        assertTrue(
+            "the emulator remained non-interactive before MainActivity launch: " +
+                "interactive=${power.isInteractive} keyguardLocked=${keyguard.isKeyguardLocked}",
+            power.isInteractive && !keyguard.isKeyguardLocked,
+        )
+    }
+
     private fun shell(command: String) {
         val descriptor = InstrumentationRegistry.getInstrumentation().uiAutomation
             .executeShellCommand(command)
@@ -262,6 +291,7 @@ class BlockedResumeComposeTest {
 
     private companion object {
         const val READINESS_TIMEOUT_MILLIS = 25_000L
+        const val DEVICE_READY_TIMEOUT_MILLIS = 5_000L
         const val POLL_MILLIS = 250L
     }
 }
