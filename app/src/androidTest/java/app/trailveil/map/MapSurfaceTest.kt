@@ -1535,12 +1535,41 @@ class MapSurfaceTest {
                 )
             }
             val slotWhenWaitSucceeded = AtomicReference<FogGenerationSlot?>(null)
-            composeRule.waitUntil(timeoutMillis = 90_000L) {
-                val settledSlot = runCatching { publishedFogSlot() }.getOrNull()
-                val settled = settledSlot != null &&
-                    readyMap.hasOnlyPublishedFogGeneration(settledSlot)
-                if (settled) slotWhenWaitSucceeded.set(settledSlot)
-                settled
+            val retirementTimeoutMillis = 90_000L
+            // Closure round 5: `waitUntil` THROWS `ComposeTimeoutException` on timeout rather than
+            // returning false, so a diagnostic placed AFTER it is unreachable on the only path that
+            // can fail. The failure this entry was opened on would still have arrived as a bare
+            // "Condition still not satisfied after 90000 ms". The two waits earlier in this test
+            // already use this `runCatching`/`getOrElse` shape; this one did not.
+            //
+            // Building the report here rather than below also stops it running on every PASSING
+            // run: `fogGenerationStyleReport` requires a ready style, which this wait's own
+            // predicate deliberately tolerates being absent, so an unused diagnostic could fail a
+            // healthy test.
+            runCatching {
+                composeRule.waitUntil(timeoutMillis = retirementTimeoutMillis) {
+                    val settledSlot = runCatching { publishedFogSlot() }.getOrNull()
+                    val settled = settledSlot != null &&
+                        readyMap.hasOnlyPublishedFogGeneration(settledSlot)
+                    if (settled) slotWhenWaitSucceeded.set(settledSlot)
+                    settled
+                }
+            }.getOrElse { failure ->
+                val slot = runCatching { publishedFogSlot() }.getOrNull()
+                val style = slot?.let { active ->
+                    runCatching { readyMap.fogGenerationStyleReport(active) }
+                        .getOrElse { unreadable -> "unreadable: $unreadable" }
+                }
+                throw AssertionError(
+                    "The superseded slot was never observed retired within " +
+                        "${retirementTimeoutMillis}ms: settledSlot=$slot " +
+                        "activeComplete=" +
+                        "${slot?.let { readyMap.hasCompletePublishedGeneration(it) }} " +
+                        "inactiveRetired=" +
+                        "${slot?.let { readyMap.hasRetiredGeneration(it.other()) }} " +
+                        "style=[$style]",
+                    failure,
+                )
             }
             // P4-047: the retirement is asserted from what the WAIT OBSERVED, not from a
             // re-check afterwards. The diagnostic added for this entry answered it on its first
@@ -1554,14 +1583,14 @@ class MapSurfaceTest {
             // state, and any assertion that re-reads it later is racing the next legitimate
             // rebuild. Observing the moment is the whole evidence; re-checking it is what made
             // this test fail three times on three different trees, one of them hosted.
-            assertNotNull(
-                "The superseded slot was never observed retired within the wait: " +
-                    "settledSlot=${publishedFogSlot()} " +
-                    "activeComplete=${readyMap.hasCompletePublishedGeneration(publishedFogSlot())} " +
-                    "inactiveRetired=${readyMap.hasRetiredGeneration(publishedFogSlot().other())} " +
-                    "style=[${readyMap.fogGenerationStyleReport(publishedFogSlot())}]",
-                slotWhenWaitSucceeded.get(),
-            )
+            // Unfailable by construction, and kept only as an executable statement of the
+            // invariant: `waitUntil` returns solely when its predicate returned true, and that
+            // predicate is the only writer of this reference. The evidence for this test is the
+            // timeout branch above, not this line -- which is exactly what closure round 5 found
+            // the previous `assertNotNull` here silently pretending otherwise.
+            checkNotNull(slotWhenWaitSucceeded.get()) {
+                "The retirement wait returned without recording the slot it observed"
+            }
         } finally {
             releaseBeforeInstall.complete(Unit)
             database.close()
@@ -4676,8 +4705,7 @@ class MapSurfaceTest {
                 InstrumentationRegistry.getInstrumentation().runOnMainSync { triggerRepaint() }
             }
             if (ready.count != 0L &&
-                framesRendered.get() >= MINIMUM_RENDERER_ANSWERS &&
-                settledOnExpectedCamera(view, expectedCamera)
+                rendererEscapeGranted(view, expectedCamera, framesRendered.get())
             ) {
                 return
             }
@@ -4712,15 +4740,49 @@ class MapSurfaceTest {
     }
 
     /**
+     * `P4-044`'s timeout escape, as one named predicate rather than a conjunction spelled inline.
+     *
+     * It exists in this shape so that [assertSettledProofDiscriminates] can drive the SAME function
+     * the escape calls. Closure round 5 found the frame-count conjunct -- the one part a stalled
+     * renderer cannot fake -- bound by nothing at all: the discriminating test called only
+     * [settledOnExpectedCamera], which never reads the frame count, so deleting the conjunct left
+     * the whole suite green and reduced the escape to precisely the proof round 4 rejected.
+     *
+     * Short-circuits, so a caller passing a frame count of zero pays for no pixel capture.
+     */
+    private fun MapLibreMap.rendererEscapeGranted(
+        view: MapView,
+        expectedCamera: CameraPosition?,
+        framesRendered: Int,
+    ): Boolean =
+        framesRendered >= MINIMUM_RENDERER_ANSWERS &&
+            settledOnExpectedCamera(view, expectedCamera)
+
+    /**
      * `P4-044`: the settled proof says yes to the state that IS on screen and no to one that is not.
      *
      * [settledOnExpectedCamera] is only ever consulted after the readiness callback has already
      * timed out, and that timeout has never reproduced locally — so the escape's integration cannot
-     * be exercised here, and only hosted CI can report on it. Its DECISION can be bound though, and
-     * this does: run on every finite-extent guard test at a genuinely settled camera, it requires a
-     * yes for the position that was just requested and a no for one displaced far beyond the
-     * epsilon. Break the camera comparison and the second assertion fails; break the liveness or
-     * stability halves and the first does.
+     * be exercised here, and only hosted CI can report on it. Its DECISION can be bound, and this
+     * does: run wherever a frozen camera is positioned — which is the only route that supplies an
+     * expected camera at all, and therefore the only route on which the escape can fire — at a
+     * genuinely settled camera, it requires a yes
+     * for the position that was just requested and a no for one displaced far beyond the epsilon,
+     * then drives [rendererEscapeGranted] itself across the three cases that matter.
+     *
+     * **What each assertion here actually binds, corrected by closure round 5** — the previous
+     * version of this sentence claimed more than it had:
+     *  - the camera comparison: bound, by the displaced case;
+     *  - the presence of the frame-count conjunct in the escape, and a non-zero
+     *    [MINIMUM_RENDERER_ANSWERS]: bound, by the zero-frames case;
+     *  - the presence of the settled proof in the escape: bound, by the displaced-with-frames case.
+     *
+     * **Not caught here, and it is not caught anywhere else either.** Breaking the `judgeable` or
+     * stability halves INSIDE [settledOnExpectedCamera] fails nothing: both make it return true
+     * more often, which satisfies the yes assertion, while the no assertion is decided by the
+     * camera comparison before either is reached. No device fixture can close that, because
+     * producing a stalled-but-lit surface on demand is the very thing this entry spent four rounds
+     * failing to do. It is recorded rather than papered over.
      *
      * The displacement is a whole degree of latitude — not a near-miss — because the epsilon exists
      * for floating-point round-tripping, not for tolerance, and a near-miss fixture would turn a
@@ -4730,9 +4792,16 @@ class MapSurfaceTest {
         view: MapView,
         requested: CameraPosition,
     ) {
+        // Read the reason AFTER the call that writes it. Kotlin evaluates an `assertTrue` message
+        // argument BEFORE the condition, so the previous form interpolated `settledReason` from
+        // before this call ran -- and in a healthy run nothing has called `settledOnExpectedCamera`
+        // yet, so the first failure of this assertion printed its initializer, an empty string.
+        // `P4-044` records learning that exact trap once already; closure round 5 found it still
+        // here, on the field's only reader.
+        val recognisesTheRequest = settledOnExpectedCamera(view, requested)
         assertTrue(
             "The settled proof does not recognise the camera it was just given ($settledReason)",
-            settledOnExpectedCamera(view, requested),
+            recognisesTheRequest,
         )
         val displaced = CameraPosition.Builder(requested)
             .target(
@@ -4746,6 +4815,29 @@ class MapSurfaceTest {
             "The settled proof accepted a camera the map was never given - all it can prove is " +
                 "that the request reached the map, and it is not proving even that",
             !settledOnExpectedCamera(view, displaced),
+        )
+        // Closure round 5. The two assertions above bind only the camera comparison: breaking the
+        // liveness or stability halves of `settledOnExpectedCamera` makes it return true MORE
+        // often, which satisfies the first assertion and leaves the second decided by the camera
+        // alone. These three drive `rendererEscapeGranted` itself -- the function the escape
+        // actually calls -- so deleting either of ITS conjuncts, or setting
+        // MINIMUM_RENDERER_ANSWERS to zero, turns one of them red.
+        assertTrue(
+            "The escape is granted to a renderer that finished no frames at all, so the frame " +
+                "count is not part of it",
+            !rendererEscapeGranted(view, requested, framesRendered = 0),
+        )
+        val escapeGrantedWhenAnswered =
+            rendererEscapeGranted(view, requested, framesRendered = MINIMUM_RENDERER_ANSWERS)
+        assertTrue(
+            "The escape is refused at a settled camera after $MINIMUM_RENDERER_ANSWERS answered " +
+                "frames, so it can never fire where it is meant to ($settledReason)",
+            escapeGrantedWhenAnswered,
+        )
+        assertTrue(
+            "The escape is granted for a camera the map was never given, so the settled proof is " +
+                "not part of it and the frame count alone is deciding",
+            !rendererEscapeGranted(view, displaced, framesRendered = MINIMUM_RENDERER_ANSWERS),
         )
     }
 
@@ -6408,7 +6500,6 @@ class MapSurfaceTest {
             var postExitFlingFrames = 0
             val flingLeaks = mutableListOf<FogCoverage>()
             val darkFlingFrames = mutableListOf<FogCoverage>()
-            val flingFrameSamples = mutableListOf<SurfaceSample>()
             try {
                 assertTrue(
                     "Too few renderer-finished fling frames were captured: ${flingFrames.size}",
@@ -6450,7 +6541,6 @@ class MapSurfaceTest {
                         frame.expectedCoverage.extent.covers(frame.snapshotEndCorners),
                     )
                     val coverage = frame.bitmap.fogCoverage()
-                    flingFrameSamples += SurfaceSample.of(coverage.fingerprint, frame.target)
                     // Same absolute-count hazard as the gesture loop above, in a second place the
                     // first version of P4-042 missed: this branch reads `revealedFraction` alone,
                     // so a dead surface satisfies `flingExited` and contributes no leak.
@@ -6830,9 +6920,16 @@ class MapSurfaceTest {
             assertSurfaceStayedLive(moving(List(MINIMUM_LIVENESS_SAMPLE_FRAMES) { 7L }), "probe")
         }
 
-        // Pins MINIMUM_STALLED_RUN_FRAMES from BOTH sides, at the real window size. One frame over
-        // the floor must fail; exactly at the floor must pass, because that is the coalescing the
-        // renderer genuinely does (measured 3, 2 and 2).
+        // One frame over the floor must fail; exactly at the floor must pass, because that is the
+        // coalescing the renderer genuinely does (measured 3, 2 and 2).
+        //
+        // **Closure round 5 corrected what this pair proves.** It used to say "pins
+        // MINIMUM_STALLED_RUN_FRAMES from BOTH sides", and it does not: both fixtures are BUILT
+        // from the constant, so they track any value it takes. What is bound is the comparison
+        // operator — flip `>` to `>=` and the second call reddens — not the number, which stays
+        // free across at least 1..5 with the suite green. Pinning the number would need a fixture
+        // whose run length is a literal, and that is only worth writing if this helper ever
+        // acquires a live call site; today it has none.
         assertThrows(AssertionError::class.java) {
             assertSurfaceStayedLive(
                 moving(List(MINIMUM_STALLED_RUN_FRAMES + 1) { 9L } + (0 until 8).map { it.toLong() }),
@@ -7957,11 +8054,6 @@ class MapSurfaceTest {
                 bearing = camera?.bearing,
             )
 
-            fun of(fingerprint: Long, target: GeoPoint): SurfaceSample = SurfaceSample(
-                fingerprint = fingerprint,
-                latitude = target.latitude,
-                longitude = target.longitude,
-            )
         }
     }
 
@@ -8355,11 +8447,19 @@ class MapSurfaceTest {
          * rejects a frame that is nearly all BLACK, which is one shape a death can take. The shape
          * it cannot see is a death at some other constant brightness.
          *
-         * Liveness of a *stream* is what actually decides it, and that is [assertSurfaceStayedLive]:
-         * a surface being driven by a moving camera cannot return the same bytes for long, whatever
-         * those bytes are. The three continuously-moving streams use both; the held-camera streams
-         * use only this, because there a repeated frame is a still camera rather than a dead
-         * surface — measured, see that helper.
+         * **Corrected by closure round 5: this predicate is on its own.** An earlier version of this
+         * paragraph said stream liveness "is what actually decides it, and that is
+         * [assertSurfaceStayedLive] ... The three continuously-moving streams use both". That was
+         * true when written and false by the time it was read: the stream gate was narrowed four
+         * times and then RETIRED, and nothing outside its own binding test calls it — its own KDoc
+         * says so in capitals. Every leak gate on this tree consumes this predicate, and no second
+         * guard sits behind it.
+         *
+         * What does back it up, on the paths that have it, is [FogCoverage.drawnFraction] asserted
+         * as a `> minimum` on the audit route: a surface that draws nothing scores zero there and
+         * goes red. The sampled leak streams have only this predicate, per frame. The gap named
+         * three paragraphs up — a death at some constant NON-black brightness — is therefore
+         * genuinely open on those streams, and `P4-042` records it rather than implying cover.
          */
         val judgeable: Boolean get() = nonBlackFraction >= MINIMUM_GUARDED_NON_BLACK_FRACTION
 
@@ -8844,6 +8944,22 @@ class MapSurfaceTest {
          * Deliberately small. Thirty seconds of half-second repaints gives a healthy renderer sixty
          * chances; requiring a handful separates "answering" from "produced nothing at all" without
          * turning a liveness question into a throughput one.
+         *
+         * **Two limits, both found by closure round 5, both recorded rather than papered over.**
+         *  1. The value is UNMEASURED. It could not be otherwise: this family has never once
+         *     reproduced locally, so no run has ever observed what a stuck hosted renderer emits.
+         *     Three is a judgement, not a measurement, and the standing rule against setting a
+         *     threshold on a noisy quantity applies to it.
+         *  2. The quantity it thresholds is partly produced by the wait itself. The wait forces
+         *     `triggerRepaint()` about sixty times, and the listener counts EVERY finished frame,
+         *     so a renderer managing one frame per ten seconds — effectively hung — still clears
+         *     three and is granted the escape.
+         *
+         * Both point the same way: this count separates "produced nothing at all" from "produced
+         * something", and it cannot separate slow from healthy. No value of it can, and inventing a
+         * rate threshold instead would be the same mistake in a new costume — this entry already
+         * narrowed one such instrument four times before retiring it. The claim made for this
+         * constant is deliberately the weak one.
          */
         const val MINIMUM_RENDERER_ANSWERS = 3
 

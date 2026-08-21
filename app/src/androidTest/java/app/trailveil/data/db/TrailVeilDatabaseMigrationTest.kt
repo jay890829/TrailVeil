@@ -297,6 +297,7 @@ class TrailVeilDatabaseMigrationTest {
         // P4-036. Three things must hold together, and the third is the one a migration usually
         // forgets: the column exists, EXISTING rows carry a correct value rather than the DEFAULT,
         // and the superseded index is gone so nothing can silently keep planning through it.
+        val fixtureLatitudes = listOf(25.0330, -33.8688, 0.0, 89.9)
         migrationHelper.createDatabase("migration-p4-036", 6).use { old ->
             old.execSQL(
                 "INSERT INTO recording_sessions(id, started_at, status, distance_meters, " +
@@ -307,7 +308,7 @@ class TrailVeilDatabaseMigrationTest {
                 "INSERT INTO track_segments(id, session_id, sequence, started_at, start_reason, " +
                     "open_slot) VALUES(1, 1, 0, 1000, 'SESSION_START', 1)",
             )
-            listOf(25.0330, -33.8688, 0.0, 89.9).forEachIndexed { index, latitude ->
+            fixtureLatitudes.forEachIndexed { index, latitude ->
                 old.execSQL(
                     "INSERT INTO track_points(id, session_id, segment_id, sequence, timestamp, " +
                         "latitude, longitude, horizontal_accuracy) VALUES(" +
@@ -332,6 +333,18 @@ class TrailVeilDatabaseMigrationTest {
                 while (cursor.moveToNext()) add(cursor.getDouble(0) to cursor.getInt(1))
             }
         }
+        // Closure round 5: the per-row check below lives inside a `forEach`, so an EMPTY result
+        // set satisfies it for free. A 6->7 migration that dropped every track point would pass
+        // this case green -- the index assertion still holds, and the trigger check further down
+        // inserts its own fresh row afterwards, so nothing else here would notice either. That is
+        // the standing rule's "<= maximum" shape in its list form: nothing is the best possible
+        // score. Pin the rows first, and derive the count from the fixture rather than restating
+        // it as a second literal.
+        assertEquals(
+            "the 6->7 migration did not preserve the rows it was supposed to backfill",
+            fixtureLatitudes.size,
+            buckets.size,
+        )
         buckets.forEach { (latitude, bucket) ->
             assertEquals(
                 "row at latitude $latitude kept the column default instead of its bucket",

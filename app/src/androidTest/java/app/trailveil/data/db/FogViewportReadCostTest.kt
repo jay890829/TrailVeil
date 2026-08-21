@@ -288,6 +288,18 @@ class FogViewportReadCostTest {
         // earlier version used `returned * 2`, a margin of two rows, on a fixture whose edges sat
         // exactly on bucket boundaries; it could not fail for an index reason and was one
         // 0.0001-degree edit from failing for no reason at all.
+        // Closure round 5: both bounds below put `visited` on the SMALL side, so a read that
+        // matches nothing scores `0 <= 0` and `0 <= band` and passes them for free -- the standing
+        // rule's "fraction <= maximum" shape, where zero is the best possible score. It is
+        // reachable, and by this entry's own A/B #2: stop installing the bucket triggers and the
+        // fixture's raw-SQL rows keep the column default, the bucketed read matches nothing, and
+        // this case -- the one whose name claims it lands the narrowing measurement -- goes green
+        // on a fog read that returned no rows. Only the sibling gate reddens. A `> minimum`
+        // assertion protects itself; these two do not, so the precondition is stated separately.
+        assertTrue(
+            "the bucketed read returned no rows at all, so neither bound below can mean anything",
+            returned > 0,
+        )
         assertTrue(
             "the bucketed read visits $visited rows to return $returned, which is not a bound " +
                 "proportional to the box",

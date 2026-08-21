@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.os.SystemClock
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.junit4.v2.createComposeRule
 import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
@@ -143,18 +144,25 @@ class FogRevealLatencyTest {
                             distanceDeltaMeters = 1.0,
                         )
                     }
-                    composeRule.waitUntil(timeoutMillis = 2_000L) {
-                        rendered.isNotEmpty() || failures.isNotEmpty()
+                    // `waitUntil` THROWS on timeout instead of returning false, so the diagnostic
+                    // below it was unreachable: hosted run `32472632567` failed exactly here and
+                    // carried nothing but "Condition still not satisfied after 2000 ms". See
+                    // `P4-035`'s flake log (7). What passes and what fails is unchanged -- the same
+                    // elapsed time still fails the same sample -- only what the failure says.
+                    try {
+                        composeRule.waitUntil(timeoutMillis = PER_SAMPLE_TIMEOUT_MILLIS) {
+                            rendered.isNotEmpty() || failures.isNotEmpty()
+                        }
+                    } catch (timeout: ComposeTimeoutException) {
+                        throw AssertionError(
+                            stalledDiagnostic(index, this, observedFeed, failures),
+                            timeout,
+                        )
                     }
-                    val completed = rendered.poll() ?: error(
-                            "Fog was not installed after persisted point $index; " +
-                                "failure=${failures.poll()?.stackTraceToString()}, " +
-                                "latest=${observedFeed.latest}, " +
-                                "starts=${observedFeed.starts}, " +
-                                "completions=${observedFeed.completions}, " +
-                                "revisions=${observedFeed.revisions}, " +
-                                "reads=${observedFeed.reads}",
-                            )
+                    val completed = rendered.poll()
+                        ?: throw AssertionError(
+                            stalledDiagnostic(index, this, observedFeed, failures),
+                        )
                     add(
                         TimeUnit.NANOSECONDS.toMillis(
                             completed.elapsedNanos - startedNanos,
@@ -177,11 +185,39 @@ class FogRevealLatencyTest {
 
             assertTrue(
                 "Persisted-point-to-fog p95 was ${p95Millis}ms: $samplesMillis",
-                p95Millis <= 2_000L,
+                p95Millis <= P95_BUDGET_MILLIS,
             )
         } finally {
             database.close()
         }
+    }
+
+    /**
+     * Everything known about a sample that never produced an installed fog render.
+     *
+     * Read under each list's own monitor: [ObservedFeed] is written from the feed's coroutines
+     * while this runs, and a `ConcurrentModificationException` raised while building a failure
+     * message would replace one uninformative failure with another.
+     */
+    private fun stalledDiagnostic(
+        index: Int,
+        measuredSoFar: List<Long>,
+        observedFeed: ObservedFeed,
+        failures: LinkedBlockingQueue<Throwable>,
+    ): String {
+        val latest = synchronized(observedFeed.latest) { observedFeed.latest.toList() }
+        val starts = synchronized(observedFeed.starts) { observedFeed.starts.toList() }
+        val completions = synchronized(observedFeed.completions) { observedFeed.completions.toList() }
+        val revisions = synchronized(observedFeed.revisions) { observedFeed.revisions.toList() }
+        val reads = synchronized(observedFeed.reads) { observedFeed.reads.size }
+        return "Fog was not installed within ${PER_SAMPLE_TIMEOUT_MILLIS}ms of persisted point " +
+            "$index of $SAMPLE_COUNT. Note that the per-sample wait equals the p95 budget " +
+            "(${P95_BUDGET_MILLIS}ms), so a single sample that overruns arrives HERE rather than " +
+            "as a p95 failure, whatever the other samples measured. " +
+            "measuredSoFar=$measuredSoFar, " +
+            "failure=${failures.poll()?.stackTraceToString()}, " +
+            "latest=$latest, starts=$starts, completions=$completions, " +
+            "revisions=$revisions, readBatches=$reads"
     }
 
     private data class TimedRender(
@@ -224,5 +260,18 @@ class FogRevealLatencyTest {
 
     private companion object {
         const val SAMPLE_COUNT = 20
+
+        /** The product criterion this test is named for. */
+        const val P95_BUDGET_MILLIS = 2_000L
+
+        /**
+         * Deliberately equal to [P95_BUDGET_MILLIS], which is what makes the p95 assertion
+         * unfailable in practice: with [SAMPLE_COUNT] = 20 the p95 index is 18, so the statistic
+         * tolerates one slow sample, but no sample can ever be RECORDED as slow because the wait
+         * gives up at the same bound. Whether that is the contract this test should have is an open
+         * question owned by `P4-035`'s flake log (7); it is written down rather than silently
+         * changed, because loosening it would change what the suite accepts.
+         */
+        const val PER_SAMPLE_TIMEOUT_MILLIS = 2_000L
     }
 }
