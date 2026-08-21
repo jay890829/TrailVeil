@@ -50,6 +50,12 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
 
     fun claimAbandonedResumeAttempt(sessionId: Long): Boolean = resumeClaims.claim(sessionId)
 
+    /** `P4-048`: what this runtime has told the user about, shared with the service in-process. */
+    override val announcedInterruptions = AnnouncedInterruptions()
+
+    fun announcedInterruptionInThisRuntime(sessionId: Long): Boolean =
+        announcedInterruptions.wasAnnounced(sessionId)
+
     /** Wall-clock instant this boot began, so a session older than the boot can be told apart. */
     fun bootedAtEpochMillis(): Long =
         bootInstantEpochMillis(clock.epochMillis(), clock.elapsedRealtimeNanos())
@@ -151,6 +157,7 @@ internal interface RecordingRuntimeDependencies {
     val clock: RecordingServiceClock
     val operationIds: RecordingOperationIdFactory
     val recordingServiceState: RecordingServiceState
+    val announcedInterruptions: AnnouncedInterruptions
 }
 
 internal interface RecordingServiceClock {

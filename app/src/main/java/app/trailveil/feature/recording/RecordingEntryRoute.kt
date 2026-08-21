@@ -446,6 +446,7 @@ internal fun RecordingEntryRoute(
             startupReconciled = startupReconciled,
             activityResumed = activityResumed,
             claim = appContainer::claimAbandonedResumeAttempt,
+            announcedInThisRuntime = appContainer::announcedInterruptionInThisRuntime,
         )
         when (action) {
             null -> Unit

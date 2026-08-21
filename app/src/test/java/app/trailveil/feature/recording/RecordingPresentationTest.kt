@@ -347,6 +347,39 @@ class RecordingPresentationTest {
     }
 
     @Test
+    fun anExplorationThisRuntimeAnnouncedAsInterruptedIsEndedRatherThanResumed() {
+        // P4-048, decided by the product owner on 2026-08-21 from P5-001 row 6. The app told the
+        // user 「探索已中斷 — 錄製意外停止，已儲存的位置仍保留在歷史中」 and then, on reopening,
+        // was still recording that same exploration. Both halves were individually correct, and
+        // together they mislead anyone who acts on the notification.
+        //
+        // This fixture is deliberately the one directly above, changed in exactly one way: the
+        // session still starts inside this boot, so the boot comparison would resume it. Only the
+        // announcement differs, which is the whole claim of P4-048.
+        assertEquals(
+            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = BOOTED_AT + AN_HOUR),
+            abandonedAction(
+                startedAt = BOOTED_AT + AN_HOUR,
+                announcedInThisRuntime = { true },
+            ),
+        )
+    }
+
+    @Test
+    fun anAnnouncementAboutAnotherExplorationDoesNotEndThisOne() {
+        // The record is per session, not a runtime-wide latch. A user who is told exploration 4 was
+        // interrupted, starts exploration 7, and then loses the process must still have 7 resumed --
+        // P4-041 measured that recovery on the POCO and P4-048 must not take it away.
+        assertEquals(
+            AbandonedExplorationAction.Resume(7L),
+            abandonedAction(
+                startedAt = BOOTED_AT + AN_HOUR,
+                announcedInThisRuntime = { sessionId -> sessionId == 4L },
+            ),
+        )
+    }
+
+    @Test
     fun anExplorationTheDeviceRestartedUnderIsEndedRatherThanResumed() {
         // PLAN.md: 「裝置重開機後不靜默恢復定位；下次開啟時將未正常結束的 session 標示為中斷。」
         // Both clauses live here. Nothing else in the tree can enforce either: the durable row
@@ -547,6 +580,7 @@ class RecordingPresentationTest {
         startupReconciled: Boolean = true,
         activityResumed: Boolean = true,
         claim: (Long) -> Boolean = { true },
+        announcedInThisRuntime: (Long) -> Boolean = { false },
     ): AbandonedExplorationAction? = abandonedExplorationAction(
         state = state,
         activeSessionId = activeSessionId,
@@ -556,6 +590,7 @@ class RecordingPresentationTest {
         startupReconciled = startupReconciled,
         activityResumed = activityResumed,
         claim = claim,
+        announcedInThisRuntime = announcedInThisRuntime,
     )
 
     @Test

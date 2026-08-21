@@ -200,6 +200,14 @@ internal const val BOOT_BOUNDARY_TOLERANCE_MILLIS = 5_000L
  * [claim] is taken rather than consulted by the caller so that "once per session per process" is part
  * of this decision instead of a line beside it — the guard has twice been correct in isolation while
  * the wiring that reaches it was bound by nothing.
+ *
+ * **`P4-048`: an announcement outranks the boot comparison.** If this runtime has already told the
+ * user that this exploration was interrupted, it ends - resuming it would make the notification a
+ * lie, which is what the product owner decided on 2026-08-21 after `P5-001` row 6. This is NOT
+ * "stop resuming": a process killed and restarted by the system announces nothing, so
+ * [announcedInThisRuntime] is false there and the `P4-041` recovery is untouched. The announcement
+ * is the whole difference, and it is asked of this decision rather than checked beside it for the
+ * same reason [claim] is.
  */
 internal fun abandonedExplorationAction(
     state: RecordingDisplayState,
@@ -210,6 +218,7 @@ internal fun abandonedExplorationAction(
     startupReconciled: Boolean,
     activityResumed: Boolean,
     claim: (Long) -> Boolean,
+    announcedInThisRuntime: (Long) -> Boolean,
 ): AbandonedExplorationAction? {
     if (state != RecordingDisplayState.ABANDONED) return null
     val sessionId = activeSessionId ?: return null
@@ -222,7 +231,10 @@ internal fun abandonedExplorationAction(
     // An unknown start time cannot be shown to postdate the boot, so it takes the safe branch.
     val predatesThisBoot = activeSessionStartedAt == null ||
         activeSessionStartedAt < bootedAtEpochMillis + BOOT_BOUNDARY_TOLERANCE_MILLIS
-    return if (predatesThisBoot) {
+    // P4-048. Ordered before the boot comparison rather than folded into it, because the two say
+    // different things: the boot comparison asks whether resuming COULD be right, and this asks
+    // whether the user has already been told it will not happen. An announcement wins.
+    return if (predatesThisBoot || announcedInThisRuntime(sessionId)) {
         AbandonedExplorationAction.Interrupt(
             sessionId = sessionId,
             stoppedRecordingAt = activeSessionLastPointAt ?: activeSessionStartedAt,

@@ -23,6 +23,8 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -181,6 +183,26 @@ class RecordingOutcomeNotificationTest {
                 context.getString(app.trailveil.R.string.recording_interrupted_title),
                 outcomeNotifications.single().notification.extras
                     .getString(android.app.Notification.EXTRA_TITLE),
+            )
+            // P4-048, and this is the WIRING half rather than the decision half. The decision -
+            // that an announced exploration is ended rather than resumed - is owned by
+            // `abandonedExplorationAction` and bound by JVM tests. What no JVM test can reach is
+            // whether the real service actually records what it just announced, and this file is
+            // the only place that drives the production service into the interrupt path at all.
+            //
+            // The failure this rules out is the one this decision table has met twice already, and
+            // its own KDoc names: a guard correct in isolation while the wiring reaching it is bound
+            // by nothing. Delete `announceInterruption`'s record and every JVM test still passes.
+            assertTrue(
+                "The service announced an interruption for session $sessionId without recording " +
+                    "it, so reopening would resume the exploration the user was just told had " +
+                    "ended (P4-048)",
+                container.announcedInterruptionInThisRuntime(sessionId),
+            )
+            assertFalse(
+                "The runtime claims an announcement for a session it never announced, so the " +
+                    "record is a latch rather than a per-session fact (P4-048)",
+                container.announcedInterruptionInThisRuntime(sessionId + 1_000L),
             )
         } finally {
             container.setLocationEngineOverrideForTesting(null)

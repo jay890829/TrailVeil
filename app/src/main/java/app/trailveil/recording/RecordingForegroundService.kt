@@ -334,7 +334,7 @@ class RecordingForegroundService : Service() {
                     // startForeground was refused because the permission grade cannot re-arm
                     // location from the background (measured on the POCO: sessions 39 and 43
                     // refused at 使用時允許; session 44 recovered at 一律允許, P4-041).
-                    notifier.showInterrupted()
+                    announceInterruption(state.sessionId)
                 }
                 command.action == ACTION_START && command.sessionId != null ->
                     dependencies.recordingRepository.failStart(
@@ -421,8 +421,26 @@ class RecordingForegroundService : Service() {
         // Notified either way. The claim is that recording stopped without completing and that
         // whatever was already saved is kept, and both are true whether or not the terminal row
         // could be written — nothing else will tell the user this happened.
-        notifier.showInterrupted()
+        //
+        // This is the site P4-048 exists for. When the interrupt above fails - which is what a full
+        // disk does - the durable row stays ACTIVE while the user is told the exploration ended,
+        // and without the record below, reopening would resume it.
+        announceInterruption(sessionId)
         stopRuntime(startId)
+    }
+
+    /**
+     * Tell the user an exploration was interrupted, and remember that this runtime said so.
+     *
+     * `P4-048`. Every announcement goes through here, so the memory cannot fall out of step with the
+     * notification: [RecordingForegroundNotifier.showInterrupted] has no session to record and the
+     * two would otherwise be separate statements at each site. What the runtime remembers is read by
+     * `abandonedExplorationAction`, which refuses to resume an exploration the user has been told
+     * about.
+     */
+    private fun announceInterruption(sessionId: Long) {
+        dependencies.announcedInterruptions.announce(sessionId)
+        notifier.showInterrupted()
     }
 
     private fun stopRuntime(startId: Int) {
