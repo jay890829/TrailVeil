@@ -152,6 +152,55 @@ class LatitudeBucketDerivationTest {
         )
     }
 
+    /**
+     * The database's OWN arithmetic, read back out of it and evaluated against the Kotlin's.
+     *
+     * [LatitudeBuckets.BUCKETS_PER_DEGREE] is the reader's bucket size; the trigger and the
+     * migration are the writers. While those were bare `500.0` literals, changing the constant
+     * moved the reader alone and every already-stored point would have fallen out of the fog
+     * viewport read at once — silently, and in the direction every leak audit accepts. They are
+     * interpolated from the constant now, and this checks that the text which actually reached
+     * SQLite still computes what Kotlin computes.
+     *
+     * It reads the trigger from `sqlite_master` and asks the database to evaluate its own
+     * expression, so a change to the interpolation, the offset, or the rounding shows up here. The
+     * sibling JVM test compares `of()` against a hand-written expression, which cannot catch any of
+     * those.
+     */
+    @Test
+    fun theTriggersArithmeticAgreesWithTheKotlinAtEveryKindOfLatitude() {
+        database = openWithTriggers()
+        val db = database.openHelper.readableDatabase
+
+        val triggerSql = db.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = " +
+                "'track_points_lat_bucket_insert'",
+        ).use { cursor ->
+            assertEquals("the bucket repair trigger is not installed", 1, cursor.count)
+            cursor.moveToFirst()
+            cursor.getString(0)
+        }
+        // The expression as the trigger actually spells it, lifted from the installed text rather
+        // than retyped here — retyping is the mistake this whole test exists to catch.
+        val expression = BUCKET_EXPRESSION.find(triggerSql)?.value
+            ?: error("the trigger no longer computes the bucket in the expected shape: $triggerSql")
+
+        listOf(WALKED_LATITUDE, MOVED_LATITUDE, 0.0, -0.0001, -33.8688, 89.9999, -90.0, 90.0)
+            .forEach { latitude ->
+                val fromSql = db.query(
+                    "SELECT " + expression.replace("NEW.latitude", latitude.toString()),
+                ).use { cursor ->
+                    cursor.moveToFirst()
+                    cursor.getInt(0)
+                }
+                assertEquals(
+                    "the database and the Kotlin disagree about latitude $latitude",
+                    LatitudeBuckets.of(latitude),
+                    fromSql,
+                )
+            }
+    }
+
     private fun storedBucket(): Int =
         database.openHelper.readableDatabase
             .query("SELECT lat_bucket FROM track_points ORDER BY id ASC LIMIT 1")
@@ -170,5 +219,15 @@ class LatitudeBucketDerivationTest {
 
         /** A real bucket, for somewhere else entirely: not zero, so "unset" is not the case here. */
         const val WRONG_BUCKET = 12345
+
+        /**
+         * The bucket arithmetic as it appears inside the installed trigger.
+         *
+         * Loose on the numbers and strict on the shape: it must not pin the very constant whose
+         * drift this test exists to detect, but it must fail rather than silently match nothing if
+         * the expression is rewritten into a different form.
+         */
+        val BUCKET_EXPRESSION =
+            Regex("""CAST\(\(NEW\.latitude \+ [0-9.]+\) \* [0-9.]+ AS INTEGER\)""")
     }
 }

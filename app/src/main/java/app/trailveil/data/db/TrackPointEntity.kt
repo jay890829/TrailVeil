@@ -96,14 +96,19 @@ data class TrackPointEntity(
 
     internal companion object {
         /**
-         * What an unset bucket looks like — deliberately not a plausible one.
+         * The value an unset bucket holds, matching the column's SQL `DEFAULT 0`.
          *
-         * The bucket is derived from [latitude], so no default can be right for an arbitrary point;
-         * `RecordingDao.insertPointRow` — the one private method all four of that DAO's insert paths
-         * call — derives it on the way in, and a database trigger repairs anything written around
-         * the DAO. A row carrying this value would simply never match the fog read's equality set,
-         * so it would vanish from the map rather than corrupt it, which is why the derivation is a
-         * choke point and not a comment.
+         * It is NOT an impossible value — `LatitudeBuckets.of(-90.0)` is also 0 — and there is no
+         * impossible one available, because the whole non-negative range is legal. (Only the `IN`
+         * list's padding gets to be impossible; it uses -1, which no row can carry.) So this
+         * default cannot be relied on to announce itself: an unset row would quietly join the
+         * southernmost bucket on Earth.
+         *
+         * That is why the bucket is derived rather than defaulted. `RecordingDao.insertPointRow` is
+         * the single method all four of that DAO's insert paths route through and it derives the
+         * value there; a database trigger repairs anything written around the DAO in raw SQL. This
+         * constant exists so the Kotlin default and the SQL default cannot drift apart, not as a
+         * sentinel anyone should test for.
          */
         const val UNSET_LAT_BUCKET = 0
     }

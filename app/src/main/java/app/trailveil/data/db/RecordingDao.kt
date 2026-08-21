@@ -168,6 +168,10 @@ internal abstract class RecordingDao {
      * makes the remaining three correct by construction rather than by review, and the database
      * trigger stays as the backstop for the raw SQL that never reaches this method at all.
      *
+     * The guarantee is "every path inside this DAO", not "nothing can bypass it": [insertPointRowUnbucketed]
+     * is `protected` and visible to any subclass, as it must be for Room to implement it. What
+     * closes that gap is the trigger, which repairs whatever reaches the table by any route.
+     *
      * A wrong bucket fails silently in the worst direction: the row drops out of the fog viewport
      * read, so the map draws MORE fog than it earned, and every leak audit in the suite accepts
      * extra fog.

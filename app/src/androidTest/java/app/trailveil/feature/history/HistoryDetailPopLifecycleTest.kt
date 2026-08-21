@@ -12,6 +12,7 @@ import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeUp
 import androidx.core.graphics.get
@@ -131,9 +132,10 @@ class HistoryDetailPopLifecycleTest {
             }
 
             // Re-enter through the real list and prove teardown did not poison the replacement GL
-            // renderer or its gesture ownership.
-            composeRule.onNodeWithTag(RecordingHistoryTestTags.item(FIXTURE_SESSION_ID)).performClick()
-            composeRule.waitUntil(NAVIGATION_TIMEOUT_MILLIS) { trackMapIsShowing() }
+            // renderer or its gesture ownership. Scrolled into view for the same reason as the
+            // first entry: the list restores its scroll position on pop, and on a device with
+            // enough saved sessions the fixture is below the fold.
+            openFixtureDetailFromList()
             val replacementMapView = awaitDetailMapView(excluding = firstMapView)
             assertNotSame("The popped MapView was reused after destruction", firstMapView, replacementMapView)
             val replacementMap = awaitTrackMap(replacementMapView)
@@ -214,7 +216,19 @@ class HistoryDetailPopLifecycleTest {
     }
 
     private fun openFixtureDetailFromList() {
-        composeRule.onNodeWithTag(RecordingHistoryTestTags.item(FIXTURE_SESSION_ID)).performClick()
+        // Scrolled into view before it is clicked. The list is a plain `verticalScroll` Column, so
+        // every card is COMPOSED whatever the scroll position - `onNodeWithTag` finds the fixture
+        // even when it is far below the fold, and `performClick` then dispatches at coordinates
+        // outside the window, which silently does nothing. The failure that produces is a 20 s
+        // timeout waiting for the detail map, naming nothing about scrolling.
+        //
+        // It only bites on a device that has ACCUMULATED sessions, because the fixture sorts to the
+        // bottom: hosted CI starts from a fresh emulator and never sees it, while a local emulator
+        // reaches it after enough runs. Reproduced at three separate commits, one of them hosted-
+        // green, and fixed by `pm clear` - which is what identified the cause rather than the tree.
+        composeRule.onNodeWithTag(RecordingHistoryTestTags.item(FIXTURE_SESSION_ID))
+            .performScrollTo()
+            .performClick()
         composeRule.waitUntil(NAVIGATION_TIMEOUT_MILLIS) { trackMapIsShowing() }
         composeRule.onNodeWithTag(RecordingHistoryTestTags.TrackMap).assertIsDisplayed()
     }

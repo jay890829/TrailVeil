@@ -205,27 +205,60 @@ internal fun createDatabaseInvariantTriggers(database: SupportSQLiteDatabase) {
  * audit in the suite accepts extra fog.
  */
 internal fun createTrackPointInvariantTriggers(database: SupportSQLiteDatabase) {
-    trackPointBucketTriggerSql.forEach(database::execSQL)
+    trackPointBucketTriggerSql.forEach { (name, sql) ->
+        // NOT `CREATE TRIGGER IF NOT EXISTS` on its own. These triggers embed
+        // [LatitudeBuckets.BUCKETS_PER_DEGREE], and `IF NOT EXISTS` on an EXISTING database is a
+        // no-op — so retuning the bucket size would leave every already-installed phone repairing
+        // rows with the OLD arithmetic while the app read them with the new, which drops points out
+        // of the fog viewport silently. Compared and replaced only on a mismatch, so the common
+        // open path still writes nothing.
+        val installed = database.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            arrayOf<Any>(name),
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+        if (installed == sql) return@forEach
+        database.execSQL("DROP TRIGGER IF EXISTS $name")
+        database.execSQL(sql)
+    }
 }
 
+private const val LAT_BUCKET_SQL =
+    "CAST((NEW.latitude + 90.0) * ${LatitudeBuckets.BUCKETS_PER_DEGREE} AS INTEGER)"
+
+/**
+ * One source of truth for the bucket arithmetic, interpolated rather than retyped.
+ *
+ * `BUCKETS_PER_DEGREE` used to appear as a bare `500.0` here and in the migration's backfill,
+ * neither of which read the Kotlin constant. Changing the constant alone would then have moved the
+ * READER without moving the WRITERS, and every previously stored point would fall out of the fog
+ * viewport read at once - total silent fog loss, in the direction every leak audit accepts.
+ * `LatitudeBucketDerivationTest` reads this text back out of `sqlite_master` and evaluates it, so
+ * the coupling is measured rather than trusted to this comment.
+ *
+ * Each entry carries its own name so the installer can compare what is already there against what
+ * this text says and replace it on a mismatch; `CREATE TRIGGER IF NOT EXISTS` alone would leave an
+ * existing database on the old arithmetic forever. Note the limit: this heals FUTURE writes only.
+ * Retuning the bucket size on a shipped build still needs a migration to re-derive the column for
+ * rows already stored.
+ */
 private val trackPointBucketTriggerSql = listOf(
-    """
-    CREATE TRIGGER IF NOT EXISTS track_points_lat_bucket_insert
+    "track_points_lat_bucket_insert" to """
+    CREATE TRIGGER track_points_lat_bucket_insert
     AFTER INSERT ON track_points
-    FOR EACH ROW WHEN NEW.lat_bucket != CAST((NEW.latitude + 90.0) * 500.0 AS INTEGER)
+    FOR EACH ROW WHEN NEW.lat_bucket != $LAT_BUCKET_SQL
     BEGIN
         UPDATE track_points
-        SET lat_bucket = CAST((NEW.latitude + 90.0) * 500.0 AS INTEGER)
+        SET lat_bucket = $LAT_BUCKET_SQL
         WHERE id = NEW.id;
     END
     """.trimIndent(),
-    """
-    CREATE TRIGGER IF NOT EXISTS track_points_lat_bucket_update
+    "track_points_lat_bucket_update" to """
+    CREATE TRIGGER track_points_lat_bucket_update
     AFTER UPDATE OF latitude, lat_bucket ON track_points
-    FOR EACH ROW WHEN NEW.lat_bucket != CAST((NEW.latitude + 90.0) * 500.0 AS INTEGER)
+    FOR EACH ROW WHEN NEW.lat_bucket != $LAT_BUCKET_SQL
     BEGIN
         UPDATE track_points
-        SET lat_bucket = CAST((NEW.latitude + 90.0) * 500.0 AS INTEGER)
+        SET lat_bucket = $LAT_BUCKET_SQL
         WHERE id = NEW.id;
     END
     """.trimIndent(),

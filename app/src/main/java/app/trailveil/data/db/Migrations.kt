@@ -244,9 +244,6 @@ internal val MIGRATION_3_4 = object : Migration(3, 4) {
 }
 
 /**
- * Indexes the box the fog viewport asks for, so a settle stops visiting every row to exclude it.
- */
-/**
  * `P4-036`: gives `track_points` the coarse latitude bucket that lets the fog viewport read bound
  * both dimensions, and retires the range-led index it supersedes. The backfill is plain arithmetic
  * — measured at 85 ms per 200,000 rows — which is the practical reason a bucket beat a Morton key,
@@ -255,8 +252,11 @@ internal val MIGRATION_3_4 = object : Migration(3, 4) {
 internal val MIGRATION_6_7 = object : Migration(6, 7) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL("ALTER TABLE track_points ADD COLUMN lat_bucket INTEGER NOT NULL DEFAULT 0")
+        // Interpolated from the Kotlin constant, not retyped: a bare literal here would let the
+        // reader's bucket size drift away from what was written into every existing row.
         db.execSQL(
-            "UPDATE track_points SET lat_bucket = CAST((latitude + 90.0) * 500.0 AS INTEGER)",
+            "UPDATE track_points SET lat_bucket = " +
+                "CAST((latitude + 90.0) * ${LatitudeBuckets.BUCKETS_PER_DEGREE} AS INTEGER)",
         )
         db.execSQL(
             """
@@ -269,6 +269,12 @@ internal val MIGRATION_6_7 = object : Migration(6, 7) {
     }
 }
 
+/**
+ * Indexes the box the fog viewport asks for, so a settle stops visiting every row to exclude it.
+ *
+ * Superseded by [MIGRATION_6_7], which retires this index for one that can bound both dimensions.
+ * Kept because a v5 database still upgrades through here.
+ */
 internal val MIGRATION_5_6 = object : Migration(5, 6) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL(

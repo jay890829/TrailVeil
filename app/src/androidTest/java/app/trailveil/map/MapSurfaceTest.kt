@@ -81,6 +81,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Assume
 import org.junit.Ignore
 import org.junit.Rule
@@ -2367,6 +2368,11 @@ class MapSurfaceTest {
                         Thread.sleep(ZOOM_SETTLE_MILLIS)
                         val settled = map.auditFogCoverage()
                         assertTrue(
+                            "The settled frame drew nothing at all (${settled.report()}): a dead " +
+                                "rendering surface, not a fog verdict - see P4-042",
+                            settled.drawnFraction >= MINIMUM_DRAWN_FRACTION,
+                        )
+                        assertTrue(
                             "The settled camera after the " + name + " presented unexplored map " +
                                 "as revealed: " + settled.report(),
                             settled.uncoveredFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
@@ -2494,6 +2500,22 @@ class MapSurfaceTest {
                     return@longPinchOutInSteps
                 }
                 val audit = map.auditFogCoverage()
+                // P4-042's SIXTH site, and the one with the widest reach: this helper drives three
+                // shipped tests. `uncoveredFraction` is 0.0 on a dead surface - `auditFogCoverage`
+                // captures its bare reference AFTER the fogged frame, so a persistent death makes
+                // both black, every pixel is skipped as undrawn, and the audit returns zeroes. That
+                // 0.0 then beats the `-1.0` seed, satisfies the "no coverage was measured at all"
+                // gate, and passes the leak verdict. Three green fog verdicts on a black screen.
+                //
+                // `drawnFraction` is the liveness signal this path already carries and nothing was
+                // reading per hold: it compares the fogged capture against the bare one, so it goes
+                // to zero exactly when there is nothing to compare. No brightness threshold is
+                // involved, which is why it works where the absolute-luminance guards cannot.
+                assertTrue(
+                    "A held frame drew nothing at all (${audit.report()}): a dead rendering " +
+                        "surface, not a fog verdict - see P4-042",
+                    audit.drawnFraction >= MINIMUM_DRAWN_FRACTION,
+                )
                 if (audit.uncoveredFraction > worst) worst = audit.uncoveredFraction
                 report.append(
                     " z=${"%.2f".format(java.util.Locale.US, zoom)}:" +
@@ -3395,6 +3417,11 @@ class MapSurfaceTest {
                     }
                     val candidateReport = map.fogGenerationStyleReport(slotBefore)
                     val candidate = map.auditFogCoverage()
+                    assertTrue(
+                        "A sampled frame drew nothing at all (${candidate.report()}): a dead " +
+                            "rendering surface, not a fog verdict - see P4-042",
+                        candidate.drawnFraction >= MINIMUM_DRAWN_FRACTION,
+                    )
                     val slotAfter = runCatching { publishedFogSlot() }.getOrNull()
                     if (slotAfter == slotBefore && map.hasOnlyPublishedFogGeneration(slotBefore)) {
                         validatedSlot = slotBefore
@@ -3717,6 +3744,12 @@ class MapSurfaceTest {
             }
             var coverSemanticsSamples = 0
             var worstFraction = -1.0
+            // P4-042, third site: the per-hold surface audit below reads `revealedFraction`, an
+            // absolute luminance count, so a dead GL surface measures 0.0 - which is BETTER than
+            // any real reading and therefore never becomes the worst. Worse, `worstFraction`
+            // starts at -1.0 and 0.0 beats it, so a run of nothing but black frames also satisfies
+            // the anti-vacuity gate that asks whether any hold was measured at all.
+            val darkHolds = mutableListOf<FogCoverage>()
             var worstReport = "none"
             var worstOverFogged = 0.0
             var worstOverFoggedReport = "none"
@@ -3795,6 +3828,11 @@ class MapSurfaceTest {
                                     coverage.revealedFraction * 100.0,
                                 )}% ",
                             )
+                        if (!coverage.judgeable) {
+                            darkHolds += coverage
+                            trace.append("DARK ")
+                            return@gesture
+                        }
                         if (!extentCovers && coverage.revealedFraction > worstFraction) {
                             worstFraction = coverage.revealedFraction
                             worstReport = coverage.report()
@@ -3802,6 +3840,13 @@ class MapSurfaceTest {
                         }
                     } else {
                         val audit = map.auditFogCoverage()
+                        // Same as the oblique helper: a dead surface audits as all zeroes, which
+                        // reads as perfect fog on every one of the assertions below.
+                        assertTrue(
+                            "A held frame drew nothing at all (${audit.report()}): a dead " +
+                                "rendering surface, not a fog verdict - see P4-042",
+                            audit.drawnFraction >= MINIMUM_DRAWN_FRACTION,
+                        )
                         trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:")
                             .append(
                                 "${"%.4f".format(
@@ -3876,6 +3921,22 @@ class MapSurfaceTest {
                     "The persistent renderer listener captured no outside-extent state",
                     outsideTransitions.isNotEmpty(),
                 )
+                // P4-042's FIFTH consumer of the absolute-luminance path, found by closure round
+                // 2 after the first fix claimed there were four. `SurfaceTransitionAuditor` builds
+                // its samples from the same `fogCoverage()` on the same SurfaceView, and the
+                // verdict below reads `revealedFraction` alone - so a dead surface measures 0.0 on
+                // every sample, becomes the "worst" outside state, and satisfies the leak
+                // assertion. It is also asserted BEFORE the held-frame gates further down, so it
+                // would have been the first thing a dead surface got past.
+                val transitionCoverages = audit.samples.map { sample -> sample.coverage }
+                assertTrue(
+                    "${transitionCoverages.count { !it.judgeable }} renderer-transition samples " +
+                        "contained no light at all " +
+                        "(${transitionCoverages.filterNot { it.judgeable }.take(3)
+                            .map(FogCoverage::report)}): a dead rendering surface, not a fog " +
+                        "verdict - see P4-042",
+                    transitionCoverages.all { it.judgeable },
+                )
                 val worstTransition = outsideTransitions.maxBy { sample ->
                     sample.coverage.revealedFraction
                 }
@@ -3893,6 +3954,12 @@ class MapSurfaceTest {
                     )
                 }
             }
+            assertTrue(
+                "${darkHolds.size} held samples contained no light at all " +
+                    "(${darkHolds.take(3).map(FogCoverage::report)}): a dead rendering surface, " +
+                    "not a fog verdict - see P4-042",
+                darkHolds.isEmpty(),
+            )
             assertTrue(
                 "Every held sample reported composed cover state, so no map pixels were audited",
                 expectCover || worstFraction >= 0.0,
@@ -4566,6 +4633,15 @@ class MapSurfaceTest {
      * frame is missed under load leaves this waiting for a repaint nobody will ask for again, and
      * that shows up as a rendering timeout on a renderer that was merely busy. Re-asking costs a
      * frame; not re-asking cost a hosted run.
+     *
+     * **On timeout it says whether the SURFACE is alive** — `P4-042`'s discipline applied to the
+     * readiness path. This helper's bare timeout message is the single most common hosted-only red
+     * in this file's history (three different test names so far), and it is indistinguishable
+     * between "MapLibre is slow", "the camera never settled" and "the GL surface is dead". Thirty
+     * seconds of half-second repaints is not a budget problem, so a lightless capture at that point
+     * is the environment, not the map — and naming it is the difference between a flake-log line
+     * and a diagnosis. The probe is best-effort: a surface too broken to read from must not replace
+     * the real failure with an exception from the diagnostic.
      */
     private fun MapLibreMap.awaitFullyRenderedFrame(view: MapView) {
         val ready = CountDownLatch(1)
@@ -4587,10 +4663,29 @@ class MapSurfaceTest {
                 waited += REPAINT_RETRY_MILLIS
                 InstrumentationRegistry.getInstrumentation().runOnMainSync { triggerRepaint() }
             }
-            assertTrue(
-                "MapLibre did not fully render the requested camera and style state",
-                ready.count == 0L,
-            )
+            if (ready.count != 0L) {
+                val surfaceState = runCatching { view.pixelCopyFogCoverage() }
+                    .fold(
+                        onSuccess = { coverage ->
+                            if (coverage.judgeable) {
+                                "the surface still holds light (${coverage.report()}), so this is " +
+                                    "the renderer or the camera, not a dead surface"
+                            } else {
+                                "ENVIRONMENT: the surface holds no light at all " +
+                                    "(${coverage.report()}) - a dead GL surface, see P4-042"
+                            }
+                        },
+                        onFailure = { failure ->
+                            "the surface could not be read at all (${failure.javaClass.simpleName}" +
+                                ": ${failure.message}) - see P4-042"
+                        },
+                    )
+                fail(
+                    "MapLibre did not fully render the requested camera and style state after " +
+                        "${SNAPSHOT_TIMEOUT_SECONDS}s of ${REPAINT_RETRY_MILLIS}ms repaints; " +
+                        surfaceState,
+                )
+            }
         } finally {
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 view.removeOnDidFinishRenderingFrameListener(listener)
@@ -5664,8 +5759,20 @@ class MapSurfaceTest {
     }
 
     /**
-     * The same invariant under real touch input rather than a camera call: sustained drags and
-     * flings run on their own thread while this one keeps reading back what MapLibre drew.
+     * A long east-west journey with NO intervening idle, which no other pixel test performs.
+     *
+     * Every gesture that ends triggers a rebuild that re-centres the surround on the camera, so a
+     * suite made of discrete gestures keeps handing the renderer a fresh, correctly-centred extent
+     * and never travels far enough sideways on one to expose a missing side band. This presses
+     * again while the previous fling is still carrying.
+     *
+     * **What this does not catch, per the house rule.** Every stroke is identical
+     * (`fromX = 0.88 * width` to `0.12 * width`), so the camera only ever travels EAST and a band
+     * missing on the west side is never reached in pixels. The journey runs at one zoom (16.0) and
+     * one latitude. And the acceptance criterion's defining property - that no idle intervenes - is
+     * arranged by construction (there is no `waitForIdle` in the loop) rather than asserted: no
+     * `OnCameraIdleListener` is registered and no rebuild is counted, so a future change that
+     * introduced an idle here would weaken the test silently.
      */
     @Test
     fun backToBackEastwardFlingsNeverExposeAMissingSideBand() {
@@ -5723,6 +5830,8 @@ class MapSurfaceTest {
             var postExitFrames = 0
             var coveredFrames = 0
             var worstRevealed = 0.0
+            val darkFrames = mutableListOf<FogCoverage>()
+            val journeyFingerprints = mutableListOf<Long>()
             var worstReport: FogCoverage? = null
             var worstShape = "none"
             // One screen width in degrees at this camera, so "how far have we travelled" is
@@ -5813,7 +5922,17 @@ class MapSurfaceTest {
                         val covered = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                             .fetchSemanticsNodes()
                             .isNotEmpty()
-                        if (exited) {
+                        journeyFingerprints += coverage.fingerprint
+                        // P4-042, and its entry used to claim this journey was already protected
+                        // by "its cover-or-fog contract plus its nonBlackFraction reporting". It
+                        // was not: nonBlackFraction only ever reached a failure string that a
+                        // green run never builds, and an all-black frame here is `covered == false`
+                        // with `revealedFraction == 0.0`, which reads as perfect fog. Exit is
+                        // camera-derived in this test, so a dead surface would have contributed
+                        // post-exit frames, satisfied the vacuity guard, and reported no leak.
+                        if (!coverage.judgeable) {
+                            darkFrames += coverage
+                        } else if (exited) {
                             postExitFrames += 1
                             if (covered) {
                                 coveredFrames += 1
@@ -5829,6 +5948,13 @@ class MapSurfaceTest {
                 if (pointerDown) bestEffortClearStuckInjectedPointers()
             }
 
+            assertTrue(
+                "${darkFrames.size} sampled frames contained no light at all " +
+                    "(${darkFrames.take(3).map(FogCoverage::report)}): a dead rendering surface, " +
+                    "not a fog verdict - see P4-042",
+                darkFrames.isEmpty(),
+            )
+            assertSurfaceStayedLive(journeyFingerprints, "The east-west journey audit")
             // The journey has to actually leave the explored ground, or the assertion below is
             // measuring nothing - the same vacuity guard the sustained-gesture test carries.
             assertTrue(
@@ -5866,6 +5992,10 @@ class MapSurfaceTest {
         }
     }
 
+    /**
+     * The same invariant under real touch input rather than a camera call: sustained drags and
+     * flings run on their own thread while this one keeps reading back what MapLibre drew.
+     */
     @Test
     fun sustainedGesturesNeverExposeUnexploredMap() {
         val database = inMemoryDatabase()
@@ -6045,6 +6175,12 @@ class MapSurfaceTest {
                 var postExitFrames = 0
                 var postExitMaxLuminance = 0
                 var postExitMaxRevealed = 0.0
+                // P4-042: frames with no light in them, counted per frame rather than folded into
+                // a maximum. A running max is disarmed by the first healthy frame, so it can only
+                // catch a surface that was dead for the WHOLE window - never one that died mid
+                // gesture, which is the case the hosted failures actually showed.
+                val darkFrames = mutableListOf<FogCoverage>()
+                val sampledFingerprints = mutableListOf<Long>()
                 var exited = false
                 var coveredFrames = 0
                 val leaks = mutableListOf<FogCoverage>()
@@ -6080,12 +6216,20 @@ class MapSurfaceTest {
                 }
                 val coverage = map.renderedFogCoverage()
                 samples += 1
+                sampledFingerprints += coverage.fingerprint
                 if (
                     composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                         .fetchSemanticsNodes()
                         .isNotEmpty()
                 ) {
                     coveredFrames += 1
+                }
+                // A lightless frame is not a fog verdict, so it is recorded and then excluded
+                // from every judgement below - including `exited`, which an all-black frame would
+                // otherwise satisfy by measuring zero revealed.
+                if (!coverage.judgeable) {
+                    darkFrames += coverage
+                    continue
                 }
                 // The revealed track leaves the viewport within the first drag; every frame from
                 // then on is over map the user has not explored.
@@ -6109,6 +6253,8 @@ class MapSurfaceTest {
             var flingExited = false
             var postExitFlingFrames = 0
             val flingLeaks = mutableListOf<FogCoverage>()
+            val darkFlingFrames = mutableListOf<FogCoverage>()
+            val flingFingerprints = mutableListOf<Long>()
             try {
                 assertTrue(
                     "Too few renderer-finished fling frames were captured: ${flingFrames.size}",
@@ -6150,15 +6296,30 @@ class MapSurfaceTest {
                         frame.expectedCoverage.extent.covers(frame.snapshotEndCorners),
                     )
                     val coverage = frame.bitmap.fogCoverage()
-                    if (!flingExited && coverage.revealedFraction == 0.0) flingExited = true
-                    if (flingExited) {
-                        postExitFlingFrames += 1
-                        if (coverage.revealedFraction > 0.0) flingLeaks += coverage
+                    flingFingerprints += coverage.fingerprint
+                    // Same absolute-count hazard as the gesture loop above, in a second place the
+                    // first version of P4-042 missed: this branch reads `revealedFraction` alone,
+                    // so a dead surface satisfies `flingExited` and contributes no leak.
+                    if (!coverage.judgeable) {
+                        darkFlingFrames += coverage
+                    } else {
+                        if (!flingExited && coverage.revealedFraction == 0.0) flingExited = true
+                        if (flingExited) {
+                            postExitFlingFrames += 1
+                            if (coverage.revealedFraction > 0.0) flingLeaks += coverage
+                        }
                     }
                 }
             } finally {
                 flingFrames.forEach { frame -> frame.bitmap.recycle() }
             }
+            assertTrue(
+                "${darkFlingFrames.size} renderer-finished fling frames contained no light at " +
+                    "all (${darkFlingFrames.take(3).map(FogCoverage::report)}): a dead rendering " +
+                    "surface, not a fog verdict - see P4-042",
+                darkFlingFrames.isEmpty(),
+            )
+            assertSurfaceStayedLive(flingFingerprints, "The renderer-finished fling audit")
             assertTrue("No renderer-finished fling frame left the revealed track", flingExited)
             assertTrue(
                 "Too few renderer-finished fling frames were audited after leaving the track: " +
@@ -6191,6 +6352,7 @@ class MapSurfaceTest {
                     putString(
                         "stream",
                         "TrailVeil fog gesture invariant: frames=$samples " +
+                            "distinctFrames=${sampledFingerprints.toSet().size} " +
                             "postExitFrames=$postExitFrames " +
                             "revealedReference=${explored.report()} " +
                             "postExitWorst=[maxLuminance=$postExitMaxLuminance " +
@@ -6211,17 +6373,21 @@ class MapSurfaceTest {
             )
             // P4-042's other half, and this gate was the hole: `revealedFraction` is an absolute
             // luminance count, so an ALL-BLACK frame - the hosted emulator's dead GL surface -
-            // measures zero revealed, sets `exited`, contributes no leak, and passes. The already
-            // computed post-exit maximum settles it: fog over a drawn map still transmits light,
-            // so a maximum below the fogged-surface floor means the frames judged here had no map
-            // in them at all. (`compareFogCoverage`'s guard cannot reach this path: it judges a
-            // fogged capture against a bare reference, and this gate takes no bare reference.)
+            // measures zero revealed, sets `exited`, contributes no leak, and passes.
+            // (`compareFogCoverage`'s guard cannot reach this path: it judges a fogged capture
+            // against a bare reference, and this gate takes no bare reference.)
+            //
+            // Asserted on the per-frame count rather than on a post-exit maximum. The maximum was
+            // this gate's first answer and closure verification showed it is disarmed by the first
+            // healthy frame, so it fired only when EVERY frame was dark - never for a surface that
+            // died part-way through, which is the shape the hosted reds actually had.
             assertTrue(
-                "The judged frames contained no light at all (maxLuminance=$postExitMaxLuminance " +
-                    "over $postExitFrames post-exit frames): a dead rendering surface, not a fog " +
-                    "verdict - see P4-042",
-                postExitFrames == 0 || postExitMaxLuminance >= MINIMUM_FOGGED_SURFACE_LUMINANCE,
+                "${darkFrames.size} of ${samples + darkFrames.size} sampled frames contained no " +
+                    "light at all (${darkFrames.take(3).map(FogCoverage::report)}): a dead " +
+                    "rendering surface, not a fog verdict - see P4-042",
+                darkFrames.isEmpty(),
             )
+            assertSurfaceStayedLive(sampledFingerprints, "The sustained gesture audit")
             assertTrue(
                 "Unexplored map was drawn unfogged during gestures: $leaks",
                 leaks.isEmpty(),
@@ -6328,7 +6494,7 @@ class MapSurfaceTest {
                         sequence = index.toLong(),
                         timestamp = 1_000L + index * 5_000L,
                         latitude = center.latitude,
-                        longitude = center.longitude + index * 0.0002,
+                        longitude = center.longitude + index * REVEALED_POINT_SPACING_DEGREES,
                         horizontalAccuracy = 5.0,
                     ),
                     distanceDeltaMeters = 20.0,
@@ -6410,6 +6576,14 @@ class MapSurfaceTest {
         var revealed = 0L
         var nonBlack = 0L
         var maxLuminance = 0
+        // P4-042: how UNIFORM the frame is, which is the one property that separates a dead
+        // surface from a live one without needing to know how bright the death was. A histogram
+        // over 256 luminance values costs one pass and one kilobyte.
+        val histogram = LongArray(256)
+        // A cheap content fingerprint. Liveness turns out not to be a property of ONE frame (see
+        // FogCoverage.judgeable), so what a gate actually needs is whether the surface CHANGED
+        // while the camera moved - and that needs frames to be comparable to each other.
+        var fingerprint = 1L
         pixels.forEach { pixel ->
             val luminance = (
                 77 * ((pixel shr 16) and 0xff) +
@@ -6419,12 +6593,17 @@ class MapSurfaceTest {
             if (luminance > maxLuminance) maxLuminance = luminance
             if (luminance >= UNFOGGED_LUMINANCE) revealed += 1L
             if (luminance >= MINIMUM_VISIBLE_SURFACE_LUMINANCE) nonBlack += 1L
+            histogram[luminance.coerceIn(0, 255)] += 1L
+            fingerprint = fingerprint * 31L + pixel.toLong()
         }
         return FogCoverage(
             revealedFraction = revealed.toDouble() / pixels.size.toDouble(),
             nonBlackFraction = nonBlack.toDouble() / pixels.size.toDouble(),
             maxLuminance = maxLuminance,
             sampledPixels = pixels.size.toLong(),
+            modalLuminanceFraction = histogram.max().toDouble() / pixels.size.toDouble(),
+            distinctLuminances = histogram.count { it > 0L },
+            fingerprint = fingerprint,
         )
     }
 
@@ -6458,13 +6637,92 @@ class MapSurfaceTest {
     }
 
     /**
-     * The over-fog side of the comparator had no calibration at all: every sweep proved the detector
-     * could see a *leak*, and nothing proved it could see a *double coat*. Setting
-     * `MINIMUM_BARE_FOR_OVER_FOG = 255` or `OVER_FOG_RATIO = 0.0` would have left every over-fog
-     * gate in this file reporting 0.0000% and the suite green. This pins all three instruments:
-     * that the strict ratio fires on a bright double coat, that the floor-free block measure fires
-     * on a dark-ocean one the strict ratio is designed to refuse, and that thickness separates the
-     * deliberate seam guard from a filled region.
+     * `P4-042`: the liveness instruments themselves, which nothing was measuring.
+     *
+     * Closure round 2 pointed out that `judgeable` and its stream companion were added to five
+     * gates and bound by no test at all — so a future edit could weaken either one and the suite
+     * would stay green, which is the same failure this whole entry is about. This pins both in
+     * both directions, with synthetic values rather than a rendered frame, because the question is
+     * arithmetic and a rendered frame would only re-measure the emulator.
+     *
+     * The numbers are the ones measured on the API 36 emulator over three green runs of
+     * `sustainedGesturesNeverExposeUnexploredMap`: 58-61 sampled frames with a longest identical
+     * run of 15, 10 and 10.
+     */
+    @Test
+    fun theLivenessInstrumentsRejectAStalledSurfaceAndAcceptAMeasuredLiveOne() {
+        // A surface that stopped responding returns one buffer for the whole window.
+        val stalled = List(60) { 12345L }
+        val stalledFailure = assertThrows(AssertionError::class.java) {
+            assertSurfaceStayedLive(stalled, "probe")
+        }
+        assertTrue(
+            "A stalled surface was not named: ${stalledFailure.message}",
+            stalledFailure.message.orEmpty().contains("same frame"),
+        )
+
+        // A surface that died HALF WAY through: the case a running maximum and a distinct-count
+        // both miss, and the reason this gate measures the longest run rather than either. It is
+        // also the case that showed the first bound (half the window) was too loose — it passed by
+        // exactly one frame, so the bound is 40% and this is the test that moved it.
+        val diedMidway = List(30) { it.toLong() } + List(30) { 999L }
+        assertThrows(AssertionError::class.java) {
+            assertSurfaceStayedLive(diedMidway, "probe")
+        }
+
+        // The measured live shape must pass, with its real repeat runs intact: 61 frames whose
+        // longest identical run is 15. Built explicitly so that if the bound is ever tightened
+        // below what this emulator actually produces, this fails instead of the whole map package.
+        val live = buildList {
+            repeat(15) { add(7L) }
+            repeat(10) { add(8L) }
+            repeat(10) { add(9L) }
+            repeat(26) { index -> add(100L + index) }
+        }
+        assertEquals(61, live.size)
+        assertSurfaceStayedLive(live, "probe")
+
+        // And the per-frame guard, which only ever claimed to catch a nearly-black frame.
+        assertTrue(
+            "A fully painted frame was called unjudgeable",
+            FogCoverage(
+                revealedFraction = 0.0,
+                nonBlackFraction = 0.99,
+                maxLuminance = 16,
+                sampledPixels = 2_592_000L,
+            ).judgeable,
+        )
+        assertTrue(
+            "An all-black frame was accepted as a fog verdict",
+            !FogCoverage(
+                revealedFraction = 0.0,
+                nonBlackFraction = 0.0,
+                maxLuminance = 0,
+                sampledPixels = 2_592_000L,
+            ).judgeable,
+        )
+        // Stated as a test rather than as a comment: a death at some CONSTANT non-black brightness
+        // is invisible to the per-frame guard. That is why the stream gate exists, and this pins
+        // the limitation so nobody re-derives the per-frame idea a fourth time.
+        assertTrue(
+            "The per-frame guard has silently grown a reach it was measured not to have",
+            FogCoverage(
+                revealedFraction = 0.0,
+                nonBlackFraction = 1.0,
+                maxLuminance = 12,
+                sampledPixels = 2_592_000L,
+            ).judgeable,
+        )
+    }
+
+    /**
+     * A capture with no light in it is an environment failure, not a fog verdict.
+     *
+     * The hosted emulator's GL surface dies under cumulative load and captures as pure black, which
+     * the over-fog arithmetic reads as the whole screen under two coats. This pins both directions:
+     * a dead capture must be NAMED as environment, and a genuine full-frame double coat over the
+     * same bright reference must still be judged as fog rather than swallowed by the liveness
+     * guard - without that half, the guard could silently disarm the detector it protects.
      */
     @Test
     fun aDeadCaptureIsReportedAsEnvironmentRatherThanAsFogCoverage() {
@@ -6530,6 +6788,15 @@ class MapSurfaceTest {
         )
     }
 
+    /**
+     * The over-fog side of the comparator had no calibration at all: every sweep proved the detector
+     * could see a *leak*, and nothing proved it could see a *double coat*. Setting
+     * `MINIMUM_BARE_FOR_OVER_FOG = 255` or `OVER_FOG_RATIO = 0.0` would have left every over-fog
+     * gate in this file reporting 0.0000% and the suite green. This pins all three instruments:
+     * that the strict ratio fires on a bright double coat, that the floor-free block measure fires
+     * on a dark-ocean one the strict ratio is designed to refuse, and that thickness separates the
+     * deliberate seam guard from a filled region.
+     */
     @Test
     fun theOverFogDetectorFiresOnADoubleCoatIncludingOverDarkOcean() {
         val width = 16
@@ -6838,15 +7105,24 @@ class MapSurfaceTest {
 
     private fun compareFogCoverage(fogged: IntArray, bare: IntArray, width: Int): FogAudit {
         assertEquals("Snapshot sizes differ", bare.size, fogged.size)
+        // Checked rather than assumed, because the dead-capture guard below relies on it: with an
+        // empty frame `brightBare * DIVISOR >= bare.size` degenerates to `0 >= 0` and the guard
+        // would fire on nothing at all.
+        assertTrue("A fog comparison was asked for on an empty frame", bare.isNotEmpty())
         // P4-042: a dead GL surface (the hosted emulator's cumulative ColorBuffer death) captures as
         // pure black, which the over-fog arithmetic then reads as the whole screen under two coats -
         // twice it produced overFogged=100% with the dark block spanning the full frame. A capture
         // with NO light at all where the bare reference is bright is not a fog verdict: two coats
         // over a bright pixel still transmit ~FOG_TRANSMISSION^2 (>=10 luminance over bare 128; ~20
         // over 255), so a max under DEAD_CAPTURE_MAX_LUMINANCE across every bright-bare pixel has no
-        // fog explanation. (Boundary owned and documented: a uniform TRIPLE coat over a dim scene
-        // could in principle land near ~5 - that class has never occurred, and naming it as
-        // environment would still stop the run for a human, which is the correct failure mode.)
+        // fog explanation.
+        //
+        // Boundary owned and stated with the arithmetic done as the CODE does it, not as algebra
+        // would: `luminance` returns an Int (a `shr 8` truncation), so a triple coat over bare 140
+        // has real value 3.008 and truncates to 3, which fires. The honest dead band for a uniform
+        // triple coat is bare in [128, 186] under truncation - not the [128, 139] a rounding
+        // argument gives. That class has never occurred, and naming it as environment would still
+        // stop the run for a human, which is the correct failure mode.
         var brightBare = 0L
         var maxFoggedOverBrightBare = 0
         bare.indices.forEach { index ->
@@ -6856,13 +7132,17 @@ class MapSurfaceTest {
                 if (fogLuminance > maxFoggedOverBrightBare) maxFoggedOverBrightBare = fogLuminance
             }
         }
-        // Multiplied rather than divided, and gated on there being ANY bright pixel at all: the
-        // first draft wrote `brightBare >= bare.size / DIVISOR`, which integer-divides to 0 on the
-        // small synthetic fixtures in this file, so a 4-pixel dark-ocean case satisfied `0 >= 0`
-        // and the guard fired on a frame it has nothing to say about. The sibling calibration test
-        // caught it immediately, which is the whole reason that test exists.
+        // Multiplied rather than divided: the first draft wrote `brightBare >= bare.size /
+        // DIVISOR`, which integer-divides to 0 on the small synthetic fixtures in this file, so a
+        // 4-pixel dark-ocean case satisfied `0 >= 0` and the guard fired on a frame it has nothing
+        // to say about. The sibling calibration test caught it immediately, which is the whole
+        // reason that test exists.
+        //
+        // An explicit `brightBare > 0` conjunct was here too and has been removed: for any
+        // non-empty frame the multiplication already implies it, so it was dead code presented as
+        // load-bearing. `bare` is never empty - `compareFogCoverage` is only reached with a
+        // captured frame.
         if (
-            brightBare > 0L &&
             brightBare * DEAD_CAPTURE_MINIMUM_BRIGHT_FRACTION_DIVISOR >= bare.size &&
             maxFoggedOverBrightBare <= DEAD_CAPTURE_MAX_LUMINANCE
         ) {
@@ -7279,6 +7559,60 @@ class MapSurfaceTest {
         )
     }
 
+    /**
+     * `P4-042`: the surface kept responding to the camera while these frames were sampled.
+     *
+     * This is the liveness gate that works, and it works because it asks a question a dead surface
+     * cannot answer well no matter how bright it is: a GL surface being driven by a moving camera
+     * cannot hand back the same bytes for long. [FogCoverage.judgeable] documents why no property
+     * of a SINGLE frame can decide this — real frames reach `distinct=1, modal=100%`, and a
+     * legitimate double coat measures luminance 17 against a death bounded only below about 20.
+     *
+     * Calibrated by measurement, not by argument. Three consecutive green runs of
+     * `sustainedGesturesNeverExposeUnexploredMap` on the API 36 emulator sampled 58-61 frames and
+     * produced a longest run of IDENTICAL consecutive frames of 15, 10 and 10 — the repeats are
+     * real, because sampling outruns the render rate. A surface that died at the start of the
+     * window would produce a run equal to the whole window.
+     *
+     * The bound is **40% of the sampled frames**: 1.6x above the worst observed live run (15 of 61
+     * is 24.6%), and below any death that persists. It was first written as half, and the test that
+     * binds this helper immediately showed why that is too loose — a surface that dies exactly
+     * midway produces a run of exactly half and passes. The test now carries that case.
+     *
+     * **Only for streams sampled while the camera is MOVING.** That premise is load-bearing, and
+     * measurement made it explicit: applied to `sweepGesture`'s renderer-transition samples — which
+     * are taken while the camera is deliberately HELD at each step — it failed a healthy run at 13
+     * identical frames out of 30 (6 distinct). Repeats there are not a stalled surface, they are a
+     * still camera reporting finished frames with nothing new to draw. So the held-frame streams
+     * keep [FogCoverage.judgeable] and do not get this gate, and the three continuously-moving
+     * streams (sustained gestures, the renderer-finished fling loop, the east-west journey) get
+     * both.
+     *
+     * **What this does not catch, per the house rule:** a death lasting less than 40% of the
+     * sampled window. `P4-044` records the hosted failure as a CUMULATIVE, persistent one, which is
+     * the case this targets; a brief flicker is not covered and is not claimed to be. It also does
+     * not apply to gates that take a single frame — those have no stream to judge — nor to the
+     * held-camera streams above, nor below [MINIMUM_LIVENESS_SAMPLE_FRAMES] samples, where a run
+     * length says nothing.
+     */
+    private fun assertSurfaceStayedLive(fingerprints: List<Long>, what: String) {
+        if (fingerprints.size < MINIMUM_LIVENESS_SAMPLE_FRAMES) return
+        var longestRepeat = 0
+        var currentRepeat = 0
+        var previous: Long? = null
+        fingerprints.forEach { fingerprint ->
+            currentRepeat = if (fingerprint == previous) currentRepeat + 1 else 1
+            previous = fingerprint
+            longestRepeat = max(longestRepeat, currentRepeat)
+        }
+        assertTrue(
+            "$what: the surface returned the same frame $longestRepeat times in a row out of " +
+                "${fingerprints.size} sampled (${fingerprints.toSet().size} distinct) - a surface " +
+                "that stopped responding to the camera, not a fog verdict; see P4-042 and P4-044",
+            longestRepeat * 5 <= fingerprints.size * 2,
+        )
+    }
+
     /** Copies the pixels users actually see from MapLibre's SurfaceView without a Style mutation. */
     private fun MapView.pixelCopyFogCoverage(): FogCoverage {
         val ready = CountDownLatch(1)
@@ -7632,11 +7966,56 @@ class MapSurfaceTest {
         val nonBlackFraction: Double,
         val maxLuminance: Int,
         val sampledPixels: Long,
+        /** Share of pixels holding the single most common luminance; 1.0 means a flat frame. */
+        val modalLuminanceFraction: Double = 1.0,
+        /** How many distinct luminance values the frame contains; 1 means a flat frame. */
+        val distinctLuminances: Int = 1,
+        /** Content hash of the captured pixels, for telling two frames apart. */
+        val fingerprint: Long = 0L,
     ) {
+        /**
+         * `P4-042`: whether this frame is a fog verdict at all.
+         *
+         * [revealedFraction] counts pixels ABOVE a luminance threshold, so a frame with nothing in
+         * it — the hosted emulator's dead GL surface — measures zero revealed, which every leak
+         * gate reads as perfect fog. The gates that consume an absolute count are therefore the
+         * gates a dead surface passes, and it is a property of the reading rather than of any one
+         * of them. It lives here so a new gate inherits the question instead of having to remember
+         * it.
+         *
+         * **This is NECESSARY, NOT SUFFICIENT, and the history is why.** Three attempts were made
+         * to decide liveness from a single frame, and measurement refuted all three:
+         *  1. A running maximum of [maxLuminance] asserted once after the loop. Disarmed by the
+         *     first healthy frame, so the mid-gesture death it was written for went uncaught.
+         *  2. Per frame, `maxLuminance >= MINIMUM_FOGGED_SURFACE_LUMINANCE` (20). The map package
+         *     rejected it on four tests in one run: real, fully painted frames measure
+         *     `maxLuminance=16, nonBlack=99%`. That floor describes a single coat over a lit
+         *     basemap, not liveness.
+         *  3. Uniformity — "a dead surface is flat, a map is not". Measured on this emulator, real
+         *     frames reach `modal=100%, distinct=1`: fog at alpha 184 over a uniform basemap region
+         *     genuinely produces ONE luminance across 2 592 000 pixels. The revealed reference
+         *     itself measures `distinct=2`.
+         *
+         * And the underlying reason all three failed: `P4-042`'s own evidence never established how
+         * BRIGHT the hosted death is. It bounds the fogged luminance below about 20 in one recorded
+         * case, and a legitimate double coat measures about 17 — so real and dead overlap, and no
+         * absolute threshold can separate them. What this predicate therefore does is narrow: it
+         * rejects a frame that is nearly all BLACK, which is one shape a death can take. The shape
+         * it cannot see is a death at some other constant brightness.
+         *
+         * Liveness of a *stream* is what actually decides it, and that is [assertSurfaceStayedLive]:
+         * a surface being driven by a moving camera cannot return the same bytes for long, whatever
+         * those bytes are. The three continuously-moving streams use both; the held-camera streams
+         * use only this, because there a repeated frame is a still camera rather than a dead
+         * surface — measured, see that helper.
+         */
+        val judgeable: Boolean get() = nonBlackFraction >= MINIMUM_GUARDED_NON_BLACK_FRACTION
+
         fun report(): String = "[maxLuminance=$maxLuminance " +
             "aboveThreshold=${"%.4f".format(java.util.Locale.US, revealedFraction * 100.0)}% " +
             "nonBlack=${"%.4f".format(java.util.Locale.US, nonBlackFraction * 100.0)}% " +
-            "pixels=$sampledPixels]"
+            "modal=${"%.4f".format(java.util.Locale.US, modalLuminanceFraction * 100.0)}% " +
+            "distinct=$distinctLuminances pixels=$sampledPixels]"
     }
 
     private data class FlingFrameAudit(
@@ -7918,9 +8297,26 @@ class MapSurfaceTest {
          * cannot silently make this test measure its own track again.
          */
         const val EASTWEST_EXIT_CLEARANCE_SCREEN_WIDTHS = 0.5
+
+        /**
+         * The east-west spacing `revealTrack` writes between consecutive points.
+         *
+         * `revealTrack` reads this rather than repeating the number. It used to be a hand-copied
+         * literal in both places, which made the "computed from the fixture's own constants"
+         * justification above false: changing the fixture's spacing would have moved the corridor
+         * without moving the threshold, which is precisely how this test came to measure its own
+         * revealed ground and get a product task opened on the result (`P4-043`, withdrawn).
+         */
         const val REVEALED_POINT_SPACING_DEGREES = 0.0002
 
-        /** 25 m of reveal radius in degrees of longitude, near enough at this latitude. */
+        /**
+         * `FogRenderStyle.revealRadiusMeters` (25 m) expressed in degrees of longitude at this
+         * fixture's latitude — a HAND CONVERSION, and the one input to the exit threshold that is
+         * still not coupled to its source. Production could halve the reveal radius without this
+         * moving. It is deliberately generous rather than exact for that reason: the threshold it
+         * feeds only has to clear the corridor, and over-clearing costs a little travel while
+         * under-clearing is what produces a false leak.
+         */
         const val REVEAL_RADIUS_DEGREES = 0.00025
         const val MINIMUM_EASTWEST_POST_EXIT_FRAMES = 12
 
@@ -8048,6 +8444,13 @@ class MapSurfaceTest {
 
         /** The fallback under one ordinary fog coat measures 60; the opaque install guard is 0. */
         const val MINIMUM_FOGGED_SURFACE_LUMINANCE = 20
+
+        /**
+         * Below this many samples a longest-repeat run says nothing, so the liveness gate abstains.
+         * Every site that uses it already asserts its own minimum sample count separately, so
+         * abstaining here cannot make a gate vacuous on its own.
+         */
+        const val MINIMUM_LIVENESS_SAMPLE_FRAMES = 8
 
         /**
          * "Not blacked out" for frames inside the A/B overlap or retention windows, where a

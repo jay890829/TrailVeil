@@ -23,14 +23,25 @@ internal object LatitudeBuckets {
     const val BUCKETS_PER_DEGREE = 500.0
 
     /**
+     * How tall a band the equality list can still express, in degrees.
+     *
+     * This is the real design input: coarser than render zoom 10 no index helps, because the box
+     * already contains everything the table holds. [MAX_BUCKETS] is DERIVED from it rather than
+     * chosen alongside it — the two used to be tethered only by this comment, so retuning
+     * [BUCKETS_PER_DEGREE] would have silently changed how tall a band still qualifies.
+     */
+    const val MAX_BAND_DEGREES = 1.28
+
+    /**
      * Fixed arity for the `IN` list, padded with [PADDING_BUCKET].
      *
      * Padding rather than a variable-length list so Room prepares ONE statement instead of one per
-     * distinct list size; measured identical plans and byte-identical rows at 63, 128, 512 and 640
-     * slots. 640 covers a whole-screen box at render zoom 10 at the equator (583 buckets) with
-     * margin, and every finer zoom at every latitude on Earth.
+     * distinct list size; measured identical plans and byte-identical rows at 6, 63, 128, 512 and
+     * 640 slots. At the shipped granularity this is 640, which covers a whole-screen box at render
+     * zoom 10 at the equator (583 buckets) with margin, and every finer zoom at every latitude on
+     * Earth.
      */
-    const val MAX_BUCKETS = 640
+    const val MAX_BUCKETS = (MAX_BAND_DEGREES * BUCKETS_PER_DEGREE).toInt()
 
     /**
      * Impossible by construction: [TrackPointEntity] requires latitude in [-90, 90], so a real
