@@ -232,18 +232,26 @@ class FogViewportReadCostTest {
      * How many rows the index actually makes the engine touch, which is the number the entry's
      * headline is stated in.
      *
-     * A returned-row count cannot show this: both routes return the same rows by construction, and
-     * an assertion on them is satisfied by a full table scan. `sqlite3_stmt_scanstatus` is not
-     * exposed on Android, so the visited count is DERIVED — and the derivation is taken from the
-     * ENGINE'S OWN PLAN rather than from what this test believes the query does.
+     * **What this is, stated exactly, because a previous version overstated it.** It is not a
+     * measurement of rows visited: `sqlite3_stmt_scanstatus` is not exposed on Android, and there
+     * is no way from here to count what the engine actually walked. It is a PLAN CLASSIFIER that
+     * then computes what a plan of that shape would visit. The classification comes from the
+     * engine's own constraint list rather than from what this test believes the query does, which
+     * is the part that matters and the part the first version got wrong.
      *
-     * That distinction is the whole point, and the first version of this test got it wrong in the
-     * way this file keeps getting things wrong: it counted rows with a hand-written
+     * The limit that follows is real and worth naming: a mutation whose plan text is BYTE-IDENTICAL
+     * to the shipped one cannot be distinguished here, however much work it actually does. Closure
+     * round 3 built one — an extra redundant `longitude` bound that SQLite plans identically while
+     * walking 1 722 rows instead of 82 — and no plan-derived gate can see it. The rows-visited
+     * numbers in the ledger are a HOST measurement taken with a counting mechanism this platform
+     * does not offer.
+     *
+     * The first version of this test counted rows with a hand-written
      * `WHERE lat_bucket IN (...) AND longitude BETWEEN ?` that had no connection to the production
      * statement, so every number was plan-invariant and no mutation of the real query could move
      * them. Now the plan's constraint list decides which predicates bound the count: if SQLite
      * stops reporting `longitude>?`, the longitude predicate leaves the count, `visited` jumps to
-     * the whole latitude band, and the ratio below fails.
+     * the whole latitude band, and the ratio below fails — which is what the A/B measures.
      */
     @Test
     fun theIndexNarrowsTheRowsVisitedAndNotOnlyTheRowsReturned() {

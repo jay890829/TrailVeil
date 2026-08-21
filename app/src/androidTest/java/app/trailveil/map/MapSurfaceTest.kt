@@ -88,6 +88,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.maplibre.android.camera.CameraUpdateFactory
+import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
@@ -2368,11 +2369,6 @@ class MapSurfaceTest {
                         Thread.sleep(ZOOM_SETTLE_MILLIS)
                         val settled = map.auditFogCoverage()
                         assertTrue(
-                            "The settled frame drew nothing at all (${settled.report()}): a dead " +
-                                "rendering surface, not a fog verdict - see P4-042",
-                            settled.drawnFraction >= MINIMUM_DRAWN_FRACTION,
-                        )
-                        assertTrue(
                             "The settled camera after the " + name + " presented unexplored map " +
                                 "as revealed: " + settled.report(),
                             settled.uncoveredFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
@@ -2511,11 +2507,6 @@ class MapSurfaceTest {
                 // reading per hold: it compares the fogged capture against the bare one, so it goes
                 // to zero exactly when there is nothing to compare. No brightness threshold is
                 // involved, which is why it works where the absolute-luminance guards cannot.
-                assertTrue(
-                    "A held frame drew nothing at all (${audit.report()}): a dead rendering " +
-                        "surface, not a fog verdict - see P4-042",
-                    audit.drawnFraction >= MINIMUM_DRAWN_FRACTION,
-                )
                 if (audit.uncoveredFraction > worst) worst = audit.uncoveredFraction
                 report.append(
                     " z=${"%.2f".format(java.util.Locale.US, zoom)}:" +
@@ -3251,7 +3242,11 @@ class MapSurfaceTest {
         setSingleFogLayerVisible(id, true)
         val only = snapshotPixels()
         setSingleFogLayerVisible(id, false)
-        return compareFogCoverage(only, bare, snapshotWidth())
+        // Calls `compareFogCoverage` DIRECTLY, so it is invisible to any enumeration of the four
+        // audit helpers - which is how closure round 3 found it still unguarded after two rounds of
+        // counting sites. On a dead surface every isolated quad measures 0.0 over-fog, `doubled` is
+        // never set, and both quad tests pass on a black screen.
+        return compareFogCoverage(only, bare, snapshotWidth()).alsoRequireSomethingWasDrawn()
     }
 
     private fun MapLibreMap.fogLayerVisibility(id: String): String? {
@@ -3417,11 +3412,6 @@ class MapSurfaceTest {
                     }
                     val candidateReport = map.fogGenerationStyleReport(slotBefore)
                     val candidate = map.auditFogCoverage()
-                    assertTrue(
-                        "A sampled frame drew nothing at all (${candidate.report()}): a dead " +
-                            "rendering surface, not a fog verdict - see P4-042",
-                        candidate.drawnFraction >= MINIMUM_DRAWN_FRACTION,
-                    )
                     val slotAfter = runCatching { publishedFogSlot() }.getOrNull()
                     if (slotAfter == slotBefore && map.hasOnlyPublishedFogGeneration(slotBefore)) {
                         validatedSlot = slotBefore
@@ -3842,11 +3832,6 @@ class MapSurfaceTest {
                         val audit = map.auditFogCoverage()
                         // Same as the oblique helper: a dead surface audits as all zeroes, which
                         // reads as perfect fog on every one of the assertions below.
-                        assertTrue(
-                            "A held frame drew nothing at all (${audit.report()}): a dead " +
-                                "rendering surface, not a fog verdict - see P4-042",
-                            audit.drawnFraction >= MINIMUM_DRAWN_FRACTION,
-                        )
                         trace.append("z=${"%.2f".format(java.util.Locale.US, zoom)}:")
                             .append(
                                 "${"%.4f".format(
@@ -4643,7 +4628,10 @@ class MapSurfaceTest {
      * and a diagnosis. The probe is best-effort: a surface too broken to read from must not replace
      * the real failure with an exception from the diagnostic.
      */
-    private fun MapLibreMap.awaitFullyRenderedFrame(view: MapView) {
+    private fun MapLibreMap.awaitFullyRenderedFrame(
+        view: MapView,
+        expectedCamera: CameraPosition? = null,
+    ) {
         val ready = CountDownLatch(1)
         lateinit var listener: MapView.OnDidFinishRenderingFrameListener
         listener = MapView.OnDidFinishRenderingFrameListener { fullyRendered, _, _ ->
@@ -4663,6 +4651,7 @@ class MapSurfaceTest {
                 waited += REPAINT_RETRY_MILLIS
                 InstrumentationRegistry.getInstrumentation().runOnMainSync { triggerRepaint() }
             }
+            if (ready.count != 0L && settledOnExpectedCamera(view, expectedCamera)) return
             if (ready.count != 0L) {
                 val surfaceState = runCatching { view.pixelCopyFogCoverage() }
                     .fold(
@@ -4691,6 +4680,119 @@ class MapSurfaceTest {
                 view.removeOnDidFinishRenderingFrameListener(listener)
             }
         }
+    }
+
+    /**
+     * `P4-044`: the settled proof says yes to the state that IS on screen and no to one that is not.
+     *
+     * [settledOnExpectedCamera] is only ever consulted after the readiness callback has already
+     * timed out, and that timeout has never reproduced locally — so the escape's integration cannot
+     * be exercised here, and only hosted CI can report on it. Its DECISION can be bound though, and
+     * this does: run on every finite-extent guard test at a genuinely settled camera, it requires a
+     * yes for the position that was just requested and a no for one displaced far beyond the
+     * epsilon. Break the camera comparison and the second assertion fails; break the liveness or
+     * stability halves and the first does.
+     *
+     * The displacement is a whole degree of latitude — not a near-miss — because the epsilon exists
+     * for floating-point round-tripping, not for tolerance, and a near-miss fixture would turn a
+     * deliberate design decision into a tuned constant.
+     */
+    private fun MapLibreMap.assertSettledProofDiscriminates(
+        view: MapView,
+        requested: CameraPosition,
+    ) {
+        assertTrue(
+            "The settled proof does not recognise the camera it was just given ($settledReason)",
+            settledOnExpectedCamera(view, requested),
+        )
+        val displaced = CameraPosition.Builder(requested)
+            .target(
+                LatLng(
+                    (requireNotNull(requested.target).latitude + 1.0).coerceIn(-85.0, 85.0),
+                    requireNotNull(requested.target).longitude,
+                ),
+            )
+            .build()
+        assertTrue(
+            "The settled proof accepted a camera the screen is not showing, so a stuck renderer " +
+                "would pass through it - see P4-044",
+            !settledOnExpectedCamera(view, displaced),
+        )
+    }
+
+    /**
+     * `P4-044`: the requested state IS on screen, proved directly rather than via a drawn-frame
+     * callback.
+     *
+     * [awaitFullyRenderedFrame] waits for `OnDidFinishRenderingFrameListener(fullyRendered = true)`,
+     * which fires when something is DRAWN. That is a proxy for "the requested camera and style are
+     * showing", and the proxy is unavailable in exactly the case where the answer is *already*: a
+     * camera move too small to change a pixel need never produce a frame, and no amount of
+     * `triggerRepaint()` can conjure one. The boundary-search helpers halve their step eighteen
+     * times, so their last steps are reliably sub-pixel — which is why every member of this hosted
+     * failure family is an `*AcrossTheFiniteExtent*` name, and why the diagnostic reported a
+     * surface that was alive and fully painted.
+     *
+     * Three conditions together, and each is doing work:
+     *  - the camera IS the requested one, which is what stops a genuinely stuck renderer showing a
+     *    STALE frame from passing here; without it this would be a weakening rather than a proof.
+     *  - the surface holds light, so a dead capture cannot satisfy it (`P4-042`).
+     *  - the content is unchanged across a forced repaint, so the renderer has settled rather than
+     *    being mid-draw.
+     *
+     * Returns false when no expected camera was supplied — a caller that cannot say what it asked
+     * for gets the old behaviour, because there is nothing to check the screen against.
+     */
+    private var settledReason: String = ""
+
+    private fun MapLibreMap.settledOnExpectedCamera(
+        view: MapView,
+        expectedCamera: CameraPosition?,
+    ): Boolean {
+        settledReason = "?"
+        val expected = expectedCamera ?: run { settledReason = "no expected"; return false }
+        val actual = composeRule.runOnIdle { cameraPosition }
+        val target = actual.target ?: run { settledReason = "no target"; return false }
+        val expectedTarget = expected.target ?: run { settledReason = "no expected target"; return false }
+        val cameraMatches = abs(target.latitude - expectedTarget.latitude) <= SETTLED_CAMERA_EPSILON &&
+            abs(
+                WebMercator.wrapLongitude(target.longitude - expectedTarget.longitude),
+            ) <= SETTLED_CAMERA_EPSILON &&
+            abs(actual.zoom - expected.zoom) <= SETTLED_CAMERA_EPSILON &&
+            abs(actual.tilt - expected.tilt) <= SETTLED_CAMERA_TILT_EPSILON &&
+            abs(
+                WebMercator.wrapLongitude(actual.bearing - expected.bearing),
+            ) <= SETTLED_CAMERA_TILT_EPSILON
+        if (!cameraMatches) {
+            settledReason = "the camera is not the one that was requested"
+            return false
+        }
+        // Two consecutive identical captures, retried a few times. One pair is not enough
+        // immediately after a rendered frame - measured: right after `awaitFullyRenderedFrame`
+        // returns, a forced repaint still produces a DIFFERENT frame, because tiles are arriving.
+        // The retry cannot mask the case this rejects: a renderer that has stopped responding is
+        // stable on the first pair, not the third.
+        var previous: Long? = null
+        repeat(SETTLED_STABILITY_ATTEMPTS) {
+            val capture = runCatching { view.pixelCopyFogCoverage() }.getOrNull()
+            if (capture == null) {
+                settledReason = "the surface could not be read"
+                return false
+            }
+            if (!capture.judgeable) {
+                settledReason = "the surface holds no light (${capture.report()})"
+                return false
+            }
+            if (capture.fingerprint == previous) {
+                settledReason = "settled"
+                return true
+            }
+            previous = capture.fingerprint
+            InstrumentationRegistry.getInstrumentation().runOnMainSync { triggerRepaint() }
+            SystemClock.sleep(REPAINT_RETRY_MILLIS)
+        }
+        settledReason = "the surface kept changing across $SETTLED_STABILITY_ATTEMPTS repaints"
+        return false
     }
 
     /**
@@ -5831,7 +5933,6 @@ class MapSurfaceTest {
             var coveredFrames = 0
             var worstRevealed = 0.0
             val darkFrames = mutableListOf<FogCoverage>()
-            val journeyFingerprints = mutableListOf<Long>()
             var worstReport: FogCoverage? = null
             var worstShape = "none"
             // One screen width in degrees at this camera, so "how far have we travelled" is
@@ -5922,7 +6023,6 @@ class MapSurfaceTest {
                         val covered = composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                             .fetchSemanticsNodes()
                             .isNotEmpty()
-                        journeyFingerprints += coverage.fingerprint
                         // P4-042, and its entry used to claim this journey was already protected
                         // by "its cover-or-fog contract plus its nonBlackFraction reporting". It
                         // was not: nonBlackFraction only ever reached a failure string that a
@@ -5954,7 +6054,6 @@ class MapSurfaceTest {
                     "not a fog verdict - see P4-042",
                 darkFrames.isEmpty(),
             )
-            assertSurfaceStayedLive(journeyFingerprints, "The east-west journey audit")
             // The journey has to actually leave the explored ground, or the assertion below is
             // measuring nothing - the same vacuity guard the sustained-gesture test carries.
             assertTrue(
@@ -6180,7 +6279,10 @@ class MapSurfaceTest {
                 // catch a surface that was dead for the WHOLE window - never one that died mid
                 // gesture, which is the case the hosted failures actually showed.
                 val darkFrames = mutableListOf<FogCoverage>()
-                val sampledFingerprints = mutableListOf<Long>()
+                // Kept for the diagnostic stream line only. This stream does NOT take the
+                // liveness gate: it reads the camera MODEL at its own sampling instant rather than
+                // the camera each frame was rendered from - see assertSurfaceStayedLive.
+                val sampledFrames = mutableListOf<SurfaceSample>()
                 var exited = false
                 var coveredFrames = 0
                 val leaks = mutableListOf<FogCoverage>()
@@ -6216,7 +6318,10 @@ class MapSurfaceTest {
                 }
                 val coverage = map.renderedFogCoverage()
                 samples += 1
-                sampledFingerprints += coverage.fingerprint
+                sampledFrames += SurfaceSample.of(
+                    coverage.fingerprint,
+                    composeRule.runOnIdle { map.cameraPosition },
+                )
                 if (
                     composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                         .fetchSemanticsNodes()
@@ -6254,7 +6359,7 @@ class MapSurfaceTest {
             var postExitFlingFrames = 0
             val flingLeaks = mutableListOf<FogCoverage>()
             val darkFlingFrames = mutableListOf<FogCoverage>()
-            val flingFingerprints = mutableListOf<Long>()
+            val flingFrameSamples = mutableListOf<SurfaceSample>()
             try {
                 assertTrue(
                     "Too few renderer-finished fling frames were captured: ${flingFrames.size}",
@@ -6296,7 +6401,7 @@ class MapSurfaceTest {
                         frame.expectedCoverage.extent.covers(frame.snapshotEndCorners),
                     )
                     val coverage = frame.bitmap.fogCoverage()
-                    flingFingerprints += coverage.fingerprint
+                    flingFrameSamples += SurfaceSample.of(coverage.fingerprint, frame.target)
                     // Same absolute-count hazard as the gesture loop above, in a second place the
                     // first version of P4-042 missed: this branch reads `revealedFraction` alone,
                     // so a dead surface satisfies `flingExited` and contributes no leak.
@@ -6319,7 +6424,7 @@ class MapSurfaceTest {
                     "surface, not a fog verdict - see P4-042",
                 darkFlingFrames.isEmpty(),
             )
-            assertSurfaceStayedLive(flingFingerprints, "The renderer-finished fling audit")
+            assertSurfaceStayedLive(flingFrameSamples, "The renderer-finished fling audit")
             assertTrue("No renderer-finished fling frame left the revealed track", flingExited)
             assertTrue(
                 "Too few renderer-finished fling frames were audited after leaving the track: " +
@@ -6352,7 +6457,7 @@ class MapSurfaceTest {
                     putString(
                         "stream",
                         "TrailVeil fog gesture invariant: frames=$samples " +
-                            "distinctFrames=${sampledFingerprints.toSet().size} " +
+                            "distinctFrames=${sampledFrames.map { it.fingerprint }.toSet().size} " +
                             "postExitFrames=$postExitFrames " +
                             "revealedReference=${explored.report()} " +
                             "postExitWorst=[maxLuminance=$postExitMaxLuminance " +
@@ -6387,7 +6492,6 @@ class MapSurfaceTest {
                     "rendering surface, not a fog verdict - see P4-042",
                 darkFrames.isEmpty(),
             )
-            assertSurfaceStayedLive(sampledFingerprints, "The sustained gesture audit")
             assertTrue(
                 "Unexplored map was drawn unfogged during gestures: $leaks",
                 leaks.isEmpty(),
@@ -6651,8 +6755,10 @@ class MapSurfaceTest {
      */
     @Test
     fun theLivenessInstrumentsRejectAStalledSurfaceAndAcceptAMeasuredLiveOne() {
-        // A surface that stopped responding returns one buffer for the whole window.
-        val stalled = List(60) { 12345L }
+        // A surface that stopped responding returns one buffer while the camera keeps moving.
+        val stalled = List(60) { index ->
+            SurfaceSample(fingerprint = 12345L, latitude = 25.0 + index * 0.01, longitude = 121.0)
+        }
         val stalledFailure = assertThrows(AssertionError::class.java) {
             assertSurfaceStayedLive(stalled, "probe")
         }
@@ -6661,26 +6767,40 @@ class MapSurfaceTest {
             stalledFailure.message.orEmpty().contains("same frame"),
         )
 
-        // A surface that died HALF WAY through: the case a running maximum and a distinct-count
-        // both miss, and the reason this gate measures the longest run rather than either. It is
-        // also the case that showed the first bound (half the window) was too loose — it passed by
-        // exactly one frame, so the bound is 40% and this is the test that moved it.
-        val diedMidway = List(30) { it.toLong() } + List(30) { 999L }
+        // A surface that died HALF WAY through, which an unconditional run-length bound calibrated
+        // on a whole window can miss depending on where the bound sits.
+        val diedMidway = List(30) { index ->
+            SurfaceSample(fingerprint = index.toLong(), latitude = 25.0 + index * 0.01, longitude = 121.0)
+        } + List(30) { index ->
+            SurfaceSample(fingerprint = 999L, latitude = 25.3 + index * 0.01, longitude = 121.0)
+        }
         assertThrows(AssertionError::class.java) {
             assertSurfaceStayedLive(diedMidway, "probe")
         }
 
-        // The measured live shape must pass, with its real repeat runs intact: 61 frames whose
-        // longest identical run is 15. Built explicitly so that if the bound is ever tightened
-        // below what this emulator actually produces, this fails instead of the whole map package.
-        val live = buildList {
-            repeat(15) { add(7L) }
-            repeat(10) { add(8L) }
-            repeat(10) { add(9L) }
-            repeat(26) { index -> add(100L + index) }
+        // The case the old unconditional bound got WRONG, and the reason this gate is conditional:
+        // a camera held perfectly still repeats frames for as long as it is held, and that is not
+        // a defect. Sixty identical frames at one camera must pass.
+        val heldStill = List(60) { SurfaceSample(fingerprint = 7L, latitude = 25.0, longitude = 121.0) }
+        assertSurfaceStayedLive(heldStill, "probe")
+
+        // And a sub-pixel camera step is not movement either - the P4-044 case. Forty identical
+        // frames whose camera creeps by a TOTAL well under the visible threshold must also pass.
+        // (An earlier version of this fixture crept by threshold/10 per STEP, which over forty
+        // steps is four times the threshold; the gate compares a run's first sample with its last,
+        // so that fixture was asserting a case that ought to fail, and did.)
+        val creeping = List(40) { index ->
+            SurfaceSample(
+                fingerprint = 7L,
+                latitude = 25.0 + index * VISIBLE_CAMERA_MOVE_DEGREES / 100.0,
+                longitude = 121.0,
+            )
         }
-        assertEquals(61, live.size)
-        assertSurfaceStayedLive(live, "probe")
+        assertSurfaceStayedLive(creeping, "probe")
+
+        // A sample that knows nothing about its camera never accuses the renderer.
+        val cameraless = List(60) { SurfaceSample(fingerprint = 7L, latitude = null, longitude = null) }
+        assertSurfaceStayedLive(cameraless, "probe")
 
         // And the per-frame guard, which only ever claimed to catch a nearly-black frame.
         assertTrue(
@@ -6895,7 +7015,28 @@ class MapSurfaceTest {
         setFogLayersVisible(false)
         val bare = snapshotStableBarePixels("fog coverage reference")
         restoreFogLayerVisibility(visibility)
-        return compareFogCoverage(fogged, bare, snapshotWidth())
+        return compareFogCoverage(fogged, bare, snapshotWidth()).alsoRequireSomethingWasDrawn()
+    }
+
+    /**
+     * `P4-042`: an audit of a surface that drew nothing is not a fog verdict.
+     *
+     * This lives on the RESULT rather than at the call sites, and that is the point. The site count
+     * for this guard was wrong in three consecutive closure rounds — four, then five, then nine —
+     * every time because someone enumerated call sites by hand and missed a family. A consumer
+     * cannot forget a check it never had to remember.
+     *
+     * `drawnFraction` is the right signal here and needs no brightness threshold: it counts pixels
+     * whose BARE reference had any light, so it goes to zero exactly when there was nothing to
+     * compare against. On a persistent death both captures are dead, every pixel is skipped, and
+     * the audit returns all zeroes — which every leak assertion downstream reads as perfect fog.
+     */
+    private fun FogAudit.alsoRequireSomethingWasDrawn(): FogAudit = also {
+        assertTrue(
+            "The audited frame drew nothing at all (${report()}): a dead rendering surface, not a " +
+                "fog verdict - see P4-042",
+            drawnFraction >= MINIMUM_DRAWN_FRACTION,
+        )
     }
 
     /**
@@ -7392,19 +7533,20 @@ class MapSurfaceTest {
 
         fun moveTo(normalizedY: Double) {
             val latitude = WebMercator.latitudeAtNormalizedY(normalizedY.coerceIn(0.0, 1.0))
+            // P4-044: the requested position is kept so the readiness wait can PROVE the screen is
+            // showing it, instead of waiting for a drawn-frame callback that a sub-pixel step of
+            // this binary search need never produce.
+            val requested = CameraPosition.Builder()
+                .target(LatLng(latitude, extent.centerLongitude))
+                .zoom(EXPLORATION_GESTURE_ZOOM)
+                .tilt(tilt)
+                .bearing(bearing)
+                .build()
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
-                moveCamera(
-                    CameraUpdateFactory.newCameraPosition(
-                        org.maplibre.android.camera.CameraPosition.Builder()
-                            .target(LatLng(latitude, extent.centerLongitude))
-                            .zoom(EXPLORATION_GESTURE_ZOOM)
-                            .tilt(tilt)
-                            .bearing(bearing)
-                            .build(),
-                    ),
-                )
+                moveCamera(CameraUpdateFactory.newCameraPosition(requested))
             }
-            awaitFullyRenderedFrame(view)
+            awaitFullyRenderedFrame(view, requested)
+            assertSettledProofDiscriminates(view, requested)
         }
 
         moveTo(centerY)
@@ -7452,19 +7594,19 @@ class MapSurfaceTest {
         val halfDegrees = extent.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
 
         fun moveTo(longitude: Double) {
+            // P4-044, same reason as the north-edge helper: an eighteen-step binary search ends in
+            // steps too small to change a pixel.
+            val requested = CameraPosition.Builder()
+                .target(LatLng(centerLatitude, longitude))
+                .zoom(EXPLORATION_GESTURE_ZOOM)
+                .tilt(tilt)
+                .bearing(bearing)
+                .build()
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
-                moveCamera(
-                    CameraUpdateFactory.newCameraPosition(
-                        org.maplibre.android.camera.CameraPosition.Builder()
-                            .target(LatLng(centerLatitude, longitude))
-                            .zoom(EXPLORATION_GESTURE_ZOOM)
-                            .tilt(tilt)
-                            .bearing(bearing)
-                            .build(),
-                    ),
-                )
+                moveCamera(CameraUpdateFactory.newCameraPosition(requested))
             }
-            awaitFullyRenderedFrame(view)
+            awaitFullyRenderedFrame(view, requested)
+            assertSettledProofDiscriminates(view, requested)
         }
 
         moveTo(extent.centerLongitude)
@@ -7568,49 +7710,137 @@ class MapSurfaceTest {
      * of a SINGLE frame can decide this — real frames reach `distinct=1, modal=100%`, and a
      * legitimate double coat measures luminance 17 against a death bounded only below about 20.
      *
-     * Calibrated by measurement, not by argument. Three consecutive green runs of
-     * `sustainedGesturesNeverExposeUnexploredMap` on the API 36 emulator sampled 58-61 frames and
-     * produced a longest run of IDENTICAL consecutive frames of 15, 10 and 10 — the repeats are
-     * real, because sampling outruns the render rate. A surface that died at the start of the
-     * window would produce a run equal to the whole window.
+     * **The question it asks is a conditional one, and that is the whole design.** For every run of
+     * IDENTICAL consecutive frames, it asks whether the CAMERA moved across that run. Frames that
+     * repeat while the camera is still are not evidence of anything; frames that repeat while the
+     * camera moves visibly are a surface that has stopped answering.
      *
-     * The bound is **40% of the sampled frames**: 1.6x above the worst observed live run (15 of 61
-     * is 24.6%), and below any death that persists. It was first written as half, and the test that
-     * binds this helper immediately showed why that is too loose — a surface that dies exactly
-     * midway produces a run of exactly half and passes. The test now carries that case.
+     * **It is sound only where the camera was recorded WITH the frame, which is one site.** The
+     * renderer-finished fling audit records `FlingFrameAudit.target` as part of capturing each
+     * frame, so its pairs are real. The polled samplers - the sustained gesture loop and the
+     * east-west journey - read `map.cameraPosition`, which is the camera MODEL, at their own
+     * sampling instant. During a fling that model advances continuously while the renderer produces
+     * frames at its own rate, so a fast sampler legitimately collects many identical frames whose
+     * recorded model camera differs. Measured: the journey produced a run of 17 on a healthy
+     * surface. Those two streams therefore keep [FogCoverage.judgeable] and do not take this gate;
+     * pairing a frame with a camera it was not rendered from is not evidence, and no threshold can
+     * repair that.
      *
-     * **Only for streams sampled while the camera is MOVING.** That premise is load-bearing, and
-     * measurement made it explicit: applied to `sweepGesture`'s renderer-transition samples — which
-     * are taken while the camera is deliberately HELD at each step — it failed a healthy run at 13
-     * identical frames out of 30 (6 distinct). Repeats there are not a stalled surface, they are a
-     * still camera reporting finished frames with nothing new to draw. So the held-frame streams
-     * keep [FogCoverage.judgeable] and do not get this gate, and the three continuously-moving
-     * streams (sustained gestures, the renderer-finished fling loop, the east-west journey) get
-     * both.
+     * This is the third narrowing this instrument has taken from measurement, and the pattern is
+     * the record: an unconditional run-length bound measured the test's sleep schedule, a
+     * per-frame luminance predicate measured the fog alpha, and a model-camera pairing measures the
+     * sampling rate. What survives is the one comparison where both halves come from the same
+     * moment.
      *
-     * **What this does not catch, per the house rule:** a death lasting less than 40% of the
-     * sampled window. `P4-044` records the hosted failure as a CUMULATIVE, persistent one, which is
-     * the case this targets; a brief flicker is not covered and is not claimed to be. It also does
-     * not apply to gates that take a single frame — those have no stream to judge — nor to the
-     * held-camera streams above, nor below [MINIMUM_LIVENESS_SAMPLE_FRAMES] samples, where a run
-     * length says nothing.
+     * It was first written as an unconditional bound — "the longest identical run must be under 40%
+     * of the window" — calibrated from three green runs measuring 15, 10 and 10 of 58-61. Closure
+     * round 3 showed that number measures the TEST rather than the surface: the calibration stream
+     * spends 5 500 ms in deliberate `Thread.sleep` against about 1 730 ms of actual input, and
+     * `dragVertically(lift = false)` ends with `ACTION_CANCEL`, which produces no fling — so its
+     * 1 500 ms settle is a provably frozen camera, and that window alone accounts for the run of 15.
+     * The bound was therefore a function of `FLING_CANONICAL_SETTLE_MILLIS` and of how fast the
+     * emulator can take snapshots, both test constants. Raising the settle would have reddened a
+     * healthy surface. That is precisely the failure mode this file keeps having to unlearn.
+     *
+     * Pairing each frame with the camera that produced it removes the dependence entirely: no
+     * threshold on window fraction, no calibration against a sleep schedule, and the premise "a
+     * moving camera cannot repeat" is now true by construction rather than by assumption. It also
+     * makes the guard usable on the held-camera streams that had to be exempted before.
+     *
+     * **A short run is renderer coalescing, not a stall, and that needed measuring too.** The
+     * renderer-finished fling audit samples on MapLibre's own callbacks and legitimately returns the
+     * same bytes for a few of them while the camera moves - measured over three green runs at
+     * 3, 2 and 2 identical frames out of 8-12 samples. The sustained sampler, which polls rather
+     * than waiting for callbacks, never repeats during movement at all. So a run must clear
+     * [MINIMUM_STALLED_RUN_FRAMES] (one above the worst observed) or a third of the window,
+     * whichever is larger. That fraction is a noise floor sitting ON TOP of the camera condition,
+     * not the signal - which is what distinguishes it from the unconditional 40% bound this
+     * replaced, whose fraction WAS the signal and therefore measured the test's sleep schedule.
+     *
+     * **What this does not catch, per the house rule:** a death confined to samples during which
+     * the camera happens not to move visibly; a death shorter than the floor above; and a death in
+     * a window of fewer than [MINIMUM_LIVENESS_SAMPLE_FRAMES] samples. Movement is judged at
+     * [VISIBLE_CAMERA_MOVE_DEGREES], which is several device pixels at these streams' zoom - a
+     * deliberately conservative floor, because a false positive here reds a healthy suite while a
+     * false negative only loses one sample pair.
      */
-    private fun assertSurfaceStayedLive(fingerprints: List<Long>, what: String) {
-        if (fingerprints.size < MINIMUM_LIVENESS_SAMPLE_FRAMES) return
-        var longestRepeat = 0
-        var currentRepeat = 0
-        var previous: Long? = null
-        fingerprints.forEach { fingerprint ->
-            currentRepeat = if (fingerprint == previous) currentRepeat + 1 else 1
-            previous = fingerprint
-            longestRepeat = max(longestRepeat, currentRepeat)
+    private fun assertSurfaceStayedLive(samples: List<SurfaceSample>, what: String) {
+        if (samples.size < MINIMUM_LIVENESS_SAMPLE_FRAMES) return
+        var runStart = 0
+        var worst: Pair<Int, Int>? = null
+        var worstLength = 0
+        samples.indices.forEach { index ->
+            val endsRun = index == samples.lastIndex ||
+                samples[index + 1].fingerprint != samples[runStart].fingerprint
+            if (!endsRun) return@forEach
+            val length = index - runStart + 1
+            val floor = maxOf(MINIMUM_STALLED_RUN_FRAMES, samples.size / 3)
+            if (length > floor && samples[runStart].cameraMovedVisiblyTo(samples[index]) &&
+                length > worstLength
+            ) {
+                worstLength = length
+                worst = runStart to index
+            }
+            runStart = index + 1
         }
+        val violation = worst
         assertTrue(
-            "$what: the surface returned the same frame $longestRepeat times in a row out of " +
-                "${fingerprints.size} sampled (${fingerprints.toSet().size} distinct) - a surface " +
-                "that stopped responding to the camera, not a fog verdict; see P4-042 and P4-044",
-            longestRepeat * 5 <= fingerprints.size * 2,
+            "$what: the surface returned the same frame for $worstLength consecutive samples while " +
+                "the camera moved from ${violation?.let { pair -> samples[pair.first] }} to " +
+                "${violation?.let { pair -> samples[pair.second] }} - a surface that stopped " +
+                "responding to the camera, not a fog verdict; see P4-042 and P4-044 " +
+                "(${samples.size} sampled, ${samples.map { it.fingerprint }.toSet().size} distinct)",
+            violation == null,
         )
+    }
+
+    /**
+     * One sampled frame and as much of the camera that produced it as the sampling site knows.
+     *
+     * The fields are nullable on purpose: the renderer-finished fling audit records only the
+     * camera target per frame, and demanding a full [CameraPosition] there would have meant
+     * inventing values. An absent field simply does not vote, and a sample that knows nothing never
+     * accuses the renderer.
+     */
+    private data class SurfaceSample(
+        val fingerprint: Long,
+        val latitude: Double?,
+        val longitude: Double?,
+        val zoom: Double? = null,
+        val tilt: Double? = null,
+        val bearing: Double? = null,
+    ) {
+        /** Did the camera move far enough between these two samples that the pixels had to change? */
+        fun cameraMovedVisiblyTo(other: SurfaceSample): Boolean =
+            moved(latitude, other.latitude, VISIBLE_CAMERA_MOVE_DEGREES) ||
+                movedAround(longitude, other.longitude, VISIBLE_CAMERA_MOVE_DEGREES) ||
+                moved(zoom, other.zoom, VISIBLE_CAMERA_MOVE_ZOOM) ||
+                moved(tilt, other.tilt, VISIBLE_CAMERA_MOVE_DEGREES_OF_ANGLE) ||
+                movedAround(bearing, other.bearing, VISIBLE_CAMERA_MOVE_DEGREES_OF_ANGLE)
+
+        private fun moved(from: Double?, to: Double?, threshold: Double): Boolean =
+            from != null && to != null && abs(from - to) > threshold
+
+        private fun movedAround(from: Double?, to: Double?, threshold: Double): Boolean =
+            from != null && to != null &&
+                abs(WebMercator.wrapLongitude(from - to)) > threshold
+
+        companion object {
+            fun of(fingerprint: Long, camera: CameraPosition?): SurfaceSample = SurfaceSample(
+                fingerprint = fingerprint,
+                latitude = camera?.target?.latitude,
+                longitude = camera?.target?.longitude,
+                zoom = camera?.zoom,
+                tilt = camera?.tilt,
+                bearing = camera?.bearing,
+            )
+
+            fun of(fingerprint: Long, target: GeoPoint): SurfaceSample = SurfaceSample(
+                fingerprint = fingerprint,
+                latitude = target.latitude,
+                longitude = target.longitude,
+            )
+        }
     }
 
     /** Copies the pixels users actually see from MapLibre's SurfaceView without a Style mutation. */
@@ -8451,6 +8681,56 @@ class MapSurfaceTest {
          * abstaining here cannot make a gate vacuous on its own.
          */
         const val MINIMUM_LIVENESS_SAMPLE_FRAMES = 8
+
+        /**
+         * `P4-044`: how close the camera must be to the requested one before the screen is accepted
+         * as showing it.
+         *
+         * Deliberately tight. This is not a tolerance for "near enough" — it exists only because
+         * `CameraPosition` round-trips through floating point, and the case it serves is a camera
+         * that was set EXACTLY and simply produced no new frame. A loose value here would let a
+         * genuinely stuck renderer pass, which is the one thing this check exists to prevent.
+         */
+        const val SETTLED_CAMERA_EPSILON = 1e-9
+
+        /** Tilt and bearing are degrees the platform stores as floats; the same intent, coarser. */
+        const val SETTLED_CAMERA_TILT_EPSILON = 1e-4
+
+        /**
+         * How many repaints the content gets to stop changing before the proof declines.
+         *
+         * Four, because a map that has just rendered a frame is often still receiving tiles and the
+         * first pair of captures legitimately differs - measured, immediately after
+         * `awaitFullyRenderedFrame` returns. A renderer that has genuinely stopped is identical on
+         * the first pair, so this costs a stuck renderer nothing.
+         */
+        const val SETTLED_STABILITY_ATTEMPTS = 4
+
+        /**
+         * How far the camera must move before the pixels are obliged to change.
+         *
+         * One device pixel at zoom z spans 360 / (256 * 2^z) degrees, which at the exploration zoom
+         * these streams run at (16) is about 2.1e-5 degrees. This is roughly five of those. It is
+         * deliberately conservative in the direction of saying "the camera did not really move",
+         * because a false positive reds a healthy suite while a false negative only discards one
+         * sample pair out of dozens.
+         */
+        const val VISIBLE_CAMERA_MOVE_DEGREES = 1e-4
+
+        /** The same intent for zoom, where a thousandth of a level is already sub-pixel. */
+        const val VISIBLE_CAMERA_MOVE_ZOOM = 1e-3
+
+        /** And for tilt and bearing, which move every pixel on screen when they change at all. */
+        const val VISIBLE_CAMERA_MOVE_DEGREES_OF_ANGLE = 0.05
+
+        /**
+         * How many identical frames during real camera movement are still renderer coalescing.
+         *
+         * Measured, not chosen: three green runs of the renderer-finished fling audit produced
+         * worst camera-moving runs of 3, 2 and 2 out of 8-12 samples, and the polled sustained
+         * sampler produced none at all. Four is one above the worst observed.
+         */
+        const val MINIMUM_STALLED_RUN_FRAMES = 4
 
         /**
          * "Not blacked out" for frames inside the A/B overlap or retention windows, where a

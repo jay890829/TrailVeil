@@ -6,6 +6,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -200,6 +201,76 @@ class LatitudeBucketDerivationTest {
                 )
             }
     }
+
+    /**
+     * An ALREADY-INSTALLED database gets the current arithmetic, not the one it was created with.
+     *
+     * This closes the blind spot that produced the defect it guards. Both bucket triggers were
+     * `CREATE TRIGGER IF NOT EXISTS`, which on an existing database is a no-op — so retuning
+     * [LatitudeBuckets.BUCKETS_PER_DEGREE] would have left every installed phone repairing rows
+     * with the OLD arithmetic while the app read them with the new. No test could see it, for
+     * exactly the reason stated here: every test database in the suite is created fresh, with no
+     * trigger to be stale.
+     *
+     * So this creates the stale state deliberately — a trigger with a DIFFERENT bucket size,
+     * installed under the production name — and then runs the installer over it.
+     */
+    @Test
+    fun anOutdatedBucketTriggerIsReplacedRatherThanLeftInPlace() {
+        database = openWithTriggers()
+        val db = database.openHelper.writableDatabase
+        val stale = "CREATE TRIGGER track_points_lat_bucket_insert AFTER INSERT ON track_points " +
+            "FOR EACH ROW WHEN NEW.lat_bucket != CAST((NEW.latitude + 90.0) * 250.0 AS INTEGER) " +
+            "BEGIN UPDATE track_points SET lat_bucket = " +
+            "CAST((NEW.latitude + 90.0) * 250.0 AS INTEGER) WHERE id = NEW.id; END"
+        db.execSQL("DROP TRIGGER IF EXISTS track_points_lat_bucket_insert")
+        db.execSQL(stale)
+        assertTrue(
+            "the stale trigger was not installed, so this test would prove nothing",
+            installedTriggerSql().contains("250.0"),
+        )
+
+        createTrackPointInvariantTriggers(db)
+
+        val repaired = installedTriggerSql()
+        assertTrue(
+            "an outdated bucket trigger survived the installer, so an upgraded database would " +
+                "keep repairing rows with arithmetic the app no longer reads: $repaired",
+            !repaired.contains("250.0"),
+        )
+        assertTrue(
+            "the replacement does not carry the current bucket size: $repaired",
+            repaired.contains(LatitudeBuckets.BUCKETS_PER_DEGREE.toString()),
+        )
+        // And it actually fires with the new arithmetic, not merely reads correctly.
+        db.execSQL(
+            "INSERT INTO recording_sessions (started_at, status, ended_at, distance_meters, " +
+                "accepted_point_count, rejected_point_count, created_app_version) " +
+                "VALUES (1, 'COMPLETED', 2, 0.0, 0, 0, 'test')",
+        )
+        db.execSQL(
+            "INSERT INTO track_segments (session_id, sequence, started_at, start_reason, " +
+                "ended_at, end_reason) VALUES (1, 0, 1, 'test', 2, 'test')",
+        )
+        db.execSQL(
+            "INSERT INTO track_points (session_id, segment_id, sequence, timestamp, latitude, " +
+                "longitude, horizontal_accuracy, lat_bucket) VALUES " +
+                "(1, 1, 0, 100, $WALKED_LATITUDE, $WALKED_LONGITUDE, 5.0, $WRONG_BUCKET)",
+        )
+        assertEquals(
+            "a row written after the replacement carries the old arithmetic's bucket",
+            LatitudeBuckets.of(WALKED_LATITUDE),
+            storedBucket(),
+        )
+    }
+
+    private fun installedTriggerSql(): String =
+        database.openHelper.readableDatabase.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = " +
+                "'track_points_lat_bucket_insert'",
+        ).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else ""
+        }
 
     private fun storedBucket(): Int =
         database.openHelper.readableDatabase
