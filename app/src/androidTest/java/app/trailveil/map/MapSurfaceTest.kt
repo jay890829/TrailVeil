@@ -1534,13 +1534,31 @@ class MapSurfaceTest {
                     mapZoom = INSTALL_GATE_WIDE_ZOOM,
                 )
             }
+            val slotWhenWaitSucceeded = AtomicReference<FogGenerationSlot?>(null)
             composeRule.waitUntil(timeoutMillis = 90_000L) {
                 val settledSlot = runCatching { publishedFogSlot() }.getOrNull()
-                settledSlot != null && readyMap.hasOnlyPublishedFogGeneration(settledSlot)
+                val settled = settledSlot != null &&
+                    readyMap.hasOnlyPublishedFogGeneration(settledSlot)
+                if (settled) slotWhenWaitSucceeded.set(settledSlot)
+                settled
             }
             val settledSlot = publishedFogSlot()
+            // P4-047: this assertion used to say only that a slot "was not retired", which names
+            // neither which slot nor which half of the condition failed - and the two halves have
+            // different causes. `hasOnlyPublishedFogGeneration` is an AND of "the active slot's
+            // layers are all present" (an install problem if false) and "the other slot's layers
+            // are all gone" (a retirement problem if false). It also records whether the published
+            // slot CHANGED between the wait succeeding and this check, because the observed failure
+            // is a wait that passed followed immediately by an assert that did not - which is the
+            // signature of a concurrent install republishing, not of a slot that never retired.
             assertTrue(
-                "A superseded slot was not retired after the globally guarded recovery",
+                "A superseded slot was not retired after the globally guarded recovery: " +
+                    "settledSlot=$settledSlot slotWhenWaitSucceeded=${slotWhenWaitSucceeded.get()} " +
+                    "slotChangedAfterTheWait=" +
+                    "${slotWhenWaitSucceeded.get() != null && slotWhenWaitSucceeded.get() != settledSlot} " +
+                    "activeComplete=${readyMap.hasCompletePublishedGeneration(settledSlot)} " +
+                    "inactiveRetired=${readyMap.hasRetiredGeneration(settledSlot.other())} " +
+                    "style=[${readyMap.fogGenerationStyleReport(settledSlot)}]",
                 readyMap.hasOnlyPublishedFogGeneration(settledSlot),
             )
         } finally {
@@ -7447,6 +7465,33 @@ class MapSurfaceTest {
             val inactiveGone = FogOverlayIds.generationLayers(activeSlot.other())
                 .none { id -> style.getLayer(id) != null }
             result.set(activeComplete && inactiveGone)
+        }
+        return result.get()
+    }
+
+    /**
+     * `P4-047`: the two halves of [hasOnlyPublishedFogGeneration], separately.
+     *
+     * That predicate is an AND, and a failure of each half means something different — the active
+     * generation being incomplete is an INSTALL problem, the superseded one lingering is a
+     * RETIREMENT problem. Reporting only the conjunction, as the assertion did for three
+     * occurrences, cannot tell the two apart.
+     */
+    private fun MapLibreMap.hasCompletePublishedGeneration(activeSlot: FogGenerationSlot): Boolean {
+        val result = AtomicBoolean(false)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val style = style ?: return@runOnMainSync
+            result.set(requiredFogGenerationLayers(activeSlot).all { id -> style.getLayer(id) != null })
+        }
+        return result.get()
+    }
+
+    /** The other half: nothing from the superseded slot is still installed. */
+    private fun MapLibreMap.hasRetiredGeneration(retiredSlot: FogGenerationSlot): Boolean {
+        val result = AtomicBoolean(false)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val style = style ?: return@runOnMainSync
+            result.set(FogOverlayIds.generationLayers(retiredSlot).none { id -> style.getLayer(id) != null })
         }
         return result.get()
     }

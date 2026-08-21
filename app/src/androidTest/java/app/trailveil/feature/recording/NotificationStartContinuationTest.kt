@@ -47,10 +47,29 @@ class NotificationStartContinuationTest {
     fun recreationWhileThePromptIsVisibleContinuesOneDeniedStartExactlyOnce() {
         val historyStore = PermissionHistoryStore(context)
         val originalHistory = runBlocking { historyStore.current() }
-        val notificationWasGranted =
-            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
-                PackageManager.PERMISSION_GRANTED
         var sessionIdsBeforeStart: Set<Long>? = null
+
+        // P4-046: this guard is OUTSIDE the try on purpose. Revoking a granted runtime permission
+        // from in here does not fail this test, it ENDS THE RUN - Android kills a process when a
+        // permission it holds is taken away, and instrumentation lives inside the app's process, so
+        // the revoke below would kill the runner and every remaining test would be silently skipped,
+        // reported only as `Process crashed` with no assertion and no name.
+        //
+        // Measured: a full local suite aborted here at case ~90 of 175 twice. The permission state
+        // comes from whatever ran before — `RecordingOutcomeNotificationTest` grants it and leaves
+        // it granted — so the FIRST run after a fresh install works and every later one aborts.
+        //
+        // It sits outside the try because the `finally` also revokes: a first version put the guard
+        // inside, the skip fired, and the cleanup then killed the process anyway. Skipping loudly
+        // is the honest answer, and the revoke is safe from the HOST, where no app process is alive
+        // to kill — so the run gets prepared rather than repaired.
+        assumeTrue(
+            "P4-046: POST_NOTIFICATIONS is granted, and revoking it from inside instrumentation " +
+                "would kill this process and abort the whole run. Prepare the device from the host " +
+                "first: adb shell pm revoke app.trailveil android.permission.POST_NOTIFICATIONS",
+            context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+                PackageManager.PERMISSION_DENIED,
+        )
 
         try {
             enableSystemLocation()
@@ -276,11 +295,10 @@ class NotificationStartContinuationTest {
                 }
             }
             runBlocking { historyStore.replaceForTesting(originalHistory) }
-            if (notificationWasGranted) {
-                grant(Manifest.permission.POST_NOTIFICATIONS)
-            } else {
-                prepareFreshNotificationRequest()
-            }
+            // Deliberately NOT restoring a grant. `notificationWasGranted` can only be false to
+            // reach here (the assume above), and re-granting would arm the same abort for the next
+            // run - which is exactly how this defect stayed invisible for two occurrences.
+            prepareFreshNotificationRequest()
         }
     }
 

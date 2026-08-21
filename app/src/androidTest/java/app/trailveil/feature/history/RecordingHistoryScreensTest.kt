@@ -46,13 +46,21 @@ class RecordingHistoryScreensTest {
      * populated-list branch, so exactly that report would have carried no build at all. Both
      * states are asserted here for that reason.
      *
-     * The text is compared against `BuildConfig` rather than a literal, so the assertion cannot
-     * drift from what the app actually shows; the shape of the fields is `BuildIdentityTest`'s job.
+     * The text is compared against the APP's own values read at RUNTIME, not against `BuildConfig`
+     * referenced directly. That distinction is not pedantry: `BuildConfig`'s fields are
+     * `static final String`, so the compiler INLINES them into whichever artifact references them
+     * — and the app APK and the instrumentation APK are separate artifacts. Referencing
+     * `BuildConfig.GIT_COMMIT` from a test therefore compares "what the TEST was compiled with"
+     * against "what the APP shows", which is the same value only when both were built from the
+     * same tree state.
+     *
+     * Measured, on this author's own test: a full suite failed both of these with
+     * `[Build 0.1.0 (1) · 6cdf55a84993-dirty]` after the test APK was rebuilt alone while the tree's
+     * dirty flag had changed. Hosted CI builds both together and would never have shown it. Reading
+     * the field reflectively from the app's loaded class removes the inlining entirely.
      */
     @Test
     fun everyHistoryStateNamesTheBuildItIsRunning() {
-        val expected = "Build ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) " +
-            "· ${BuildConfig.GIT_COMMIT}"
         composeRule.setContent {
             TrailVeilTheme {
                 RecordingHistoryListScreen(
@@ -65,7 +73,7 @@ class RecordingHistoryScreensTest {
         composeRule.onNodeWithTag(RecordingHistoryTestTags.Empty).assertIsDisplayed()
         composeRule.onNodeWithTag(RecordingHistoryTestTags.BuildIdentity)
             .assertIsDisplayed()
-            .assertTextEquals(expected)
+            .assertTextEquals(expectedBuildIdentity())
     }
 
     @Test
@@ -93,10 +101,21 @@ class RecordingHistoryScreensTest {
         composeRule.onNodeWithTag(RecordingHistoryTestTags.List).assertIsDisplayed()
         composeRule.onNodeWithTag(RecordingHistoryTestTags.BuildIdentity)
             .assertIsDisplayed()
-            .assertTextEquals(
-                "Build ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) " +
-                    "· ${BuildConfig.GIT_COMMIT}",
-            )
+            .assertTextEquals(expectedBuildIdentity())
+    }
+
+    /**
+     * The build identity the APP was built with, read from its loaded class rather than from the
+     * `BuildConfig` symbol this test file would otherwise inline at compile time.
+     */
+    private fun expectedBuildIdentity(): String {
+        val appBuildConfig = Class.forName(
+            "app.trailveil.BuildConfig",
+            true,
+            RecordingHistoryTestTags::class.java.classLoader,
+        )
+        fun field(name: String): Any? = appBuildConfig.getField(name).get(null)
+        return "Build ${field("VERSION_NAME")} (${field("VERSION_CODE")}) · ${field("GIT_COMMIT")}"
     }
 
     @Test

@@ -46,6 +46,11 @@ class RecordingOutcomeNotificationTest {
         enableSystemLocation()
         grant(Manifest.permission.ACCESS_COARSE_LOCATION)
         grant(Manifest.permission.ACCESS_FINE_LOCATION)
+        // P4-046: this grant is what arms the abort in `NotificationStartContinuationTest`, which
+        // needs the permission DENIED and cannot revoke it from inside instrumentation without
+        // killing the run. It is not restored here for the same reason - a revoke from in here
+        // would kill this run instead. The device is prepared from the host before a full suite:
+        //   adb shell pm revoke app.trailveil android.permission.POST_NOTIFICATIONS
         grant(Manifest.permission.POST_NOTIFICATIONS)
         val notificationManager =
             context.getSystemService(NotificationManager::class.java)
