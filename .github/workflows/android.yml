@@ -123,6 +123,8 @@ jobs:
           arch: x86_64
           profile: pixel_7
           script: |
+            adb shell settings put global cached_apps_freezer disabled
+            adb shell settings get global cached_apps_freezer | grep -Fx disabled
             adb shell cmd overlay enable-exclusive --user 0 --category com.android.internal.systemui.navbar.threebutton
             adb shell cmd overlay list | grep -F '[x] com.android.internal.systemui.navbar.threebutton'
             adb shell cmd overlay list | grep -F '[ ] com.android.internal.systemui.navbar.gestural'
