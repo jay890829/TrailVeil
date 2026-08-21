@@ -1,8 +1,10 @@
 package app.trailveil.data.map
 
+import app.trailveil.map.fog.GeoPoint
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ViewportTrackDataSourceTest {
@@ -136,6 +138,92 @@ class ViewportTrackDataSourceTest {
         assertThrows(IllegalArgumentException::class.java) {
             point(longitude = Double.NaN)
         }
+    }
+
+    /**
+     * `P4-037`: many cells become many single-point segments, never one segment holding them all.
+     *
+     * Found by closure verification, which noticed that every path reaching `coarseReadModel` today
+     * hands it exactly ONE cell — so the property its KDoc leans on was true and unobserved. Put all
+     * the cells into a single segment instead and `FogTileRenderer` walks that segment's points in
+     * order drawing a capsule between each consecutive pair, which at world zoom joins ground on
+     * opposite sides of the planet and reveals everything between. That is the worst failure this
+     * change could produce, and it is the direction no leak audit catches, because a leak audit
+     * accepts extra fog and this reveals extra GROUND.
+     *
+     * Three cells far enough apart that a joining stroke would be unmistakable.
+     */
+    @Test
+    fun eachCoarseCellBecomesItsOwnSinglePointSegment() = runTest {
+        val cells = listOf(
+            GeoPoint(latitude = 25.0330, longitude = 121.5654),
+            GeoPoint(latitude = -33.8688, longitude = 151.2093),
+            GeoPoint(latitude = 51.5074, longitude = -0.1278),
+        )
+        val source = ViewportTrackDataSource(CoarseReader(cells))
+
+        val model = source.read(
+            bounds = ViewportBounds(south = -85.0, north = 85.0, west = -180.0, east = 180.0),
+            coarse = true,
+        )
+
+        assertEquals("cells were merged into fewer segments", cells.size, model.segments.size)
+        assertTrue(
+            "a coarse segment holds more than one point, so the renderer will stroke between them",
+            model.segments.all { segment -> segment.points.size == 1 },
+        )
+        assertEquals(
+            "the cells the reader supplied are not the points the renderer will draw",
+            cells.toSet(),
+            model.segments.flatMap { it.points }.toSet(),
+        )
+    }
+
+    /**
+     * `P4-037`: a reader with no coarse route is served POINTS at world zoom, not nothing.
+     *
+     * The contract is that `readCoarseCells` answers null for "ask me the other way" and an empty
+     * list for "that box holds nothing" — opposite meanings, one of which is the difference between
+     * falling back and drawing no fog at all. Nothing bound it. Change the interface default from
+     * `null` to `emptyList()` and every reader that does not override it silently reports the world
+     * as unexplored, and the one existing world-zoom test cannot catch it because its assertion
+     * compares a count against itself and both sides become zero.
+     *
+     * This reader deliberately does NOT override `readCoarseCells`, so it inherits exactly the
+     * default under test.
+     */
+    @Test
+    fun aReaderWithNoCoarseRouteStillGetsPointsAtWorldZoom() = runTest {
+        val stored = point(pointId = 1, latitude = 0.0, longitude = 0.0)
+        val reader = RecordingReader(mapOf(LongitudeInterval(-180.0, 180.0) to listOf(stored)))
+        val source = ViewportTrackDataSource(reader)
+
+        val model = source.read(
+            bounds = ViewportBounds(south = -85.0, north = 85.0, west = -180.0, east = 180.0),
+            coarse = true,
+        )
+
+        assertTrue("the reader without a coarse route was never asked for points", reader.requested.isNotEmpty())
+        assertEquals(
+            "asking for cells from a reader that has none produced no fog instead of falling back",
+            listOf(listOf(GeoPoint(stored.latitude, stored.longitude))),
+            model.segments.map { segment -> segment.points },
+        )
+    }
+
+    /** Answers the coarse route, so the cell path is actually exercised. */
+    private class CoarseReader(private val cells: List<GeoPoint>) : ViewportTrackPointReader {
+        override suspend fun read(
+            south: Double,
+            north: Double,
+            interval: LongitudeInterval,
+        ): List<ViewportTrackPoint> = emptyList()
+
+        override suspend fun readCoarseCells(
+            south: Double,
+            north: Double,
+            interval: LongitudeInterval,
+        ): List<GeoPoint> = cells
     }
 
     private fun point(

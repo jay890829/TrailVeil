@@ -270,6 +270,47 @@ internal val MIGRATION_6_7 = object : Migration(6, 7) {
 }
 
 /**
+ * `P4-037`: materialises the coarse cell summary the world-zoom read uses, so the first settle at
+ * render zoom 0-1 stops visiting every point to draw a handful of sub-pixel dots.
+ *
+ * The backfill is one grouped scan of `track_points`, measured at 94 ms per 200 000 rows on the
+ * host and 1.1 ms on a copy of the real database.
+ *
+ * It is NOT the same expression the write path uses, and the difference is worth naming rather than
+ * glossing: the trigger derives from `NEW.latitude`/`NEW.longitude` while this reads the columns
+ * directly, so the two texts cannot be shared. What IS shared is the granularity — both are built
+ * from [TrackPointCells.CELLS_PER_DEGREE_SQL], so retuning the cell size moves both together.
+ *
+ * That constant is itself a second spelling of the number, `"500.0"` written out because Room needs
+ * a compile-time constant in `@Query`. It is not tethered to [TrackPointCells.CELLS_PER_DEGREE] by
+ * this comment but by `TrackPointCellsTest`, which fails if the two drift — the tether `P4-036`
+ * learned to make a test rather than a sentence.
+ *
+ * **Nothing is dropped and nothing is rewritten.** This migration only creates a derived table and
+ * fills it from rows it does not touch, so a failure part-way leaves every recorded track intact and
+ * costs at most a rebuild of state that is derivable by definition.
+ */
+internal val MIGRATION_7_8 = object : Migration(7, 8) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS track_point_cells (
+                lat_cell INTEGER NOT NULL,
+                lon_cell INTEGER NOT NULL,
+                PRIMARY KEY(lat_cell, lon_cell)
+            )
+            """.trimIndent(),
+        )
+        // Every point already stored, or the regions they cover fall out of the world-zoom read on
+        // the first launch after the update and simply look unexplored.
+        db.execSQL(TrackPointCells.BACKFILL_SQL)
+        // Installed here as well as from the open callback so a database is never left for even one
+        // write with the table present and nothing maintaining it.
+        createTrackPointCellTriggers(db)
+    }
+}
+
+/**
  * Indexes the box the fog viewport asks for, so a settle stops visiting every row to exclude it.
  *
  * Superseded by [MIGRATION_6_7], which retires this index for one that can bound both dimensions.

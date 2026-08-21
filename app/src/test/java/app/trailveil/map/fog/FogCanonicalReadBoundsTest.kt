@@ -133,6 +133,16 @@ class FogCanonicalReadBoundsTest {
 
         repeat(5) { coordinator.render(request) }
 
+        // P4-037 made zero reachable here, so the precondition is now stated. This reader has no
+        // coarse route, and the world-zoom settle asks for one first; if the "no coarse route"
+        // answer ever stopped meaning "fall back to points", the cold settle would read NOTHING and
+        // the equality below would compare 0 against 0 and pass. The other assertion in this case
+        // is on `queryBounds`, which its own comment notes is a pure function of the request and so
+        // "cannot fail for any read path" -- leaving nothing at all to detect total fog loss.
+        assertTrue(
+            "the cold world settle read no points, so the equality below is vacuous",
+            pointsAfterCold > 0,
+        )
         assertEquals(
             "zooming all the way out repeatedly kept re-reading the whole track table",
             pointsAfterCold,

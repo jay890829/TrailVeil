@@ -12,11 +12,12 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         RecordingSessionEntity::class,
         TrackSegmentEntity::class,
         TrackPointEntity::class,
+        TrackPointCellEntity::class,
         RecordingOperationReceiptEntity::class,
         LocationReceiptWindowEntity::class,
         LocationReceiptRetentionStateEntity::class,
     ],
-    version = 7,
+    version = 8,
     exportSchema = true,
 )
 @TypeConverters(RecordingStatusConverters::class)
@@ -30,6 +31,7 @@ internal abstract class TrailVeilDatabase : RoomDatabase() {
             override fun onCreate(db: SupportSQLiteDatabase) {
                 createDatabaseInvariantTriggers(db)
                 createTrackPointInvariantTriggers(db)
+                createTrackPointCellTriggers(db)
             }
 
             override fun onOpen(db: SupportSQLiteDatabase) {
@@ -37,6 +39,7 @@ internal abstract class TrailVeilDatabase : RoomDatabase() {
                 // predates the callbacks; CREATE TRIGGER IF NOT EXISTS is idempotent.
                 createDatabaseInvariantTriggers(db)
                 createTrackPointInvariantTriggers(db)
+                createTrackPointCellTriggers(db)
             }
         }
 
@@ -53,6 +56,7 @@ internal abstract class TrailVeilDatabase : RoomDatabase() {
                     MIGRATION_4_5,
                     MIGRATION_5_6,
                     MIGRATION_6_7,
+                    MIGRATION_7_8,
                 )
                 .addCallback(invariantCallback)
                 .setJournalMode(JournalMode.WRITE_AHEAD_LOGGING)

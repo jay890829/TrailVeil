@@ -2,6 +2,7 @@ package app.trailveil.map.fog
 
 import app.trailveil.data.map.ViewportBounds
 import app.trailveil.data.map.PersistedTrackPointChangeFeed
+import app.trailveil.data.db.TrackPointCells
 import app.trailveil.data.map.ViewportTrackDataSource
 import kotlin.math.abs
 import kotlin.math.cos
@@ -94,7 +95,14 @@ class FogViewportCoordinator(
         } else {
             FogPocSpatialSelection.select(
                 missing,
-                trackDataSource.read(queryBounds).toFogTrackSegments(),
+                // P4-037. At render zoom 0-1 the tile window IS the world, so this read has no
+                // bound to narrow and visits every point to draw a few sub-pixel dots. The decision
+                // is made here because it is a fact about the mask raster, which the data source
+                // deliberately knows nothing about.
+                trackDataSource.read(
+                    bounds = queryBounds,
+                    coarse = TrackPointCells.coarseReadIsSubPixel(renderZoom(request.mapZoom)),
+                ).toFogTrackSegments(),
                 style,
             )
         }

@@ -385,6 +385,74 @@ class TrailVeilDatabaseMigrationTest {
     }
 
     @Test
+    fun migrate7To8MaterialisesTheCoarseCellsAndKeepsEveryPoint() {
+        // P4-037. Two things, and the second is what a migration usually forgets: the derived table
+        // exists AND every existing point is represented in it. A cell that is missing drops its
+        // region from the world-zoom read, which draws MORE fog than earned and so passes every leak
+        // audit in the suite -- the same silent direction P4-036's bucket fails in.
+        val fixtureLatitudes = listOf(25.0330, 25.0331, -33.8688, 0.0)
+        val fixtureLongitudes = listOf(121.5654, 121.5655, 151.2093, 0.0)
+        migrationHelper.createDatabase("migration-p4-037", 7).use { old ->
+            old.execSQL(
+                "INSERT INTO recording_sessions(id, started_at, status, distance_meters, " +
+                    "accepted_point_count, rejected_point_count, created_app_version, active_slot) " +
+                    "VALUES(1, 1000, 'ACTIVE', 0, 0, 0, 'migration-test', 1)",
+            )
+            old.execSQL(
+                "INSERT INTO track_segments(id, session_id, sequence, started_at, start_reason, " +
+                    "open_slot) VALUES(1, 1, 0, 1000, 'SESSION_START', 1)",
+            )
+            fixtureLatitudes.forEachIndexed { index, latitude ->
+                old.execSQL(
+                    "INSERT INTO track_points(id, session_id, segment_id, sequence, timestamp, " +
+                        "latitude, longitude, horizontal_accuracy, lat_bucket) VALUES(" +
+                        "${index + 1}, 1, 1, $index, ${1000 + index}, $latitude, " +
+                        "${fixtureLongitudes[index]}, 5.0, ${LatitudeBuckets.of(latitude)})",
+                )
+            }
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            "migration-p4-037",
+            8,
+            true,
+            MIGRATION_7_8,
+        )
+
+        // Every point still there. Asserted first and by count, because the per-cell checks below
+        // are all satisfied by an empty result set -- the vacuity shape closure round 5 found in
+        // this file's sibling case.
+        val survivingPoints = migrated.query("SELECT COUNT(*) FROM track_points").use { cursor ->
+            cursor.moveToFirst()
+            cursor.getInt(0)
+        }
+        assertEquals(
+            "the 7->8 migration did not preserve every track point",
+            fixtureLatitudes.size,
+            survivingPoints,
+        )
+
+        val cells = migrated.query(
+            "SELECT lat_cell, lon_cell FROM track_point_cells ORDER BY lat_cell, lon_cell",
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(cursor.getInt(0) to cursor.getInt(1))
+            }
+        }
+        // The two Taipei points share a cell at this granularity, so four points backfill three
+        // cells. That collapse IS the feature, and pinning the exact set proves the backfill used
+        // the same arithmetic the write path does rather than merely producing something.
+        val expected = fixtureLatitudes.indices.map { index ->
+            TrackPointCells.latitudeCellOf(fixtureLatitudes[index]) to
+                TrackPointCells.longitudeCellOf(fixtureLongitudes[index])
+        }.distinct().sortedWith(compareBy({ it.first }, { it.second }))
+        assertEquals("the backfill disagrees with the write path's cell arithmetic", expected, cells)
+        assertTrue("the fixture must collapse, or it proves nothing", expected.size < fixtureLatitudes.size)
+
+        migrated.close()
+    }
+
+    @Test
     fun migrate5To6AddsTheViewportBoxIndex() {
         migrationHelper.createDatabase("migration-p4-020", 5).close()
 

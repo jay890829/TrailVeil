@@ -143,6 +143,79 @@ class FogViewportCoordinatorTest {
         assertTrue(merge.missingKeys.none { key -> key in initial.keys })
     }
 
+    /**
+     * `P4-037`: the coordinator asks for cells at world zoom and for points everywhere else.
+     *
+     * This exists because of a gap the A/B round found rather than by plan. The read-cost gate calls
+     * the DAO query directly, and [TrackPointCells.coarseReadIsSubPixel] is covered on its own, so
+     * deleting the `coarse =` argument from the coordinator's `read` call left NOTHING red: the
+     * parameter defaults to false, the point route runs, the fog is identical, and the entire saving
+     * quietly disappears. A failure whose only symptom is being slow again is exactly the kind that
+     * survives a green suite.
+     *
+     * Both directions are asserted. Only the world case would catch that deletion, but only the
+     * exploration case catches the opposite mistake — a widened ceiling substituting cell centres at
+     * a zoom where the displacement can actually be drawn, which is a wrong map rather than a slow
+     * one.
+     */
+    @Test
+    fun theWorldZoomReadTakesTheCellRouteAndTheExplorationZoomReadDoesNot() = runTest {
+        val reader = RecordingReader()
+        val coordinator = coordinatorReading(reader)
+        val centre = GeoPoint(latitude = 25.0330, longitude = 121.5654)
+
+        coordinator.render(FogViewportRequest(center = centre, mapZoom = WORLD_MAP_ZOOM))
+        assertEquals("the world-zoom settle did not ask for cells", 1, reader.coarseReads)
+        assertEquals("the world-zoom settle read points as well", 0, reader.pointReads)
+
+        coordinator.render(FogViewportRequest(center = centre, mapZoom = EXPLORATION_MAP_ZOOM))
+        assertEquals("the exploration-zoom settle asked for cells", 1, reader.coarseReads)
+        assertTrue("the exploration-zoom settle read no points at all", reader.pointReads > 0)
+    }
+
+    /**
+     * Counts which route was taken, and answers both.
+     *
+     * `readCoarseCells` returns a non-empty list rather than null on purpose: null means "ask me the
+     * other way", so a null-returning reader would fall back to points and the two counters could
+     * not tell a coarse request from a point one.
+     */
+    private class RecordingReader : ViewportTrackPointReader {
+        var pointReads = 0
+        var coarseReads = 0
+
+        override suspend fun read(
+            south: Double,
+            north: Double,
+            interval: app.trailveil.data.map.LongitudeInterval,
+        ): List<ViewportTrackPoint> {
+            pointReads += 1
+            return emptyList()
+        }
+
+        override suspend fun readCoarseCells(
+            south: Double,
+            north: Double,
+            interval: app.trailveil.data.map.LongitudeInterval,
+        ): List<GeoPoint> {
+            coarseReads += 1
+            return listOf(GeoPoint(latitude = 25.0330, longitude = 121.5654))
+        }
+    }
+
+    private fun coordinatorReading(reader: ViewportTrackPointReader): FogViewportCoordinator {
+        val style = FogRenderStyle()
+        return FogViewportCoordinator(
+            trackDataSource = ViewportTrackDataSource(reader),
+            pipeline = FogTilePipeline(
+                memoryCache = FogMemoryTileCache(maxBytes = 4L * 1024L * 1024L),
+                diskCache = null,
+                renderMask = FogTileRenderer(style)::render,
+            ),
+            style = style,
+        )
+    }
+
     private fun coordinator(
         read: suspend (Double, Double, app.trailveil.data.map.LongitudeInterval) ->
             List<ViewportTrackPoint>,
@@ -163,5 +236,13 @@ class FogViewportCoordinatorTest {
             pipeline = pipeline,
             style = style,
         )
+    }
+
+    private companion object {
+        /** `renderZoom` floors, so anything under 1.0 is render zoom 0 -- the whole planet. */
+        const val WORLD_MAP_ZOOM = 0.5
+
+        /** The zoom a user actually explores at, where a cell centre could be drawn. */
+        const val EXPLORATION_MAP_ZOOM = 14.2
     }
 }

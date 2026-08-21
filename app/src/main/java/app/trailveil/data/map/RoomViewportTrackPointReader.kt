@@ -1,8 +1,10 @@
 package app.trailveil.data.map
 
 import app.trailveil.data.db.LatitudeBuckets
+import app.trailveil.data.db.TrackPointCells
 import app.trailveil.data.db.RecordingDao
 import app.trailveil.data.db.ViewportTrackPointRow
+import app.trailveil.map.fog.GeoPoint
 
 /** Room-backed viewport projection that exposes no map-provider-specific types. */
 internal class RoomViewportTrackPointReader(
@@ -22,6 +24,33 @@ internal class RoomViewportTrackPointReader(
                 pointSequence = row.pointSequence,
                 latitude = row.latitude,
                 longitude = row.longitude,
+            )
+        }
+
+    /**
+     * `P4-037`: the occupied cells this box touches, as their centres.
+     *
+     * Bounds are converted to cell indices here rather than in SQL, by the same functions the write
+     * path uses, so the two cannot disagree about where a cell begins.
+     *
+     * The saving is the table's SIZE, not a narrowed scan — at world zoom the box has no bound to
+     * narrow, and the measured plan constrains on `lat_cell` only. `fogCellsInBox` records the plan
+     * and why that is the expected answer rather than a shortfall.
+     */
+    override suspend fun readCoarseCells(
+        south: Double,
+        north: Double,
+        interval: LongitudeInterval,
+    ): List<GeoPoint> =
+        dao.fogCellsInBox(
+            southCell = TrackPointCells.latitudeCellOf(minOf(south, north)),
+            northCell = TrackPointCells.latitudeCellOf(maxOf(south, north)),
+            westCell = TrackPointCells.longitudeCellOf(minOf(interval.west, interval.east)),
+            eastCell = TrackPointCells.longitudeCellOf(maxOf(interval.west, interval.east)),
+        ).map { cell ->
+            GeoPoint(
+                latitude = TrackPointCells.latitudeAtCentreOf(cell.latitudeCell),
+                longitude = TrackPointCells.longitudeAtCentreOf(cell.longitudeCell),
             )
         }
 

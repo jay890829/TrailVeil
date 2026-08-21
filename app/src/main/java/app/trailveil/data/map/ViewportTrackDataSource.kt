@@ -87,6 +87,20 @@ data class ViewportTrackPoint(
 /** A provider supplies points for exactly one non-dateline-wrapping longitude interval. */
 fun interface ViewportTrackPointReader {
     suspend fun read(south: Double, north: Double, interval: LongitudeInterval): List<ViewportTrackPoint>
+
+    /**
+     * `P4-037`: the same box as coarse cell centres, or null when this reader has no coarse route.
+     *
+     * Null rather than an empty list, because the two mean opposite things: empty is "that box holds
+     * nothing", which is an answer, and null is "ask me the other way", which is not. A reader
+     * without a summary table returns null and the caller reads points, which is what every
+     * lambda-shaped test reader does by inheriting this default.
+     */
+    suspend fun readCoarseCells(
+        south: Double,
+        north: Double,
+        interval: LongitudeInterval,
+    ): List<GeoPoint>? = null
 }
 
 /** A persisted segment identity and its ordered viewport points. */
@@ -118,7 +132,52 @@ data class ViewportTrackReadModel(
 class ViewportTrackDataSource(
     private val reader: ViewportTrackPointReader,
 ) {
-    suspend fun read(bounds: ViewportBounds): ViewportTrackReadModel {
+    /**
+     * [coarse] asks for the cell route: one sub-pixel dot per occupied cell instead of every point.
+     *
+     * The DECISION is not made here on purpose. Whether a cell is small enough to substitute is a
+     * fact about the mask raster, and this class "deliberately knows nothing about Room or a map
+     * SDK" — so the caller that knows the render zoom decides, and this only honours it. A reader
+     * with no coarse route answers null and the point route runs, so the flag can never silently
+     * produce a worse answer than the one it replaced.
+     */
+    suspend fun read(bounds: ViewportBounds, coarse: Boolean = false): ViewportTrackReadModel {
+        if (coarse) {
+            val cells = bounds.longitudeIntervals().map { interval ->
+                reader.readCoarseCells(bounds.south, bounds.north, interval)
+                    ?: return@read readPoints(bounds)
+            }
+            return coarseReadModel(cells.flatten())
+        }
+        return readPoints(bounds)
+    }
+
+    /**
+     * One single-point segment per cell.
+     *
+     * Never a [ViewportTrackPoint]: that type requires a positive `pointId`, `sessionId` and
+     * `segmentId`, so a cell would need fabricated ids, and a fabricated id can collide with a real
+     * one in the `distinctBy(pointId)` merge below. Cells carry no identity at all and never enter
+     * that merge.
+     *
+     * One point per segment is also what stops cells being joined to each other. The point route
+     * only joins consecutive sequences — "a bbox can omit middle points from one persisted segment;
+     * never draw across that gap" — and cells have no sequences to be consecutive in. So the
+     * renderer draws dots, and the ground between two cells is never presented as explored.
+     */
+    private fun coarseReadModel(cells: List<GeoPoint>): ViewportTrackReadModel =
+        ViewportTrackReadModel(
+            segments = cells.distinct().map { cell ->
+                ViewportTrackSegment(
+                    sessionId = COARSE_CELL_NO_SESSION,
+                    segmentId = COARSE_CELL_NO_SEGMENT,
+                    segmentSequence = 0L,
+                    points = listOf(cell),
+                )
+            },
+        )
+
+    private suspend fun readPoints(bounds: ViewportBounds): ViewportTrackReadModel {
         val merged = bounds.longitudeIntervals()
             .flatMap { interval -> reader.read(bounds.south, bounds.north, interval) }
             .distinctBy(ViewportTrackPoint::pointId)
@@ -145,6 +204,16 @@ class ViewportTrackDataSource(
                     }
                 },
         )
+    }
+
+    private companion object {
+        /**
+         * A cell belongs to no recording, and nothing reads these back: `toFogTrackSegments()`
+         * assigns render-local ids by position and ignores both fields. They are named rather than
+         * left as bare zeroes so the absence is legible instead of looking like a missing lookup.
+         */
+        const val COARSE_CELL_NO_SESSION = 0L
+        const val COARSE_CELL_NO_SEGMENT = 0L
     }
 
     /** A bbox can omit middle points from one persisted segment; never draw across that gap. */

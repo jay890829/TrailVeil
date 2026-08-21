@@ -176,6 +176,10 @@ internal abstract class RecordingDao {
      * read, so the map draws MORE fog than it earned, and every leak audit in the suite accepts
      * extra fog.
      */
+    // P4-037's cell is deliberately NOT derived here beside the bucket. It is maintained by
+    // `track_points_cell_insert`, so it covers every route into the table rather than this one --
+    // including the raw-SQL inserts the migrations and the read-cost fixtures use, which this
+    // function never sees. See `createTrackPointCellTriggers`.
     protected suspend fun insertPointRow(point: TrackPointEntity): Long =
         insertPointRowUnbucketed(point.copy(latBucket = LatitudeBuckets.of(point.latitude)))
     @Insert(onConflict = OnConflictStrategy.ABORT) protected abstract suspend fun insertReceiptRow(receipt: RecordingOperationReceiptEntity)
@@ -646,10 +650,79 @@ internal abstract class RecordingDao {
         limit: Int,
     ): List<PersistedTrackPointChangeRow>
 
+    /**
+     * `P4-037`: the occupied cells a world-zoom box touches, which is what that read visits instead
+     * of every point.
+     *
+     * Bounds are cell indices computed by [TrackPointCells] rather than degrees, so this query does
+     * no arithmetic and cannot disagree with the write path about where a cell starts.
+     *
+     * The plan, measured rather than assumed, is
+     * `SEARCH track_point_cells USING COVERING INDEX sqlite_autoindex_track_point_cells_1
+     * (lat_cell>? AND lat_cell<?)`. Note what that says and does not say: the seek is constrained by
+     * `lat_cell` ALONE, because SQLite stops constraining a scan at the first range predicate and
+     * `lon_cell` is a second range -- the very rule `P4-036` exists because of. `lon_cell` is applied
+     * as a filter inside that range, off the covering index, so no table row is ever touched.
+     *
+     * That is not the source of the saving and this must not be read as claiming it is. At world
+     * zoom the latitude range is the whole planet, so nothing is narrowed at all; the read is cheap
+     * only because the TABLE is small -- 3 000 rows against 40 000 points on the read-cost fixture.
+     * An index that helped here would mean the box had a bound, and out here it has none.
+     */
+    @Query(
+        """
+        SELECT lat_cell, lon_cell FROM track_point_cells
+        WHERE lat_cell BETWEEN :southCell AND :northCell
+            AND lon_cell BETWEEN :westCell AND :eastCell
+        ORDER BY lat_cell ASC, lon_cell ASC
+        """,
+    )
+    abstract suspend fun fogCellsInBox(
+        southCell: Int,
+        northCell: Int,
+        westCell: Int,
+        eastCell: Int,
+    ): List<TrackPointCellEntity>
+
+    @Query("SELECT COUNT(*) FROM track_point_cells") abstract suspend fun trackPointCellCount(): Int
+
     @Query("SELECT COUNT(*) FROM recording_sessions") abstract suspend fun sessionCount(): Int
     @Query("SELECT COUNT(*) FROM track_segments") abstract suspend fun segmentCount(): Int
     @Query("SELECT COUNT(*) FROM track_points") abstract suspend fun pointCount(): Int
-    @Query("DELETE FROM recording_sessions WHERE id = :sessionId") abstract suspend fun deleteSession(sessionId: Long): Int
+    @Query("DELETE FROM recording_sessions WHERE id = :sessionId")
+    protected abstract suspend fun deleteSessionRow(sessionId: Long): Int
+
+    @Query("DELETE FROM track_point_cells")
+    protected abstract suspend fun clearTrackPointCells()
+
+    /**
+     * Rebuilds every cell from the points that remain.
+     *
+     * `INSERT OR IGNORE` on the write path is append-only, so deleting points can only ever leave
+     * cells occupied by nothing -- which the acceptance criterion names. This rebuilds rather than
+     * subtracting, and that is the deliberate choice: the table is derived state with no information
+     * of its own, so recomputing it is obviously correct, while working out which cells the deleted
+     * points vacated needs their coordinates AFTER they are gone. Measured at 94 ms per 200 000
+     * points against a delete a user performs by hand.
+     */
+    @Query(TrackPointCells.BACKFILL_SQL)
+    protected abstract suspend fun fillTrackPointCellsFromPoints()
+
+    /**
+     * Deletes a session and repairs the derived cell table in the same transaction.
+     *
+     * There is **no production caller** for this today -- the app offers no delete -- so this is the
+     * route being kept correct rather than a live one being fixed. It is here because the derived
+     * table would otherwise be silently wrong the moment one appeared, and a stale cell is the
+     * failure that draws more fog and passes every audit.
+     */
+    @Transaction
+    open suspend fun deleteSession(sessionId: Long): Int {
+        val deleted = deleteSessionRow(sessionId)
+        clearTrackPointCells()
+        fillTrackPointCellsFromPoints()
+        return deleted
+    }
     @Transaction
     open suspend fun executePrepareStart(
         startedAt: Long,

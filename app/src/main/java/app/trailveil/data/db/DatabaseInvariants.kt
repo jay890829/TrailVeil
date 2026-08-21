@@ -222,6 +222,65 @@ internal fun createTrackPointInvariantTriggers(database: SupportSQLiteDatabase) 
     }
 }
 
+/**
+ * `P4-037`'s derived table, kept honest by the database rather than by the one writer that remembers.
+ *
+ * Separate from [createTrackPointInvariantTriggers] for the reason that function's KDoc gives about
+ * itself: this trigger names `track_point_cells`, which does not exist before v8, and SQLite accepts
+ * a trigger over a missing table at CREATE time and fails only when it fires. Called from the open
+ * callback and from `MIGRATION_7_8` only.
+ *
+ * A trigger rather than a DAO write, which is the opposite of how `lat_bucket` is handled and is
+ * deliberate. There the DAO derives in Kotlin and the trigger only guards other writers, so it fires
+ * on a mismatch and is otherwise a comparison. Here the two would do the SAME `INSERT OR IGNORE`, so
+ * a DAO copy would be redundant work on the recording path and a second place to forget. The `WHEN
+ * NOT EXISTS` guard means the common case -- the second and every later point in an already-occupied
+ * cell -- is one primary-key probe and no write at all.
+ *
+ * The failure it prevents is the silent direction again: a point whose cell was never written drops
+ * its region out of the world-zoom read, which draws MORE fog than earned, and every leak audit in
+ * the suite accepts extra fog.
+ */
+internal fun createTrackPointCellTriggers(database: SupportSQLiteDatabase) {
+    trackPointCellTriggerSql.forEach { (name, sql) ->
+        // Compared and replaced on a mismatch, never `IF NOT EXISTS`, for the reason spelled out in
+        // [createTrackPointInvariantTriggers]: retuning the cell size would otherwise leave every
+        // installed phone writing cells with the old arithmetic while the read used the new.
+        val installed = database.query(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            arrayOf<Any>(name),
+        ).use { cursor -> if (cursor.moveToFirst()) cursor.getString(0) else null }
+        if (installed == sql) return@forEach
+        database.execSQL("DROP TRIGGER IF EXISTS $name")
+        database.execSQL(sql)
+    }
+}
+
+/**
+ * One entry, and both cells computed from `NEW.latitude`/`NEW.longitude` rather than from
+ * `NEW.lat_bucket`.
+ *
+ * Reusing the stored bucket would look like sharing but would couple this to the firing ORDER of two
+ * independent triggers: on a raw-SQL insert the bucket is wrong until its own `AFTER INSERT` trigger
+ * repairs it, and SQLite does not promise which runs first. Deriving from the columns the row
+ * actually carries is order-free.
+ */
+private val trackPointCellTriggerSql = listOf(
+    "track_points_cell_insert" to """
+    CREATE TRIGGER track_points_cell_insert
+    AFTER INSERT ON track_points
+    FOR EACH ROW WHEN NOT EXISTS (
+        SELECT 1 FROM track_point_cells
+        WHERE lat_cell = ${TrackPointCells.LAT_CELL_SQL}
+            AND lon_cell = ${TrackPointCells.LON_CELL_SQL}
+    )
+    BEGIN
+        INSERT OR IGNORE INTO track_point_cells(lat_cell, lon_cell)
+        VALUES(${TrackPointCells.LAT_CELL_SQL}, ${TrackPointCells.LON_CELL_SQL});
+    END
+    """.trimIndent(),
+)
+
 private const val LAT_BUCKET_SQL =
     "CAST((NEW.latitude + 90.0) * ${LatitudeBuckets.BUCKETS_PER_DEGREE} AS INTEGER)"
 

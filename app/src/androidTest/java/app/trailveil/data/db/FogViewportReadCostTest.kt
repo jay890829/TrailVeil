@@ -408,6 +408,132 @@ class FogViewportReadCostTest {
      * latitude (about 5.3 km) and 0.0492 of longitude (about 5.0 km at this latitude), a rough
      * square; the decoys sit three to five degrees away, hundreds of kilometres north and south.
      */
+    /**
+     * `P4-037`: at world zoom the read visits occupied CELLS, not every point.
+     *
+     * This is the entry's whole claim, measured on the same populated fixture as the gates above and
+     * against the read it replaces. The world box is the one case no index can help: `P4-036`'s
+     * bucket narrows a latitude BAND, and out here the band is the planet, so the point read
+     * necessarily visits every row to draw a handful of sub-pixel dots.
+     *
+     * Measured on this fixture: the point read returns all 40 000 rows and the cell read 3 000, so
+     * 13.3x fewer. The threshold is set well under that, to pin the SUMMARY still being a summary
+     * rather than the exact ratio this fixture's shape produces — a `track_point_cells` that grew
+     * towards one row per point, from a coarsened granularity or a rebuild that stopped collapsing,
+     * walks the ratio down to 1 and is caught here.
+     *
+     * **What this case cannot see, corrected after closure verification claimed the opposite.** An
+     * earlier draft of this KDoc said the gate exists to catch "the coarse route falling back to
+     * points". It cannot: this test calls `dao.fogCellsInBox` DIRECTLY, and the fallback lives in
+     * `ViewportTrackDataSource.read`, which this test never constructs. The route is bound by
+     * `FogViewportCoordinatorTest` and `ViewportTrackDataSourceTest` instead. Naming a failure a
+     * test structurally cannot observe is worse than naming none, because it stops anyone looking
+     * for the gate that really covers it.
+     *
+     * And this fixture is a PESSIMISTIC case for the collapse, deliberately so. Its decoy half is
+     * 20 000 points scattered at 0.005 degree steps across four degrees of latitude, chosen to give
+     * the latitude band real work to exclude, and points spread that thinly barely share cells at
+     * all. A walked track is the opposite shape — the ledger's own measurement on a real database
+     * collapsed 200 000 points into 837 cells. The saving here is the floor, not the expectation.
+     */
+    @Test
+    fun theWorldZoomReadVisitsCellsRatherThanEveryPoint() {
+        insertConcentratedTrack()
+
+        val points = rowsFrom(
+            capture {
+                dao.fogPointsInLongitudeInterval(
+                    south = WORLD_SOUTH,
+                    west = WORLD_WEST,
+                    north = WORLD_NORTH,
+                    east = WORLD_EAST,
+                )
+            },
+        )
+        val cellStatement = capture {
+            dao.fogCellsInBox(
+                southCell = TrackPointCells.latitudeCellOf(WORLD_SOUTH),
+                northCell = TrackPointCells.latitudeCellOf(WORLD_NORTH),
+                westCell = TrackPointCells.longitudeCellOf(WORLD_WEST),
+                eastCell = TrackPointCells.longitudeCellOf(WORLD_EAST),
+            )
+        }
+        val cells = rowsFrom(cellStatement)
+
+        // Stated separately and as a `>` bound, because every assertion after it puts `cells` on the
+        // SMALL side and so scores best at zero -- the standing shape where an empty answer passes
+        // for free. It is reachable: drop the cell trigger and this fixture's raw-SQL rows leave the
+        // table empty, and a case named for measuring a saving would go green having measured none.
+        assertTrue("the cell read returned nothing, so no bound below can mean anything", cells > 0)
+        assertEquals(
+            "the world-zoom point read did not visit every row, so it is not the baseline this " +
+                "saving is measured against",
+            totalRows(),
+            points,
+        )
+        assertTrue(
+            "the world-zoom read visited $cells cells against $points points, which is not the " +
+                "order-of-magnitude narrowing this entry exists to produce",
+            cells * MINIMUM_WORLD_ZOOM_NARROWING < points,
+        )
+        // And structurally, not only by count. The negative half used to be
+        // `!plan.contains("track_points ")`, which closure verification showed could never fail:
+        // this statement names only `track_point_cells`, and SQLite's plan prints the query ALIAS
+        // where one exists — a fact this very file relies on elsewhere, matching `SEARCH p `. So the
+        // guard was excluding a string that could not appear. What IS falsifiable is that the scan
+        // is served from the key rather than walked: drop the primary key and this becomes a SCAN.
+        val plan = planOf(cellStatement)
+        assertTrue("the cell read does not enter track_point_cells: $plan", plan.contains("track_point_cells"))
+        assertTrue(
+            "the cell read walks the whole summary table instead of seeking into it: $plan",
+            plan.contains("SEARCH") && !plan.contains("SCAN track_point_cells"),
+        )
+        // And the property the retired guard was REACHING for, expressed so it can actually fail:
+        // one plan step means one pass over one table. Closure verification's scenario was a
+        // liveness filter -- `AND EXISTS (SELECT 1 FROM track_points p WHERE ...)` -- which probes
+        // the 40 000-row point table once per cell while every name-matching assertion stays green,
+        // because the plan prints the ALIAS `p` and the only literal `track_points` hides inside
+        // `index_track_points_lat_bucket_longitude`. A subquery cannot hide from a step COUNT.
+        assertEquals(
+            "the cell read is more than one pass over one table, so it reaches the point table " +
+                "under an alias no name check can see: $plan",
+            1,
+            plan.split(" | ").size,
+        )
+    }
+
+    /**
+     * Nothing the user walked falls outside the cells the world read returns.
+     *
+     * The count above is the saving; this is the price, and it is the half that fails silently. A
+     * point whose cell is missing simply looks unexplored when zoomed out, which draws MORE fog than
+     * earned and is the direction every leak audit in the suite accepts.
+     *
+     * Asked as "how many points have no cell", so the answer is zero when the property holds and the
+     * failure message carries the count rather than only that something was wrong.
+     */
+    @Test
+    fun everyStoredPointLiesInsideACellTheWorldReadReturns() {
+        insertConcentratedTrack()
+
+        val orphaned = countWhere(
+            "NOT EXISTS (SELECT 1 FROM track_point_cells c WHERE " +
+                "c.lat_cell = CAST((track_points.latitude + 90.0) * " +
+                "${TrackPointCells.CELLS_PER_DEGREE_SQL} AS INTEGER) AND " +
+                "c.lon_cell = CAST((track_points.longitude + 180.0) * " +
+                "${TrackPointCells.CELLS_PER_DEGREE_SQL} AS INTEGER))",
+            emptyArray(),
+        )
+
+        assertEquals(
+            "points are stored whose cell was never written, so the ground they cover looks " +
+                "unexplored at world zoom",
+            0,
+            orphaned,
+        )
+        assertTrue("the fixture stored no points at all", totalRows() > 0)
+    }
+
     private fun insertConcentratedTrack() {
         val sessionId = insertSession()
         val segmentId = insertSegment(sessionId)
@@ -525,5 +651,31 @@ class FogViewportReadCostTest {
 
         /** As many again, far outside the queried latitude band, so the band has work to exclude. */
         const val DECOY_POINTS = 20_000
+
+        /**
+         * The whole planet: the box a cold settle at render zoom 0 actually asks for.
+         *
+         * No index narrows this one, which is the entire reason the cell table exists. `P4-036`'s
+         * bucket bounds a latitude band, and here the band is every band.
+         */
+        const val WORLD_SOUTH = -90.0
+        const val WORLD_NORTH = 90.0
+        const val WORLD_WEST = -180.0
+        const val WORLD_EAST = 180.0
+
+        /**
+         * How many times fewer rows the cell read must visit before it counts as a narrowing.
+         *
+         * Five, against 13.3 measured, for the reason the sibling gates give: this exists to catch
+         * the summary ceasing to summarise -- a granularity or a rebuild that walks the table
+         * towards one row per point, putting the ratio at 1 -- not to pin a number that follows from
+         * how this fixture is shaped. A floor of ten would sit 33 per cent under the measurement,
+         * close enough that reshaping the decoy half could redden it for no reason to do with the
+         * cell table.
+         *
+         * It does NOT catch the coarse ROUTE being lost; see this gate's own KDoc for why, and
+         * `FogViewportCoordinatorTest` for the case that does.
+         */
+        const val MINIMUM_WORLD_ZOOM_NARROWING = 5
     }
 }
