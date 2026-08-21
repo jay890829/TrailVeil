@@ -196,17 +196,22 @@ class FogViewportReadCostTest {
             1,
             Regex("SEARCH p ").findAll(plan).count(),
         )
-        // The fallback DOES plan as a scan now, and that is the deliberate trade rather than an
-        // oversight: `P4-036` retired the `(latitude, longitude)` index because keeping both cost
-        // a measured +13.1% on every write, and dropping it paid for the new one exactly. The
-        // fallback only runs for a band taller than about 1.28 degrees. Asserted rather than
-        // assumed so the trade stays visible: this IS an unindexed full scan, and the entry
-        // discloses it as the cost of the swap rather than pretending the box always contains
-        // everything out there.
+        // The fallback DOES scan the whole table now, and that is the deliberate trade rather than
+        // an oversight: `P4-036` retired the `(latitude, longitude)` index because keeping both
+        // cost a measured +13.1% on every write, and dropping it paid for the new one exactly. The
+        // fallback only runs for a band taller than about 1.28 degrees.
+        //
+        // It is NOT an unindexed table scan, and calling it one was wrong twice — in this comment
+        // and in the assertion message below. The `ORDER BY` leads with `p.session_id`, so SQLite
+        // walks `index_track_points_session_id_id` end to end with a rowid lookup per row: a
+        // non-covering full index scan, generally MORE I/O than reading the table. `SCAN p` is what
+        // the plan says either way, which is why the wrong description survived a correction that
+        // only reached the ledger.
         val fallback = fallbackRead()
         val fallbackPlan = planOf(fallback)
         assertTrue(
-            "the fallback viewport read unexpectedly found an index: $fallbackPlan",
+            "the fallback viewport read no longer scans the whole table, so the trade this entry " +
+                "recorded has changed: $fallbackPlan",
             fallbackPlan.contains("SCAN p"),
         )
         // And the band is narrowing real work, not merely named in a plan: half this table lies

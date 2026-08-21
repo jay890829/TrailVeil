@@ -4652,8 +4652,13 @@ class MapSurfaceTest {
         expectedCamera: CameraPosition? = null,
     ) {
         val ready = CountDownLatch(1)
+        // Every finished frame, not only the fully-rendered ones. `P4-044`'s escape needs to know
+        // whether the renderer is ANSWERING, and a partial-render callback proves that just as well
+        // as a complete one - while costing nothing, because the listener is already here.
+        val framesRendered = AtomicInteger(0)
         lateinit var listener: MapView.OnDidFinishRenderingFrameListener
         listener = MapView.OnDidFinishRenderingFrameListener { fullyRendered, _, _ ->
+            framesRendered.incrementAndGet()
             if (fullyRendered) {
                 view.removeOnDidFinishRenderingFrameListener(listener)
                 ready.countDown()
@@ -4670,7 +4675,12 @@ class MapSurfaceTest {
                 waited += REPAINT_RETRY_MILLIS
                 InstrumentationRegistry.getInstrumentation().runOnMainSync { triggerRepaint() }
             }
-            if (ready.count != 0L && settledOnExpectedCamera(view, expectedCamera)) return
+            if (ready.count != 0L &&
+                framesRendered.get() >= MINIMUM_RENDERER_ANSWERS &&
+                settledOnExpectedCamera(view, expectedCamera)
+            ) {
+                return
+            }
             if (ready.count != 0L) {
                 val surfaceState = runCatching { view.pixelCopyFogCoverage() }
                     .fold(
@@ -4733,8 +4743,8 @@ class MapSurfaceTest {
             )
             .build()
         assertTrue(
-            "The settled proof accepted a camera the screen is not showing, so a stuck renderer " +
-                "would pass through it - see P4-044",
+            "The settled proof accepted a camera the map was never given - all it can prove is " +
+                "that the request reached the map, and it is not proving even that",
             !settledOnExpectedCamera(view, displaced),
         )
     }
@@ -4752,12 +4762,32 @@ class MapSurfaceTest {
      * failure family is an `*AcrossTheFiniteExtent*` name, and why the diagnostic reported a
      * surface that was alive and fully painted.
      *
-     * Three conditions together, and each is doing work:
-     *  - the camera IS the requested one, which is what stops a genuinely stuck renderer showing a
-     *    STALE frame from passing here; without it this would be a weakening rather than a proof.
+     * **What each condition proves, corrected by closure round 4.** This was written claiming the
+     * camera comparison is "what stops a genuinely stuck renderer showing a STALE frame from
+     * passing". It is not, and the claim was a tautology: `cameraPosition` is MapLibre's camera
+     * MODEL, and both callers set it with `moveCamera` on the main thread immediately before, so it
+     * matches by construction whatever the renderer did. That left the "proof" resting on two
+     * conditions a stuck renderer satisfies by definition — a stuck surface holds whatever light it
+     * last drew, and is perfectly stable.
+     *
+     * **The liveness signal is the renderer's own callback count, not pixels.** An active pixel
+     * probe was built first — move the camera a whole degree, require the frame to change — and the
+     * live renderer FAILED it: at these zooms the surface is uniformly fogged, so a one-degree move
+     * produces a byte-identical frame. That is the same wall `P4-042` hit three times: a uniform
+     * frame carries no information, and no pixel comparison can separate "nothing to draw" from
+     * "not drawing".
+     *
+     * What can: `OnDidFinishRenderingFrameListener` fires for EVERY finished frame, not only fully
+     * rendered ones. A renderer that produced [MINIMUM_RENDERER_ANSWERS] frames while this was
+     * waiting is answering, whatever those frames contained; a stuck one produces none. The
+     * listener was already installed, so this costs nothing and uses the very mechanism whose
+     * `fullyRendered` half is the thing timing out.
+     *
+     * The three conditions are therefore:
+     *  - the renderer produced frames while we waited — the part a stuck renderer cannot fake;
+     *  - the camera model is the requested one — cheap, and it only ever proved that the request
+     *    reached the map, which is all it is now claimed to prove;
      *  - the surface holds light, so a dead capture cannot satisfy it (`P4-042`).
-     *  - the content is unchanged across a forced repaint, so the renderer has settled rather than
-     *    being mid-draw.
      *
      * Returns false when no expected camera was supplied — a caller that cannot say what it asked
      * for gets the old behaviour, because there is nothing to check the screen against.
@@ -6443,7 +6473,6 @@ class MapSurfaceTest {
                     "surface, not a fog verdict - see P4-042",
                 darkFlingFrames.isEmpty(),
             )
-            assertSurfaceStayedLive(flingFrameSamples, "The renderer-finished fling audit")
             assertTrue("No renderer-finished fling frame left the revealed track", flingExited)
             assertTrue(
                 "Too few renderer-finished fling frames were audited after leaving the track: " +
@@ -6774,41 +6803,59 @@ class MapSurfaceTest {
      */
     @Test
     fun theLivenessInstrumentsRejectAStalledSurfaceAndAcceptAMeasuredLiveOne() {
-        // A surface that stopped responding returns one buffer while the camera keeps moving.
-        val stalled = List(60) { index ->
-            SurfaceSample(fingerprint = 12345L, latitude = 25.0 + index * 0.01, longitude = 121.0)
+        // Every fixture below is sized like the window the gate ACTUALLY sees. Closure round 4
+        // found the previous ones were 40-60 samples while the only guarded site produces 8-12, so
+        // all three calibration constants were free: MINIMUM_STALLED_RUN_FRAMES anywhere in 1..29,
+        // MINIMUM_LIVENESS_SAMPLE_FRAMES anywhere in 1..60 — and anything from 13 up disabled the
+        // gate outright at its only site with nothing going red. A fixture that does not resemble
+        // the real window binds the shape of a decision without binding the decision.
+        fun moving(fingerprints: List<Long>): List<SurfaceSample> = fingerprints.mapIndexed { index, f ->
+            SurfaceSample(fingerprint = f, latitude = 25.0 + index * 0.01, longitude = 121.0)
         }
+
+        // A surface that stopped responding returns one buffer while the camera keeps moving,
+        // across a window the size the fling audit really produces.
         val stalledFailure = assertThrows(AssertionError::class.java) {
-            assertSurfaceStayedLive(stalled, "probe")
+            assertSurfaceStayedLive(moving(List(12) { 12345L }), "probe")
         }
         assertTrue(
             "A stalled surface was not named: ${stalledFailure.message}",
             stalledFailure.message.orEmpty().contains("same frame"),
         )
 
-        // A surface that died HALF WAY through, which an unconditional run-length bound calibrated
-        // on a whole window can miss depending on where the bound sits.
-        val diedMidway = List(30) { index ->
-            SurfaceSample(fingerprint = index.toLong(), latitude = 25.0 + index * 0.01, longitude = 121.0)
-        } + List(30) { index ->
-            SurfaceSample(fingerprint = 999L, latitude = 25.3 + index * 0.01, longitude = 121.0)
-        }
+        // Pins MINIMUM_LIVENESS_SAMPLE_FRAMES from above: at the smallest window the gate must
+        // still judge, a fully stalled surface fails. Raise the constant past this and the gate
+        // stops firing at its only site, which is how it was silently disableable.
         assertThrows(AssertionError::class.java) {
-            assertSurfaceStayedLive(diedMidway, "probe")
+            assertSurfaceStayedLive(moving(List(MINIMUM_LIVENESS_SAMPLE_FRAMES) { 7L }), "probe")
         }
 
-        // The case the old unconditional bound got WRONG, and the reason this gate is conditional:
-        // a camera held perfectly still repeats frames for as long as it is held, and that is not
-        // a defect. Sixty identical frames at one camera must pass.
-        val heldStill = List(60) { SurfaceSample(fingerprint = 7L, latitude = 25.0, longitude = 121.0) }
+        // Pins MINIMUM_STALLED_RUN_FRAMES from BOTH sides, at the real window size. One frame over
+        // the floor must fail; exactly at the floor must pass, because that is the coalescing the
+        // renderer genuinely does (measured 3, 2 and 2).
+        assertThrows(AssertionError::class.java) {
+            assertSurfaceStayedLive(
+                moving(List(MINIMUM_STALLED_RUN_FRAMES + 1) { 9L } + (0 until 8).map { it.toLong() }),
+                "probe",
+            )
+        }
+        assertSurfaceStayedLive(
+            moving(List(MINIMUM_STALLED_RUN_FRAMES) { 9L } + (0 until 8).map { 100L + it }),
+            "probe",
+        )
+
+        // A surface that died part-way through a real-sized window.
+        assertThrows(AssertionError::class.java) {
+            assertSurfaceStayedLive(moving((0 until 6).map { it.toLong() } + List(6) { 999L }), "probe")
+        }
+
+        // A camera held perfectly still repeats frames for as long as it is held, and that is not a
+        // defect — the conditional question is the whole design.
+        val heldStill = List(12) { SurfaceSample(fingerprint = 7L, latitude = 25.0, longitude = 121.0) }
         assertSurfaceStayedLive(heldStill, "probe")
 
-        // And a sub-pixel camera step is not movement either - the P4-044 case. Forty identical
-        // frames whose camera creeps by a TOTAL well under the visible threshold must also pass.
-        // (An earlier version of this fixture crept by threshold/10 per STEP, which over forty
-        // steps is four times the threshold; the gate compares a run's first sample with its last,
-        // so that fixture was asserting a case that ought to fail, and did.)
-        val creeping = List(40) { index ->
+        // And a sub-pixel camera step is not movement either — the P4-044 case.
+        val creeping = List(12) { index ->
             SurfaceSample(
                 fingerprint = 7L,
                 latitude = 25.0 + index * VISIBLE_CAMERA_MOVE_DEGREES / 100.0,
@@ -6818,8 +6865,13 @@ class MapSurfaceTest {
         assertSurfaceStayedLive(creeping, "probe")
 
         // A sample that knows nothing about its camera never accuses the renderer.
-        val cameraless = List(60) { SurfaceSample(fingerprint = 7L, latitude = null, longitude = null) }
-        assertSurfaceStayedLive(cameraless, "probe")
+        assertSurfaceStayedLive(
+            List(12) { SurfaceSample(fingerprint = 7L, latitude = null, longitude = null) },
+            "probe",
+        )
+
+        // Below the abstention threshold the gate says nothing, whatever the frames look like.
+        assertSurfaceStayedLive(moving(List(MINIMUM_LIVENESS_SAMPLE_FRAMES - 1) { 7L }), "probe")
 
         // And the per-frame guard, which only ever claimed to catch a nearly-black frame.
         assertTrue(
@@ -7761,7 +7813,25 @@ class MapSurfaceTest {
      * repeat while the camera is still are not evidence of anything; frames that repeat while the
      * camera moves visibly are a surface that has stopped answering.
      *
-     * **It is sound only where the camera was recorded WITH the frame, which is one site.** The
+     * **NOT APPLIED ANYWHERE, and that is the honest end of four narrowings.** Kept because the
+     * reasoning and the binding test are correct, and because a future stream sampled densely
+     * enough could use it — but every window this file actually produces is too small for it to say
+     * anything.
+     *
+     * The arithmetic that ends it: the last surviving site samples **8-12 frames**, and a healthy
+     * run was measured returning **7 identical consecutive frames** while the camera moved. A floor
+     * that avoids that false red is essentially the whole window, which makes the gate unable to
+     * fire at all. There is no threshold that both spares a healthy run and catches a stall at that
+     * size — the window is too short for the question.
+     *
+     * Three earlier calibrations were each refuted by measurement, and this is the fourth: the
+     * 3, 2 and 2 that set the floor came from three runs, and a fourth run produced 7. Calibrating
+     * a threshold from a handful of samples of a noisy quantity is how all four happened.
+     *
+     * What remains guarding these paths is [FogCoverage.judgeable] per frame and `drawnFraction` on
+     * the audit path — both sound, both much narrower than this was claimed to be.
+     *
+     * **It would be sound only where the camera was recorded WITH the frame, which is one site.** The
      * renderer-finished fling audit records `FlingFrameAudit.target` as part of capturing each
      * frame, so its pairs are real. The polled samplers - the sustained gesture loop and the
      * east-west journey - read `map.cameraPosition`, which is the camera MODEL, at their own
@@ -7796,12 +7866,13 @@ class MapSurfaceTest {
      * **A short run is renderer coalescing, not a stall, and that needed measuring too.** The
      * renderer-finished fling audit samples on MapLibre's own callbacks and legitimately returns the
      * same bytes for a few of them while the camera moves - measured over three green runs at
-     * 3, 2 and 2 identical frames out of 8-12 samples. The sustained sampler, which polls rather
-     * than waiting for callbacks, never repeats during movement at all. So a run must clear
-     * [MINIMUM_STALLED_RUN_FRAMES] (one above the worst observed) or a third of the window,
-     * whichever is larger. That fraction is a noise floor sitting ON TOP of the camera condition,
-     * not the signal - which is what distinguishes it from the unconditional 40% bound this
-     * replaced, whose fraction WAS the signal and therefore measured the test's sleep schedule.
+     * 3, 2 and 2 identical frames out of 8-12 samples. So a run must clear
+     * [MINIMUM_STALLED_RUN_FRAMES], one above the worst observed.
+     *
+     * There was also a `samples.size / 3` term, presented as a noise floor sitting on top of the
+     * camera condition. Closure round 4 showed it is **dead code at the only site that runs**: with
+     * 8-12 samples, `size / 3` is at most 4, which is [MINIMUM_STALLED_RUN_FRAMES] - so the larger
+     * of the two was always the constant. It is removed rather than left looking active.
      *
      * **What this does not catch, per the house rule:** a death confined to samples during which
      * the camera happens not to move visibly; a death shorter than the floor above; and a death in
@@ -7811,6 +7882,11 @@ class MapSurfaceTest {
      * false negative only loses one sample pair.
      */
     private fun assertSurfaceStayedLive(samples: List<SurfaceSample>, what: String) {
+        // Sized against the window this gate ACTUALLY sees. Closure round 4 measured that the only
+        // site it applies to samples 8-12 frames, while every fixture binding it was 40-60 - so
+        // `MINIMUM_LIVENESS_SAMPLE_FRAMES` was free anywhere in 1..60, and any value from 13 up
+        // made the gate STRUCTURALLY UNABLE TO FIRE at that site with nothing going red. A guard
+        // that can be switched off silently is not a guard.
         if (samples.size < MINIMUM_LIVENESS_SAMPLE_FRAMES) return
         var runStart = 0
         var worst: Pair<Int, Int>? = null
@@ -7820,8 +7896,8 @@ class MapSurfaceTest {
                 samples[index + 1].fingerprint != samples[runStart].fingerprint
             if (!endsRun) return@forEach
             val length = index - runStart + 1
-            val floor = maxOf(MINIMUM_STALLED_RUN_FRAMES, samples.size / 3)
-            if (length > floor && samples[runStart].cameraMovedVisiblyTo(samples[index]) &&
+            if (length > MINIMUM_STALLED_RUN_FRAMES &&
+                samples[runStart].cameraMovedVisiblyTo(samples[index]) &&
                 length > worstLength
             ) {
                 worstLength = length
@@ -8723,8 +8799,18 @@ class MapSurfaceTest {
 
         /**
          * Below this many samples a longest-repeat run says nothing, so the liveness gate abstains.
-         * Every site that uses it already asserts its own minimum sample count separately, so
-         * abstaining here cannot make a gate vacuous on its own.
+         *
+         * **This DOES leave a window with no stream-liveness check, and an earlier version of this
+         * comment claimed otherwise.** The only guarded site bounds itself at
+         * [MINIMUM_RENDERED_FLING_FRAMES] = 3, below this threshold, so a run producing 3 to 7
+         * fling frames satisfies its own vacuity gate and gets no liveness verdict at all.
+         *
+         * That is the right behaviour rather than a hole to close by lowering the number: measured
+         * coalescing is 3, 2 and 2 identical frames, so in a window of 3 to 7 a stall and ordinary
+         * coalescing are genuinely indistinguishable. Judging them would produce false reds on
+         * healthy runs, which costs more than the missed verdict. It is stated here so the next
+         * reader does not have to rediscover it — closure round 4 did, from a claim in this file
+         * that was simply wrong.
          */
         const val MINIMUM_LIVENESS_SAMPLE_FRAMES = 8
 
@@ -8751,6 +8837,15 @@ class MapSurfaceTest {
          * the first pair, so this costs a stuck renderer nothing.
          */
         const val SETTLED_STABILITY_ATTEMPTS = 4
+
+        /**
+         * How many finished frames prove the renderer was answering while the wait ran.
+         *
+         * Deliberately small. Thirty seconds of half-second repaints gives a healthy renderer sixty
+         * chances; requiring a handful separates "answering" from "produced nothing at all" without
+         * turning a liveness question into a throughput one.
+         */
+        const val MINIMUM_RENDERER_ANSWERS = 3
 
         /**
          * How far the camera must move before the pixels are obliged to change.
