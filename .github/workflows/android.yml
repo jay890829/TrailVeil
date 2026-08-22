@@ -3,6 +3,10 @@ name: Android CI
 on:
   push:
   pull_request:
+  # Lets the suite be run on demand against an unchanged tree. Added for `P4-049`, whose acceptance
+  # criterion is five consecutive clean hosted runs of a shard that used to hang intermittently --
+  # evidence that cannot be gathered by pushing, because there is nothing left to push.
+  workflow_dispatch:
 
 permissions:
   contents: read
