@@ -18,6 +18,8 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.maplibre.android.http.HttpLogger
+import org.maplibre.android.log.Logger
 import org.xmlpull.v1.XmlPullParser
 
 @RunWith(AndroidJUnit4::class)
@@ -223,6 +225,40 @@ class RecordingPlatformContractTest {
         assertNotEquals(
             RecordingForegroundNotifier.NOTIFICATION_ID,
             RecordingForegroundNotifier.OUTCOME_NOTIFICATION_ID,
+        )
+    }
+
+    /**
+     * A tile URL is a position: the `P5-002` logcat capture caught MapLibre printing
+     * `.../14/13698/7027.pbf`, a 2.2 km square containing the device. `TrailVeilApplication` closes
+     * both paths, and this holds them, because a two-line privacy switch with nothing on it reads
+     * exactly like tidy-up — which is the lesson `allowBackup` already taught this class.
+     *
+     * The process under test has run `Application.onCreate`, so these are the live values.
+     */
+    @Test
+    fun theMapSdkCannotPrintATileRequestUrlBecauseATileUrlIsAPosition() {
+        assertFalse(
+            "HttpLogger.logRequestUrl is on, so a failed tile request prints its URL, and a tile " +
+                "URL locates the device to a couple of kilometres",
+            HttpLogger.logRequestUrl,
+        )
+
+        // MapLibre keeps its level in a private field with no getter. Read it rather than replacing
+        // the global LoggerDefinition, which would leak into every later test in this process.
+        val logLevel = Logger::class.java.getDeclaredField("logLevel")
+            .apply { isAccessible = true }
+            .getInt(null)
+        assertTrue(
+            "MapLibre's verbosity is $logLevel, which still emits the DEBUG line carrying the tile " +
+                "URL; it must be at least WARN (${Logger.WARN})",
+            logLevel >= Logger.WARN,
+        )
+        // Guard the guard: if the level were somehow above ERROR the assertion above would pass by
+        // silencing everything, including failures worth seeing.
+        assertTrue(
+            "MapLibre logging is silenced past ERROR, so real map failures are invisible too",
+            logLevel <= Logger.ERROR,
         )
     }
 }
