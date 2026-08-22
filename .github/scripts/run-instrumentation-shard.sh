@@ -71,17 +71,50 @@ restore_device() {
   adb shell cmd overlay list | grep -F '[x] com.android.internal.systemui.navbar.threebutton'
 }
 
+diagnostics="${GITHUB_WORKSPACE:-.}/shard-diagnostics"
+mkdir -p "$diagnostics"
+
+# Captured on every non-green outcome, because until now a red run left NOTHING to read: no test
+# report, no logcat, no process state. Every P4-049 diagnosis so far was reconstructed from
+# truncated console output. `ps -A` on the hang path is the instrument that entry names as missing --
+# `do_freezer_trap` has never appeared in a hosted log because nothing has ever looked. adb can be
+# wedged when the shard is, so each capture is bounded and failure to capture is not fatal.
+capture_state() {
+  timeout 60 adb logcat -d > "$diagnostics/logcat-${shard_name}-$1.txt" 2>&1 || true
+  timeout 60 adb shell ps -A -o PID,S,WCHAN,NAME > "$diagnostics/ps-${shard_name}-$1.txt" 2>&1 || true
+  timeout 60 adb shell dumpsys activity processes > "$diagnostics/procs-${shard_name}-$1.txt" 2>&1 || true
+}
+
+# A retried shard that then fails an assertion exits on the test failure, not 124, so the hang is
+# invisible to anything reading exit codes or GitHub's attempt counter. Say so where a human looks.
+note() {
+  echo "$1"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    echo "- **${shard_name}**: $1" >> "$GITHUB_STEP_SUMMARY"
+  fi
+}
+
 echo "Shard ${shard_name}: ${shard_args[*]}"
 timeout "$shard_timeout" ./gradlew connectedDebugAndroidTest "${shard_args[@]}"
 code=$?
 if [ "$code" = "0" ]; then
   exit 0
 fi
+capture_state attempt1
 if [ "$code" != "124" ]; then
+  note "failed tests on the first attempt (exit $code) and was NOT retried."
   exit "$code"
 fi
 
 echo "Shard ${shard_name} hung; rebooting the emulator for one retry"
+note "HUNG and was retried on a rebooted emulator. Any result below is from the retry."
 adb reboot
 restore_device
 timeout "$shard_timeout" ./gradlew connectedDebugAndroidTest "${shard_args[@]}"
+code=$?
+if [ "$code" = "0" ]; then
+  note "passed on the retry, so this run still contained a hang."
+else
+  capture_state attempt2
+fi
+exit "$code"

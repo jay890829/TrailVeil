@@ -141,3 +141,19 @@ jobs:
             adb shell cmd overlay list | grep -F '[x] com.android.internal.systemui.navbar.threebutton'
             adb shell cmd overlay list | grep -F '[ ] com.android.internal.systemui.navbar.gestural'
             bash .github/scripts/run-instrumentation-shard.sh
+
+      # Until this existed a red run left nothing to read: no report, no logcat, no process state,
+      # so every diagnosis was reconstructed from truncated console output. `always()` rather than
+      # `failure()` because a shard that hangs and then PASSES on the retry leaves diagnostics worth
+      # keeping while the job is green; `if-no-files-found: ignore` keeps clean runs from uploading.
+      - name: Upload shard diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-${{ matrix.shard.name }}-${{ github.run_attempt }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            shard-diagnostics/
+            app/build/reports/androidTests/
+            app/build/outputs/androidTest-results/
