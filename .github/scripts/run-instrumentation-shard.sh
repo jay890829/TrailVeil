@@ -26,9 +26,22 @@
 # `com.google.android.permissioncontroller` both sat in `do_freezer_trap`. Android's cached-app
 # freezer had suspended the instrumentation process and the permission dialog's process. That is
 # also the honest explanation for "no in-process timeout can escape it" above: a frozen process
-# cannot run its own watchdog, whatever the renderer is doing. Disabling the freezer took the same
-# test at the same position in the same shard from an indefinite hang to 21 seconds, so the shards
-# now assert `cached_apps_freezer disabled` before running and again after a reboot.
+# cannot run its own watchdog, whatever the renderer is doing. Disabling the freezer took that same
+# test from an indefinite hang to 21 seconds, so the shards now assert `cached_apps_freezer
+# disabled` before running and again after a reboot.
+#
+# BOTH hangs live in `rest`, and disabling the freezer did not retire the GL one. With the freezer
+# verifiably disabled -- asserted before the run and re-asserted after the retry's reboot, both
+# echoed in the log -- run 32555585123 still hung, and hung to the GL signature described above:
+# both attempts stopped at exactly 105/116, each within four seconds of a `bad color buffer
+# handle`, the second on an emulator the retry had just rebooted. That is the 75/142 pattern at a
+# different count. Four consecutive hosted runs had cleared 116/116 first, so 116 is not a wall but
+# a margin `rest` was sitting on. It is now split by the runner's own numShards exactly as `map`
+# is: 57 + 59 = 116, measured to cover the shard with no overlap and no silent drop.
+#
+# The GL hang stayed hidden behind the freezer one because the local before/after that measured the
+# freezer fix ran a 59-test half, which never reaches position 106. A fix measured on part of a
+# shard has not been measured on the shard.
 #
 # This lives in a script file because the emulator-runner executes its `script:` input line by line
 # and fails on the first nonzero line, which makes multi-line shell control flow there impossible --
@@ -43,7 +56,7 @@ restore_device() {
   adb wait-for-device
   sleep 90
   # Re-asserted after the reboot rather than trusted to persist. A frozen instrumentation process is
-  # the measured cause of the `rest` shard's timeouts (P4-049) and it stops the retry dead too.
+  # one measured cause of the `rest` shard's timeouts (P4-049) and it stops the retry dead too.
   adb shell settings put global cached_apps_freezer disabled
   adb shell settings get global cached_apps_freezer | grep -Fx disabled
   adb shell cmd overlay enable-exclusive --user 0 --category com.android.internal.systemui.navbar.threebutton
