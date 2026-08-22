@@ -465,6 +465,102 @@ class RecordingForegroundServiceTest {
             activity.close()
         }
     }
+    /**
+     * `P5-001` row 8's remaining half: rapid repeated external controls. The row's other halves are
+     * covered — a STALE stop cannot stop a replacement runtime, a PENDING stop completes before
+     * location resumes, and the notification path itself works — but nothing exercised the same
+     * control arriving several times in a row, or a fresh Start following a Stop with no gap.
+     *
+     * Both are worth holding rather than assumed. The failure mode is concrete and this suite has
+     * already paid for it once: `active_slot` is UNIQUE, so a session that claims the slot before
+     * the previous one released it does not merely misbehave, it throws. A duplicate Stop that
+     * wrote a second terminal state would also silently overwrite `ended_at` and `stop_reason`.
+     *
+     * The stop action is sent five times with no delay between them, then two further Start/Stop
+     * cycles run back to back. What must hold is that each session is stopped exactly ONCE and that
+     * the slot is free for the next Start.
+     */
+    @Test
+    fun repeatedStopsStopOneSessionOnceAndTheSlotIsFreeForAnImmediateRestart() = runBlocking {
+        enableSystemLocation()
+        grant(Manifest.permission.ACCESS_COARSE_LOCATION)
+        grant(Manifest.permission.ACCESS_FINE_LOCATION)
+        val application = context.applicationContext as TrailVeilApplication
+        val repository = application.appContainer.recordingRepository
+        val notifier = RecordingForegroundNotifier(context)
+        val sessionIds = mutableListOf<Long>()
+
+        val activity = ActivityScenario.launch(MainActivity::class.java)
+        try {
+            repeat(3) { cycle ->
+                val sessionId = repository.beginStart(
+                    operationId("rapid-$cycle"),
+                    System.currentTimeMillis(),
+                    "instrumentation",
+                ).sessionId
+                sessionIds += sessionId
+                activity.onActivity {
+                    RecordingForegroundService.startFromVisibleActivity(it, sessionId)
+                }
+                withTimeout(10_000) {
+                    while (repository.state().lifecycle != RecordingLifecycle.ACTIVE) {
+                        delay(50)
+                    }
+                }
+
+                // The first cycle is the burst; the later two prove an immediate restart works.
+                val stops = if (cycle == 0) 5 else 1
+                val action = notifier.notification(sessionId).actions.single().actionIntent
+                repeat(stops) { action.send() }
+
+                withTimeout(10_000) {
+                    while (repository.state().lifecycle != RecordingLifecycle.STOPPED) {
+                        delay(50)
+                    }
+                }
+            }
+        } finally {
+            activity.close()
+        }
+
+        assertEquals("a cycle did not create its own session", 3, sessionIds.distinct().size)
+        val database = TrailVeilDatabase.open(context)
+        try {
+            val dao = database.recordingDao()
+            sessionIds.forEach { sessionId ->
+                val session = requireNotNull(dao.sessionById(sessionId))
+                assertEquals(
+                    "session $sessionId did not reach a terminal state",
+                    RecordingStatus.COMPLETED,
+                    session.status,
+                )
+                assertNull(
+                    "session $sessionId still holds the UNIQUE active_slot, so the next Start " +
+                        "would collide with it",
+                    session.activeSlot,
+                )
+                assertEquals(
+                    "session $sessionId was stopped ${countStopReceipts(database, sessionId)} " +
+                        "times; repeated taps must collapse to one terminal write",
+                    1,
+                    countStopReceipts(database, sessionId),
+                )
+            }
+        } finally {
+            database.close()
+        }
+    }
+
+    /** Terminal STOP writes for one session; REQUEST_STOP may legitimately arrive many times. */
+    private fun countStopReceipts(database: TrailVeilDatabase, sessionId: Long): Int =
+        database.openHelper.readableDatabase.query(
+            "SELECT COUNT(*) FROM recording_operation_receipts " +
+                "WHERE session_id = $sessionId AND command_kind = 'STOP'",
+        ).use { cursor ->
+            cursor.moveToFirst()
+            cursor.getInt(0)
+        }
+
     private fun grant(permission: String) {
         if (context.checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
             InstrumentationRegistry.getInstrumentation().uiAutomation
