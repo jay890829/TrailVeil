@@ -304,7 +304,17 @@ class RecordingForegroundServiceTest {
         val activity = ActivityScenario.launch(MainActivity::class.java)
         val releaseRoomWriter = CompletableDeferred<Unit>()
         val roomWriterLocked = CompletableDeferred<Unit>()
-        val blockingDatabase = TrailVeilDatabase.open(context)
+        // `P4-050`: the app's OWN Room instance, not a second one from TrailVeilDatabase.open().
+        // A second instance is a second SQLite connection, so holding a write transaction on it made
+        // the service's delivery writes CONTEND for the lock rather than queue behind it. On a slow
+        // or loaded device that contention wins its own race and terminates the session with
+        // SQLiteDatabaseLockedException (SQLITE_BUSY) -> storage_failure, which is a truthful reason
+        // for a different event than the one under test. Measured: 5/5 green idle, 0/7 green under
+        // `dd conv=fsync` + CPU load, and the wrapped cause read directly off the catch site.
+        // Through the app's own instance the writes SERIALISE inside Room's single writer, so the
+        // bounded fix queue is the only thing that can overflow and backpressure is the only
+        // terminal cause available.
+        val blockingDatabase = container.databaseForTesting()
         var blockingTransaction: Job? = null
         try {
             activity.onActivity {
@@ -369,7 +379,9 @@ class RecordingForegroundServiceTest {
         } finally {
             releaseRoomWriter.complete(Unit)
             blockingTransaction?.cancelAndJoin()
-            blockingDatabase.close()
+            // Deliberately NOT closed: this is the application's own database, not a second handle
+            // this test opened, and closing it would tear the running app's storage out from under
+            // every later test in the shard.
             runCatching {
                 if (repository.state().lifecycle == RecordingLifecycle.ACTIVE) {
                     repository.interrupt(
