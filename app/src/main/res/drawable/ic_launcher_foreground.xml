@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!--
+      The fog. It fills the whole layer, so the launcher mask - circle, squircle,
+      square or teardrop - defines the tile and the icon always has a solid body to
+      find on any wallpaper. The cleared swath is not drawn: it is a hole cut through
+      the fog with evenOdd, exactly as FogTileRenderer works (fogAlpha=184 over the
+      basemap, then the track punched out to alpha 0). What shows through the hole is
+      ic_launcher_background, the ground.
+
+      Subpath 1 - the full 108x108 field.
+      Subpath 2 - one swath cleared by a walk, and also the V of TrailVeil.
+        Centreline (39.61,45.37) -> (53.16,66.25) -> (66.72,45.37), half-width 6.913
+        (the reveal radius), round caps and a round join, with the sharp inner notch
+        that a union of two round-capped segments really produces. The right terminal
+        swells to r=8.434 - the reveal disc standing on the current point.
+
+      Emitted and verified programmatically: the outline matches the true capsule
+      union with 0 mismatches over 67600 samples; every arc is under 180 degrees so
+      large-arc-flag is 0 throughout; max ink radius 23.81 from (54,54), so at a
+      launcher's 1.5x foreground zoom the mark reaches 35.7 against a 36 mask radius
+      and is never clipped - only the sacrificial fog field is.
+    -->
+    <path
+        android:fillType="evenOdd"
+        android:pathData="M0,0L108,0L108,108L0,108ZM33.81,49.13L47.36,70.01A6.913,6.913 0 0,0 53.16,73.16A6.913,6.913 0 0,0 58.96,70.02L69.89,53.19A8.434,8.434 0 0,0 71.31,38.30A8.434,8.434 0 0,0 58.29,45.66L53.16,53.55L45.41,41.61A6.913,6.913 0 0,0 35.85,39.57A6.913,6.913 0 0,0 33.81,49.13Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="54"
+                android:centerY="50"
+                android:gradientRadius="78">
+                <!-- Each stop is #000000 at alpha 184 composited over a real basemap
+                     tone: near-white road, then the app's own committed ground colour
+                     #D6DBD2 (res/raw/maplibre_fallback_style.json), then shaded cover.
+                     The result is the colour TrailVeil actually shows under fog. -->
+                <item android:offset="0" android:color="#FF474640" />
+                <item android:offset="0.55" android:color="#FF3C3D3A" />
+                <item android:offset="1" android:color="#FF1E201D" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

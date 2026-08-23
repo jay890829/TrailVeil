@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!--
+      Byte-for-byte the same geometry as ic_launcher_foreground, in a single
+      #FF000000 fill for the system to tint. Nothing here was ever carried by
+      colour: the mark is the hole, and a hole is a shape. The themed icon is
+      therefore the same picture - a field of fog with one swath cleared through
+      it - and not a reduction of it.
+    -->
+    <path
+        android:fillColor="#FF000000"
+        android:fillType="evenOdd"
+        android:pathData="M0,0L108,0L108,108L0,108ZM33.81,49.13L47.36,70.01A6.913,6.913 0 0,0 53.16,73.16A6.913,6.913 0 0,0 58.96,70.02L69.89,53.19A8.434,8.434 0 0,0 71.31,38.30A8.434,8.434 0 0,0 58.29,45.66L53.16,53.55L45.41,41.61A6.913,6.913 0 0,0 35.85,39.57A6.913,6.913 0 0,0 33.81,49.13Z" />
+</vector>

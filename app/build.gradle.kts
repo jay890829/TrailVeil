@@ -199,8 +199,6 @@ android {
             "GradleDependency",
             "NewerVersionAvailable",
             "OldTargetApi",
-            // Assigned before sensitive storage and production branding land.
-            "MissingApplicationIcon",
         )
     }
 }

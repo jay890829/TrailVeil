@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!--
+      The ground. Only ever seen through the swath cut out of the foreground fog,
+      so this layer is deliberately quiet: no shape, nothing that must stay in
+      register with the hole while a launcher parallaxes the two layers apart.
+
+      #D6DBD2 is the app's own basemap ground, the one committed colour in
+      res/raw/maplibre_fallback_style.json; the lighter stop is the warmer paper
+      the Liberty style shows in open country. Endpoints sit at 18,18 -> 90,90 so
+      the whole range is realised inside the 72dp mask window instead of being
+      spent on corners nobody sees; tileMode clamps beyond them.
+    -->
+    <path android:pathData="M0,0L108,0L108,108L0,108Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="linear"
+                android:startX="18"
+                android:startY="18"
+                android:endX="90"
+                android:endY="90"
+                android:startColor="#FFF2ECDC"
+                android:endColor="#FFD6DBD2" />
+        </aapt:attr>
+    </path>
+</vector>
