@@ -23,6 +23,11 @@ import app.trailveil.data.db.TrailVeilDatabase
 import app.trailveil.data.recording.RecordingLifecycle
 import app.trailveil.recording.RecordingForegroundService
 import java.io.FileInputStream
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -42,6 +47,15 @@ class NotificationStartContinuationTest {
 
     private val instrumentation = InstrumentationRegistry.getInstrumentation()
     private val context: Context = ApplicationProvider.getApplicationContext()
+
+    /** Single-threaded on purpose: see [denyButtonNodes]. Daemon, so a stuck probe cannot hold the
+     *  process open. JUnit builds one instance per test method, so this is one thread per test. */
+    private val accessibilityProbe = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "deny-button-probe").apply { isDaemon = true }
+    }
+
+    /** Non-zero means the wedge described on [boundedProbe] actually happened in this run. */
+    private val probeExpiries = AtomicInteger(0)
 
     @Test
     fun recreationWhileThePromptIsVisibleContinuesOneDeniedStartExactlyOnce() {
@@ -124,6 +138,15 @@ class NotificationStartContinuationTest {
                 // are separated rather than both blamed on the product. A continuation that never
                 // reached AWAITING_RESULT means the request was never launched, which *is* this
                 // task's defect, and falls through to the hard failure below.
+                // An expired probe is not an absent dialog, it is the P4-049 wedge: the prompt was
+                // unobservable, not missing. Assert before the skip so it can never go green.
+                assertEquals(
+                    "The accessibility probe stopped returning, so the prompt could not be observed " +
+                        "at all. This is the hosted wedge from P4-049, not a host without a " +
+                        "dialog: ${promptDiagnostics()}",
+                    0,
+                    probeExpiries.get(),
+                )
                 assumeTrue(
                     "This host never presented the notification prompt within " +
                         "$PROMPT_APPEARANCE_TIMEOUT_MILLIS ms while the app was correctly waiting " +
@@ -351,7 +374,54 @@ class NotificationStartContinuationTest {
         return null
     }
 
-    private fun denyButtonNodes(): List<AccessibilityNodeInfo> {
+    /**
+     * `P4-049`: this query is why the shard hung, and the bound above it was only apparent.
+     *
+     * `rootInActiveWindow` is a SYNCHRONOUS binder call into whichever process is drawing the
+     * prompt. Measured on 2026-08-23 across six hosted runs of one unchanged commit, `rest-1` hung
+     * in four of them, always here: `ps` at the stall showed `app.trailveil`, `app.trailveil.test`
+     * and `com.google.android.permissioncontroller` all in interruptible sleep, **zero**
+     * `do_freezer_trap`, no process in uninterruptible sleep and none burning CPU. The last
+     * app-side log line was an `AccessibilityNodeInfo` access, then 35 minutes of nothing until the
+     * shard timeout killed the job.
+     *
+     * [awaitDenyButton] re-checks its deadline only BETWEEN calls, so one call that never returns
+     * escapes the deadline completely and takes the whole shard with it. Bounding the call is what
+     * makes that deadline real. On expiry this reports "no nodes" and counts the expiry, the caller
+     * keeps polling until its own budget runs out, and the run then ends through an assertion that
+     * names the wedge and carries [promptDiagnostics] — instead of a dead job.
+     *
+     * Measured on 2026-08-23 by making this read block forever: the class finished in 72.8 s rather
+     * than hanging. That first bound alone ended the run as a SKIP, because an unobservable prompt
+     * is indistinguishable from an absent one until [probeExpiries] separates them; the guard at
+     * the `assumeTrue` below is what keeps this from quietly going green.
+     *
+     * The worker is abandoned rather than joined on expiry: a thread parked in a binder
+     * transaction cannot be interrupted, so waiting on it would reproduce the very hang this
+     * removes. It is a daemon, and a stuck one makes every later probe expire too, which is the
+     * behaviour worth having — the prompt is genuinely unreachable at that point.
+     */
+    private fun denyButtonNodes(): List<AccessibilityNodeInfo> =
+        boundedProbe(emptyList()) { readDenyButtonNodes() }
+
+    /**
+     * Runs [read] on the probe thread and gives up after [ACCESSIBILITY_PROBE_TIMEOUT_MILLIS].
+     *
+     * Every accessibility read on the polling path goes through here, [promptDiagnostics] included:
+     * a diagnostic that hangs is precisely the dead job it exists to report.
+     */
+    private fun <T> boundedProbe(fallback: T, read: () -> T): T = try {
+        accessibilityProbe.submit<T> { read() }
+            .get(ACCESSIBILITY_PROBE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)
+    } catch (expired: TimeoutException) {
+        probeExpiries.incrementAndGet()
+        fallback
+    } catch (rejected: RejectedExecutionException) {
+        probeExpiries.incrementAndGet()
+        fallback
+    }
+
+    private fun readDenyButtonNodes(): List<AccessibilityNodeInfo> {
         val root = instrumentation.uiAutomation.rootInActiveWindow ?: return emptyList()
         // The permission controller ships as com.google.android.permissioncontroller on Google APIs
         // images while keeping the AOSP resource namespace. Match both so an image that namespaces
@@ -380,12 +450,16 @@ class NotificationStartContinuationTest {
      */
     private fun promptDiagnostics(): String {
         val automation = instrumentation.uiAutomation
-        val activePackage = automation.rootInActiveWindow?.packageName?.toString() ?: "none"
-        val windowPackages = runCatching {
-            automation.windows.mapNotNull { window ->
-                window.root?.packageName?.toString()
-            }.distinct()
-        }.getOrDefault(emptyList())
+        val activePackage = boundedProbe("unreadable") {
+            automation.rootInActiveWindow?.packageName?.toString() ?: "none"
+        }
+        val windowPackages = boundedProbe(emptyList<String>()) {
+            runCatching {
+                automation.windows.mapNotNull { window ->
+                    window.root?.packageName?.toString()
+                }.distinct()
+            }.getOrDefault(emptyList())
+        }
         val controllerPresent = windowPackages.any { name -> name.endsWith("permissioncontroller") }
         // The decisive field. IDLE or REQUESTING_PERMISSION means the app never reached
         // `launcher.launch` — a stall on the route's own DataStore writes looks exactly like a lost
@@ -394,7 +468,8 @@ class NotificationStartContinuationTest {
         val continuation = currentContinuation()
         return "continuation=$continuation activeWindow=$activePackage windows=$windowPackages " +
             "permissionControllerWindow=$controllerPresent denyNodes=${denyButtonNodes().size} " +
-            "selfPermission=${context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)}"
+            "selfPermission=${context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)} " +
+            "probeExpiries=${probeExpiries.get()}"
     }
 
     private fun awaitDenyButtonGone(): Boolean {
@@ -446,6 +521,13 @@ class NotificationStartContinuationTest {
         const val PROMPT_APPEARANCE_TIMEOUT_MILLIS = 60_000L
         const val SERVICE_TIMEOUT_MILLIS = 15_000L
         const val POLL_MILLIS = 50L
+
+        /**
+         * Generous against a healthy call, which returns in milliseconds, and far inside
+         * [PROMPT_APPEARANCE_TIMEOUT_MILLIS] so the caller's budget is what decides the verdict.
+         * This exists only to stop a call that never returns from being waited on forever.
+         */
+        const val ACCESSIBILITY_PROBE_TIMEOUT_MILLIS = 5_000L
         const val PRE_RESULT_DWELL_MILLIS = 500L
 
         /** The saved continuation state that proves the request really was launched. */
