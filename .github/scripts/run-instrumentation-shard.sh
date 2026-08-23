@@ -80,6 +80,25 @@ mkdir -p "$diagnostics"
 # `do_freezer_trap` has never appeared in a hosted log because nothing has ever looked. adb can be
 # wedged when the shard is, so each capture is bounded and failure to capture is not fatal.
 capture_state() {
+  # ART writes every Java thread's stack to logcat when a process receives SIGQUIT, and that is the
+  # one thing `ps` cannot supply: it reports that a process sits in S, never which frame it sleeps
+  # in. `P4-049` spent two rounds narrowing a blocked frame by elimination and got it wrong, purely
+  # because no capture ever held a stack. Signal first, so the traces land in the logcat dump below.
+  #
+  # `adb root` is required because the shell uid may not signal an app uid. It works on the
+  # `google_apis` image this workflow pins and would fail on `google_apis_playstore`. Every step is
+  # best effort: this runs on a path that has ALREADY failed, and a capture must never convert a
+  # diagnosable failure into a broken one.
+  timeout 60 adb root >/dev/null 2>&1 || true
+  timeout 60 adb wait-for-device >/dev/null 2>&1 || true
+  for process in app.trailveil app.trailveil.test; do
+    # awk coerces to a number, which drops adb's trailing carriage return and takes the first pid.
+    process_pid=$(timeout 30 adb shell pidof "$process" 2>/dev/null | awk '{print $1+0}')
+    [ -n "$process_pid" ] && [ "$process_pid" != "0" ] || continue
+    timeout 30 adb shell kill -3 "$process_pid" >/dev/null 2>&1 || true
+  done
+  # ART writes the dump asynchronously; without this the logcat below races it.
+  sleep 5
   timeout 60 adb logcat -d > "$diagnostics/logcat-${shard_name}-$1.txt" 2>&1 || true
   timeout 60 adb shell ps -A -o PID,S,WCHAN,NAME > "$diagnostics/ps-${shard_name}-$1.txt" 2>&1 || true
   timeout 60 adb shell dumpsys activity processes > "$diagnostics/procs-${shard_name}-$1.txt" 2>&1 || true
