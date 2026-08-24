@@ -113,21 +113,38 @@ fun requireInternalSigningConfiguration() {
             TRAILVEIL_INTERNAL_SIGNING_PROPERTIES to an absolute external properties file.
             Required keys: storeFile, storePassword, keyAlias, keyPassword.
             Keep the properties file and keystore outside this repository.
-            See README.md#internal-signing.
+            See README.md#app-signing.
             """.trimIndent(),
         )
     }
 }
 
-val explicitlyRequestsInternal = gradle.startParameter.taskNames.any { requestedTask ->
-    requestedTask.substringAfterLast(':').contains("Internal", ignoreCase = true)
+val signedDistributionTaskNames = buildSet {
+    listOf("Internal", "Release").forEach { variant ->
+        add("assemble$variant")
+        add("bundle$variant")
+        add("install$variant")
+        add("package$variant")
+        add("package${variant}Bundle")
+        add("package${variant}UniversalApk")
+        add("sign${variant}Bundle")
+        add("signingConfigWriter$variant")
+        add("validateSigning$variant")
+    }
 }
-if (explicitlyRequestsInternal) {
+
+fun requiresDistributionSigning(taskName: String): Boolean =
+    signedDistributionTaskNames.any { candidate -> candidate.equals(taskName, ignoreCase = true) }
+
+val explicitlyRequestsSignedDistribution = gradle.startParameter.taskNames.any { requestedTask ->
+    requiresDistributionSigning(requestedTask.substringAfterLast(':'))
+}
+if (explicitlyRequestsSignedDistribution) {
     requireInternalSigningConfiguration()
 }
 
 tasks.configureEach {
-    if (name.contains("Internal", ignoreCase = true)) {
+    if (requiresDistributionSigning(name)) {
         doFirst {
             requireInternalSigningConfiguration()
         }
@@ -164,6 +181,14 @@ android {
     }
 
     buildTypes {
+        getByName("release") {
+            // GitHub distributes this APK directly, so Android never re-signs it for us. Reuse the
+            // fixed certificate already installed by internal field builds: a different key would
+            // force an uninstall, which permanently deletes TrailVeil's non-backed-up history.
+            signingConfig = signingConfigs.getByName("internal")
+            isDebuggable = false
+            isMinifyEnabled = false
+        }
         create("internal") {
             initWith(getByName("debug"))
             signingConfig = signingConfigs.getByName("internal")

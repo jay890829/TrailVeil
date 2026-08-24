@@ -48,12 +48,21 @@ After configuring the external key described below, run the equivalent internal 
 .\gradlew.bat clean assembleInternal lintInternal testDebugUnitTest
 ```
 
-The fixed-signature APK is written to `app/build/outputs/apk/internal/app-internal.apk`. Build either APK without the other checks with:
+Produce the only APK eligible for upload to a GitHub Release with the audited local release script:
+
+```powershell
+.\scripts\build-github-release.ps1
+```
+
+It refuses a dirty tree and publishes its fully verified outputs only under `app/build/github-release/`. Raw Gradle APKs below are engineering artifacts and must never be uploaded as a release asset:
 
 ```powershell
 .\gradlew.bat assembleDebug
 .\gradlew.bat assembleInternal
+.\gradlew.bat assembleRelease
 ```
+
+The fixed-signature internal engineering APK is written to `app/build/outputs/apk/internal/app-internal.apk`; the unaudited raw release output is `app/build/outputs/apk/release/app-release.apk`.
 
 Run the provider-neutral viewport JVM suite alone with:
 
@@ -70,7 +79,7 @@ With an Android device or compatible emulator connected, install one build linea
 .\gradlew.bat installInternal
 ```
 
-`debug` and `internal` intentionally share the application ID but use different signing certificates. Android will not replace one with the other; uninstall the currently installed package before switching lineages. Repeated `internal` builds use the fixed external key and are upgrade-compatible when `versionCode` increases.
+All variants share the application ID. `debug` uses Android's debug certificate and cannot replace a signed distribution build. `internal` and `release` use the same fixed external TrailVeil certificate, so a release APK can replace an internal field build without an uninstall; future updates must keep that certificate and increase `versionCode`.
 
 Run all debug instrumentation tests or only the recording-entry Compose tests with:
 
@@ -94,9 +103,9 @@ On the designated validation device, append `"-Pandroid.testInstrumentationRunne
 
 Some devices restrict adb testing. On HyperOS, `pm clear` and input injection are blocked, so reset app data with `adb uninstall app.trailveil` followed by a reinstall, and keep the screen awake with `adb shell svc power stayon usb` during instrumentation.
 
-## Internal signing
+## App signing
 
-The `internal` build type keeps the fixed `app.trailveil` application ID and uses a non-debug signing key stored outside the repository. By default, Gradle reads:
+The `internal` and `release` build types keep the fixed `app.trailveil` application ID and use one non-debug app-signing key stored outside the repository. This was originally named the internal signer; it is now the lifetime signing identity for direct GitHub APK releases as well. Reusing it is deliberate: changing keys would make Android reject an in-place update and force users to uninstall, permanently deleting data that TrailVeil cannot back up or export. By default, Gradle reads:
 
 ```text
 ~/.trailveil/signing/internal-signing.properties
@@ -111,10 +120,14 @@ keyAlias=trailveil-internal
 keyPassword=replace-with-the-external-secret
 ```
 
-A relative `storeFile` is resolved from the properties file's directory. Never place the properties file, keystore, passwords, private key, certificate-fingerprint record, or recovery details in this checkout. The repository ignores common keystore formats and `internal-signing.properties` as defense in depth, but the external location remains the security boundary.
+A relative `storeFile` is resolved from the properties file's directory. Never place the properties file, keystore, passwords, private key, custody record, or recovery details in this checkout. The public certificate fingerprint below is deliberately tracked so release consumers and the build gate can identify the signer; it cannot recover or impersonate the private key. The repository ignores common keystore formats and `internal-signing.properties` as defense in depth, but the external location remains the security boundary.
 
-With no signing material present, debug builds and CI remain available; any task that includes the `internal` variant fails with the required path and property names. Once configured, the `assembleInternal` and `installInternal` commands above use this fixed identity.
+With no signing material present, debug builds, CI, source compilation, and lint remain available; artifact assembly/bundling/packaging/signing/install tasks for `internal` or `release` fail with the required path and property names. Once configured, `assembleInternal`, `installInternal`, and `assembleRelease` use this fixed identity. The release APK is written to `app/build/outputs/apk/release/app-release.apk` with version name `0.1.0`; unlike `internal`, it is non-debuggable and has no `-internal` suffix.
 
-The Android package identity is `app.trailveil` and is independent of the repository owner's account name. Keep the actual certificate SHA-256 fingerprint and key-custody/recovery record outside Git with the protected key backup.
+Never upload the keystore or properties file to the repository, GitHub Secrets, Actions artifacts, or release assets. Signed APKs, SHA-256 checksums, and the public certificate fingerprint are safe to publish. `scripts/build-github-release.ps1` refuses a dirty tree, builds and verifies the release variant locally, and stages only those public artifacts under the ignored `app/build/github-release/` directory.
 
-GitHub Actions is configured to run the equivalent debug build, lint, and JVM checks on JDK 17 with SDK Platform 37.0 and Build Tools 36.0.0, plus the instrumentation suite on an API 36 emulator. Internal signing material is intentionally not available to CI.
+The pinned public certificate SHA-256 is `307963f32352e6565889982c2b6021af960c94db5c40e0e38c52a2f2cf13856d`. The certificate's historical subject says `TrailVeil Internal`; that label does not change its cryptographic identity or make a release APK debuggable. The release script requires this exact public fingerprint as well as equality with a freshly built internal-lineage APK.
+
+The Android package identity is `app.trailveil` and is independent of the repository owner's account name. Keep the key-custody/recovery record outside Git with the protected key backup; publish only the certificate fingerprint.
+
+GitHub Actions is configured to run the equivalent debug build, lint, and JVM checks on JDK 17 with SDK Platform 37.0 and Build Tools 36.0.0, plus the instrumentation suite on an API 36 emulator. App-signing material is intentionally not available to CI; release APKs are built locally and only the signed public artifact is uploaded to GitHub Releases.
