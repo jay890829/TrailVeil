@@ -39,7 +39,15 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 
-/** Real Activity Result/SavedState regression for P3-006's pending notification Start. */
+/**
+ * Real Activity Result/SavedState regression for P3-006's pending notification Start.
+ *
+ * P4-049 keeps this device-only case out of hosted CI. The hosted Google APIs emulator has never
+ * presented and completed this scenario: every finished sample skipped after the 60-second prompt
+ * budget, while intermittent downstream stalls inside this exact test killed the whole rest shard.
+ * The blocked frame was never captured, so this does not assign a permission-controller root cause.
+ * The source and manifest entry remain, and explicit device/unfiltered runs still execute it.
+ */
 @RunWith(AndroidJUnit4::class)
 class NotificationStartContinuationTest {
     @get:Rule

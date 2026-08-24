@@ -83,13 +83,13 @@ jobs:
           - name: rest-0
             args: >-
               -Pandroid.testInstrumentationRunnerArguments.notPackage=app.trailveil.map
-              -Pandroid.testInstrumentationRunnerArguments.notClass=app.trailveil.feature.recording.BlockedResumeComposeTest
+              -Pandroid.testInstrumentationRunnerArguments.notClass=app.trailveil.feature.recording.BlockedResumeComposeTest,app.trailveil.feature.recording.NotificationStartContinuationTest
               -Pandroid.testInstrumentationRunnerArguments.numShards=2
               -Pandroid.testInstrumentationRunnerArguments.shardIndex=0
           - name: rest-1
             args: >-
               -Pandroid.testInstrumentationRunnerArguments.notPackage=app.trailveil.map
-              -Pandroid.testInstrumentationRunnerArguments.notClass=app.trailveil.feature.recording.BlockedResumeComposeTest
+              -Pandroid.testInstrumentationRunnerArguments.notClass=app.trailveil.feature.recording.BlockedResumeComposeTest,app.trailveil.feature.recording.NotificationStartContinuationTest
               -Pandroid.testInstrumentationRunnerArguments.numShards=2
               -Pandroid.testInstrumentationRunnerArguments.shardIndex=1
 

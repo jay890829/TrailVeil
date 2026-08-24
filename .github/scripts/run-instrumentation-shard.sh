@@ -20,11 +20,11 @@
 # never retried -- flakes cannot hide behind this. A retried shard gets a rebooted emulator because
 # the broken GL state outlives the app process.
 #
-# `rest` hit that same wall at 116 tests and is now split too (P4-049): 57 + 59, measured to cover
-# the shard with no overlap and no silent drop. Three hosted occurrences, every one stopping at the
-# same test on BOTH attempts with the retry on a freshly rebooted emulator -- 32480422381,
-# 32508539772 and 32555585123. Four runs cleared 116 before the last of those failed, so 116 was a
-# margin `rest` sat on rather than a wall.
+# `rest` was split after hangs at 116 tests and later grew to 58 + 60. P4-049 established that every
+# hosted run which reached NotificationStartContinuationTest skipped it without exercising its
+# scenario, while every recurrence stopped inside that exact test. The hosted shards now exclude
+# that device-only class and enumerate 58 + 59 = 117, with no overlap or other drop; its source and
+# manifest entry remain for explicit device and unfiltered runs.
 #
 # THE FREEZER ASSERTION BELOW IS NOT A FIX FOR THOSE, and an earlier version of this header said it
 # was. Android's cached-app freezer really does hang this suite on a desk AVD: measured 2026-08-22
