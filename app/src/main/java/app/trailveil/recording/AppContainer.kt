@@ -50,6 +50,8 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
 
     fun claimAbandonedResumeAttempt(sessionId: Long): Boolean = resumeClaims.claim(sessionId)
 
+    fun releaseAbandonedResumeAttempt(sessionId: Long): Boolean = resumeClaims.release(sessionId)
+
     /** `P4-048`: what this runtime has told the user about, shared with the service in-process. */
     override val announcedInterruptions = AnnouncedInterruptions()
 

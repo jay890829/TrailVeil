@@ -223,11 +223,11 @@ internal fun RecordingEntryRoute(
         }
     }
 
-    suspend fun interruptAbandonedRecording(sessionId: Long, stoppedRecordingAt: Long?) {
+    suspend fun interruptAbandonedRecording(sessionId: Long, stoppedRecordingAt: Long?): Boolean {
         // Also quiet, and for a different reason than the resume: the row is being closed, so what
         // the user needs to see is the interrupted exploration itself, which the card already
         // becomes the moment the terminal row lands.
-        controller.interruptAbandonedAcrossRestart(
+        return controller.interruptAbandonedAcrossRestart(
             sessionId = sessionId,
             stoppedRecordingAtEpochMillis = stoppedRecordingAt,
         )
@@ -448,17 +448,17 @@ internal fun RecordingEntryRoute(
             claim = appContainer::claimAbandonedResumeAttempt,
             announcedInThisRuntime = appContainer::announcedInterruptionInThisRuntime,
         )
-        when (action) {
-            null -> Unit
-            is AbandonedExplorationAction.Resume -> resumeAbandonedRecording(action)
-            is AbandonedExplorationAction.Interrupt ->
-                // The action carries its own terminal instant; the route computes nothing, so there
-                // is no inline expression here for a fixture to miss.
+        runClaimedAbandonedAction(
+            action = action,
+            resume = ::resumeAbandonedRecording,
+            interrupt = { interrupt ->
                 interruptAbandonedRecording(
-                    sessionId = action.sessionId,
-                    stoppedRecordingAt = action.stoppedRecordingAt,
+                    sessionId = interrupt.sessionId,
+                    stoppedRecordingAt = interrupt.stoppedRecordingAt,
                 )
-        }
+            },
+            release = appContainer::releaseAbandonedResumeAttempt,
+        )
     }
     // A view-tree diagnostic makes the production presentation boundary observable to scale and
     // frame tests without exposing canonical coordinates or adding a second data subscription.

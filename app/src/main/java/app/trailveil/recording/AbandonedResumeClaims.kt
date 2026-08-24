@@ -25,6 +25,15 @@ internal class AbandonedResumeClaims {
     fun claim(sessionId: Long): Boolean =
         sessionId > NOTHING_CLAIMED && claimed.getAndSet(sessionId) != sessionId
 
+    /**
+     * Return an attempt that never reached a durable outcome.
+     *
+     * Compare-and-set is essential: this guard intentionally remembers only one session, so a late
+     * cancellation from session A must never clear the newer claim that session B already installed.
+     */
+    fun release(sessionId: Long): Boolean =
+        sessionId > NOTHING_CLAIMED && claimed.compareAndSet(sessionId, NOTHING_CLAIMED)
+
     private companion object {
         const val NOTHING_CLAIMED = 0L
     }
