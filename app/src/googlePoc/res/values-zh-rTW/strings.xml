@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="google_poc_loading">正在載入 Google 地圖…</string>
+    <string name="google_poc_map_loaded">Google 地圖已載入；拖曳或點按地圖即可觀察回呼。</string>
+    <string name="google_poc_camera_gesture_started">相機手勢已開始（原因=%1$d）</string>
+    <string name="google_poc_map_click">點按地圖：緯度=%1$.6f，經度=%2$.6f</string>
+    <string name="google_poc_map_long_click">長按地圖：緯度=%1$.6f，經度=%2$.6f</string>
+    <string name="google_poc_camera_changed">相機：緯度=%1$.6f，經度=%2$.6f，縮放=%3$.2f</string>
+    <string name="google_poc_camera_idle">相機已停止：緯度=%1$.6f，經度=%2$.6f，縮放=%3$.2f</string>
+    <string name="google_poc_poi_click">地標名稱=%1$s，Place ID=%2$s，經緯度=%3$.6f,%4$.6f</string>
+    <string name="google_poc_reason_missing_key">尚未設定外部 API 金鑰。</string>
+    <string name="google_poc_reason_invalid_key">外部 API 金鑰無效。</string>
+    <string name="google_poc_reason_no_network">沒有可通過驗證的網際網路連線。</string>
+    <string name="google_poc_reason_no_play_services">裝置沒有相容的 Google Play 服務。</string>
+    <string name="google_poc_reason_initialization_failure">Google 地圖無法初始化。</string>
+    <string name="google_poc_reason_load_timeout">Google 地圖未在時限內完成載入。</string>
+    <string name="google_poc_fallback_without_guidance">Google Maps PoC 無法使用。\n%1$s\n\n探索記錄與歷史資料仍保存在本機，且未受影響。</string>
+    <string name="google_poc_fallback_with_guidance">Google Maps PoC 無法使用。\n%1$s\n\n%2$s\n\n探索記錄與歷史資料仍保存在本機，且未受影響。</string>
+</resources>

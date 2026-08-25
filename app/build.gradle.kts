@@ -1,5 +1,6 @@
 import java.io.File
 import java.nio.file.Files
+import java.security.MessageDigest
 import java.util.Properties
 import javax.xml.parsers.DocumentBuilderFactory
 
@@ -38,6 +39,128 @@ val internalStoreFile = internalSigningProperties
     }
 val repositoryRoot = rootProject.projectDir.canonicalFile
 
+private val googlePocMissingKeySentinel = "TRAILVEIL_GOOGLE_MAPS_POC_MISSING_KEY"
+private val googlePocKeyPattern = Regex("^AIza[A-Za-z0-9_-]{35}$")
+private val googlePocKeyFingerprintPattern = Regex("^[a-f0-9]{64}$")
+private val defaultGooglePocPropertiesFile = File(
+    System.getProperty("user.home"),
+    ".trailveil/maps/google-maps.properties",
+)
+private val googlePocPropertiesOverride = providers
+    .environmentVariable("TRAILVEIL_GOOGLE_MAPS_PROPERTIES")
+    .orNull
+    ?.trim()
+    ?.takeIf(String::isNotEmpty)
+
+private enum class GooglePocKeyBuildReason {
+    VALID,
+    MISSING_KEY,
+    INVALID_KEY,
+    CONFIG_PATH_NOT_ABSOLUTE,
+    CONFIG_FILE_INSIDE_REPOSITORY,
+    CONFIG_FILE_UNREADABLE,
+}
+
+private data class GooglePocKeyBuildConfiguration(
+    val key: String?,
+    val reason: GooglePocKeyBuildReason,
+)
+
+private fun readGooglePocKeyConfiguration(): GooglePocKeyBuildConfiguration {
+    val configuredPath = googlePocPropertiesOverride
+    if (configuredPath != null && !File(configuredPath).isAbsolute) {
+        return GooglePocKeyBuildConfiguration(
+            key = null,
+            reason = GooglePocKeyBuildReason.CONFIG_PATH_NOT_ABSOLUTE,
+        )
+    }
+
+    val propertiesFile = configuredPath?.let(::File) ?: defaultGooglePocPropertiesFile
+    if (propertiesFile.isInsideRepository()) {
+        return GooglePocKeyBuildConfiguration(
+            key = null,
+            reason = GooglePocKeyBuildReason.CONFIG_FILE_INSIDE_REPOSITORY,
+        )
+    }
+    if (!propertiesFile.isFile) {
+        return GooglePocKeyBuildConfiguration(
+            key = null,
+            reason = GooglePocKeyBuildReason.MISSING_KEY,
+        )
+    }
+
+    return try {
+        val properties = Properties().apply {
+            propertiesFile.inputStream().use(::load)
+        }
+        val key = properties.getProperty("debugApiKey")?.trim()
+        val expectedFingerprint = properties
+            .getProperty("debugApiKeySha256")
+            ?.trim()
+            ?.lowercase()
+        when {
+            key.isNullOrEmpty() -> GooglePocKeyBuildConfiguration(
+                key = null,
+                reason = GooglePocKeyBuildReason.MISSING_KEY,
+            )
+
+            !googlePocKeyPattern.matches(key) -> GooglePocKeyBuildConfiguration(
+                key = null,
+                reason = GooglePocKeyBuildReason.INVALID_KEY,
+            )
+
+            expectedFingerprint == null ||
+                !googlePocKeyFingerprintPattern.matches(expectedFingerprint) ||
+                key.sha256Hex() != expectedFingerprint -> GooglePocKeyBuildConfiguration(
+                key = null,
+                reason = GooglePocKeyBuildReason.INVALID_KEY,
+            )
+
+            else -> GooglePocKeyBuildConfiguration(
+                key = key,
+                reason = GooglePocKeyBuildReason.VALID,
+            )
+        }
+    } catch (_: Exception) {
+        GooglePocKeyBuildConfiguration(
+            key = null,
+            reason = GooglePocKeyBuildReason.CONFIG_FILE_UNREADABLE,
+        )
+    }
+}
+
+private val googlePocKeyConfiguration = readGooglePocKeyConfiguration()
+
+private fun String.sha256Hex(): String = MessageDigest
+    .getInstance("SHA-256")
+    .digest(toByteArray(Charsets.UTF_8))
+    .joinToString(separator = "") { byte -> "%02x".format(byte) }
+
+private fun String.toBuildConfigString(): String =
+    "\"${replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")}\""
+
+private fun googlePocKeyGuidance(configuration: GooglePocKeyBuildConfiguration): String = when (
+    configuration.reason
+) {
+    GooglePocKeyBuildReason.VALID -> ""
+    GooglePocKeyBuildReason.MISSING_KEY ->
+        "Add debugApiKey and debugApiKeySha256 to ~/.trailveil/maps/google-maps.properties, or set " +
+            "TRAILVEIL_GOOGLE_MAPS_PROPERTIES to an absolute external properties file."
+
+    GooglePocKeyBuildReason.INVALID_KEY ->
+        "debugApiKey is invalid or does not match debugApiKeySha256. " +
+            "Use an external file and rebuild the googlePoc variant."
+
+    GooglePocKeyBuildReason.CONFIG_PATH_NOT_ABSOLUTE ->
+        "TRAILVEIL_GOOGLE_MAPS_PROPERTIES must be an absolute path outside this repository."
+
+    GooglePocKeyBuildReason.CONFIG_FILE_INSIDE_REPOSITORY ->
+        "Move the Google Maps properties file outside this repository and rebuild the googlePoc variant."
+
+    GooglePocKeyBuildReason.CONFIG_FILE_UNREADABLE ->
+        "The external Google Maps properties file could not be read; check its permissions and rebuild."
+}
+
 /**
  * `P5-002`: the commit an installed build was made from, so a field report can name it.
  *
@@ -68,7 +191,12 @@ val gitCommit: Provider<String> = providers.exec {
 fun File.isInsideRepository(): Boolean {
     var candidate: File? = canonicalFile
     while (candidate != null) {
-        if (Files.isSameFile(candidate.toPath(), repositoryRoot.toPath())) {
+        val sameAsRepository = try {
+            Files.isSameFile(candidate.toPath(), repositoryRoot.toPath())
+        } catch (_: Exception) {
+            false
+        }
+        if (sameAsRepository) {
             return true
         }
         candidate = candidate.parentFile
@@ -195,11 +323,37 @@ android {
             versionNameSuffix = "-internal"
             matchingFallbacks += listOf("debug")
         }
+        create("googlePoc") {
+            initWith(getByName("debug"))
+            versionNameSuffix = "-googlePoc"
+            matchingFallbacks += listOf("debug")
+            buildConfigField(
+                "boolean",
+                "GOOGLE_MAPS_POC_KEY_CONFIGURED",
+                (googlePocKeyConfiguration.reason == GooglePocKeyBuildReason.VALID).toString(),
+            )
+            buildConfigField(
+                "String",
+                "GOOGLE_MAPS_POC_KEY_REASON",
+                googlePocKeyConfiguration.reason.name.toBuildConfigString(),
+            )
+            buildConfigField(
+                "String",
+                "GOOGLE_MAPS_POC_KEY_GUIDANCE",
+                googlePocKeyGuidance(googlePocKeyConfiguration).toBuildConfigString(),
+            )
+            resValue(
+                "string",
+                "trailveil_google_maps_poc_api_key",
+                googlePocKeyConfiguration.key ?: googlePocMissingKeySentinel,
+            )
+        }
     }
 
     buildFeatures {
         compose = true
         buildConfig = true
+        resValues = true
     }
 
     sourceSets {
@@ -230,6 +384,78 @@ android {
 
 ksp {
     arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+val mergedManifestFiles = mapOf(
+    "debug" to layout.buildDirectory.file(
+        "intermediates/merged_manifests/debug/processDebugManifest/AndroidManifest.xml",
+    ),
+    "internal" to layout.buildDirectory.file(
+        "intermediates/merged_manifests/internal/processInternalManifest/AndroidManifest.xml",
+    ),
+    "release" to layout.buildDirectory.file(
+        "intermediates/merged_manifests/release/processReleaseManifest/AndroidManifest.xml",
+    ),
+    "googlePoc" to layout.buildDirectory.file(
+        "intermediates/merged_manifests/googlePoc/processGooglePocManifest/AndroidManifest.xml",
+    ),
+)
+val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifest") {
+    group = "verification"
+    description = "Proves Google Maps markers exist only in the isolated googlePoc manifest"
+    dependsOn(
+        "processDebugManifest",
+        "processInternalManifest",
+        "processReleaseManifest",
+        "processGooglePocManifest",
+    )
+    inputs.files(mergedManifestFiles.values)
+    outputs.upToDateWhen { false }
+    doLast {
+        val googleManifest = mergedManifestFiles.getValue("googlePoc").get().asFile.readText()
+        check("com.google.android.geo.API_KEY" in googleManifest) {
+            "googlePoc merged manifest is missing the Google Maps API-key marker"
+        }
+        check("app.trailveil.googlepoc.GoogleMapsPocActivity" in googleManifest) {
+            "googlePoc merged manifest is missing its isolated launcher Activity"
+        }
+        check("org.apache.http.legacy" in googleManifest) {
+            "googlePoc merged manifest is missing the Maps SDK 20 legacy-renderer compatibility shim"
+        }
+        check("app.trailveil.MainActivity" !in googleManifest) {
+            "googlePoc merged manifest unexpectedly exposes the production launcher"
+        }
+        check("app.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES" !in googleManifest) {
+            "googlePoc merged manifest unexpectedly exposes production MapLibre notices"
+        }
+
+        mergedManifestFiles
+            .filterKeys { variant -> variant != "googlePoc" }
+            .forEach { (variant, manifestProvider) ->
+                val manifest = manifestProvider.get().asFile.readText()
+                check("com.google.android.geo.API_KEY" !in manifest) {
+                    "$variant merged manifest leaked the Google Maps API-key marker"
+                }
+                check("app.trailveil.googlepoc.GoogleMapsPocActivity" !in manifest) {
+                    "$variant merged manifest leaked the Google PoC launcher"
+                }
+                check("org.apache.http.legacy" !in manifest) {
+                    "$variant merged manifest leaked the Google PoC legacy-renderer compatibility shim"
+                }
+                check("app.trailveil.MainActivity" in manifest) {
+                    "$variant merged manifest lost the production launcher"
+                }
+                check("app.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES" in manifest) {
+                    "$variant merged manifest lost the production MapLibre notices"
+                }
+            }
+    }
+}
+
+tasks.configureEach {
+    if (name == "assembleGooglePoc") {
+        dependsOn(verifyGooglePocMergedManifest)
+    }
 }
 
 val instrumentationTestManifest = layout.projectDirectory.file(
@@ -419,4 +645,6 @@ dependencies {
 
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)
+
+    add("googlePocImplementation", "com.google.android.gms:play-services-maps:20.0.0")
 }
