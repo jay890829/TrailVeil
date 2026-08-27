@@ -2,8 +2,20 @@ package app.trailveil.googlepoc
 
 import app.trailveil.BuildConfig
 import app.trailveil.R
+import app.trailveil.TrailVeilApplication
 import app.trailveil.map.ProviderFallbackReason
 import app.trailveil.map.ProviderRuntimeGate
+import app.trailveil.map.fog.FogRuntime
+import app.trailveil.map.fog.FogGenerationReusePolicy
+import app.trailveil.map.fog.FogSynchronizationRenderDecision
+import app.trailveil.map.fog.FogSnapshotVisualProbePlanner
+import app.trailveil.map.fog.FogTileGeneration
+import app.trailveil.map.fog.FogTileProviderAdapter
+import app.trailveil.map.fog.FogViewportBatchCoverageRenderer
+import app.trailveil.map.fog.FogViewportBatchSubrenderer
+import app.trailveil.map.fog.FogViewportCoverageRequest
+import app.trailveil.map.fog.GeoPoint
+import app.trailveil.map.fog.GoogleFogLifecycleGate
 import android.content.Context
 import android.graphics.Color
 import android.net.ConnectivityManager
@@ -26,6 +38,19 @@ import com.google.android.gms.maps.OnMapReadyCallback
 import com.google.android.gms.maps.model.CameraPosition
 import com.google.android.gms.maps.model.LatLng
 import com.google.android.gms.maps.model.PointOfInterest
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.collect
+import kotlin.math.floor
 
 /** Camera state deliberately contains no TrailVeil recording or history state. */
 data class GoogleMapsPocCamera(
@@ -43,6 +68,32 @@ data class GoogleMapsPocPointOfInterest(
     val latLng: LatLng,
 )
 
+enum class GoogleFogInstallPhase {
+    RUNTIME,
+    SYNCHRONIZATION,
+    RENDER,
+    TILE_DELIVERY,
+    SNAPSHOT,
+    REFRESH_REJECTED,
+    INSTALLED,
+}
+
+data class GoogleFogInstallDiagnostic(
+    val phase: GoogleFogInstallPhase,
+    val pendingTileCount: Int?,
+    val refreshFailure: GoogleFogRefreshFailure?,
+    val clearFailureClass: String?,
+    val refreshGeneration: Long?,
+    val refreshStarted: Boolean,
+    val refreshPublished: Boolean,
+    val visualRequiredTileCount: Int,
+    val visualVerifiedTileCount: Int,
+    val snapshotAttempt: Int,
+    val visualOffScreenOnlyTileCount: Int,
+    val visualMismatchedTileCount: Int,
+    val visualMinimumOnScreenProbeCount: Int,
+)
+
 interface GoogleMapsPocCallbacks {
     fun onCameraChanged(camera: GoogleMapsPocCamera) = Unit
     fun onCameraIdle(camera: GoogleMapsPocCamera) = Unit
@@ -50,11 +101,14 @@ interface GoogleMapsPocCallbacks {
     fun onMapClick(latitude: Double, longitude: Double) = Unit
     fun onMapLongClick(latitude: Double, longitude: Double) = Unit
     fun onPointOfInterestClick(pointOfInterest: GoogleMapsPocPointOfInterest) = Unit
+    /** Coordinate-free test/diagnostic signal emitted only after canonical fog is installed. */
+    fun onCanonicalFogInstalled(generation: Long) = Unit
 }
 
 /**
- * Non-release Google Maps provider surface. This Activity intentionally does not construct the
- * recording/history graph; all failure paths therefore stay local to this screen.
+ * Non-release Google Maps provider surface. The screen reads the shared canonical fog runtime but
+ * intentionally does not construct a second recording/history graph; all provider failures stay
+ * local to this screen.
  */
 class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     /** Assign before the map loads to observe camera, gesture and basic POI callbacks. */
@@ -65,11 +119,30 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     private lateinit var fallback: TextView
     private lateinit var callbackStatus: TextView
     private var mapView: MapView? = null
+    private var googleMap: GoogleMap? = null
     private var mapLoaded = false
     private var terminalFallback: ProviderFallbackReason? = null
+    private val lifecycleGate = GoogleFogLifecycleGate()
+    private val fogScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var fogRuntime: FogRuntime? = null
+    private var fogRuntimeLoadStarted = false
+    private var fogRuntimeLoadJob: Job? = null
+    private var fogSyncJob: Job? = null
+    private val fogSyncPolicy = app.trailveil.map.fog.FogSynchronizationRenderPolicy()
+    private val fogVisualProbePlanner = FogSnapshotVisualProbePlanner()
+    private var fogCoverageRenderer: FogViewportBatchCoverageRenderer? = null
+    private var fogAdapter: FogTileProviderAdapter? = null
+    private var fogOverlay: GoogleFogTileOverlayController? = null
+    private var fogGeneration: FogTileGeneration? = null
+    private var fogRenderJob: Job? = null
+    private var canonicalFogInstalledGeneration: Long? = null
+    private var canonicalFogPublishedGeneration: Long? = null
+    private var fogInstallTimeout: Runnable? = null
+    private var fogInstallPhase = GoogleFogInstallPhase.RUNTIME
+    private var failedFogInstallDiagnostic: GoogleFogInstallDiagnostic? = null
 
     private val mapLoadTimeout = Runnable {
-        if (!mapLoaded) {
+        if (lifecycleGate.callbacksAllowed() && !mapLoaded) {
             showFallback(ProviderFallbackReason.MAP_LOAD_TIMEOUT)
         }
     }
@@ -146,53 +219,429 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     }
 
     override fun onDestroy() {
+        lifecycleGate.markDestroyed()
         mainHandler.removeCallbacks(mapLoadTimeout)
+        cancelFogInstallTimeout()
+        fogRuntimeLoadJob?.cancel()
+        fogRuntimeLoadJob = null
+        fogSyncJob?.cancel()
+        fogSyncJob = null
+        fogRenderJob?.cancel()
+        fogRenderJob = null
+        fogGeneration?.cancel()
+        fogGeneration = null
+        canonicalFogPublishedGeneration = null
+        fogOverlay?.detach()
+        fogOverlay = null
+        fogAdapter = null
+        fogRuntime = null
+        fogCoverageRenderer = null
+        fogSyncPolicy.reset()
+        fogScope.cancel()
+        googleMap = null
         disposeMapView()
         super.onDestroy()
     }
 
     override fun onMapReady(map: GoogleMap) {
-        if (terminalFallback != null) return
-        map.setOnCameraMoveListener {
-            dispatchCameraChanged(map.cameraPosition.toPocCamera())
+        val lease = lifecycleGate.acquire() ?: return
+        if (!installFogOverlay(map, lease)) {
+            if (lifecycleGate.isCurrent(lease)) {
+                showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+            }
+            return
         }
-        map.setOnCameraIdleListener {
-            dispatchCameraIdle(map.cameraPosition.toPocCamera())
+        if (!lifecycleGate.isCurrent(lease)) {
+            fogOverlay?.detach()
+            fogOverlay = null
+            fogAdapter = null
+            return
         }
-        map.setOnCameraMoveStartedListener { reason ->
-            callbackStatus.text = getString(R.string.google_poc_camera_gesture_started, reason)
-            callbacks?.onCameraMoveStarted(reason)
+        googleMap = map
+        try {
+            map.setOnCameraMoveListener {
+                if (!lifecycleGate.isCurrent(lease)) return@setOnCameraMoveListener
+                dispatchCameraChanged(map.cameraPosition.toPocCamera())
+            }
+            map.setOnCameraIdleListener {
+                if (!lifecycleGate.isCurrent(lease)) return@setOnCameraIdleListener
+                val camera = map.cameraPosition
+                dispatchCameraIdle(camera.toPocCamera())
+                requestCanonicalFog(camera, lease)
+            }
+            map.setOnCameraMoveStartedListener { reason ->
+                if (!lifecycleGate.isCurrent(lease)) return@setOnCameraMoveStartedListener
+                beginFogGeneration(lease)
+                if (!lifecycleGate.isCurrent(lease)) return@setOnCameraMoveStartedListener
+                callbackStatus.text = getString(R.string.google_poc_camera_gesture_started, reason)
+                callbacks?.onCameraMoveStarted(reason)
+            }
+            map.setOnMapClickListener { point ->
+                if (!lifecycleGate.isCurrent(lease)) return@setOnMapClickListener
+                callbackStatus.text = getString(
+                    R.string.google_poc_map_click,
+                    point.latitude,
+                    point.longitude,
+                )
+                callbacks?.onMapClick(point.latitude, point.longitude)
+            }
+            map.setOnMapLongClickListener { point ->
+                if (!lifecycleGate.isCurrent(lease)) return@setOnMapLongClickListener
+                callbackStatus.text = getString(
+                    R.string.google_poc_map_long_click,
+                    point.latitude,
+                    point.longitude,
+                )
+                callbacks?.onMapLongClick(point.latitude, point.longitude)
+            }
+            map.setOnPoiClickListener { pointOfInterest ->
+                if (!lifecycleGate.isCurrent(lease)) return@setOnPoiClickListener
+                dispatchPointOfInterestClick(pointOfInterest.toPocPointOfInterest())
+            }
+            map.setOnMapLoadedCallback {
+                if (!lifecycleGate.isCurrent(lease)) return@setOnMapLoadedCallback
+                mapLoaded = true
+                mainHandler.removeCallbacks(mapLoadTimeout)
+                callbackStatus.setText(R.string.google_poc_map_loaded)
+                revealMapWhenCanonicalFogIsReady()
+            }
+            map.moveCamera(CameraUpdateFactory.newLatLngZoom(POC_START, POC_START_ZOOM))
+            initializeCanonicalFogRuntime(lease)
+            // The first canonical render is intentionally requested only by the completed baseline.
+        } catch (_: Exception) {
+            if (lifecycleGate.isCurrent(lease)) {
+                showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+            }
+        } catch (_: LinkageError) {
+            if (lifecycleGate.isCurrent(lease)) {
+                showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+            }
         }
-        map.setOnMapClickListener { point ->
-            callbackStatus.text = getString(
-                R.string.google_poc_map_click,
-                point.latitude,
-                point.longitude,
+    }
+
+    private fun installFogOverlay(
+        map: GoogleMap,
+        lease: GoogleFogLifecycleGate.Lease,
+    ): Boolean {
+        if (!lifecycleGate.isCurrent(lease)) return false
+        val adapter = FogTileProviderAdapter()
+        val controller = GoogleFogTileOverlayController(
+            map = map,
+            provider = GoogleFogTileProvider(adapter),
+        )
+        if (controller.attach() == null) {
+            controller.detach()
+            return false
+        }
+        if (!lifecycleGate.isCurrent(lease)) {
+            controller.detach()
+            return false
+        }
+        fogAdapter = adapter
+        fogOverlay = controller
+        return true
+    }
+
+    private fun initializeCanonicalFogRuntime(lease: GoogleFogLifecycleGate.Lease) {
+        if (!lifecycleGate.isCurrent(lease) || fogRuntimeLoadStarted) return
+        fogRuntimeLoadStarted = true
+        fogInstallPhase = GoogleFogInstallPhase.RUNTIME
+        val application = application as? TrailVeilApplication
+        if (application == null) {
+            showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+            return
+        }
+        fogRuntimeLoadJob = fogScope.launch {
+            try {
+                val runtime = withTimeout(FOG_RUNTIME_TIMEOUT_MILLIS) {
+                    withContext(Dispatchers.IO) {
+                        application.appContainer.fogRuntime()
+                    }
+                }
+                ensureActive()
+                if (!lifecycleGate.isCurrent(lease)) return@launch
+                fogRuntimeLoadJob = null
+                fogRuntime = runtime
+                fogCoverageRenderer = FogViewportBatchCoverageRenderer(
+                    subrenderer = FogViewportBatchSubrenderer { request, keys ->
+                        runtime.viewportCoordinator.renderTiles(request, keys)
+                    },
+                    maxTiles = MAX_VIEWPORT_FOG_TILES,
+                )
+                startCanonicalFogSynchronization(runtime, lease)
+            } catch (_: TimeoutCancellationException) {
+                if (lifecycleGate.isCurrent(lease)) {
+                    showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                if (lifecycleGate.isCurrent(lease)) {
+                    showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+                }
+            }
+        }
+    }
+
+    private fun startCanonicalFogSynchronization(
+        runtime: FogRuntime,
+        lease: GoogleFogLifecycleGate.Lease,
+    ) {
+        fogSyncJob?.cancel()
+        fogSyncPolicy.reset()
+        fogInstallPhase = GoogleFogInstallPhase.SYNCHRONIZATION
+        fogSyncJob = fogScope.launch {
+            try {
+                val baseline = withTimeout(FOG_SYNC_TIMEOUT_MILLIS) {
+                    withContext(Dispatchers.IO) {
+                        runtime.changeSynchronizer.synchronizeTo()
+                    }
+                }
+                ensureActive()
+                if (!lifecycleGate.isCurrent(lease)) return@launch
+                when (fogSyncPolicy.onBaselineSynchronized(baseline)) {
+                    FogSynchronizationRenderDecision.RENDER_CURRENT_CAMERA -> {
+                        googleMap?.let { map -> requestCanonicalFog(map.cameraPosition, lease) }
+                    }
+                    else -> Unit
+                }
+                runtime.pointChanges.revisionsAfter(baseline.cursor).collect { revision ->
+                    ensureActive()
+                    val synchronization = withTimeout(FOG_SYNC_TIMEOUT_MILLIS) {
+                        withContext(Dispatchers.IO) {
+                            runtime.changeSynchronizer.synchronizeTo(revision.latestCursor)
+                        }
+                    }
+                    ensureActive()
+                    if (!lifecycleGate.isCurrent(lease)) return@collect
+                    when (fogSyncPolicy.onRevisionSynchronized(synchronization)) {
+                        FogSynchronizationRenderDecision.REFRESH_CURRENT_CAMERA -> {
+                            val map = googleMap ?: return@collect
+                            if (!lifecycleGate.isCurrent(lease)) return@collect
+                            beginFogGeneration(lease)
+                            requestCanonicalFog(map.cameraPosition, lease)
+                        }
+                        FogSynchronizationRenderDecision.WAIT_FOR_BASELINE,
+                        FogSynchronizationRenderDecision.NO_REFRESH,
+                        FogSynchronizationRenderDecision.RENDER_CURRENT_CAMERA
+                        -> Unit
+                    }
+                }
+            } catch (_: TimeoutCancellationException) {
+                if (lifecycleGate.isCurrent(lease)) {
+                    keepCanonicalCoverVisible()
+                    showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                if (lifecycleGate.isCurrent(lease)) {
+                    keepCanonicalCoverVisible()
+                    showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+                }
+            }
+        }
+    }
+
+    /** Revokes old provider coverage before any movement-triggered canonical work starts. */
+    private fun beginFogGeneration(
+        lease: GoogleFogLifecycleGate.Lease? = null,
+    ): FogTileGeneration? {
+        if (!lifecycleGate.callbacksAllowed()) return null
+        if (lease != null && !lifecycleGate.isCurrent(lease)) return null
+        val adapter = fogAdapter ?: return null
+        fogRenderJob?.cancel()
+        fogRenderJob = null
+        fogGeneration?.cancel()
+        val generation = adapter.beginGeneration()
+        fogGeneration = generation
+        canonicalFogInstalledGeneration = null
+        canonicalFogPublishedGeneration = null
+        cancelFogInstallTimeout()
+        keepCanonicalCoverVisible()
+        if (fogOverlay?.onGenerationStarted(generation.id) != true) {
+            generation.cancel()
+            fogGeneration = null
+            showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+            return null
+        }
+        fogInstallPhase = GoogleFogInstallPhase.RENDER
+        return generation
+    }
+
+    private fun requestCanonicalFog(
+        camera: CameraPosition,
+        lease: GoogleFogLifecycleGate.Lease? = null,
+    ) {
+        if (!lifecycleGate.callbacksAllowed()) return
+        if (lease != null && !lifecycleGate.isCurrent(lease)) return
+        if (!fogSyncPolicy.canRender()) return
+        val coverageRenderer = fogCoverageRenderer ?: return
+        val adapter = fogAdapter ?: return
+        val coverageRequest = currentCoverageRequest(camera) ?: run {
+            showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+            return
+        }
+        val generation = fogGeneration?.takeIf { pending ->
+            FogGenerationReusePolicy.canReuse(
+                activeGenerationId = pending.id,
+                installedGenerationId = canonicalFogInstalledGeneration,
+                adapterIsCurrent = adapter.isCurrent(pending),
+            ) && canonicalFogPublishedGeneration != pending.id
+        } ?: beginFogGeneration() ?: return
+        fogRenderJob?.cancel()
+        val renderLease = lease ?: lifecycleGate.acquire() ?: return
+        fogRenderJob = fogScope.launch {
+            try {
+                val rendered = withTimeout(FOG_RENDER_TIMEOUT_MILLIS) {
+                    withContext(Dispatchers.IO) {
+                        coverageRenderer.render(coverageRequest)
+                    }
+                }
+                ensureActive()
+                if (!lifecycleGate.isCurrent(renderLease)) return@launch
+                val publication = withContext(Dispatchers.Default) {
+                    val published = adapter.publishMasks(generation, rendered)
+                    published to if (published) {
+                        fogVisualProbePlanner.plan(coverageRequest, rendered)
+                    } else {
+                        null
+                    }
+                }
+                val published = publication.first
+                val visualProbePlan = publication.second
+                ensureActive()
+                if (
+                    !lifecycleGate.isCurrent(renderLease) ||
+                    !published ||
+                    visualProbePlan == null ||
+                    fogGeneration !== generation ||
+                    !adapter.isCurrent(generation)
+                ) {
+                    return@launch
+                }
+                canonicalFogPublishedGeneration = generation.id
+                val controller = fogOverlay
+                if (controller == null) {
+                    showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+                    return@launch
+                }
+                scheduleFogInstallTimeout(generation, adapter, renderLease)
+                fogInstallPhase = GoogleFogInstallPhase.TILE_DELIVERY
+                val refreshStarted = controller.onCanonicalPublished(
+                    generation = generation.id,
+                    visualProbePlan = visualProbePlan,
+                ) { installed ->
+                    if (
+                        !lifecycleGate.isCurrent(renderLease) ||
+                        fogGeneration !== generation ||
+                        !adapter.isCurrent(generation)
+                    ) {
+                        return@onCanonicalPublished
+                    }
+                    cancelFogInstallTimeout()
+                    if (!installed) {
+                        fogInstallPhase = GoogleFogInstallPhase.SNAPSHOT
+                        showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+                        return@onCanonicalPublished
+                    }
+                    canonicalFogInstalledGeneration = generation.id
+                    canonicalFogPublishedGeneration = generation.id
+                    fogInstallPhase = GoogleFogInstallPhase.INSTALLED
+                    revealMapWhenCanonicalFogIsReady()
+                    callbacks?.onCanonicalFogInstalled(generation.id)
+                }
+                if (!refreshStarted) {
+                    cancelFogInstallTimeout()
+                    fogInstallPhase = GoogleFogInstallPhase.REFRESH_REJECTED
+                    showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+                }
+            } catch (_: TimeoutCancellationException) {
+                if (
+                    lifecycleGate.isCurrent(renderLease) &&
+                    fogGeneration === generation &&
+                    adapter.isCurrent(generation)
+                ) {
+                    showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+                }
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                if (
+                    lifecycleGate.isCurrent(renderLease) &&
+                    fogGeneration === generation &&
+                    adapter.isCurrent(generation)
+                ) {
+                    showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+                }
+            }
+        }
+    }
+
+    /** Captures SDK projection state on the main thread before any background canonical work. */
+    private fun currentCoverageRequest(camera: CameraPosition): FogViewportCoverageRequest? {
+        val map = googleMap ?: return null
+        return try {
+            val visible = map.projection.visibleRegion
+            FogViewportCoverageRequest(
+                center = camera.target.toFogGeoPoint(),
+                floorZoom = floor(camera.zoom.toDouble()).toInt().coerceIn(0, 22),
+                nearLeft = visible.nearLeft.toFogGeoPoint(),
+                farLeft = visible.farLeft.toFogGeoPoint(),
+                farRight = visible.farRight.toFogGeoPoint(),
+                nearRight = visible.nearRight.toFogGeoPoint(),
             )
-            callbacks?.onMapClick(point.latitude, point.longitude)
+        } catch (_: Exception) {
+            null
+        } catch (_: LinkageError) {
+            null
         }
-        map.setOnMapLongClickListener { point ->
-            callbackStatus.text = getString(
-                R.string.google_poc_map_long_click,
-                point.latitude,
-                point.longitude,
-            )
-            callbacks?.onMapLongClick(point.latitude, point.longitude)
-        }
-        map.setOnPoiClickListener { pointOfInterest ->
-            dispatchPointOfInterestClick(pointOfInterest.toPocPointOfInterest())
-        }
-        map.moveCamera(CameraUpdateFactory.newLatLngZoom(POC_START, POC_START_ZOOM))
-        map.setOnMapLoadedCallback {
-            if (terminalFallback != null) return@setOnMapLoadedCallback
-            mapLoaded = true
-            mainHandler.removeCallbacks(mapLoadTimeout)
+    }
+
+    private fun revealMapWhenCanonicalFogIsReady() {
+        if (
+            lifecycleGate.callbacksAllowed() &&
+            mapLoaded &&
+            canonicalFogInstalledGeneration != null
+        ) {
             mapView?.visibility = View.VISIBLE
             fallback.visibility = View.GONE
             callbackStatus.visibility = View.VISIBLE
-            callbackStatus.setText(R.string.google_poc_map_loaded)
             root.bringChildToFront(callbackStatus)
         }
+    }
+
+    private fun keepCanonicalCoverVisible() {
+        if (!lifecycleGate.callbacksAllowed()) return
+        fallback.visibility = View.VISIBLE
+        callbackStatus.visibility = View.GONE
+        root.bringChildToFront(fallback)
+    }
+
+    private fun scheduleFogInstallTimeout(
+        generation: FogTileGeneration,
+        adapter: FogTileProviderAdapter,
+        lease: GoogleFogLifecycleGate.Lease,
+    ) {
+        cancelFogInstallTimeout()
+        val timeout = Runnable {
+            fogInstallTimeout = null
+            if (
+                lifecycleGate.isCurrent(lease) &&
+                fogGeneration === generation &&
+                adapter.isCurrent(generation) &&
+                canonicalFogInstalledGeneration != generation.id
+            ) {
+                showFallback(ProviderFallbackReason.INITIALIZATION_FAILURE)
+            }
+        }
+        fogInstallTimeout = timeout
+        mainHandler.postDelayed(timeout, FOG_INSTALL_TIMEOUT_MILLIS)
+    }
+
+    private fun cancelFogInstallTimeout() {
+        fogInstallTimeout?.let(mainHandler::removeCallbacks)
+        fogInstallTimeout = null
     }
 
     private fun createLocalSurface() {
@@ -235,8 +684,28 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     }
 
     private fun showFallback(reason: ProviderFallbackReason) {
+        if (!lifecycleGate.enterTerminalFallback()) return
+        failedFogInstallDiagnostic = fogInstallDiagnosticForTesting()
         terminalFallback = reason
         mapLoaded = false
+        googleMap = null
+        fogRuntimeLoadJob?.cancel()
+        fogRuntimeLoadJob = null
+        fogSyncJob?.cancel()
+        fogSyncJob = null
+        fogRenderJob?.cancel()
+        fogRenderJob = null
+        fogGeneration?.cancel()
+        fogGeneration = null
+        canonicalFogInstalledGeneration = null
+        canonicalFogPublishedGeneration = null
+        cancelFogInstallTimeout()
+        fogOverlay?.detach()
+        fogOverlay = null
+        fogAdapter = null
+        fogRuntime = null
+        fogCoverageRenderer = null
+        fogSyncPolicy.reset()
         mainHandler.removeCallbacks(mapLoadTimeout)
         disposeMapView()
         fallback.visibility = View.VISIBLE
@@ -245,7 +714,44 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
         root.bringChildToFront(fallback)
     }
 
+    /** Coordinate-free state used by the opt-in AVD engineering harness. */
+    fun fogInstallDiagnosticForTesting(): GoogleFogInstallDiagnostic =
+        failedFogInstallDiagnostic ?: fogOverlay?.let { controller ->
+            val refresh = controller.refreshSnapshot()
+            val visual = controller.visualProof()
+            GoogleFogInstallDiagnostic(
+                phase = fogInstallPhase,
+                pendingTileCount = controller.pendingCanonicalTileCount(),
+                refreshFailure = controller.refreshFailure(),
+                clearFailureClass = controller.clearFailureClass(),
+                refreshGeneration = refresh.generation,
+                refreshStarted = refresh.generationStarted,
+                refreshPublished = refresh.canonicalPublished,
+                visualRequiredTileCount = visual.requiredTileCount,
+                visualVerifiedTileCount = visual.verifiedTileCount,
+                snapshotAttempt = visual.snapshotAttempt,
+                visualOffScreenOnlyTileCount = visual.offScreenOnlyTileCount,
+                visualMismatchedTileCount = visual.mismatchedTileCount,
+                visualMinimumOnScreenProbeCount = visual.minimumOnScreenProbeCount,
+            )
+        } ?: GoogleFogInstallDiagnostic(
+            phase = fogInstallPhase,
+            pendingTileCount = null,
+            refreshFailure = GoogleFogRefreshFailure.NOT_ATTACHED,
+            clearFailureClass = null,
+            refreshGeneration = null,
+            refreshStarted = false,
+            refreshPublished = false,
+            visualRequiredTileCount = 0,
+            visualVerifiedTileCount = 0,
+            snapshotAttempt = 0,
+            visualOffScreenOnlyTileCount = 0,
+            visualMismatchedTileCount = 0,
+            visualMinimumOnScreenProbeCount = 0,
+        )
+
     private fun forwardLifecycleCall(action: MapView.() -> Unit) {
+        if (!lifecycleGate.callbacksAllowed()) return
         val view = mapView ?: return
         try {
             view.action()
@@ -271,6 +777,7 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     }
 
     private fun dispatchCameraChanged(camera: GoogleMapsPocCamera) {
+        if (!lifecycleGate.callbacksAllowed()) return
         callbackStatus.text = getString(
             R.string.google_poc_camera_changed,
             camera.latitude,
@@ -281,6 +788,7 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     }
 
     private fun dispatchCameraIdle(camera: GoogleMapsPocCamera) {
+        if (!lifecycleGate.callbacksAllowed()) return
         callbackStatus.text = getString(
             R.string.google_poc_camera_idle,
             camera.latitude,
@@ -291,6 +799,7 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     }
 
     private fun dispatchPointOfInterestClick(pointOfInterest: GoogleMapsPocPointOfInterest) {
+        if (!lifecycleGate.callbacksAllowed()) return
         callbackStatus.text = getString(
             R.string.google_poc_poi_click,
             pointOfInterest.name,
@@ -325,6 +834,11 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
 
     private companion object {
         const val MAP_LOAD_TIMEOUT_MILLIS = 30_000L
+        const val FOG_RUNTIME_TIMEOUT_MILLIS = 10_000L
+        const val FOG_SYNC_TIMEOUT_MILLIS = 15_000L
+        const val FOG_RENDER_TIMEOUT_MILLIS = 30_000L
+        const val FOG_INSTALL_TIMEOUT_MILLIS = 15_000L
+        const val MAX_VIEWPORT_FOG_TILES = 256
         val POC_START = LatLng(25.033_964, 121.564_468)
         const val POC_START_ZOOM = 16F
         const val FALLBACK_TAG = "trailveil_google_poc_fallback"
@@ -362,3 +876,8 @@ private fun PointOfInterest.toPocPointOfInterest(): GoogleMapsPocPointOfInterest
         placeId = placeId,
         latLng = latLng,
     )
+
+private fun LatLng.toFogGeoPoint(): GeoPoint = GeoPoint(
+    latitude = latitude,
+    longitude = longitude,
+)

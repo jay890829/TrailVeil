@@ -39,6 +39,18 @@ val internalStoreFile = internalSigningProperties
     }
 val repositoryRoot = rootProject.projectDir.canonicalFile
 
+private val androidTestBuildTypeProperty = "trailveilAndroidTestBuildType"
+private val androidTestBuildType = providers
+    .gradleProperty(androidTestBuildTypeProperty)
+    .orElse("debug")
+    .get()
+    .trim()
+    .also { buildType ->
+        require(buildType in setOf("debug", "googlePoc")) {
+            "$androidTestBuildTypeProperty must be debug or googlePoc; received '$buildType'"
+        }
+    }
+
 private val googlePocMissingKeySentinel = "TRAILVEIL_GOOGLE_MAPS_POC_MISSING_KEY"
 private val googlePocKeyPattern = Regex("^AIza[A-Za-z0-9_-]{35}$")
 private val googlePocKeyFingerprintPattern = Regex("^[a-f0-9]{64}$")
@@ -282,6 +294,9 @@ tasks.configureEach {
 android {
     namespace = "app.trailveil"
     compileSdk = 37
+    // Keep the ordinary instrumentation graph on debug. The Google PoC test source set is only
+    // selected when an operator explicitly opts into the isolated googlePoc test variant.
+    testBuildType = androidTestBuildType
 
     defaultConfig {
         applicationId = "app.trailveil"

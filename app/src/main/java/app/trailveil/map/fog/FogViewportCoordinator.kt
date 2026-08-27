@@ -28,6 +28,27 @@ data class FogViewportRender(
     val mosaic: FogTileMosaic,
 )
 
+/** One complete rectangular tile batch before provider-specific encoding or mosaic composition. */
+data class FogViewportTileRender(
+    val request: FogViewportRequest,
+    val keys: List<FogTileKey>,
+    val queryBounds: ViewportBounds?,
+    val tiles: List<FogMosaicTile>,
+) {
+    init {
+        require(keys.isNotEmpty()) { "viewport tile render must not be empty" }
+        require(keys.toSet().size == keys.size) {
+            "viewport tile render keys must be unique"
+        }
+        require(tiles.map(FogMosaicTile::key) == keys) {
+            "viewport tile masks must exactly match the requested key order"
+        }
+    }
+
+    fun masksByKey(): Map<FogTileKey, FogPixelMask> =
+        tiles.associate { tile -> tile.key to tile.mask }
+}
+
 class FogRuntime(
     val viewportCoordinator: FogViewportCoordinator,
     val pointChanges: PersistedTrackPointChangeFeed,
@@ -73,6 +94,47 @@ class FogViewportCoordinator(
             zoom = renderZoom(request.mapZoom),
             renderVersion = renderVersion,
         )
+        val rendered = renderTilesLocked(request, keys)
+        FogViewportRender(
+            request = request,
+            keys = rendered.keys,
+            queryBounds = rendered.queryBounds,
+            mosaic = FogPocMosaic.compose(rendered.tiles).anchoredNear(request.center.longitude),
+        )
+    }
+
+    /**
+     * Renders one complete provider viewport with a single bounded Room selection.
+     *
+     * [keys] must be one row-major rectangular XYZ window at this request's render zoom. This is
+     * the batch seam used by providers whose visible screen needs more than the legacy 3x3 mosaic;
+     * it deliberately reuses the same mutex, caches, spatial selection and canonical renderer.
+     */
+    suspend fun renderTiles(
+        request: FogViewportRequest,
+        keys: List<FogTileKey>,
+    ): FogViewportTileRender = mutex.withLock {
+        require(keys.size <= MAX_PROVIDER_VIEWPORT_TILES) {
+            "provider viewport exceeds $MAX_PROVIDER_VIEWPORT_TILES tiles"
+        }
+        require(keys.toSet().size == keys.size) {
+            "provider viewport keys must be unique"
+        }
+        require(keys.all { key ->
+            key.zoom == renderZoom(request.mapZoom) && key.renderVersion == renderVersion
+        }) {
+            "provider viewport keys must match request zoom and render version"
+        }
+        // Validates non-empty, shared identity and a complete row-major rectangle even on a
+        // completely warm cache where no query bounds would otherwise be constructed.
+        FogViewportTileGrid.queryBounds(keys, marginMeters = 0.0)
+        renderTilesLocked(request, keys)
+    }
+
+    private suspend fun renderTilesLocked(
+        request: FogViewportRequest,
+        keys: List<FogTileKey>,
+    ): FogViewportTileRender {
         // Ask the caches what is actually missing before reading anything. A tile window at low
         // zoom is the whole world, so reading for tiles that were already cached made every
         // settle out there a full-table read - invisible against a test database of forty points,
@@ -113,11 +175,11 @@ class FogViewportCoordinator(
                     ?: pipeline.load(key, selected[key].orEmpty()).mask,
             )
         }
-        FogViewportRender(
+        return FogViewportTileRender(
             request = request,
             keys = keys,
             queryBounds = queryBounds,
-            mosaic = FogPocMosaic.compose(tiles).anchoredNear(request.center.longitude),
+            tiles = tiles,
         )
     }
 
@@ -174,6 +236,7 @@ class FogViewportCoordinator(
     companion object {
         // 100 m/s * 60 s accepted continuity ceiling + 25 m reveal radius + rounding allowance.
         const val DEFAULT_QUERY_MARGIN_METERS = 6_100.0
+        const val MAX_PROVIDER_VIEWPORT_TILES = 256
     }
 }
 
