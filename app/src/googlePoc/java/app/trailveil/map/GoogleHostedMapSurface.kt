@@ -113,6 +113,20 @@ private fun claimCameraFlight(
 /** Logcat tag of the googlePoc-only map-ready breadcrumb read by the process-death driver. */
 private const val MAP_READY_LOG_TAG = "TrailVeilMapReady"
 
+// LogNotTimber: the breadcrumb stays on android.util.Log deliberately. TrailVeil plants no Timber
+// tree (Timber only arrives transitively through a map SDK), so a Timber call would log nothing, and
+// `.github/scripts/verify-process-death-restoration.sh` reads this exact tag with
+// `adb logcat -s TrailVeilMapReady:I`. Counts and booleans only; never a coordinate.
+@Suppress("LogNotTimber")
+private fun logMapReady(mapView: View, restoredState: Bundle?) {
+    Log.i(
+        MAP_READY_LOG_TAG,
+        "map-ready restored=${restoredState != null}" +
+            " keys=${restoredState?.keySet()?.size ?: 0}" +
+            " cameraDefault=${mapView.getTag(R.id.map_camera_default_at_ready)}",
+    )
+}
+
 /** Composition-owned hosted map with the production canonical-fog binding. */
 @Composable
 internal fun GoogleHostedMapSurface(
@@ -453,12 +467,7 @@ internal fun GoogleHostedMapSurface(
                 // Host-observable, coordinate-free breadcrumb for the process-death driver script:
                 // whether a provider-tagged envelope was restored, how many SDK keys its payload
                 // carried, and whether the camera is still the SDK default. Counts and booleans.
-                Log.i(
-                    MAP_READY_LOG_TAG,
-                    "map-ready restored=${restoredState != null}" +
-                        " keys=${restoredState?.keySet()?.size ?: 0}" +
-                        " cameraDefault=${mapView.getTag(R.id.map_camera_default_at_ready)}",
-                )
+                logMapReady(mapView, restoredState)
                 try {
                     // Register the detail load callback before constructing the binding. A Google
                     // map can finish its first frame before getMapAsync returns; early registration

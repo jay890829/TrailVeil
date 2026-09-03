@@ -316,6 +316,10 @@ class HistoryDetailPopLifecycleTest {
         )
     }
 
+    // LogNotTimber: this diagnostic line stays on android.util.Log on purpose. TrailVeil plants no
+    // Timber tree (Timber is only MapLibre's transitive dependency), so a Timber call would log
+    // nothing, and the stage-9 evidence greps this fixed tag from `adb logcat`. Counts only.
+    @Suppress("LogNotTimber")
     private fun calibrateWholeWindowMapDetector(
         mapView: MapView,
         map: MapLibreMap,

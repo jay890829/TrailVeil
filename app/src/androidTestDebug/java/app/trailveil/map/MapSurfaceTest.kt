@@ -7171,6 +7171,10 @@ class MapSurfaceTest {
      *
      * Only valid for a settled camera: it needs two frames of the same view.
      */
+    // LogNotTimber: this diagnostic line stays on android.util.Log on purpose. TrailVeil plants no
+    // Timber tree (Timber is only MapLibre's transitive dependency), so a Timber call would log
+    // nothing, and the stage-9 evidence greps this fixed tag from `adb logcat`. Counts only.
+    @Suppress("LogNotTimber")
     private fun MapLibreMap.auditFogCoverage(): FogAudit {
         // Both frames are held to one standard - two bit-identical fully rendered snapshots -
         // and the pair is bracketed: a second fogged frame taken after the bare reference must
