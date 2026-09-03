@@ -8,6 +8,8 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.floor
 import kotlin.math.max
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -80,6 +82,13 @@ class FogViewportCoordinator(
     private val mutex = Mutex()
     private val placeholderRenderer = FogTileRenderer(style)
     private val invalidator = FogTileInvalidator(0..22, style)
+
+    /**
+     * Whether the process-scoped lock is held right now. A device test that finds a map with a
+     * runtime, a built binding and no generation cannot otherwise tell a surface waiting on this
+     * lock from one that never asked; a suspended holder shows in no thread dump.
+     */
+    internal val isLockedForTesting: Boolean get() = mutex.isLocked
 
     init {
         require(renderVersion >= 0) { "renderVersion must be non-negative" }
@@ -214,9 +223,16 @@ class FogViewportCoordinator(
             if (updates.isEmpty()) {
                 return@withLock FogRevealMerge(emptySet(), emptySet())
             }
-            val keys = updates
-                .flatMap { update -> invalidator.affectedKeys(update, renderVersion) }
-                .toSet()
+            val keys = buildSet {
+                updates.forEach { update ->
+                    // A page carries up to 256 points and this scan spans every zoom level, so the
+                    // loop is long enough that a caller's timeout has to be able to reach it.
+                    // Without a cancellation point the shared lock stays held long past that
+                    // timeout and every other surface in the process starves behind it.
+                    currentCoroutineContext().ensureActive()
+                    addAll(invalidator.affectedKeys(update, renderVersion, ::worthInvalidating))
+                }
+            }
             val segments = updates.mapIndexed { index, update ->
                 TrackSegment(
                     id = index,
@@ -229,6 +245,18 @@ class FogViewportCoordinator(
         }
 
     suspend fun clearDerivedCache() = mutex.withLock { pipeline.clear() }
+
+    /**
+     * Whether the exact invalidation answer for [key] can change what the merge keeps.
+     *
+     * [FogTilePipeline.mergeReveal] reports an uncached tile as missing and leaves it to be rebuilt
+     * from canonical Room data, so testing one buys an answer that is then discarded. The scan
+     * spans all 23 zoom levels, while the memory and disk caches together hold only the tiles that
+     * were actually rendered (loadCached promotes a disk hit), so almost every candidate is in that
+     * discarded majority: the merge is bounded by what the caches hold, and skipping the rest is
+     * the difference between tens of seconds and milliseconds for one page.
+     */
+    private fun worthInvalidating(key: FogTileKey): Boolean = pipeline.loadCached(key) != null
 
     private fun renderZoom(mapZoom: Double): Int =
         floor(mapZoom).toInt().coerceIn(0, 22)

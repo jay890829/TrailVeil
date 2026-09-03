@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="map_loading">正在載入線上底圖…</string>
+    <string name="map_fog_unavailable">探索圖層無法使用，未知區域會保持遮蔽</string>
     <string name="google_poc_loading">正在載入 Google 地圖…</string>
     <string name="google_poc_map_loaded">Google 地圖已載入；拖曳或點按地圖即可觀察回呼。</string>
     <string name="google_poc_camera_gesture_started">相機手勢已開始（原因=%1$d）</string>
@@ -16,4 +18,10 @@
     <string name="google_poc_reason_load_timeout">Google 地圖未在時限內完成載入。</string>
     <string name="google_poc_fallback_without_guidance">Google Maps PoC 無法使用。\n%1$s\n\n探索記錄與歷史資料仍保存在本機，且未受影響。</string>
     <string name="google_poc_fallback_with_guidance">Google Maps PoC 無法使用。\n%1$s\n\n%2$s\n\n探索記錄與歷史資料仍保存在本機，且未受影響。</string>
+    <string name="map_provider_unavailable_missing_key">線上地圖目前無法使用：此版本未設定地圖金鑰。</string>
+    <string name="map_provider_unavailable_invalid_key">線上地圖目前無法使用：此版本的地圖金鑰無效。</string>
+    <string name="map_provider_unavailable_no_network">線上地圖目前無法使用：沒有可用的網際網路連線。</string>
+    <string name="map_provider_unavailable_no_play_services">線上地圖目前無法使用：這台裝置缺少或停用了相容的 Google Play 服務。</string>
+    <string name="map_provider_unavailable_initialization_failure">線上地圖無法啟動。</string>
+    <string name="map_provider_unavailable_reassurance">足跡記錄與探索歷史都保存在這台裝置上，功能不受影響。</string>
 </resources>

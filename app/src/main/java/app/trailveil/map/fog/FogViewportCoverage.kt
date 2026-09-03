@@ -39,6 +39,28 @@ data class FogViewportCoverageRequest(
 }
 
 /**
+ * True only when both the current visible floor-zoom rectangle and every renderer-observed LOD
+ * request are already present in the published immutable generation. Unlike a raw geographic bbox,
+ * this uses real tile prefetch as the surround: small movement inside prepared tiles stays visible,
+ * while the first request outside them fails immediately to the safety cover.
+ */
+fun fogViewportCoveredByPublishedTiles(
+    viewport: FogViewportCoverageRequest,
+    recentActualRequests: Set<FogTileKey>,
+    publishedKeys: Set<FogTileKey>,
+    planner: FogViewportCoveragePlanner = FogViewportCoveragePlanner(),
+): Boolean {
+    if (publishedKeys.isEmpty()) return false
+    val predicted = try {
+        planner.plan(viewport).keySet
+    } catch (_: IllegalArgumentException) {
+        return false
+    }
+    return publishedKeys.containsAll(predicted) &&
+        publishedKeys.containsAll(recentActualRequests)
+}
+
+/**
  * A finite, deterministic set of canonical XYZ keys covering one complete viewport.
  *
  * [keys] is row-major (north-to-south, then west-to-east in the camera's unwrapped world copy).

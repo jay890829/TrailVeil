@@ -32,7 +32,20 @@ class FogTileInvalidator(
         this.zoomLevels = zoomLevels.toList()
     }
 
-    fun affectedKeys(update: FogRevealUpdate, renderVersion: Int): Set<FogTileKey> {
+    /**
+     * The tiles whose rendered pixels change because of one persisted update.
+     *
+     * [worthTesting] is asked about each conservative candidate before the exact comparison is paid
+     * for, and a rejected candidate is absent from the result. Comparing masks costs two full tile
+     * renders, and this scan covers every configured zoom level, so a caller that already knows an
+     * answer would be discarded can use this to avoid producing it. Rejecting a candidate whose
+     * answer is used would under-report invalidation and leave a stale cached tile.
+     */
+    fun affectedKeys(
+        update: FogRevealUpdate,
+        renderVersion: Int,
+        worthTesting: (FogTileKey) -> Boolean = { true },
+    ): Set<FogTileKey> {
         require(renderVersion >= 0) { "renderVersion must be non-negative" }
         val before = update.previousInSegment
             ?.let { previous -> listOf(TrackSegment(id = 0, points = listOf(previous))) }
@@ -50,6 +63,7 @@ class FogTileInvalidator(
                     afterPoints
                 }
                 candidateKeys(candidatePoints, zoom, renderVersion).forEach { key ->
+                    if (!worthTesting(key)) return@forEach
                     if (renderer.render(key, before) != renderer.render(key, after)) {
                         add(key)
                     }

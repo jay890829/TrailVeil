@@ -7,4 +7,6 @@
     <item name="recording_presentation_latest_outcome" type="id" />
     <item name="recording_presentation_state" type="id" />
     <item name="recording_notification_start_continuation" type="id" />
+    <item name="recording_entry_fog_runtime_loaded" type="id" />
+    <item name="recording_entry_composition" type="id" />
 </resources>

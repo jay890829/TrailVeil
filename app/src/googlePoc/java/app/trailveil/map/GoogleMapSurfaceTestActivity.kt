@@ -1,0 +1,132 @@
+package app.trailveil.map
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Modifier
+import app.trailveil.map.fog.GeoPoint
+import app.trailveil.map.fog.FogRuntime
+import app.trailveil.ui.theme.TrailVeilTheme
+import com.google.android.gms.maps.GoogleMap
+import com.google.android.gms.maps.MapView
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+
+/** Unexported googlePoc-only host for real Activity recreation and forced terminal paths. */
+internal class GoogleMapSurfaceTestActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        // Stage 9: a test may replay a bundle captured from a previous instance's
+        // onSaveInstanceState as if the framework had restored it. This is the only seam through
+        // which the provider-tag envelope filter can be exercised with a REAL envelope; the
+        // framework offers no way to inject one into a launch.
+        val planted = GoogleMapSurfaceTestHooks.plantedSavedInstanceState
+        GoogleMapSurfaceTestHooks.plantedSavedInstanceState = null
+        super.onCreate(planted ?: savedInstanceState)
+        setContent {
+            TrailVeilTheme {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    fogRequired = GoogleMapSurfaceTestHooks.fogRequired,
+                    fogRuntime = GoogleMapSurfaceTestHooks.fogRuntime,
+                    fallbackTimeoutMillis = 30_000L,
+                    fogCoverTimeoutMillisForTesting =
+                        GoogleMapSurfaceTestHooks.fogCoverTimeoutMillis,
+                    providerStartupDecisionForTesting = GoogleMapSurfaceTestHooks.decision.get(),
+                    cameraRequest = GoogleMapSurfaceTestHooks.cameraRequestState.value
+                        ?: GoogleMapSurfaceTestHooks.cameraRequest,
+                    currentLocation = GoogleMapSurfaceTestHooks.currentLocationState.value
+                        ?: GoogleMapSurfaceTestHooks.currentLocation,
+                    followLocation = GoogleMapSurfaceTestHooks.followLocationState.value
+                        ?: GoogleMapSurfaceTestHooks.followLocation,
+                    trackOverlay = GoogleMapSurfaceTestHooks.trackOverlay,
+                    onUserMovedCamera = {
+                        GoogleMapSurfaceTestHooks.userMovedCount.incrementAndGet()
+                    },
+                    onMapReadyForTesting = { map ->
+                        GoogleMapSurfaceTestHooks.onMapReady.get()?.invoke(map)
+                    },
+                    onMapViewCreatedForTesting = { view ->
+                        GoogleMapSurfaceTestHooks.onMapViewCreated.get()?.invoke(view)
+                    },
+                    onMapLoadStateForTesting = { state ->
+                        GoogleMapSurfaceTestHooks.onMapLoadState.get()?.invoke(state)
+                    },
+                    onFogStateForTesting = { state ->
+                        GoogleMapSurfaceTestHooks.onFogState.get()?.invoke(state)
+                    },
+                    onFogProofForTesting = { observation ->
+                        GoogleMapSurfaceTestHooks.onFogProof.get()?.invoke(observation)
+                    },
+                    onOverlayVisibilityForTesting = { visible ->
+                        GoogleMapSurfaceTestHooks.onOverlayVisibility.get()?.invoke(visible)
+                    },
+                    onOverlayObservationForTesting = { observation ->
+                        GoogleMapSurfaceTestHooks.onOverlayObservation.get()?.invoke(observation)
+                    },
+                    cameraRequestDurationMillisForTesting =
+                        GoogleMapSurfaceTestHooks.cameraRequestDurationMillis,
+                )
+            }
+        }
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        GoogleMapSurfaceTestHooks.onSaveInstanceState.get()?.invoke(outState)
+    }
+}
+
+internal object GoogleMapSurfaceTestHooks {
+    val decision = AtomicReference<ProviderStartupDecision?>(null)
+    val onMapReady = AtomicReference<((GoogleMap) -> Unit)?>(null)
+    val onMapViewCreated = AtomicReference<((MapView) -> Unit)?>(null)
+    val onMapLoadState = AtomicReference<((BasemapLoadState) -> Unit)?>(null)
+    val onFogState = AtomicReference<((GoogleCanonicalFogState) -> Unit)?>(null)
+    val onFogProof = AtomicReference<((GoogleFogProofObservation) -> Unit)?>(null)
+    val onOverlayVisibility = AtomicReference<((Boolean) -> Unit)?>(null)
+    val onOverlayObservation =
+        AtomicReference<((GoogleMapOverlayObservation) -> Unit)?>(null)
+    val userMovedCount = AtomicInteger(0)
+    @Volatile var fogRequired: Boolean = false
+    @Volatile var fogRuntime: FogRuntime? = null
+    @Volatile var fogCoverTimeoutMillis: Long = 20_000L
+    @Volatile var cameraRequest: MapCameraRequest? = null
+    @Volatile var currentLocation: GeoPoint? = null
+    @Volatile var followLocation: GeoPoint? = null
+    @Volatile var trackOverlay: MapTrackOverlay? = null
+    @Volatile var cameraRequestDurationMillis: Int? = null
+    val currentLocationState = mutableStateOf<GeoPoint?>(null)
+    val followLocationState = mutableStateOf<GeoPoint?>(null)
+    val cameraRequestState = mutableStateOf<MapCameraRequest?>(null)
+
+    /** Replayed exactly once by the next `GoogleMapSurfaceTestActivity.onCreate`, then cleared. */
+    @Volatile var plantedSavedInstanceState: Bundle? = null
+    val onSaveInstanceState = AtomicReference<((Bundle) -> Unit)?>(null)
+
+    fun reset() {
+        decision.set(null)
+        onMapReady.set(null)
+        onMapViewCreated.set(null)
+        onMapLoadState.set(null)
+        onFogState.set(null)
+        onFogProof.set(null)
+        onOverlayVisibility.set(null)
+        onOverlayObservation.set(null)
+        userMovedCount.set(0)
+        fogRequired = false
+        fogRuntime = null
+        fogCoverTimeoutMillis = 20_000L
+        cameraRequest = null
+        currentLocation = null
+        followLocation = null
+        trackOverlay = null
+        cameraRequestDurationMillis = null
+        currentLocationState.value = null
+        followLocationState.value = null
+        cameraRequestState.value = null
+        plantedSavedInstanceState = null
+        onSaveInstanceState.set(null)
+    }
+}

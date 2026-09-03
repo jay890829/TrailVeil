@@ -55,6 +55,10 @@ internal fun RecordingEntryRoute(
     onOpenHistory: () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
+    DisposableEffect(Unit) {
+        ACTIVE_ROUTE_COMPOSITIONS.incrementAndGet()
+        onDispose { ACTIVE_ROUTE_COMPOSITIONS.decrementAndGet() }
+    }
     val historyStore = remember(activity.applicationContext) {
         PermissionHistoryStore(activity.applicationContext)
     }
@@ -467,6 +471,15 @@ internal fun RecordingEntryRoute(
             R.id.recording_presentation_latest_point_id,
             recordingPresentation.latestAcceptedPoint?.id,
         )
+        // Whether this route has handed the map its fog runtime yet. A map whose cover never
+        // lowers is indistinguishable from outside between "no runtime was ever delivered" and
+        // "delivered and the binding failed"; the two need opposite fixes. Boolean only.
+        activity.window.decorView.setTag(R.id.recording_entry_fog_runtime_loaded, fogRuntime != null)
+        activity.window.decorView.setTag(
+            R.id.recording_entry_composition,
+            "historyLoaded=$latestHistoryLoaded reconciled=$startupReconciled " +
+                "summary=${latestSessionSummary != null} activeRoutes=${ACTIVE_ROUTE_COMPOSITIONS.get()}",
+        )
         activity.window.decorView.setTag(
             R.id.recording_presentation_latest_outcome,
             latestSessionSummary?.latestOperationOutcome?.value,
@@ -686,6 +699,9 @@ internal fun RecordingEntryRoute(
         followLocation = currentLocation.takeIf { following },
     )
 }
+
+/** How many entry-route compositions are alive; a view-tree diagnostic, never product logic. */
+private val ACTIVE_ROUTE_COMPOSITIONS = java.util.concurrent.atomic.AtomicInteger(0)
 
 private fun Activity.readRecordingPermissionSnapshot(
     history: PermissionHistory,

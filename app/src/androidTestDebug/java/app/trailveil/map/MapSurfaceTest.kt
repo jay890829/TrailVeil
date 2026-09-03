@@ -3286,7 +3286,7 @@ class MapSurfaceTest {
      * seconds over seven layers, and a basemap that is still loading changes underneath it.
      */
     private fun MapLibreMap.measureQuadAlone(id: String): FogAudit {
-        val bare = snapshotStableBarePixels("single-quad reference for $id")
+        val bare = snapshotStablePixels("single-quad reference for $id")
         setSingleFogLayerVisible(id, true)
         val only = snapshotPixels()
         setSingleFogLayerVisible(id, false)
@@ -7172,7 +7172,35 @@ class MapSurfaceTest {
      * Only valid for a settled camera: it needs two frames of the same view.
      */
     private fun MapLibreMap.auditFogCoverage(): FogAudit {
-        return auditFogCoverage(snapshotPixels())
+        // Both frames are held to one standard - two bit-identical fully rendered snapshots -
+        // and the pair is bracketed: a second fogged frame taken after the bare reference must
+        // match the first, or the basemap changed underneath the audit (a tile or a label
+        // landing between the two captures) and the pair is taken again. V02-005 stage 9
+        // found a single fogged snapshot at the settled hold of a pinch on the production
+        // style carrying placeholder tiles the stable bare frame no longer had: scattered
+        // interior pixels brighter under fog than bare (black fog cannot brighten anything),
+        // 0.07-0.13 % of the frame against the 0.1 % limit - and then that each frame being
+        // stable on its own was not enough, because a tile can still land in the gap between
+        // them (five clean runs, then 0.1304 %). The bracket measures exactly that gap. A
+        // basemap that never holds still long enough is named as environment, not judged as
+        // fog; every threshold and rule of the comparison itself is unchanged.
+        val deadline = SystemClock.uptimeMillis() + AUDIT_BRACKET_TIMEOUT_MILLIS
+        var attempts = 0
+        while (true) {
+            attempts += 1
+            val fogged = snapshotStablePixels("fog coverage fogged frame")
+            val audit = auditFogCoverage(fogged)
+            val foggedAfter = snapshotStablePixels("fog coverage fogged frame after the reference")
+            val drift = changedPixelCount(fogged, foggedAfter)
+            android.util.Log.i(AUDIT_LOG_TAG, "bracket attempt=$attempts drift=$drift")
+            if (drift.toDouble() <= fogged.size * MAXIMUM_AUDIT_BRACKET_DRIFT_FRACTION) return audit
+            assertTrue(
+                "ENVIRONMENT, not a fog verdict: the basemap kept changing under the audit - " +
+                    "$drift pixels differed between the fogged frames bracketing the bare " +
+                    "reference on attempt $attempts",
+                SystemClock.uptimeMillis() < deadline,
+            )
+        }
     }
 
     private fun MapLibreMap.auditFogCoverage(fogged: IntArray): FogAudit {
@@ -7181,7 +7209,7 @@ class MapSurfaceTest {
         // app never produces — two coats where it draws one.
         val visibility = ALL_FOG_LAYERS.associateWith { fogLayerVisibility(it) }
         setFogLayersVisible(false)
-        val bare = snapshotStableBarePixels("fog coverage reference")
+        val bare = snapshotStablePixels("fog coverage reference")
         restoreFogLayerVisibility(visibility)
         return compareFogCoverage(fogged, bare, snapshotWidth()).alsoRequireSomethingWasDrawn()
     }
@@ -7316,8 +7344,8 @@ class MapSurfaceTest {
     private fun MapLibreMap.auditWithFogRemoved(): FogAudit {
         val visibility = ALL_FOG_LAYERS.associateWith { fogLayerVisibility(it) }
         setFogLayersVisible(false)
-        val first = snapshotStableBarePixels("fog-removed calibration first reference")
-        val second = snapshotStableBarePixels("fog-removed calibration second reference")
+        val first = snapshotStablePixels("fog-removed calibration first reference")
+        val second = snapshotStablePixels("fog-removed calibration second reference")
         restoreFogLayerVisibility(visibility)
         return compareFogCoverage(first, second, snapshotWidth())
     }
@@ -8273,13 +8301,14 @@ class MapSurfaceTest {
         requireNotNull(composeRule.runOnIdle { attachedMapView() }).width
 
     /**
-     * A fog comparison is meaningful only after the no-fog reference has stopped changing. A
+     * A fog comparison is meaningful only after both of its frames have stopped changing. A
      * `fullyRendered` callback prevents accepting an in-progress renderer frame; requiring two
      * bit-identical snapshots then prevents a tile that lands between the paired captures from
-     * being reported as missing fog. This deliberately has no luminance floor: OpenFreeMap ocean
-     * tiles are dark, and a real leak there must remain judgeable.
+     * being reported as missing fog - or, on the fogged side, as fog over something the stable
+     * bare reference no longer shows. This deliberately has no luminance floor: OpenFreeMap
+     * ocean tiles are dark, and a real leak there must remain judgeable.
      */
-    private fun MapLibreMap.snapshotStableBarePixels(label: String): IntArray {
+    private fun MapLibreMap.snapshotStablePixels(label: String): IntArray {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         var previous: IntArray? = null
         var changedPixels = -1L
@@ -8728,6 +8757,17 @@ class MapSurfaceTest {
         const val REPAINT_RETRY_MILLIS = 500L
         const val BARE_REFERENCE_STABILITY_ATTEMPTS = 12
         const val BARE_REFERENCE_STABILITY_RETRY_MILLIS = 50L
+
+        /**
+         * The bracket around an audit's bare reference: the fogged frames taken before and after
+         * it may differ by at most this fraction of the frame (259 pixels of a 1080x2400 capture)
+         * before the pair is taken again. The drift that produced false leaks was 1900-3400
+         * pixels; a loading hold measured 60-70 thousand. A bracket that never closes within
+         * [AUDIT_BRACKET_TIMEOUT_MILLIS] is an environment failure, named as such.
+         */
+        const val MAXIMUM_AUDIT_BRACKET_DRIFT_FRACTION = 0.0001
+        const val AUDIT_BRACKET_TIMEOUT_MILLIS = 10_000L
+        const val AUDIT_LOG_TAG = "FogAudit"
         const val UNFOGGED_LUMINANCE = 150
         const val MINIMUM_REVEALED_FRACTION = 0.01
 

@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
+    <string name="map_loading">Loading the online basemap…</string>
+    <string name="map_fog_unavailable">Exploration overlay unavailable — unknown areas stay hidden</string>
     <string name="google_poc_loading">Loading Google map…</string>
     <string name="google_poc_map_loaded">Google map loaded; pan or tap to observe callbacks.</string>
     <string name="google_poc_camera_gesture_started">Camera gesture started (reason=%1$d)</string>
@@ -16,4 +18,10 @@
     <string name="google_poc_reason_load_timeout">The Google map did not finish loading in time.</string>
     <string name="google_poc_fallback_without_guidance">Google Maps PoC unavailable.\n%1$s\n\nRecording and history remain local and unchanged.</string>
     <string name="google_poc_fallback_with_guidance">Google Maps PoC unavailable.\n%1$s\n\n%2$s\n\nRecording and history remain local and unchanged.</string>
+    <string name="map_provider_unavailable_missing_key">The online map is unavailable: this build has no map key configured.</string>
+    <string name="map_provider_unavailable_invalid_key">The online map is unavailable: this build’s map key is not valid.</string>
+    <string name="map_provider_unavailable_no_network">The online map is unavailable: no validated internet connection.</string>
+    <string name="map_provider_unavailable_no_play_services">The online map is unavailable: compatible Google Play services are missing or disabled on this device.</string>
+    <string name="map_provider_unavailable_initialization_failure">The online map could not start.</string>
+    <string name="map_provider_unavailable_reassurance">Recording and exploration history stay on this device and keep working.</string>
 </resources>

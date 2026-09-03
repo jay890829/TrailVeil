@@ -30,6 +30,9 @@ internal class FogChangeSynchronizer(
     private val mutex = Mutex()
     private var cursor: PersistedPointCursor? = null
 
+    /** See [FogViewportCoordinator.isLockedForTesting]; the same question for this lock. */
+    internal val isLockedForTesting: Boolean get() = mutex.isLocked
+
     init {
         require(pageSize > 0) { "pageSize must be positive" }
     }

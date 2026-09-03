@@ -9,20 +9,28 @@
         <meta-data
             android:name="com.google.android.geo.API_KEY"
             android:value="@string/trailveil_google_maps_poc_api_key" />
+        <!-- `V02-005` stage 2, the launcher inversion: the production MainActivity and its real
+             navigation graph ARE the googlePoc experience from here on. The PoC Activity is
+             de-launchered and unexported, retained solely as the AVD engineering harness the
+             googlePoc benchmark/boundary suites drive until `V02-007`. -->
         <activity
             android:name=".googlepoc.GoogleMapsPocActivity"
-            android:exported="true"
+            android:exported="false"
             android:label="@string/app_name"
-            android:theme="@style/Theme.TrailVeil">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-        </activity>
+            android:theme="@style/Theme.TrailVeil" />
         <activity
-            android:name=".MainActivity"
-            tools:node="remove" />
+            android:name=".map.GoogleMapSurfaceTestActivity"
+            android:exported="false"
+            android:theme="@style/Theme.TrailVeil" />
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="app.trailveil.map.GoogleMapWarmup"
+                android:value="androidx.startup" />
+        </provider>
         <meta-data
             android:name="app.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES"
             tools:node="remove" />

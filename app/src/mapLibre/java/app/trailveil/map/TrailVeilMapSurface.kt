@@ -88,18 +88,6 @@ import org.maplibre.geojson.Polygon
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 
-internal enum class BasemapLoadState {
-    LOADING,
-    ONLINE,
-    LOCAL_FALLBACK,
-}
-
-internal object MapSurfaceTestTags {
-    const val Map = "trailveil_map"
-    const val Status = "trailveil_map_status"
-    const val FogSafetyCover = "trailveil_fog_safety_cover"
-}
-
 internal object FogOverlayIds {
     const val Source = "trailveil-cumulative-fog-source"
     const val Layer = "trailveil-cumulative-fog-layer"
@@ -239,69 +227,6 @@ internal object TrackOverlayIds {
     const val PointLayer = "trailveil-session-track-point-layer"
 }
 
-internal data class MapCameraRequest(
-    val requestId: Long,
-    val point: GeoPoint,
-    /** `null` moves the camera without touching the zoom the user chose. */
-    val zoom: Double? = 16.0,
-) {
-    init {
-        require(requestId >= 0L) { "requestId must be non-negative" }
-        require(zoom == null || (zoom.isFinite() && zoom in 0.0..22.0)) {
-            "zoom must be in 0..22"
-        }
-    }
-}
-
-/**
- * What a new location should do to a camera that is following it.
- *
- * Following is not the same kind of camera move as being sent somewhere. A follow step is bounded
- * by how far a person walked between two fixes, which is why it can be made without hiding the map
- * first; a jump to somewhere off screen is not, and goes through the ordinary programmed path with
- * everything that protects.
- */
-internal enum class FollowCameraMove {
-    /** Close enough to centred already; moving would only jitter the map under the user. */
-    HOLD,
-    EASE,
-    JUMP,
-}
-
-/**
- * The dead zone is a fraction of the shorter viewport edge, so it means the same thing in portrait
- * and landscape: about a finger's width of drift before the map re-centres. Without one, a 5 m
- * location update would nudge the camera every few seconds and rebuild the fog with it.
- */
-internal const val FOLLOW_DEAD_ZONE_FRACTION: Double = 0.12
-
-internal fun followCameraMove(
-    offsetX: Double,
-    offsetY: Double,
-    viewportWidth: Int,
-    viewportHeight: Int,
-): FollowCameraMove {
-    if (viewportWidth <= 0 || viewportHeight <= 0) return FollowCameraMove.HOLD
-    if (!offsetX.isFinite() || !offsetY.isFinite()) return FollowCameraMove.JUMP
-    val halfWidth = viewportWidth / 2.0
-    val halfHeight = viewportHeight / 2.0
-    if (kotlin.math.abs(offsetX) > halfWidth || kotlin.math.abs(offsetY) > halfHeight) {
-        return FollowCameraMove.JUMP
-    }
-    val deadZone = minOf(viewportWidth, viewportHeight) * FOLLOW_DEAD_ZONE_FRACTION
-    val distance = kotlin.math.hypot(offsetX, offsetY)
-    return if (distance <= deadZone) FollowCameraMove.HOLD else FollowCameraMove.EASE
-}
-
-internal data class MapTrackOverlay(
-    val requestId: Long,
-    val segments: List<List<GeoPoint>>,
-) {
-    init {
-        require(requestId >= 0L) { "requestId must be non-negative" }
-    }
-}
-
 /** Immutable test evidence for the canonical fog geometry that actually reached the renderer. */
 internal data class InstalledFogCoverageSnapshot(
     val generation: Long,
@@ -415,6 +340,10 @@ internal fun TrailVeilMapSurface(
     }
     val restoredMapState = remember(savedStateRegistry, savedStateKey) {
         savedStateRegistry.consumeRestoredStateForKey(savedStateKey)
+            ?.takeIf { envelope ->
+                envelope.getString(MAP_SAVED_STATE_PROVIDER_KEY) == MAP_STATE_PROVIDER
+            }
+            ?.getBundle(MAP_SAVED_STATE_PAYLOAD_KEY)
     }
     val mapView = remember(
         context,
@@ -534,7 +463,13 @@ internal fun TrailVeilMapSurface(
         compositionActive.set(true)
 
         savedStateRegistry.registerSavedStateProvider(savedStateKey) {
-            Bundle().also(mapView::onSaveInstanceState)
+            Bundle().apply {
+                putString(MAP_SAVED_STATE_PROVIDER_KEY, MAP_STATE_PROVIDER)
+                putBundle(
+                    MAP_SAVED_STATE_PAYLOAD_KEY,
+                    Bundle().also(mapView::onSaveInstanceState),
+                )
+            }
         }
         val componentCallbacks = object : ComponentCallbacks2 {
             override fun onConfigurationChanged(newConfig: Configuration) = Unit
@@ -1200,6 +1135,14 @@ internal fun TrailVeilMapSurface(
                 .fillMaxSize()
                 .semantics { this.contentDescription = contentDescription }
                 .testTag(MapSurfaceTestTags.Map),
+            update = { view ->
+                // Compose hands an AndroidView to the accessibility tree as the hosted View itself
+                // (the semantics modifier above serves Compose tests and previews, never a screen
+                // reader), so the map's one TalkBack target is the MapView and it must carry the
+                // localized description rather than the SDK's own "map created with" string.
+                // Measured on device in V02-005 stage 9; the attribution control beneath it stays.
+                view.contentDescription = contentDescription
+            },
         )
         if (fogRequired && !fogCoverageInstalled) {
             // A plain Box, not a Surface: the cover exists to stop unexplored area being shown as
@@ -1752,34 +1695,6 @@ private fun FogPixelMask.toBitmap(): Bitmap {
     return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
 }
 
-internal suspend fun renderCanonicalFogWithRetry(
-    request: FogViewportRequest,
-    retryDelayMillis: Long,
-    render: suspend (FogViewportRequest) -> FogViewportRender,
-    installAndAwait: suspend (FogViewportRender) -> Unit,
-    onFailure: (Exception) -> Unit,
-): FogViewportRender = retryFogOperation(retryDelayMillis, onFailure) {
-    render(request).also { rendered -> installAndAwait(rendered) }
-}
-
-private suspend fun <T> retryFogOperation(
-    retryDelayMillis: Long,
-    onFailure: (Exception) -> Unit,
-    operation: suspend () -> T,
-): T {
-    require(retryDelayMillis >= 0L) { "retryDelayMillis must be non-negative" }
-    while (true) {
-        try {
-            return operation()
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Exception) {
-            onFailure(failure)
-            delay(retryDelayMillis)
-        }
-    }
-}
-
 private suspend fun MapView.installFogGenerationAndAwait(
     map: MapLibreMap,
     style: Style,
@@ -1914,9 +1829,6 @@ private const val WORLD_LONGITUDE_SPAN = 360.0
 private const val VISIBLE_REGION_CORNERS = 4
 
 private const val FOG_RETRY_DELAY_MILLIS = 1_000L
-
-/** No programmed camera flight is in the air. */
-private const val IDLE_CAMERA_FLIGHT = 0L
 private const val FOG_FRAME_TIMEOUT_MILLIS = 5_000L
 private const val FOG_SEAM_GUARD_WIDTH_PIXELS = 3.0f
 private const val FOG_EXTENT_GUARD_BOUNDARY_WIDTH_PIXELS = 4.0f
@@ -1927,12 +1839,6 @@ private const val FOG_GEOJSON_ROLE_EXTENT_BOUNDARY = "extent-boundary"
 
 private object StaleCanonicalFogInstallException : Exception()
 private const val TRACK_CAMERA_PADDING_PX = 72
-
-/**
- * Short enough that the user stays with the map rather than watching it catch up, long enough that
- * the step reads as the map following them rather than as the map jumping.
- */
-private const val FOLLOW_EASE_MILLIS = 450
 
 /**
  * Renderer-owned zoom boundary for the two mutually exclusive world-copy arrangements.
@@ -1952,6 +1858,7 @@ private const val FOLLOW_EASE_MILLIS = 450
  * choose the arrangement in the same frame as its own repetition rule.
  */
 private const val WORLD_COPY_ZOOM = 1.0
+private const val MAP_STATE_PROVIDER = "maplibre"
 
 private fun visibleAtAndAboveWorldCopyZoom(): Expression = Expression.step(
     Expression.zoom(),
@@ -1964,27 +1871,6 @@ private fun visibleBelowWorldCopyZoom(): Expression = Expression.step(
     1.0,
     Expression.stop(WORLD_COPY_ZOOM, 0.0),
 )
-
-/** Where the map's own controls sit when the host does not stack anything of its own on top. */
-internal val MAP_CONTROL_INSET: Dp = 12.dp
-
-@Composable
-private fun MapStatusBadge(text: String) {
-    Surface(
-        modifier = Modifier
-            .padding(12.dp)
-            .testTag(MapSurfaceTestTags.Status),
-        color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
-        shape = MaterialTheme.shapes.small,
-        shadowElevation = 2.dp,
-    ) {
-        Text(
-            text = text,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-            style = MaterialTheme.typography.bodySmall,
-        )
-    }
-}
 
 /**
  * MapLibre asks its parent to stop intercepting touches once while the map initialises, and Compose

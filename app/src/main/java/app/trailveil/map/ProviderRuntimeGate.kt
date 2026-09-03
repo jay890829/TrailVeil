@@ -34,6 +34,7 @@ internal object ProviderRuntimeGate {
         keyReason: String,
         hasValidatedNetwork: Boolean,
         hasCompatibleServices: Boolean,
+        initializeWithoutValidatedNetwork: Boolean = false,
     ): ProviderStartupDecision {
         if (!keyConfigured) {
             val reason = if (keyReason == "MISSING_KEY") {
@@ -43,7 +44,7 @@ internal object ProviderRuntimeGate {
             }
             return ProviderStartupDecision(initializeMap = false, fallbackReason = reason)
         }
-        if (!hasValidatedNetwork) {
+        if (!hasValidatedNetwork && !initializeWithoutValidatedNetwork) {
             return ProviderStartupDecision(
                 initializeMap = false,
                 fallbackReason = ProviderFallbackReason.NO_VALIDATED_NETWORK,

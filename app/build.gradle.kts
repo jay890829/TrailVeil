@@ -373,6 +373,13 @@ android {
 
     sourceSets {
         getByName("androidTest").assets.directories.add("$projectDir/schemas")
+        // `V02-005` stage 1: the MapLibre map surface lives in its own source tree so the
+        // googlePoc variant can bind a Google implementation of the same neutral contract.
+        // debug/internal/release compile exactly the sources they always did.
+        listOf("debug", "internal", "release").forEach { variant ->
+            getByName(variant).kotlin.srcDir("src/mapLibre/java")
+            getByName(variant).res.srcDir("src/mapLibre/res")
+        }
     }
 
     compileOptions {
@@ -431,17 +438,40 @@ val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifes
         check("com.google.android.geo.API_KEY" in googleManifest) {
             "googlePoc merged manifest is missing the Google Maps API-key marker"
         }
-        check("app.trailveil.googlepoc.GoogleMapsPocActivity" in googleManifest) {
-            "googlePoc merged manifest is missing its isolated launcher Activity"
-        }
+        // `V02-005` stage 2 inverted this block: the production MainActivity IS the googlePoc
+        // launcher now, and the PoC Activity must remain present but never launchable.
         check("org.apache.http.legacy" in googleManifest) {
             "googlePoc merged manifest is missing the Maps SDK 20 legacy-renderer compatibility shim"
         }
-        check("app.trailveil.MainActivity" !in googleManifest) {
-            "googlePoc merged manifest unexpectedly exposes the production launcher"
+        // An <activity> either self-closes its opening tag or runs to </activity>; matching the
+        // first "/>" unconditionally would truncate a block at its first self-closing CHILD
+        // (<action .../>) and lose the intent-filter this verifier exists to check.
+        val activityBlocks = Regex("""<activity\b[^>]*?(?:/>|>[\s\S]*?</activity>)""")
+            .findAll(googleManifest).map(MatchResult::value).toList()
+        val mainActivity = activityBlocks.singleOrNull { "app.trailveil.MainActivity" in it }
+        checkNotNull(mainActivity) {
+            "googlePoc merged manifest is missing the production MainActivity"
+        }
+        check("android.intent.category.LAUNCHER" in mainActivity) {
+            "googlePoc merged manifest does not make MainActivity the launcher"
+        }
+        val pocActivity = activityBlocks.singleOrNull {
+            "app.trailveil.googlepoc.GoogleMapsPocActivity" in it
+        }
+        checkNotNull(pocActivity) {
+            "googlePoc merged manifest lost the retained PoC engineering harness Activity"
+        }
+        check("android.intent.category.LAUNCHER" !in pocActivity) {
+            "the de-launchered PoC Activity regained a launcher intent-filter"
+        }
+        check("android:exported=\"false\"" in pocActivity) {
+            "the retained PoC Activity must stay unexported"
         }
         check("app.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES" !in googleManifest) {
             "googlePoc merged manifest unexpectedly exposes production MapLibre notices"
+        }
+        check("app.trailveil.map.GoogleMapWarmup" in googleManifest) {
+            "googlePoc merged manifest is missing the map warmup initializer"
         }
 
         mergedManifestFiles
@@ -508,6 +538,12 @@ tasks.withType<Test>().configureEach {
         .withPropertyName("instrumentationTestManifestForDriftCheck")
     inputs.dir("$projectDir/src/androidTest/java")
         .withPropertyName("androidTestSourcesForDriftCheck")
+    inputs.dir("$projectDir/src/androidTestDebug/java")
+        .withPropertyName("androidTestDebugSourcesForDriftCheck")
+    inputs.file("$projectDir/src/androidTestGooglePoc/instrumentation-test-manifest.txt")
+        .withPropertyName("googleInstrumentationTestManifestForDriftCheck")
+    inputs.dir("$projectDir/src/androidTestGooglePoc/java")
+        .withPropertyName("googleInstrumentationSourcesForDriftCheck")
 }
 
 val verifyDebugAndroidTestManifest = tasks.register("verifyDebugAndroidTestManifest") {
@@ -662,4 +698,5 @@ dependencies {
     debugImplementation(libs.compose.ui.test.manifest)
 
     add("googlePocImplementation", "com.google.android.gms:play-services-maps:20.0.0")
+    add("googlePocImplementation", "androidx.startup:startup-runtime:1.2.0")
 }

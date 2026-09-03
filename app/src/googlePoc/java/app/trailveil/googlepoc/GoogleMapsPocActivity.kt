@@ -7,8 +7,10 @@ import app.trailveil.map.ProviderFallbackReason
 import app.trailveil.map.ProviderRuntimeGate
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogGenerationReusePolicy
+import app.trailveil.map.fog.FogSnapshotVisualProbePlan
 import app.trailveil.map.fog.FogSynchronizationRenderDecision
 import app.trailveil.map.fog.FogSnapshotVisualProbePlanner
+import app.trailveil.map.fog.FogTilePngCodec
 import app.trailveil.map.fog.FogTileGeneration
 import app.trailveil.map.fog.FogTileProviderAdapter
 import app.trailveil.map.fog.FogViewportBatchCoverageRenderer
@@ -23,6 +25,7 @@ import android.net.NetworkCapabilities
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.Parcel
 import android.view.Gravity
 import android.view.View
 import android.widget.FrameLayout
@@ -94,6 +97,16 @@ data class GoogleFogInstallDiagnostic(
     val visualMinimumOnScreenProbeCount: Int,
 )
 
+/** `V02-005` stage 3 (SP7): coordinate-free saved-state harness facts. */
+data class GoogleSavedStateDiagnostic(
+    val mode: String?,
+    val restoredMapStatePresent: Boolean,
+    val providerTagMatched: Boolean?,
+    val initialCameraMoveSkipped: Boolean,
+    val parcelRoundTripBytes: Int?,
+    val parcelFailureClass: String?,
+)
+
 interface GoogleMapsPocCallbacks {
     fun onCameraChanged(camera: GoogleMapsPocCamera) = Unit
     fun onCameraIdle(camera: GoogleMapsPocCamera) = Unit
@@ -141,6 +154,25 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     private var fogInstallPhase = GoogleFogInstallPhase.RUNTIME
     private var failedFogInstallDiagnostic: GoogleFogInstallDiagnostic? = null
 
+    // `V02-005` stage 3 spike seams. All default-off: an ordinary launch (no saved-state-mode
+    // extra, no *ForTesting call) behaves byte-identically to the pre-spike Activity.
+    @Volatile
+    private var statusOverlaySuppressed = false
+
+    /** SP5: when true, gesture-driven generation begins do NOT raise the opaque cover. */
+    @Volatile
+    var gestureCoverSuppressedForTesting: Boolean = false
+    private var syncMarker: View? = null
+    private var fogProvider: GoogleFogTileProvider? = null
+    private var lastInstalledVisualProbePlan: FogSnapshotVisualProbePlan? = null
+    private var savedStateMode: String? = null
+    private var restoredMapStateBundle: Bundle? = null
+    private var restoredMapStatePresent = false
+    private var providerTagMatched: Boolean? = null
+    private var initialCameraMoveSkipped = false
+    private var parcelRoundTripBytes: Int? = null
+    private var parcelFailureClass: String? = null
+
     private val mapLoadTimeout = Runnable {
         if (lifecycleGate.callbacksAllowed() && !mapLoaded) {
             showFallback(ProviderFallbackReason.MAP_LOAD_TIMEOUT)
@@ -150,6 +182,44 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         createLocalSurface()
+
+        // `V02-005` stage 3 (SP7): opt-in saved-state arms. Extra absent => the historical plain
+        // forwarding path, byte-identical behavior. The nested arms exercise the design's §6
+        // per-key SavedStateRegistry shape: consume-once on create, provider registered for save.
+        savedStateMode = intent.getStringExtra(EXTRA_SAVED_STATE_MODE)
+        val mode = savedStateMode
+        if (mode == SAVED_STATE_MODE_NESTED || mode == SAVED_STATE_MODE_NESTED_PARCELED) {
+            val wrapped = savedStateRegistry.consumeRestoredStateForKey(NESTED_MAP_STATE_KEY)
+            if (wrapped != null) {
+                val tagMatched = wrapped.getString(NESTED_PROVIDER_KEY) == NESTED_PROVIDER_VALUE
+                providerTagMatched = tagMatched
+                if (tagMatched) {
+                    val inner = wrapped.getBundle(NESTED_STATE_KEY)
+                    restoredMapStateBundle = if (mode == SAVED_STATE_MODE_NESTED_PARCELED) {
+                        inner?.let(::parcelRoundTrip)
+                    } else {
+                        inner
+                    }
+                }
+                // A mismatched or untagged entry is discarded: the map starts clean (§6's
+                // foreign-provider discard) and providerTagMatched records the fact.
+            }
+            restoredMapStatePresent = restoredMapStateBundle != null
+            savedStateRegistry.registerSavedStateProvider(
+                NESTED_MAP_STATE_KEY,
+                androidx.savedstate.SavedStateRegistry.SavedStateProvider {
+                    Bundle().apply {
+                        putString(NESTED_PROVIDER_KEY, NESTED_PROVIDER_VALUE)
+                        putBundle(
+                            NESTED_STATE_KEY,
+                            Bundle().also { inner -> mapView?.onSaveInstanceState(inner) },
+                        )
+                    }
+                },
+            )
+        } else {
+            restoredMapStatePresent = savedInstanceState != null
+        }
 
         val decision = ProviderRuntimeGate.startupDecision(
             keyConfigured = BuildConfig.GOOGLE_MAPS_POC_KEY_CONFIGURED,
@@ -173,7 +243,13 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
                     FrameLayout.LayoutParams.MATCH_PARENT,
                 ),
             )
-            candidate.onCreate(savedInstanceState)
+            val mapCreationState =
+                if (mode == SAVED_STATE_MODE_NESTED || mode == SAVED_STATE_MODE_NESTED_PARCELED) {
+                    restoredMapStateBundle
+                } else {
+                    savedInstanceState
+                }
+            candidate.onCreate(mapCreationState)
             candidate.getMapAsync(this)
             mainHandler.postDelayed(mapLoadTimeout, MAP_LOAD_TIMEOUT_MILLIS)
         } catch (_: Exception) {
@@ -204,7 +280,14 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     }
 
     override fun onSaveInstanceState(outState: Bundle) {
-        forwardLifecycleCall { onSaveInstanceState(outState) }
+        // SP7 nested arms save through the registry provider registered in onCreate instead of
+        // the top-level Activity bundle; plain/absent modes keep the historical forwarding.
+        if (
+            savedStateMode != SAVED_STATE_MODE_NESTED &&
+            savedStateMode != SAVED_STATE_MODE_NESTED_PARCELED
+        ) {
+            forwardLifecycleCall { onSaveInstanceState(outState) }
+        }
         super.onSaveInstanceState(outState)
     }
 
@@ -231,14 +314,19 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
         fogGeneration?.cancel()
         fogGeneration = null
         canonicalFogPublishedGeneration = null
+        lastInstalledVisualProbePlan = null
         fogOverlay?.detach()
         fogOverlay = null
         fogAdapter = null
+        fogProvider = null
         fogRuntime = null
         fogCoverageRenderer = null
         fogSyncPolicy.reset()
         fogScope.cancel()
         googleMap = null
+        if (savedStateMode != null) {
+            savedStateRegistry.unregisterSavedStateProvider(NESTED_MAP_STATE_KEY)
+        }
         disposeMapView()
         super.onDestroy()
     }
@@ -305,7 +393,13 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
                 callbackStatus.setText(R.string.google_poc_map_loaded)
                 revealMapWhenCanonicalFogIsReady()
             }
-            map.moveCamera(CameraUpdateFactory.newLatLngZoom(POC_START, POC_START_ZOOM))
+            if (savedStateMode != null && restoredMapStatePresent) {
+                // SP7: mirrors §6's "no initial camera on restore" deletion. Without this the
+                // unconditional POC_START move clobbers whatever the MapView restored.
+                initialCameraMoveSkipped = true
+            } else {
+                map.moveCamera(CameraUpdateFactory.newLatLngZoom(POC_START, POC_START_ZOOM))
+            }
             initializeCanonicalFogRuntime(lease)
             // The first canonical render is intentionally requested only by the completed baseline.
         } catch (_: Exception) {
@@ -325,9 +419,10 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
     ): Boolean {
         if (!lifecycleGate.isCurrent(lease)) return false
         val adapter = FogTileProviderAdapter()
+        val provider = GoogleFogTileProvider(adapter)
         val controller = GoogleFogTileOverlayController(
             map = map,
-            provider = GoogleFogTileProvider(adapter),
+            provider = provider,
         )
         if (controller.attach() == null) {
             controller.detach()
@@ -338,6 +433,7 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
             return false
         }
         fogAdapter = adapter
+        fogProvider = provider
         fogOverlay = controller
         return true
     }
@@ -457,8 +553,14 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
         fogGeneration = generation
         canonicalFogInstalledGeneration = null
         canonicalFogPublishedGeneration = null
+        lastInstalledVisualProbePlan = null
         cancelFogInstallTimeout()
-        keepCanonicalCoverVisible()
+        if (!gestureCoverSuppressedForTesting) {
+            // SP5 suppression models the §4.2 steady-state design (gestures never raise the
+            // cover; placeholder tiles anchor coverage). Everything else — generation
+            // revocation, phase coordination — stays exactly as production.
+            keepCanonicalCoverVisible()
+        }
         if (fogOverlay?.onGenerationStarted(generation.id) != true) {
             generation.cancel()
             fogGeneration = null
@@ -547,6 +649,7 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
                     }
                     canonicalFogInstalledGeneration = generation.id
                     canonicalFogPublishedGeneration = generation.id
+                    lastInstalledVisualProbePlan = visualProbePlan
                     fogInstallPhase = GoogleFogInstallPhase.INSTALLED
                     revealMapWhenCanonicalFogIsReady()
                     callbacks?.onCanonicalFogInstalled(generation.id)
@@ -606,7 +709,9 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
         ) {
             mapView?.visibility = View.VISIBLE
             fallback.visibility = View.GONE
-            callbackStatus.visibility = View.VISIBLE
+            // The status TextView is a permanent non-fog rect over the map; pixel-probing spikes
+            // suppress it so their captures measure the map, not the harness chrome.
+            callbackStatus.visibility = if (statusOverlaySuppressed) View.GONE else View.VISIBLE
             root.bringChildToFront(callbackStatus)
         }
     }
@@ -680,6 +785,23 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
                 gravity = Gravity.TOP or Gravity.START
             },
         )
+        // SP5's in-band video clapper: a pure-magenta square whose on/off pulses delimit the
+        // fling window inside a screenrecord without any host/device clock synchronization.
+        val marker = View(this).apply {
+            tag = SYNC_MARKER_TAG
+            setBackgroundColor(Color.rgb(255, 0, 255))
+            visibility = View.GONE
+        }
+        syncMarker = marker
+        // SYNC_MARKER_SIZE is dp — the video analyzer thresholds on marker AREA, and a raw-px
+        // square at this density is too small to ever cross half-area detection.
+        val markerSizePx = (SYNC_MARKER_SIZE * resources.displayMetrics.density).toInt()
+        root.addView(
+            marker,
+            FrameLayout.LayoutParams(markerSizePx, markerSizePx).apply {
+                gravity = Gravity.TOP or Gravity.END
+            },
+        )
         setContentView(root)
     }
 
@@ -699,10 +821,12 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
         fogGeneration = null
         canonicalFogInstalledGeneration = null
         canonicalFogPublishedGeneration = null
+        lastInstalledVisualProbePlan = null
         cancelFogInstallTimeout()
         fogOverlay?.detach()
         fogOverlay = null
         fogAdapter = null
+        fogProvider = null
         fogRuntime = null
         fogCoverageRenderer = null
         fogSyncPolicy.reset()
@@ -749,6 +873,114 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
             visualMismatchedTileCount = 0,
             visualMinimumOnScreenProbeCount = 0,
         )
+
+    // ------- `V02-005` stage 3 spike seams (engineering harness only; coordinate-free) -------
+
+    /** SP1/SP2/SP5: keeps the status TextView out of pixel-probed captures. Main thread only. */
+    fun setStatusOverlaySuppressedForTesting(suppressed: Boolean) {
+        statusOverlaySuppressed = suppressed
+        if (suppressed) callbackStatus.visibility = View.GONE
+    }
+
+    /** SP5's in-band video clapper toggle. Main thread only. */
+    fun setSyncMarkerVisibleForTesting(visible: Boolean) {
+        syncMarker?.visibility = if (visible) View.VISIBLE else View.GONE
+        if (visible) syncMarker?.let(root::bringChildToFront)
+    }
+
+    fun fogOverlayControllerForTesting(): GoogleFogTileOverlayController? = fogOverlay
+
+    fun fogTileProviderForTesting(): GoogleFogTileProvider? = fogProvider
+
+    fun installedFogGenerationForTesting(): Long? = canonicalFogInstalledGeneration
+
+    /**
+     * SP6/SP8: one strictly read-only snapshot probe of the INSTALLED generation against the
+     * plan it was proven with. Returns false when nothing is installed. Main thread only.
+     */
+    fun probeInstalledFogForTesting(onResult: (GoogleFogSpikeProbeResult?) -> Unit): Boolean {
+        val controller = fogOverlay ?: return false
+        val generation = canonicalFogInstalledGeneration ?: return false
+        val plan = lastInstalledVisualProbePlan ?: return false
+        controller.probeCanonicalSnapshotForTesting(generation, plan, onResult)
+        return true
+    }
+
+    /**
+     * SP9: burns generation ids until the NEXT one starts a palette cycle, so the next
+     * seam-driven refresh exercises the rotation path. Burning only revokes the adapter's
+     * published masks — clearTileCache is never called, so already-installed native tiles keep
+     * the screen fogged. Returns the burn count, 0 when the next id is already a boundary, or
+     * -1 when the adapter is absent. Main thread only.
+     */
+    fun advanceToNextPaletteCycleBoundaryForTesting(): Int {
+        val adapter = fogAdapter ?: return -1
+        val lastKnown = fogGeneration?.id
+        if (lastKnown != null && FogTilePngCodec.generationStartsNewPaletteCycle(lastKnown + 1L)) {
+            return 0
+        }
+        var burns = 0
+        while (burns <= FogTilePngCodec.SIGNATURE_COLOUR_COUNT.toInt() + 1) {
+            val burned = adapter.beginGeneration()
+            burned.cancel()
+            burns += 1
+            if (FogTilePngCodec.generationStartsNewPaletteCycle(burned.id + 1L)) return burns
+        }
+        return -1
+    }
+
+    /**
+     * SP9: a deterministic refresh trigger — no DB write, no camera move. Returns false when the
+     * fog pipeline is not ready to render. Main thread only.
+     */
+    fun requestCanonicalFogRefreshForTesting(): Boolean {
+        val map = googleMap ?: return false
+        if (!fogSyncPolicy.canRender()) return false
+        beginFogGeneration() ?: return false
+        requestCanonicalFog(map.cameraPosition)
+        return true
+    }
+
+    /** SP7/SP10: the applied camera, read back from the SDK. Main thread only. */
+    fun cameraFieldsForTesting(): GoogleMapsPocCamera? = googleMap?.cameraPosition?.toPocCamera()
+
+    fun savedStateDiagnosticForTesting(): GoogleSavedStateDiagnostic = GoogleSavedStateDiagnostic(
+        mode = savedStateMode,
+        restoredMapStatePresent = restoredMapStatePresent,
+        providerTagMatched = providerTagMatched,
+        initialCameraMoveSkipped = initialCameraMoveSkipped,
+        parcelRoundTripBytes = parcelRoundTripBytes,
+        parcelFailureClass = parcelFailureClass,
+    )
+
+    /**
+     * SP7 `nested_parceled` arm: forces the marshal/unmarshal an in-process `recreate()` may
+     * skip. A marshal failure (e.g. a live Binder inside the SDK bundle) is itself §6-relevant
+     * evidence — it is recorded, and the arm proceeds restore-less so the failure stays
+     * attributable. Note: Bundle contents unparcel lazily, so a corrupt inner Parcelable may
+     * still only surface inside `MapView.onCreate` as INITIALIZATION_FAILURE.
+     */
+    private fun parcelRoundTrip(bundle: Bundle): Bundle? {
+        val parcel = Parcel.obtain()
+        return try {
+            parcel.writeBundle(bundle)
+            val bytes = parcel.marshall()
+            parcelRoundTripBytes = bytes.size
+            val reread = Parcel.obtain()
+            try {
+                reread.unmarshall(bytes, 0, bytes.size)
+                reread.setDataPosition(0)
+                reread.readBundle(javaClass.classLoader)
+            } finally {
+                reread.recycle()
+            }
+        } catch (failure: RuntimeException) {
+            parcelFailureClass = failure.javaClass.name
+            null
+        } finally {
+            parcel.recycle()
+        }
+    }
 
     private fun forwardLifecycleCall(action: MapView.() -> Unit) {
         if (!lifecycleGate.callbacksAllowed()) return
@@ -832,7 +1064,19 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
             capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
     }
 
-    private companion object {
+    companion object {
+        // `V02-005` stage 3 spike constants (public: the androidTestGooglePoc drivers use them).
+        const val EXTRA_SAVED_STATE_MODE = "app.trailveil.googlepoc.extra.SAVED_STATE_MODE"
+        const val SAVED_STATE_MODE_PLAIN = "plain"
+        const val SAVED_STATE_MODE_NESTED = "nested"
+        const val SAVED_STATE_MODE_NESTED_PARCELED = "nested_parceled"
+        const val NESTED_MAP_STATE_KEY = "trailveil.map.primary"
+        const val NESTED_PROVIDER_KEY = "provider"
+        const val NESTED_STATE_KEY = "state"
+        const val NESTED_PROVIDER_VALUE = "google"
+        const val SYNC_MARKER_TAG = "trailveil_sp5_sync_marker"
+        const val SYNC_MARKER_SIZE = 48
+
         const val MAP_LOAD_TIMEOUT_MILLIS = 30_000L
         const val FOG_RUNTIME_TIMEOUT_MILLIS = 10_000L
         const val FOG_SYNC_TIMEOUT_MILLIS = 15_000L

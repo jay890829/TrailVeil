@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- `V02-005` stage 2: status copy the MapLibre surface alone renders. It lives in the mapLibre
+     source set for the same reason the fallback style does - the googlePoc variant must not
+     package another provider's map copy, and its lint rightly calls these unused there. -->
+<resources>
+    <string name="map_unavailable">Online basemap unavailable. Trail recording still works.</string>
+    <string name="map_loading">Loading the online basemap…</string>
+    <string name="map_fog_loading">Rebuilding explored areas…</string>
+    <string name="map_fog_unavailable">Exploration overlay unavailable — unknown areas stay hidden</string>
+</resources>

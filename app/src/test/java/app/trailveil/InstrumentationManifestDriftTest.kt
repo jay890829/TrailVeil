@@ -24,9 +24,16 @@ class InstrumentationManifestDriftTest {
     fun `every written instrumentation test is declared, and nothing declared is unwritten`() {
         val moduleDir = File(System.getProperty("user.dir"))
         val manifestFile = File(moduleDir, "src/androidTest/instrumentation-test-manifest.txt")
-        val sourceRoot = File(moduleDir, "src/androidTest/java")
+        // `V02-005` stage 1: MapLibre-coupled instrumentation lives in androidTestDebug, which the
+        // debug test variant compiles alongside androidTest; the drift scan must see both roots.
+        val sourceRoots = listOf(
+            File(moduleDir, "src/androidTest/java"),
+            File(moduleDir, "src/androidTestDebug/java"),
+        )
         require(manifestFile.isFile) { "manifest not found at ${manifestFile.absolutePath}" }
-        require(sourceRoot.isDirectory) { "androidTest sources not found at ${sourceRoot.absolutePath}" }
+        sourceRoots.forEach { root ->
+            require(root.isDirectory) { "instrumentation sources not found at ${root.absolutePath}" }
+        }
 
         val declared = manifestFile.readLines()
             .map(String::trim)
@@ -34,7 +41,9 @@ class InstrumentationManifestDriftTest {
             .toSortedSet()
 
         val written = sortedSetOf<String>()
-        sourceRoot.walkTopDown().filter { it.isFile && it.extension == "kt" }.forEach { file ->
+        sourceRoots.asSequence().flatMap { root ->
+            root.walkTopDown().filter { it.isFile && it.extension == "kt" }
+        }.forEach { file ->
             val lines = file.readLines()
             val packageName = lines.firstNotNullOfOrNull { line ->
                 PACKAGE_PATTERN.find(line.trim())?.groupValues?.get(1)

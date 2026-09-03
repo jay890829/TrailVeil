@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.SystemClock
+import android.util.Log
 import android.view.TextureView
 import android.view.View
 import android.view.ViewGroup
@@ -78,6 +79,7 @@ class HistoryDetailPopLifecycleTest {
             )
             val detector = calibrateWholeWindowMapDetector(
                 mapView = firstMapView,
+                map = firstMap,
                 listReferenceWindow = checkNotNull(listReferenceWindow),
                 listConfirmationWindow = checkNotNull(listConfirmationWindow),
             )
@@ -316,6 +318,7 @@ class HistoryDetailPopLifecycleTest {
 
     private fun calibrateWholeWindowMapDetector(
         mapView: MapView,
+        map: MapLibreMap,
         listReferenceWindow: Bitmap,
         listConfirmationWindow: Bitmap,
     ): MapDetector {
@@ -331,19 +334,39 @@ class HistoryDetailPopLifecycleTest {
         // map can still be changing well after the camera reports stable, so stability is waited
         // for rather than asserted on the first attempt. A map that never settles still fails, by
         // timeout, so this cannot turn a broken renderer into a pass.
-        val stable = awaitStableMapWindow(bounds)
+        // The whole-window capture and the TextureView's own bitmap are two views of one frame,
+        // and they have to agree before either is trusted as the map reference. On the emulator
+        // the window side can be caught blank while the map sits idle after the transition (a
+        // buffer freed while dequeued on the SurfaceTexture, `E Surface: freeAllBuffers`), and a
+        // blank region is perfectly stable, so stability alone accepted it - twice in one day,
+        // with the identical difference to sixteen digits (V02-005 stage 9, passes 29 and 34).
+        // Disagreement is therefore read as "not settled yet": ask the renderer for a frame and
+        // measure again. A window that never agrees still fails, by the same deadline.
+        val agreementDeadline = SystemClock.uptimeMillis() + CALIBRATION_STABILITY_TIMEOUT_MILLIS
+        var stable = awaitStableMapWindow(bounds)
+        var textureDifference = textureVersusWindow(mapView, stable, bounds)
+        var repaints = 0
+        while (
+            textureDifference > MAX_TEXTURE_TO_WINDOW_DIFFERENCE &&
+            SystemClock.uptimeMillis() < agreementDeadline
+        ) {
+            stable.bitmap.recycle()
+            repaints += 1
+            composeRule.runOnIdle { map.triggerRepaint() }
+            SystemClock.sleep(CALIBRATION_SETTLE_MILLIS)
+            stable = awaitStableMapWindow(bounds)
+            textureDifference = textureVersusWindow(mapView, stable, bounds)
+        }
+        Log.i(
+            LOG_TAG,
+            "calibration repaints=$repaints textureDifference=$textureDifference " +
+                "settleAttempts=${stable.attempts}",
+        )
         val mapReference = stable.print
         val mapStableDifference = stable.difference
-        val textureBitmap = composeRule.runOnIdle {
-            checkNotNull((mapView.renderView as TextureView).bitmap) {
-                "The detail TextureView produced no calibration bitmap"
-            }
-        }
-        val textureDifference = difference(textureBitmap, stable.bitmap, bounds)
-        textureBitmap.recycle()
         assertTrue(
-            "Whole-window capture omitted or altered the live detail TextureView " +
-                "(difference=$textureDifference)",
+            "Whole-window capture omitted or altered the live detail TextureView after " +
+                "$repaints repaint(s) (difference=$textureDifference)",
             textureDifference <= MAX_TEXTURE_TO_WINDOW_DIFFERENCE,
         )
         val referenceSeparation = difference(mapReference, listReferenceWindow)
@@ -378,6 +401,20 @@ class HistoryDetailPopLifecycleTest {
         )
         assertAdversarialMapSignaturesAreDetected(detector)
         return detector
+    }
+
+    /** How far the TextureView's own bitmap is from the same region of a whole-window capture. */
+    private fun textureVersusWindow(mapView: MapView, window: StableWindow, bounds: Rect): Double {
+        val textureBitmap = composeRule.runOnIdle {
+            checkNotNull((mapView.renderView as TextureView).bitmap) {
+                "The detail TextureView produced no calibration bitmap"
+            }
+        }
+        return try {
+            difference(textureBitmap, window.bitmap, bounds)
+        } finally {
+            textureBitmap.recycle()
+        }
     }
 
     /**
@@ -828,6 +865,7 @@ class HistoryDetailPopLifecycleTest {
         const val FIXTURE_STARTED_AT = 9_013_000_000L
         const val FIXTURE_ENDED_AT = FIXTURE_STARTED_AT + 60_000L
 
+        const val LOG_TAG = "HistoryDetailPop"
         const val NAVIGATION_TIMEOUT_MILLIS = 20_000L
         const val MAP_READY_TIMEOUT_MILLIS = 20_000L
         const val CAMERA_SETTLE_TIMEOUT_MILLIS = 5_000L

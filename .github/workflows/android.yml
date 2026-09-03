@@ -49,6 +49,46 @@ jobs:
       - name: Build, lint, and run JVM tests
         run: ./gradlew clean assembleDebug lintDebug testDebugUnitTest
 
+  # `V02-005` stage 2: hosted runners have no `~/.trailveil/maps` and no key environment variable,
+  # which makes this job the standing proof that the googlePoc variant builds and fails closed with
+  # no key anywhere -- the missing-key sentinel path stays compilable, the launcher inversion is
+  # verified on the exact merged manifests CI produces, and the googlePoc instrumentation APK
+  # assembles so the MapLibre-coupled androidTest sources cannot silently recouple to it.
+  googlepoc-nokey:
+    name: Google PoC keyless build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-37.0
+            build-tools;36.0.0
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        with:
+          cache-provider: basic
+
+      - name: Assemble googlePoc keyless, verify its merged manifest, and build its test APK
+        run: >-
+          ./gradlew assembleGooglePoc verifyGooglePocMergedManifest
+          assembleGooglePocAndroidTest -PtrailveilAndroidTestBuildType=googlePoc
+
   instrumentation:
     name: Compose instrumentation test (${{ matrix.shard.name }})
     runs-on: ubuntu-latest

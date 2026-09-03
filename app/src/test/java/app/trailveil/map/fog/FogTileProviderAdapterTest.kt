@@ -263,6 +263,101 @@ class FogTileProviderAdapterTest {
         assertEquals(255, alphaAt(decode(adapter.tileBytes(1, 1, 2)), 0, 0))
     }
 
+    // ---- handover generations (V02-005 design §2.2) ------------------------------------------
+
+    @Test
+    fun handoverKeepsThePreviousPublishedBytesServingWhilePending() {
+        val mask = fullyOpaqueMask()
+        val adapter = adapterFor { mask }
+        val first = adapter.beginGeneration()
+        assertTrue(adapter.publish(first, listOf(key(2, 1, 1))))
+        val servedBefore = adapter.tileResponse(x = 1, y = 1, zoom = 2)
+        assertEquals(first.id, servedBefore.publishedGeneration)
+
+        val pending = adapter.beginHandoverGeneration()
+        val servedDuring = adapter.tileResponse(x = 1, y = 1, zoom = 2)
+        assertEquals(
+            "the prior published set keeps serving while the handover renders",
+            first.id,
+            servedDuring.publishedGeneration,
+        )
+        assertArrayEquals(servedBefore.bytes, servedDuring.bytes)
+        assertTrue(adapter.isCurrent(pending))
+        assertFalse(adapter.isCurrent(first))
+    }
+
+    @Test
+    fun handoverPublishAtomicallySwapsToTheNewGeneration() {
+        val mask = fullyOpaqueMask()
+        val adapter = adapterFor { mask }
+        val first = adapter.beginGeneration()
+        assertTrue(adapter.publish(first, listOf(key(2, 1, 1))))
+
+        val pending = adapter.beginHandoverGeneration()
+        assertTrue(adapter.publish(pending, listOf(key(2, 1, 1), key(2, 2, 1))))
+        val served = adapter.tileResponse(x = 1, y = 1, zoom = 2)
+        assertEquals(pending.id, served.publishedGeneration)
+        assertEquals(2, adapter.cacheSnapshot().entryCount)
+    }
+
+    @Test
+    fun cancellingAPendingHandoverLeavesThePublishedSetIntact() {
+        val mask = fullyOpaqueMask()
+        val adapter = adapterFor { mask }
+        val first = adapter.beginGeneration()
+        assertTrue(adapter.publish(first, listOf(key(2, 1, 1))))
+
+        val pending = adapter.beginHandoverGeneration()
+        assertTrue(pending.cancel())
+        val served = adapter.tileResponse(x = 1, y = 1, zoom = 2)
+        assertEquals(
+            "a dead pending handover must not revoke proven coverage",
+            first.id,
+            served.publishedGeneration,
+        )
+        assertFalse("a stale pending handover cannot publish", adapter.publish(pending, listOf(key(2, 1, 1))))
+        assertEquals(first.id, adapter.tileResponse(x = 1, y = 1, zoom = 2).publishedGeneration)
+    }
+
+    @Test
+    fun cancellingAHandoverThatAlreadySwappedFailsClosed() {
+        val mask = fullyOpaqueMask()
+        val adapter = adapterFor { mask }
+        val first = adapter.beginGeneration()
+        assertTrue(adapter.publish(first, listOf(key(2, 1, 1))))
+        val pending = adapter.beginHandoverGeneration()
+        assertTrue(adapter.publish(pending, listOf(key(2, 1, 1))))
+
+        assertTrue(pending.cancel())
+        assertEquals(
+            "cancelling a published handover must never leave disproven tiles serving",
+            null,
+            adapter.tileResponse(x = 1, y = 1, zoom = 2).publishedGeneration,
+        )
+    }
+
+    @Test
+    fun revokePathStillClearsImmediatelyForFirstInstallAndFailureRecovery() {
+        val mask = fullyOpaqueMask()
+        val adapter = adapterFor { mask }
+        val first = adapter.beginGeneration()
+        assertTrue(adapter.publish(first, listOf(key(2, 1, 1))))
+
+        adapter.beginGeneration()
+        assertEquals(
+            "beginGeneration revokes the previous coverage on the spot",
+            null,
+            adapter.tileResponse(x = 1, y = 1, zoom = 2).publishedGeneration,
+        )
+    }
+
+    private fun fullyOpaqueMask(): FogPixelMask {
+        val alpha = ByteArray(FogTilePngCodec.TILE_SIZE * FogTilePngCodec.TILE_SIZE) {
+            FogRenderStyle().fogAlpha.toByte()
+        }
+        return FogPixelMask(FogTilePngCodec.TILE_SIZE, FogTilePngCodec.TILE_SIZE, alpha)
+    }
+
     private fun adapterFor(source: CanonicalFogTileSource): FogTileProviderAdapter =
         FogTileProviderAdapter(source)
 

@@ -28,8 +28,13 @@ data class FogTileCacheBudget(
 class FogTileGeneration internal constructor(
     val id: Long,
     private val adapter: FogTileProviderAdapter,
+    /** True for handover generations: the prior published set keeps serving while pending. */
+    val handover: Boolean = false,
 ) {
-    /** Cancelling an old generation also revokes its previously published clear coverage. */
+    /**
+     * Cancelling a revoke generation also revokes its previously published clear coverage;
+     * cancelling a PENDING handover leaves the prior published set serving untouched.
+     */
     fun cancel(): Boolean = adapter.cancel(this)
 }
 
@@ -79,7 +84,13 @@ class FogTileProviderAdapter(
     private var activeGeneration: FogTileGeneration? = null
     private var publishedGeneration: Long? = null
 
-    /** Starts a rebuild and immediately revokes the previous generation's coverage. */
+    /**
+     * Starts a rebuild and immediately revokes the previous generation's coverage.
+     *
+     * The revoke path survives only for first install and failure recovery, where nothing proven
+     * exists and the opaque cover is already up (design §2.2); steady-state refreshes use
+     * [beginHandoverGeneration].
+     */
     fun beginGeneration(): FogTileGeneration = synchronized(lock) {
         val generation = FogTileGeneration(
             id = ++nextGeneration,
@@ -87,6 +98,23 @@ class FogTileProviderAdapter(
         )
         activeGeneration = generation
         clearPublishedLocked()
+        generation
+    }
+
+    /**
+     * Starts a handover rebuild: the currently published generation KEEPS serving
+     * [tileResponse] while the pending one renders, and `publish` on the pending generation
+     * atomically swaps the sets. This is the A/B-slot invariant ("a partial target only adds fog
+     * above the complete active slot") translated to the tile adapter — stale serving during
+     * handover shows the previous canonical only.
+     */
+    fun beginHandoverGeneration(): FogTileGeneration = synchronized(lock) {
+        val generation = FogTileGeneration(
+            id = ++nextGeneration,
+            adapter = this,
+            handover = true,
+        )
+        activeGeneration = generation
         generation
     }
 
@@ -163,11 +191,20 @@ class FogTileProviderAdapter(
         }
     }
 
-    /** Cancels a generation only when it is still the active one. */
+    /**
+     * Cancels a generation only when it is still the active one.
+     *
+     * A PENDING handover dies without touching the serving set — the prior published coverage
+     * stays intact. Everything else fails closed: revoke generations, and a handover that has
+     * already swapped its own bytes in (cancelling a published set must never leave disproven
+     * tiles serving).
+     */
     fun cancel(generation: FogTileGeneration): Boolean = synchronized(lock) {
         if (!isCurrentLocked(generation)) return false
         activeGeneration = null
-        clearPublishedLocked()
+        if (!generation.handover || publishedGeneration == generation.id) {
+            clearPublishedLocked()
+        }
         true
     }
 

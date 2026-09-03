@@ -3,11 +3,55 @@ package app.trailveil.map.fog
 import java.util.concurrent.CancellationException
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
 class FogViewportCoverageTest {
+
+    @Test
+    fun `published tile surround keeps prepared motion visible and rejects first unprepared key`() {
+        val viewport = request(
+            center = GeoPoint(0.0, 0.0),
+            zoom = 5,
+            nearLeft = GeoPoint(-1.0, -1.0),
+            farLeft = GeoPoint(1.0, -1.0),
+            farRight = GeoPoint(1.0, 1.0),
+            nearRight = GeoPoint(-1.0, 1.0),
+        )
+        val visible = FogViewportCoveragePlanner().plan(viewport).keySet
+        val prefetched = FogTileKey(4, 8, 8, FogRenderVersions.CURRENT)
+        val published = visible + prefetched
+
+        assertTrue(fogViewportCoveredByPublishedTiles(viewport, setOf(prefetched), published))
+        val smallPreparedPan = viewport.copy(
+            center = GeoPoint(0.0, 0.1),
+            nearLeft = GeoPoint(-1.0, -0.9),
+            farLeft = GeoPoint(1.0, -0.9),
+            farRight = GeoPoint(1.0, 1.1),
+            nearRight = GeoPoint(-1.0, 1.1),
+        )
+        assertTrue(
+            "a small pan inside the same published tiles must stay visible",
+            fogViewportCoveredByPublishedTiles(smallPreparedPan, setOf(prefetched), published),
+        )
+        assertFalse(
+            fogViewportCoveredByPublishedTiles(
+                viewport,
+                setOf(FogTileKey(4, 9, 8, FogRenderVersions.CURRENT)),
+                published,
+            ),
+        )
+        assertFalse(
+            fogViewportCoveredByPublishedTiles(
+                viewport.copy(floorZoom = 6),
+                emptySet(),
+                published,
+            ),
+        )
+    }
+
     @Test
     fun portraitCoverageIncludesEveryVisibleRowAndIsNotLimitedToThreeRows() {
         val plan = FogViewportCoveragePlanner(maxTiles = 512).plan(

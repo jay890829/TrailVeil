@@ -17,10 +17,6 @@
     <string name="recording_entry_menu">探索選單</string>
     <string name="recording_entry_privacy_menu">隱私與資料</string>
     <string name="map_content_description">互動式探索地圖</string>
-    <string name="map_loading">正在載入線上底圖…</string>
-    <string name="map_unavailable">線上底圖目前無法使用；足跡記錄仍可正常運作。</string>
-    <string name="map_fog_loading">正在重建探索區域…</string>
-    <string name="map_fog_unavailable">探索圖層無法使用，未知區域會保持遮蔽</string>
     <string name="location_rationale_title">需要位置才能畫出足跡</string>
     <string name="location_rationale_body">允許 TrailVeil 在使用期間取得位置，之後才能透過前景服務在鎖定螢幕後持續探索。</string>
     <string name="location_permission_settings_title">位置權限已關閉</string>

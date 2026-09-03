@@ -34,7 +34,7 @@ class ProviderRuntimeGateTest {
     }
 
     @Test
-    fun validatedNetworkAndProviderServicesAreRequiredBeforeInitialization() {
+    fun defaultPolicyRequiresValidatedNetworkAndProviderServicesBeforeInitialization() {
         val noNetwork = ProviderRuntimeGate.startupDecision(
             keyConfigured = true,
             keyReason = "VALID",
@@ -50,6 +50,32 @@ class ProviderRuntimeGateTest {
 
         assertEquals(ProviderFallbackReason.NO_VALIDATED_NETWORK, noNetwork.fallbackReason)
         assertEquals(ProviderFallbackReason.PROVIDER_SERVICES_UNAVAILABLE, noServices.fallbackReason)
+    }
+
+    @Test
+    fun productionPolicyMayInitializeOfflineButStillRequiresProviderServices() {
+        val offlineWithServices = ProviderRuntimeGate.startupDecision(
+            keyConfigured = true,
+            keyReason = "VALID",
+            hasValidatedNetwork = false,
+            hasCompatibleServices = true,
+            initializeWithoutValidatedNetwork = true,
+        )
+        val offlineWithoutServices = ProviderRuntimeGate.startupDecision(
+            keyConfigured = true,
+            keyReason = "VALID",
+            hasValidatedNetwork = false,
+            hasCompatibleServices = false,
+            initializeWithoutValidatedNetwork = true,
+        )
+
+        assertTrue(offlineWithServices.initializeMap)
+        assertNull(offlineWithServices.fallbackReason)
+        assertFalse(offlineWithoutServices.initializeMap)
+        assertEquals(
+            ProviderFallbackReason.PROVIDER_SERVICES_UNAVAILABLE,
+            offlineWithoutServices.fallbackReason,
+        )
     }
 
     @Test

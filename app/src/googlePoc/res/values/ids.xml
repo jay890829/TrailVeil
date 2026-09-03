@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <item name="map_fog_cover_up" type="id" />
+    <item name="map_fog_last_cover_interval_ms" type="id" />
+    <item name="map_fog_synchronous_cover_up" type="id" />
+    <item name="map_camera_flight_active" type="id" />
+    <item name="map_overlay_visible" type="id" />
+    <item name="map_touch_down_count" type="id" />
+    <item name="map_detail_map_loaded" type="id" />
+    <item name="map_detail_map_instance" type="id" />
+    <item name="map_fog_binding_state" type="id" />
+    <item name="map_fog_last_failure" type="id" />
+    <item name="map_saved_state_restored" type="id" />
+    <item name="map_fog_runtime_present" type="id" />
+    <item name="map_fog_effect_epoch" type="id" />
+    <item name="map_camera_default_at_ready" type="id" />
+    <item name="map_saved_state_last_save" type="id" />
+    <item name="map_disposed_at" type="id" />
+    <item name="map_entry_destroyed_at" type="id" />
+    <item name="map_fog_phase" type="id" />
+    <item name="map_fog_binding_gates" type="id" />
+    <item name="map_fog_binding_instance" type="id" />
+    <item name="map_entry_destroy_stack" type="id" />
+</resources>
