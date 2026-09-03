@@ -8,7 +8,10 @@ import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.onAllNodesWithContentDescription
+import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
@@ -219,6 +222,41 @@ class GoogleRecordingEntryScreenTest {
             insertedPointId
         }
         return pointId
+    }
+
+    @Test
+    fun theDisclosureNamesGoogleMapsAndItsTerms() {
+        // `V02-006`: on the Google build the privacy sheet must name Google as the basemap
+        // provider and carry the two documents Google Maps Platform Terms 3.2.2(a) require the
+        // application to name: the Google Maps Additional Terms and the Google Privacy Policy.
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val providerName = context.getString(R.string.map_provider_disclosure_name)
+        val providerPrivacy = context.getString(R.string.map_provider_privacy_body)
+        val providerTerms = context.getString(R.string.map_provider_terms_body)
+        assertTrue(providerName.contains("Google"))
+        assertTrue(providerPrivacy.contains("policies.google.com/privacy"))
+        assertTrue(providerTerms.contains("maps.google.com/help/terms_maps"))
+
+        composeRule.waitForIdle()
+        dismissDisclosureIfShown()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Privacy).performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.PrivacySheet).assertIsDisplayed()
+        composeRule
+            .onNodeWithText(
+                context.getString(R.string.recording_entry_privacy_provider_label, providerName),
+            )
+            .performScrollTo()
+            .assertIsDisplayed()
+        composeRule.onNodeWithText(providerPrivacy).performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText(providerTerms).performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.PrivacyDismiss).performClick()
+        composeRule.waitForIdle()
+        assertTrue(
+            composeRule.onAllNodesWithTag(RecordingEntryTestTags.PrivacySheet)
+                .fetchSemanticsNodes()
+                .isEmpty(),
+        )
     }
 
     private fun dismissDisclosureIfShown() {

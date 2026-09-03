@@ -17,6 +17,7 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.runner.lifecycle.ActivityLifecycleMonitorRegistry
@@ -99,9 +100,11 @@ class RecordingEntryScreenTest {
             .assertIsDisplayed()
         composeRule
             .onNodeWithText(context.getString(R.string.recording_entry_permissions_summary))
+            .performScrollTo()
             .assertIsDisplayed()
         composeRule
             .onNodeWithText(context.getString(R.string.recording_entry_consent_note))
+            .performScrollTo()
             .assertIsDisplayed()
         composeRule.onNodeWithTag(RecordingEntryTestTags.Start).assertDoesNotExist()
 
@@ -143,6 +146,48 @@ class RecordingEntryScreenTest {
         composeRule
             .onNodeWithText(context.getString(R.string.recording_entry_privacy_body))
             .assertDoesNotExist()
+    }
+
+    @Test
+    fun theDisclosureNamesTheActiveBasemapProviderAndItsTerms() {
+        // `V02-006`: the sheet must say which third party receives basemap requests and under
+        // which terms. The shipped MapLibre build names OpenFreeMap and carries the OpenStreetMap
+        // attribution the ODbL requires; the Google build has its own twin of this case.
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(firstVisit = true),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        val providerName = context.getString(R.string.map_provider_disclosure_name)
+        val providerPrivacy = context.getString(R.string.map_provider_privacy_body)
+        val providerTerms = context.getString(R.string.map_provider_terms_body)
+        assertEquals("OpenFreeMap", providerName)
+        assertTrue(providerPrivacy.contains("OpenFreeMap"))
+        assertTrue(providerTerms.contains("OpenStreetMap contributors"))
+        assertTrue(providerTerms.contains("openstreetmap.org/copyright"))
+        assertTrue(
+            "the shared copy must not name a provider; the provider strings do",
+            !context.getString(R.string.recording_entry_privacy_body).contains("OpenFreeMap"),
+        )
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.PrivacySheet).assertIsDisplayed()
+        composeRule
+            .onNodeWithText(
+                context.getString(R.string.recording_entry_privacy_provider_label, providerName),
+            )
+            .performScrollTo()
+            .assertIsDisplayed()
+        composeRule.onNodeWithText(providerPrivacy).performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithText(providerTerms).performScrollTo().assertIsDisplayed()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.PrivacyDismiss).performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.PrivacySheet).assertDoesNotExist()
     }
 
     @Test

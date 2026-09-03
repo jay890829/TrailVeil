@@ -24,4 +24,10 @@
     <string name="map_provider_unavailable_no_play_services">The online map is unavailable: compatible Google Play services are missing or disabled on this device.</string>
     <string name="map_provider_unavailable_initialization_failure">The online map could not start.</string>
     <string name="map_provider_unavailable_reassurance">Recording and exploration history stay on this device and keep working.</string>
+    <!-- `V02-006`: the disclosure the shared privacy sheet composes for the active basemap. The
+         two URLs are the ones Google Maps Platform Terms 3.2.2(a) require the application to
+         name; the data list mirrors the Maps SDK for Android Play data disclosure. -->
+    <string name="map_provider_disclosure_name">Google Maps</string>
+    <string name="map_provider_privacy_body">This build shows Google Maps. Basemap requests go to Google and reveal the approximate area being viewed. The Maps SDK also sends Google device details (OS version and model), your IP address, a pseudonymous SDK identifier, crash reports and map-interaction events such as panning and zooming; Google handles them under the Google Privacy Policy (policies.google.com/privacy). TrailVeil never sends your recorded route to Google. Map loads are attributed to the TrailVeil developer\'s Google Cloud project and key, not to you; they are currently free and unlimited for mobile apps, and if that ever changed TrailVeil would have to change how the map is provided rather than charge you.</string>
+    <string name="map_provider_terms_body">Google Maps content is subject to the Google Maps Additional Terms of Service (maps.google.com/help/terms_maps). The Google logo on the map is Google\'s attribution and stays visible. TrailVeil uses no Google account, no Places lookups, no map styling ID and no advertising SDK.</string>
 </resources>

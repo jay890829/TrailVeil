@@ -3,6 +3,7 @@ package app.trailveil.map
 import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
@@ -115,6 +116,58 @@ class MapAccessibilityBaselineTest {
             screen = "maplibre detail",
             expectedDescendants = shippedControls,
         )
+    }
+
+    @Test
+    fun attributionAndLogoStayAboveTheNavigationBar() {
+        // `V02-006`: the OpenStreetMap credit sits behind the SDK's attribution control, so the
+        // control must be tappable. Before this task the full-bleed MapView drew the logo and the
+        // control under the system navigation bar, and a tap on the control landed on Back.
+        // Measured from the views' screen bounds against the window's navigation-bar inset.
+        dismissDisclosureIfShown()
+        val mapView = awaitLiveMapView("entry map never laid out") { view ->
+            view.isLaidOut && view.height > 0
+        }
+        composeRule.waitForIdle()
+        composeRule.runOnIdle {
+            val navigationBottom = requireNotNull(mapView.rootWindowInsets)
+                .getInsets(WindowInsets.Type.navigationBars())
+                .bottom
+            val decor = composeRule.activity.window.decorView
+            val decorLocation = IntArray(2).also(decor::getLocationOnScreen)
+            val limit = decorLocation[1] + decor.height - navigationBottom
+            // MapLibre 13 builds these two ImageViews programmatically, without ids: the
+            // attribution control carries the SDK's localized content description, the logo
+            // is the only other ImageView child that is not the compass and has none.
+            val attributionDescription = InstrumentationRegistry.getInstrumentation()
+                .targetContext
+                .getString(org.maplibre.android.R.string.maplibre_attributionsIconContentDescription)
+            val imageChildren = (0 until mapView.childCount)
+                .map(mapView::getChildAt)
+                .filterIsInstance<android.widget.ImageView>()
+                .filter { child -> child !is org.maplibre.android.maps.widgets.CompassView }
+            val attributionControl = imageChildren.firstOrNull { child ->
+                child.contentDescription == attributionDescription
+            }
+            val logo = imageChildren.firstOrNull { child ->
+                child !== attributionControl && child.contentDescription.isNullOrEmpty()
+            }
+            for ((name, candidate) in listOf(
+                "attribution control" to attributionControl,
+                "logo" to logo,
+            )) {
+                val control = requireNotNull(candidate) {
+                    "$name view missing among ${imageChildren.size} image children"
+                }
+                val location = IntArray(2).also(control::getLocationOnScreen)
+                val bottom = location[1] + control.height
+                assertTrue(
+                    "$name bottom $bottom is not above the navigation bar (limit $limit," +
+                        " inset $navigationBottom, height ${control.height})",
+                    control.height > 0 && bottom <= limit,
+                )
+            }
+        }
     }
 
     private fun dismissDisclosureIfShown() {

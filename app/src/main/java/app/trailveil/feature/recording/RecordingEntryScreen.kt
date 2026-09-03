@@ -609,6 +609,25 @@ private fun PrivacySheet(
                     text = stringResource(R.string.recording_entry_privacy_body),
                     style = MaterialTheme.typography.bodyMedium,
                 )
+                // `V02-006`: the active basemap provider names itself. Each provider source set
+                // supplies these three strings, so the sheet stays provider-neutral while the
+                // build states which third party receives basemap requests and under which terms.
+                Text(
+                    text = stringResource(
+                        R.string.recording_entry_privacy_provider_label,
+                        stringResource(R.string.map_provider_disclosure_name),
+                    ),
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = stringResource(R.string.map_provider_privacy_body),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    text = stringResource(R.string.map_provider_terms_body),
+                    style = MaterialTheme.typography.bodyMedium,
+                )
                 Text(
                     text = stringResource(R.string.recording_entry_privacy_retention_body),
                     style = MaterialTheme.typography.bodyMedium,

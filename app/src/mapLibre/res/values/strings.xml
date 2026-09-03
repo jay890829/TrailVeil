@@ -7,4 +7,10 @@
     <string name="map_loading">Loading the online basemap…</string>
     <string name="map_fog_loading">Rebuilding explored areas…</string>
     <string name="map_fog_unavailable">Exploration overlay unavailable — unknown areas stay hidden</string>
+    <!-- `V02-006`: the disclosure the shared privacy sheet composes for the active basemap. Both
+         provider source sets define these three keys in both locales; V02-008 turns them into
+         per-provider keys once both providers ship in one variant. -->
+    <string name="map_provider_disclosure_name">OpenFreeMap</string>
+    <string name="map_provider_privacy_body">This build shows the OpenFreeMap basemap, a donation-funded public map service with no availability guarantee. Basemap requests go to OpenFreeMap and reveal the approximate area being viewed; TrailVeil sends no account, identifier or route data with them.</string>
+    <string name="map_provider_terms_body">Map data © OpenStreetMap contributors, available under the Open Database License (openstreetmap.org/copyright); tiles by OpenMapTiles and OpenFreeMap. The ⓘ control on the map shows the full attribution. The map is drawn by MapLibre Native (BSD 2-Clause License); its notices ship inside the app.</string>
 </resources>

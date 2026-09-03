@@ -4,4 +4,7 @@
     <string name="map_loading">正在載入線上底圖…</string>
     <string name="map_fog_loading">正在重建探索區域…</string>
     <string name="map_fog_unavailable">探索圖層無法使用，未知區域會保持遮蔽</string>
+    <string name="map_provider_disclosure_name">OpenFreeMap</string>
+    <string name="map_provider_privacy_body">此版本顯示的是 OpenFreeMap 底圖，這是一個靠捐款營運、不保證可用性的公共地圖服務。底圖請求會傳送到 OpenFreeMap，並透露你正在瀏覽的大約區域；TrailVeil 不會隨請求送出任何帳號、識別碼或路線資料。</string>
+    <string name="map_provider_terms_body">地圖資料 © OpenStreetMap 貢獻者，依 Open Database License 授權（openstreetmap.org/copyright）；圖磚由 OpenMapTiles 與 OpenFreeMap 提供。地圖上的 ⓘ 控制項會顯示完整出處。地圖由 MapLibre Native 繪製（BSD 2-Clause 授權），其聲明隨 App 一併提供。</string>
 </resources>

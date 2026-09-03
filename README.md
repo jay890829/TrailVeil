@@ -16,6 +16,24 @@ The development requirements and current limitations are summarized below.
 - Use MapLibre Native with the no-key OpenFreeMap Liberty style as the replaceable default basemap. Provider or network failure must not interrupt recording or locally rebuilt fog. Do not bulk download or prefetch offline regions from the public endpoint; future local/self-hosted PMTiles remains an optional replacement path.
 - Treat real-device GPS, background behavior, battery use, and APK upgrade testing as required validation rather than optional final checks.
 
+## Map providers, terms and data
+
+TrailVeil draws its basemap with one of two providers. The shipped `debug`, `internal` and `release` builds use MapLibre Native with the OpenFreeMap Liberty style; the `googlePoc` build uses the Google Maps SDK for Android. The planned end state is dual-provider: Google by default with OpenFreeMap as the automatic fallback and as a deliberate choice, never both on one screen. Whichever provider is active, TrailVeil app code never transmits stored tracks, history or precise coordinates; the basemap provider necessarily receives requests for the map area being viewed. The in-app disclosure (the first-run sheet and the "Privacy and data" menu entry) names the active provider and the terms below.
+
+### Google Maps build
+
+- TrailVeil includes Google Maps features and content. Their use is subject to the [Google Maps Additional Terms of Service](https://maps.google.com/help/terms_maps/) and the [Google Privacy Policy](https://policies.google.com/privacy), as the Google Maps Platform Terms of Service section 3.2.2(a) require the application to state.
+- What Google receives, per the Maps SDK for Android Play data disclosure: the map area being viewed, device metadata (OS version, model, brand, form factor, SDK version), the device IP address, a pseudonymous Maps SDK identifier, crash and stack-trace metrics, and map-interaction events (panning and zooming) because TrailVeil uses the camera APIs. TrailVeil adds no account, advertising ID, analytics or route data to those requests.
+- The build depends only on `play-services-maps` and its Play services base libraries: no Places SDK, no map ID or cloud styling, no ads SDK, no Firebase, no analytics. Map loads therefore fall under the Maps SDK SKU, which Google prices as unlimited and free for mobile apps (checked against the first-party pricing page on 2026-09-01); they are attributed to the TrailVeil developer's Google Cloud project and API key, never to the user. The key ships only in an external properties file restricted to this package and signing certificate.
+- Google's attribution logo is drawn by the SDK and is never obscured by TrailVeil's fog overlay or safety cover; the app shows no Google Maps content next to or linked with a non-Google map, caches or scrapes no Google Maps content, and registers no point-of-interest listener in production.
+- Google's built-in labels and POI icons stay visible above the fog by owner decision. Google offers an opt-in "Promoted Places" marker-monetisation programme; TrailVeil has not enrolled and displays no advertising.
+
+### OpenFreeMap build
+
+- Map data © OpenStreetMap contributors, available under the [Open Database License](https://www.openstreetmap.org/copyright); tiles by [OpenMapTiles](https://www.openmaptiles.org/) and [OpenFreeMap](https://openfreemap.org/). The map's ⓘ control shows the full attribution string the tile service publishes.
+- OpenFreeMap is a public, donation-funded tile service that needs no API key and offers no availability guarantee; TrailVeil sends it plain style, tile, sprite and glyph requests that reveal the approximate area being viewed and carry no identifier. Do not bulk-download or prefetch from the public endpoint.
+- MapLibre Native is used under the BSD 2-Clause License; its third-party notices ship inside the app as `res/raw/maplibre_third_party_notices.txt`.
+
 ## Development
 
 The initial MVP supports Android 14 (API 34) and newer.

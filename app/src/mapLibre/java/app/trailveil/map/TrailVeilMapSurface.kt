@@ -10,6 +10,8 @@ import android.view.MotionEvent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -685,7 +687,15 @@ internal fun TrailVeilMapSurface(
         }
     }
 
-    LaunchedEffect(readyMap, compassTopInset, compassEndInset, density) {
+    // `V02-006`: the full-bleed MapView reaches under the system navigation bar, so the SDK's logo
+    // and attribution control used to be drawn beneath it and a tap on the control landed on Back.
+    // Read the bar's height here (composition) and lift both above it in the effect below. Only
+    // the full-bleed map needs this: an embedded map (`rendersIntoTheWindow`) sits inside its
+    // screen's own layout, which already keeps clear of the bar, and lifting there would float
+    // the controls above the card's bottom edge.
+    val navigationBottomPx =
+        if (rendersIntoTheWindow) 0 else WindowInsets.navigationBars.getBottom(density)
+    LaunchedEffect(readyMap, compassTopInset, compassEndInset, density, navigationBottomPx) {
         val map = readyMap ?: return@LaunchedEffect
         val top = with(density) { compassTopInset.roundToPx() }
         val side = with(density) { compassEndInset.roundToPx() }
@@ -693,6 +703,25 @@ internal fun TrailVeilMapSurface(
         // Both horizontal margins, so the same call places it correctly when the layout is
         // mirrored and `END` resolves to the left.
         map.uiSettings.setCompassMargins(side, top, side, 0)
+        // The embedded card keeps every SDK margin as shipped; only the full-bleed map moves.
+        if (rendersIntoTheWindow) return@LaunchedEffect
+        // The horizontal margins stay the SDK's own, so the attribution control keeps its place
+        // beside the logo; only the bottom margin moves, by the navigation bar plus the same gap
+        // the compass keeps from its edge. The attribution dialog behind the control is the
+        // OpenStreetMap credit the ODbL requires, so it must stay tappable.
+        val bottom = navigationBottomPx + side
+        map.uiSettings.setLogoMargins(
+            map.uiSettings.logoMarginLeft,
+            map.uiSettings.logoMarginTop,
+            map.uiSettings.logoMarginRight,
+            bottom,
+        )
+        map.uiSettings.setAttributionMargins(
+            map.uiSettings.attributionMarginLeft,
+            map.uiSettings.attributionMarginTop,
+            map.uiSettings.attributionMarginRight,
+            bottom,
+        )
     }
 
     // Reporting the user's own hand is not fog's business, and keeping it here rather than in the
