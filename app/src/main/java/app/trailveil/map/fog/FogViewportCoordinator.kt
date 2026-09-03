@@ -84,6 +84,19 @@ class FogViewportCoordinator(
     private val invalidator = FogTileInvalidator(0..22, style)
 
     /**
+     * The tiles the surfaces are showing right now, as far as the coordinator can know it: the
+     * last successfully rendered viewport. One `render` publishes its 3x3 mosaic. The provider
+     * batch seam renders one window per LOD for the same camera, all around one centre, so a
+     * window rendered at the centre already published EXTENDS the set instead of replacing it;
+     * otherwise every LOD but the last would be read as off-screen and invalidated by the next
+     * reveal merge (found by the 2026-09-03 review of this change). A window at a new centre
+     * replaces the set. The set is capped at [MAX_ACTIVE_VIEWPORT_KEYS], newest keys kept, so a
+     * camera that zooms in place cannot grow it without bound.
+     */
+    private var activeViewportCenter: GeoPoint? = null
+    private var activeViewportKeys: Set<FogTileKey> = emptySet()
+
+    /**
      * Whether the process-scoped lock is held right now. A device test that finds a map with a
      * runtime, a built binding and no generation cannot otherwise tell a surface waiting on this
      * lock from one that never asked; a suspended holder shows in no thread dump.
@@ -184,12 +197,25 @@ class FogViewportCoordinator(
                     ?: pipeline.load(key, selected[key].orEmpty()).mask,
             )
         }
-        return FogViewportTileRender(
+        val rendered = FogViewportTileRender(
             request = request,
             keys = keys,
             queryBounds = queryBounds,
             tiles = tiles,
         )
+        // Publish the viewport only after every read/render/cache operation succeeded. A failed
+        // replacement render must not make later reveal merges stop maintaining the last mosaic.
+        activeViewportKeys = if (activeViewportCenter == request.center) {
+            LinkedHashSet<FogTileKey>(activeViewportKeys).apply {
+                removeAll(keys.toSet())
+                addAll(keys)
+                while (size > MAX_ACTIVE_VIEWPORT_KEYS) remove(first())
+            }
+        } else {
+            keys.toSet()
+        }
+        activeViewportCenter = request.center
+        return rendered
     }
 
     /** Builds a safe opaque-loading mosaic without reading or populating derived caches. */
@@ -215,24 +241,37 @@ class FogViewportCoordinator(
     }
 
     /**
-     * Unions only renderer-proven affected tiles after their points have committed to Room.
-     * Cache misses stay misses and are rebuilt from canonical Room data on the next viewport load.
+     * Immediately unions a persisted reveal into the active viewport and invalidates every other
+     * possibly affected derived tile.
+     *
+     * The conservative candidate calculation is cheap even for a long high-speed step. Rendering
+     * is bounded by the active viewport (the 3x3 mosaic, or every LOD window a provider batch
+     * rendered for one camera) instead of eagerly comparing masks at zooms 0..22. An off-screen
+     * tile can therefore become a cache miss, never a stale displayed mask: its next load
+     * rebuilds the complete mask from canonical Room data.
      */
     suspend fun mergePersistedReveals(updates: List<FogRevealUpdate>): FogRevealMerge =
         mutex.withLock {
             if (updates.isEmpty()) {
                 return@withLock FogRevealMerge(emptySet(), emptySet())
             }
-            val keys = buildSet {
+            // Candidates come only from keys that exist: the byte-bounded memory and disk caches
+            // plus the last successfully rendered viewport. The invalidator never materialises the
+            // region between two points, so a far-apart same-segment pair costs a bounds test per
+            // held key, not one allocation per tile of a rectangle at every zoom (the 2026-09-03
+            // heap dump held 3.5 million such keys).
+            val maintainedKeys = pipeline.cachedKeys() + activeViewportKeys
+            val candidateKeys = buildSet {
                 updates.forEach { update ->
-                    // A page carries up to 256 points and this scan spans every zoom level, so the
-                    // loop is long enough that a caller's timeout has to be able to reach it.
-                    // Without a cancellation point the shared lock stays held long past that
-                    // timeout and every other surface in the process starves behind it.
+                    // A page carries up to 256 points and the lock is held for the whole page, so
+                    // a caller's timeout still has to be able to reach the loop: keep the
+                    // cancellation point first, or a wedged holder starves every other surface.
                     currentCoroutineContext().ensureActive()
-                    addAll(invalidator.affectedKeys(update, renderVersion, ::worthInvalidating))
+                    addAll(invalidator.candidateKeysAmong(update, renderVersion, maintainedKeys))
                 }
             }
+            val activeKeys = candidateKeys.intersect(activeViewportKeys)
+            val offscreenKeys = candidateKeys - activeKeys
             val segments = updates.mapIndexed { index, update ->
                 TrackSegment(
                     id = index,
@@ -241,22 +280,15 @@ class FogViewportCoordinator(
                         ?: listOf(update.current),
                 )
             }
-            pipeline.mergeReveal(keys, segments)
+            pipeline.invalidate(offscreenKeys)
+            val activeMerge = pipeline.mergeReveal(activeKeys, segments)
+            FogRevealMerge(
+                updatedKeys = activeMerge.updatedKeys,
+                missingKeys = activeMerge.missingKeys + offscreenKeys,
+            )
         }
 
     suspend fun clearDerivedCache() = mutex.withLock { pipeline.clear() }
-
-    /**
-     * Whether the exact invalidation answer for [key] can change what the merge keeps.
-     *
-     * [FogTilePipeline.mergeReveal] reports an uncached tile as missing and leaves it to be rebuilt
-     * from canonical Room data, so testing one buys an answer that is then discarded. The scan
-     * spans all 23 zoom levels, while the memory and disk caches together hold only the tiles that
-     * were actually rendered (loadCached promotes a disk hit), so almost every candidate is in that
-     * discarded majority: the merge is bounded by what the caches hold, and skipping the rest is
-     * the difference between tens of seconds and milliseconds for one page.
-     */
-    private fun worthInvalidating(key: FogTileKey): Boolean = pipeline.loadCached(key) != null
 
     private fun renderZoom(mapZoom: Double): Int =
         floor(mapZoom).toInt().coerceIn(0, 22)
@@ -265,6 +297,9 @@ class FogViewportCoordinator(
         // 100 m/s * 60 s accepted continuity ceiling + 25 m reveal radius + rounding allowance.
         const val DEFAULT_QUERY_MARGIN_METERS = 6_100.0
         const val MAX_PROVIDER_VIEWPORT_TILES = 256
+
+        /** Four provider windows' worth; a plan of LOD windows for one camera is capped at one. */
+        const val MAX_ACTIVE_VIEWPORT_KEYS = 4 * MAX_PROVIDER_VIEWPORT_TILES
     }
 }
 

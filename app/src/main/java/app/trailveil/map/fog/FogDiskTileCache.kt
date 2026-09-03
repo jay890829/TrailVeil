@@ -119,6 +119,10 @@ class FogDiskTileCache(
         )
     }
 
+    /** Enumerates bounded derived entries by path only; payload validation remains lazy in [get]. */
+    @Synchronized
+    fun keys(): Set<FogTileKey> = keyFiles(rootDirectory).mapNotNull(::entryKey).toSet()
+
     private fun read(file: File, expectedKey: FogTileKey): FogPixelMask {
         require(file.length() in (HEADER_BYTES + 1)..maxBytes) { "invalid entry size" }
         DataInputStream(BufferedInputStream(file.inputStream())).use { input ->
@@ -266,7 +270,9 @@ class FogDiskTileCache(
         return file.listFiles().orEmpty().flatMap(::maskFiles)
     }
 
-    private fun entryRenderVersion(file: File): Int? {
+    private fun entryRenderVersion(file: File): Int? = entryKey(file)?.renderVersion
+
+    private fun entryKey(file: File): FogTileKey? {
         val relative = runCatching {
             rootDirectory.toPath().relativize(file.absoluteFile.toPath())
         }.getOrNull() ?: return null
@@ -283,9 +289,15 @@ class FogDiskTileCache(
         val yName = relative.getName(3).toString()
         if (!yName.startsWith("y") || !yName.endsWith(".mask")) return null
         val y = yName.removePrefix("y").removeSuffix(".mask").toIntOrNull() ?: return null
-        return runCatching { FogTileKey(zoom, x, y, renderVersion) }
-            .getOrNull()
-            ?.renderVersion
+        return runCatching { FogTileKey(zoom, x, y, renderVersion) }.getOrNull()
+    }
+
+    private fun keyFiles(file: File): List<File> {
+        if (!file.exists() || Files.isSymbolicLink(file.toPath())) return emptyList()
+        if (file.isFile) return if (entryKey(file) != null) listOf(file) else emptyList()
+        require(file.isDirectory) { "Fog cache path is not a directory: $file" }
+        val children = checkNotNull(file.listFiles()) { "Unable to enumerate fog disk cache: $file" }
+        return children.flatMap(::keyFiles)
     }
 
     private fun checksum(alpha: ByteArray): Long = CRC32().apply { update(alpha) }.value

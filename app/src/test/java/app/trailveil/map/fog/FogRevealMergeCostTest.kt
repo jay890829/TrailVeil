@@ -27,9 +27,12 @@ import org.junit.Test
  *
  * Almost all of that work was discarded: the memory and disk caches together hold only the tiles
  * that were actually rendered, and [FogTilePipeline.mergeReveal] reports any uncached tile as
- * missing without merging it. So the fix is to ask the cache before paying for the exact answer,
- * and these tests pin that the scan stays bounded by what the caches actually hold rather than by
- * the zoom range.
+ * missing without merging it. The first fix (2026-09-01) asked the cache before paying for the
+ * exact answer; it still materialised every candidate tile of the region between two points at
+ * every zoom before asking, which a 2026-09-03 heap dump showed at 3.5 million keys for a far-apart
+ * same-segment pair. The P4-021 bound replaces that: candidates are taken from the keys the caches
+ * and the active viewport actually hold ([FogTileInvalidator.candidateKeysAmong]), so these tests
+ * pin that the merge stays bounded by what exists rather than by the zoom range or the region.
  */
 class FogRevealMergeCostTest {
 
@@ -98,8 +101,8 @@ class FogRevealMergeCostTest {
     /**
      * Source pin for the two lines the behavioural tests cannot fully defend.
      *
-     * Deleting `::worthInvalidating` turns the two cache tests above red, but deleting
-     * `ensureActive()` leaves every assertion green on a cold cache and every rendered pixel
+     * Widening the candidate source past `cachedKeys()` turns the two cache tests above red, but
+     * deleting `ensureActive()` leaves every assertion green on a cold cache and every rendered pixel
      * identical: its only symptom is that one wedged surface covers every later map in the
      * process, which no unit test observes. The pin also fixes the cancellation point's position,
      * which no behavioural test can see either.
@@ -109,8 +112,12 @@ class FogRevealMergeCostTest {
         val body = mergeBody()
 
         assertTrue(
-            "mergePersistedReveals must ask the cache before paying for the exact scan",
-            body.contains("worthInvalidating"),
+            "mergePersistedReveals must take its candidates only from keys that exist",
+            body.contains("candidateKeysAmong") && body.contains("pipeline.cachedKeys()"),
+        )
+        assertFalse(
+            "mergePersistedReveals must never expand the region between two points into keys",
+            body.contains("affectedKeys(") || body.contains("candidateKeys("),
         )
         assertTrue(
             "mergePersistedReveals must stay cancellable; without a suspension point the " +

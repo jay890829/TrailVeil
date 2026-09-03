@@ -45,6 +45,18 @@ class FogTilePipeline(
     @Synchronized
     fun loadCached(key: FogTileKey): FogTileLoad? = cached(key)
 
+    /** Snapshot of the byte-bounded derived keys that can become stale after a reveal. */
+    @Synchronized
+    fun cachedKeys(): Set<FogTileKey> {
+        val memoryKeys = memoryCache.keys()
+        val diskKeys = activeDiskCache()?.let { cache ->
+            runCatching { cache.keys() }
+                .onFailure { diskCacheEnabled = false }
+                .getOrNull()
+        }.orEmpty()
+        return memoryKeys + diskKeys
+    }
+
     @Synchronized
     fun load(key: FogTileKey, segments: List<TrackSegment>): FogTileLoad {
         cached(key)?.let { return it }

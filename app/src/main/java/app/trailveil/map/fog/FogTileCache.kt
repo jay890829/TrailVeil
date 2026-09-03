@@ -59,6 +59,9 @@ class FogMemoryTileCache(
     @Synchronized
     fun stats(): FogTileCacheStats = FogTileCacheStats(entries.size, byteCount)
 
+    @Synchronized
+    fun keys(): Set<FogTileKey> = entries.keys.toSet()
+
     private fun FogPixelMask.byteCount(): Long =
         Math.multiplyExact(width.toLong(), height.toLong())
 

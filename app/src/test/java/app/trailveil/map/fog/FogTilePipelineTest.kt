@@ -29,6 +29,19 @@ class FogTilePipelineTest {
     }
 
     @Test
+    fun cachedKeySnapshotIncludesMemoryAndDiskOnlyEntries() {
+        val memory = FogMemoryTileCache(maxBytes = 64)
+        val disk = FogDiskTileCache(temporaryFolder.newFolder(), maxBytes = 1_000)
+        val pipeline = pipeline(memory, disk, AtomicInteger(), mask(7))
+        val memoryAndDisk = key(x = 1)
+        val diskOnly = key(x = 2)
+        pipeline.load(memoryAndDisk, segments())
+        disk.put(diskOnly, mask(8))
+
+        assertEquals(setOf(memoryAndDisk, diskOnly), pipeline.cachedKeys())
+    }
+
+    @Test
     fun exactInvalidationRemovesBothLayersAndForcesRender() {
         val memory = FogMemoryTileCache(maxBytes = 64)
         val disk = FogDiskTileCache(temporaryFolder.newFolder(), maxBytes = 1_000)

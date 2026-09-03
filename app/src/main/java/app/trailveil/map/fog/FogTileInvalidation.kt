@@ -39,7 +39,10 @@ class FogTileInvalidator(
      * for, and a rejected candidate is absent from the result. Comparing masks costs two full tile
      * renders, and this scan covers every configured zoom level, so a caller that already knows an
      * answer would be discarded can use this to avoid producing it. Rejecting a candidate whose
-     * answer is used would under-report invalidation and leave a stale cached tile.
+     * answer is used would under-report invalidation and leave a stale cached tile. The production
+     * merge no longer calls this at all: it takes candidates from [candidateKeysAmong] over the
+     * keys the caches and the active viewport actually hold, so nothing here is materialised on
+     * the hot path.
      */
     fun affectedKeys(
         update: FogRevealUpdate,
@@ -55,6 +58,23 @@ class FogTileInvalidator(
             ?: listOf(update.current)
         val after = listOf(TrackSegment(id = 0, points = afterPoints))
 
+        return candidateKeys(update, renderVersion).filterTo(linkedSetOf()) { key ->
+            worthTesting(key) && renderer.render(key, before) != renderer.render(key, after)
+        }
+    }
+
+    /**
+     * Conservatively bounds every tile that may change without rendering a mask.
+     *
+     * Callers may safely invalidate every returned key. [affectedKeys] is narrower, but pays for
+     * two complete mask renders per candidate and should only be used when that exactness is worth
+     * its cost.
+     */
+    fun candidateKeys(update: FogRevealUpdate, renderVersion: Int): Set<FogTileKey> {
+        require(renderVersion >= 0) { "renderVersion must be non-negative" }
+        val afterPoints = update.previousInSegment
+            ?.let { previous -> listOf(previous, update.current) }
+            ?: listOf(update.current)
         return buildSet {
             zoomLevels.forEach { zoom ->
                 val candidatePoints = if (isAmbiguousHalfWorld(update, zoom)) {
@@ -62,13 +82,50 @@ class FogTileInvalidator(
                 } else {
                     afterPoints
                 }
-                candidateKeys(candidatePoints, zoom, renderVersion).forEach { key ->
-                    if (!worthTesting(key)) return@forEach
-                    if (renderer.render(key, before) != renderer.render(key, after)) {
-                        add(key)
-                    }
-                }
+                candidateBounds(candidatePoints, zoom)?.addKeysTo(this, renderVersion)
             }
+        }
+    }
+
+    /** Returns only candidates from an already bounded collection, without expanding the region. */
+    fun candidateKeysAmong(
+        update: FogRevealUpdate,
+        renderVersion: Int,
+        keys: Collection<FogTileKey>,
+    ): Set<FogTileKey> {
+        require(renderVersion >= 0) { "renderVersion must be non-negative" }
+        // No distinct(): the result is built into a set, so a duplicate input key collapses there.
+        val eligible = keys.asSequence()
+            .filter { key -> key.renderVersion == renderVersion && key.zoom in zoomLevels }
+            .groupBy(FogTileKey::zoom)
+        val afterPoints = update.previousInSegment
+            ?.let { previous -> listOf(previous, update.current) }
+            ?: listOf(update.current)
+        return buildSet {
+            eligible.forEach { (zoom, zoomKeys) ->
+                val candidatePoints = if (isAmbiguousHalfWorld(update, zoom)) {
+                    listOf(update.current)
+                } else {
+                    afterPoints
+                }
+                val bounds = candidateBounds(candidatePoints, zoom) ?: return@forEach
+                zoomKeys.filterTo(this) { key -> bounds.contains(key) }
+            }
+        }
+    }
+
+    /** Counts the conservative region without allocating one key per tile. */
+    fun candidateKeyCount(update: FogRevealUpdate): Long {
+        val afterPoints = update.previousInSegment
+            ?.let { previous -> listOf(previous, update.current) }
+            ?: listOf(update.current)
+        return zoomLevels.fold(0L) { total, zoom ->
+            val candidatePoints = if (isAmbiguousHalfWorld(update, zoom)) {
+                listOf(update.current)
+            } else {
+                afterPoints
+            }
+            Math.addExact(total, candidateBounds(candidatePoints, zoom)?.keyCount ?: 0L)
         }
     }
 
@@ -81,11 +138,10 @@ class FogTileInvalidator(
         return distanceFromHalfWorld <= max(1e-9, Math.ulp(worldSize) * 4.0)
     }
 
-    private fun candidateKeys(
+    private fun candidateBounds(
         points: List<GeoPoint>,
         zoom: Int,
-        renderVersion: Int,
-    ): Set<FogTileKey> {
+    ): CandidateTileBounds? {
         val tileCount = 1 shl zoom
         val worldSize = style.tileSize.toDouble() * tileCount
         var previousX: Double? = null
@@ -110,29 +166,50 @@ class FogTileInvalidator(
 
         val firstY = floor(minY / style.tileSize).toLong().coerceAtLeast(0L)
         val lastY = floor(maxY / style.tileSize).toLong().coerceAtMost(tileCount - 1L)
-        if (firstY > lastY) return emptySet()
+        if (firstY > lastY) return null
 
         val firstX = floor(minX / style.tileSize).toLong()
         val lastX = floor(maxX / style.tileSize).toLong()
-        val rawXValues: LongRange = if (lastX - firstX + 1 >= tileCount) {
-            0L..(tileCount - 1L)
-        } else {
-            firstX..lastX
+        return CandidateTileBounds(zoom, tileCount, firstX, lastX, firstY, lastY)
+    }
+
+    private data class CandidateTileBounds(
+        val zoom: Int,
+        val tileCount: Int,
+        val firstX: Long,
+        val lastX: Long,
+        val firstY: Long,
+        val lastY: Long,
+    ) {
+        val xCount: Long = minOf(lastX - firstX + 1L, tileCount.toLong())
+        val keyCount: Long = Math.multiplyExact(xCount, lastY - firstY + 1L)
+
+        fun contains(key: FogTileKey): Boolean {
+            if (key.zoom != zoom || key.y.toLong() !in firstY..lastY) return false
+            if (xCount == tileCount.toLong()) return true
+            val firstWrapped = Math.floorMod(firstX, tileCount.toLong()).toInt()
+            val wrappedOffset = Math.floorMod(key.x - firstWrapped, tileCount)
+            return wrappedOffset.toLong() < xCount
         }
 
-        return buildSet {
-            for (rawX in rawXValues) {
-                val x = Math.floorMod(rawX, tileCount.toLong()).toInt()
-                for (rawY in firstY..lastY) {
-                    add(
-                        FogTileKey(
-                            zoom = zoom,
-                            x = x,
-                            y = rawY.toInt(),
-                            renderVersion = renderVersion,
-                        ),
-                    )
-                }
+        fun addKeysTo(destination: MutableSet<FogTileKey>, renderVersion: Int) {
+            if (xCount == tileCount.toLong()) {
+                repeat(tileCount) { x -> addColumnTo(destination, x, renderVersion) }
+                return
+            }
+            repeat(xCount.toInt()) { offset ->
+                val x = Math.floorMod(firstX + offset, tileCount.toLong()).toInt()
+                addColumnTo(destination, x, renderVersion)
+            }
+        }
+
+        private fun addColumnTo(
+            destination: MutableSet<FogTileKey>,
+            x: Int,
+            renderVersion: Int,
+        ) {
+            for (rawY in firstY..lastY) {
+                destination += FogTileKey(zoom, x, rawY.toInt(), renderVersion)
             }
         }
     }
