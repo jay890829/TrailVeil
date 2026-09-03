@@ -14,6 +14,8 @@ import app.trailveil.map.fog.FogViewportRequest
 import app.trailveil.map.fog.GeoPoint
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 
 /**
  * The provider-neutral map surface contract.
@@ -131,6 +133,64 @@ internal suspend fun <T> retryFogOperation(
             onFailure(failure)
             delay(retryDelayMillis)
         }
+    }
+}
+
+/**
+ * What a canonical fog pass wants the driver to do next.
+ *
+ * [AWAIT_NEXT_REVISION] parks until the fog content counter moves; [STOP] ends the loop, and is
+ * only ever legal where some input the pass is keyed on has already changed, so a replacement
+ * pass is already on its way.
+ */
+internal enum class CanonicalFogPassOutcome {
+    AWAIT_NEXT_REVISION,
+    STOP,
+}
+
+/**
+ * Runs [pass] once per distinct content revision - never concurrently, and never by cancelling a
+ * pass that is already in flight.
+ *
+ * A merged page of persisted reveals is a *content-changed signal*, not a reason to abandon a
+ * half-installed generation. Making that signal an effect key turned every merged page into a
+ * restart of the render, the style install and the retirement; where one round trip is slower
+ * than the gap between merges - a software-GL host under a live write stream - the canonical can
+ * then never finish, and the callback the liveness gate observes is the last statement of that
+ * round trip. That is what reddened the hosted `map-0` shard twice on 2026-09-03/04 while the
+ * same case passed locally in under two seconds.
+ *
+ * ORDERING RULE, load-bearing: [currentRevision] is read BEFORE the pass and never after. A merge
+ * landing between that read and the style install is not in the mosaic the pass just composed and
+ * must still buy a follow-up. Because the comparison is against a pre-pass value, and because both
+ * a snapshot flow and a state flow replay their current value to a new collector, no wakeup can be
+ * lost in the window between a pass ending and collection starting. Conflation is harmless for the
+ * same reason: the counter is monotone, so any conflated value still differs from a pre-pass one.
+ * Reading the counter after the pass would silently drop exactly those reveals.
+ *
+ * REVEAL-LOSS AUDIT of the [STOP] exits. A pass may report [STOP] only where something the effect
+ * is keyed on has already changed, so a replacement pass is guaranteed and will render warm from
+ * caches that already hold every merged mask: the entry guards are all effect keys; the
+ * post-install mismatch check's own condition IS "an effect key already changed"; the non-covering
+ * branch requests a new viewport, which bumps the viewport generation and therefore re-keys;
+ * cancellation replaces the whole loop, and the replacement reads the counter fresh; and a failing
+ * attempt never reaches [STOP] at all, because [retryFogOperation] re-renders on every pass and so
+ * absorbs pending merges rather than queueing them.
+ *
+ * The other provider's surface already holds this contract by a different route: its coordinator
+ * records a merged page as a boolean, refuses to start a rebuild while a reusable one is pending,
+ * and re-checks staleness once at the end of an install. There the pass is an object it can
+ * abandon; here the pass IS the coroutine, so the coalescing has to live in the effect.
+ */
+internal suspend fun driveCanonicalFogPasses(
+    revisions: Flow<Long>,
+    currentRevision: () -> Long,
+    pass: suspend () -> CanonicalFogPassOutcome,
+) {
+    while (true) {
+        val startedAtRevision = currentRevision()
+        if (pass() == CanonicalFogPassOutcome.STOP) return
+        revisions.first { revision -> revision != startedAtRevision }
     }
 }
 

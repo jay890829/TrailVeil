@@ -26,6 +26,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
@@ -398,6 +399,11 @@ internal fun TrailVeilMapSurface(
     var fogViewportRequest by remember(mapView, fogRuntime) {
         mutableStateOf<FogViewportRequest?>(null)
     }
+    // What the change feed has merged, and nothing else. This counter is COLLECTED INSIDE the
+    // canonical render+install effect below and is deliberately NOT one of its keys: as a key it
+    // cancelled the in-flight render, style install and retirement once per merged page, which
+    // on a host slower than the merge cadence meant the canonical could never finish at all.
+    // `CanonicalFogEffectKeySourcePinTest` fails if it is ever put back.
     var fogRevision by remember(mapView, fogRuntime) { mutableLongStateOf(0L) }
     var fogViewportGeneration by remember(mapView, fogRuntime) { mutableLongStateOf(0L) }
     var fogPlaceholderReadyGeneration by remember(mapView, fogRuntime) {
@@ -982,7 +988,6 @@ internal fun TrailVeilMapSurface(
         fogViewportRequest,
         fogViewportGeneration,
         fogPlaceholderReadyGeneration,
-        fogRevision,
         fogBaselineReady,
         fogInstallFaultForTesting,
     ) {
@@ -992,122 +997,152 @@ internal fun TrailVeilMapSurface(
         val generation = fogViewportGeneration
         if (!fogBaselineReady) return@LaunchedEffect
         if (fogPlaceholderReadyGeneration != generation) return@LaunchedEffect
-        var styleMayHaveChanged = false
-        var installedStateReconciled = false
-        var preparedSlot: FogGenerationSlot? = null
-        var previousSlot: FogGenerationSlot? = null
-        try {
-            val rendered = renderCanonicalFogWithRetry(
-                request = request,
-                retryDelayMillis = FOG_RETRY_DELAY_MILLIS,
-                render = { viewport ->
-                    withContext(Dispatchers.Default) {
-                        runtime.viewportCoordinator.render(viewport)
-                    }
-                },
-                installAndAwait = { viewport ->
-                    val incomingExtent = FogBackdropGeometry.extent(viewport.mosaic)
-                    val cameraAlreadyOutsideIncoming = !surroundHoldsForCamera(incomingExtent)
-                    if (cameraAlreadyOutsideIncoming && !followingCameraMove.get()) {
-                        // Keep the older globally guarded renderer generation in place. Rejecting a
-                        // stale landing before style mutation avoids needless work; the post-install
-                        // check below still handles movement that happens while a valid S2 renders.
-                        retainCommittedGenerationOrRaiseCover()
-                        currentOnCanonicalFogInstallDecisionForTesting?.invoke(
-                            CanonicalFogInstallDecision(
-                                generation = generation,
-                                render = viewport,
-                                installedExtent = incomingExtent,
-                                installedSlot = null,
-                                rejectedBeforeStyleMutation = true,
-                                coverageInstalledAtDecision = fogCoverageInstalled,
-                            ),
-                        )
-                        requestViewport()
-                        throw StaleCanonicalFogInstallException
-                    }
-                    currentCanonicalFogInstallCheckpointForTesting?.invoke(
-                        CanonicalFogInstallCheckpoint(
-                            phase = CanonicalFogInstallCheckpointPhase.BEFORE_STYLE_INSTALL,
-                            generation = generation,
-                            fogRevision = fogRevision,
-                            render = viewport,
-                            installedExtent = null,
-                            installedSlot = null,
-                        ),
-                    )
-                    styleMayHaveChanged = true
-                    previousSlot = activeFogSlot
-                    preparedSlot = mapView.installFogGenerationAndAwait(
-                        map = checkNotNull(readyMap) { "Map disappeared during canonical fog install" },
-                        style = style,
-                        mosaic = viewport.mosaic,
-                        fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
-                        activeSlot = previousSlot,
-                        installFaultForTesting = fogInstallFaultForTesting,
-                    )
-                },
-                onFailure = { failure ->
-                    if (failure !== StaleCanonicalFogInstallException &&
-                        generation == fogViewportGeneration &&
-                        request == fogViewportRequest &&
-                        style === readyStyle
-                    ) {
-                        // A partial target is never published and only adds fog above the complete
-                        // active slot. Preserve that committed generation; the next attempt removes
-                        // the abandoned target before reusing its IDs.
-                        retainCommittedGenerationOrRaiseCover()
-                        fogRenderFailed = true
-                        currentOnFogFailure(failure)
-                    }
-                },
-            )
-            currentCanonicalFogInstallCheckpointForTesting?.invoke(
-                CanonicalFogInstallCheckpoint(
-                    phase = CanonicalFogInstallCheckpointPhase.AFTER_STYLE_INSTALL_BEFORE_RECONCILE,
-                    generation = generation,
-                    fogRevision = fogRevision,
-                    render = rendered,
-                    installedExtent = FogBackdropGeometry.extent(rendered.mosaic),
-                    installedSlot = preparedSlot,
-                ),
-            )
+        driveCanonicalFogPasses(
+            revisions = snapshotFlow { fogRevision },
+            currentRevision = { fogRevision },
+        ) canonicalPass@{
             if (
                 generation != fogViewportGeneration ||
                 request != fogViewportRequest ||
-                style !== readyStyle
+                style !== readyStyle ||
+                fogPlaceholderReadyGeneration != generation ||
+                !fogBaselineReady
             ) {
-                return@LaunchedEffect
+                // Free on the first pass - every value here is an effect key and was just read to
+                // build this coroutine. On a follow-up it stops a pass rendering a window a camera
+                // listener already superseded before Compose dispatched the re-key.
+                return@canonicalPass CanonicalFogPassOutcome.STOP
             }
-            val installedExtent = FogBackdropGeometry.extent(rendered.mosaic)
-            val installedSlot = checkNotNull(preparedSlot) {
-                "Canonical fog rendered without a prepared renderer generation"
-            }
-            activeFogSlot = installedSlot
-            installedSurround = installedExtent
-            // The coverage seam is consulted here and only here: it forces this decision, not the
-            // movement raise or the pre-mutation staleness check, so a forced non-covering answer
-            // cannot leak into paths that must keep answering from real geometry (a transient
-            // install retry once re-ran the pre-check against the forced answer and failed red).
-            val decisionCoverageHolds =
-                currentFogSurroundCoverageForTesting?.invoke(installedExtent)
-                    ?: surroundHoldsForCamera()
-            if (!decisionCoverageHolds) {
-                // The canonical reveal window is stale, but this complete slot's exterior guard
-                // still covers the live camera. Retain renderer coverage and request a better
-                // window instead of flashing the separately composed opaque cover.
-                fogCoverageInstalled = true
-                canonicalFogLoaded = false
-                currentOnCanonicalFogInstallDecisionForTesting?.invoke(
-                    CanonicalFogInstallDecision(
+            var styleMayHaveChanged = false
+            var installedStateReconciled = false
+            var preparedSlot: FogGenerationSlot? = null
+            var previousSlot: FogGenerationSlot? = null
+            try {
+                val rendered = renderCanonicalFogWithRetry(
+                    request = request,
+                    retryDelayMillis = FOG_RETRY_DELAY_MILLIS,
+                    render = { viewport ->
+                        withContext(Dispatchers.Default) {
+                            runtime.viewportCoordinator.render(viewport)
+                        }
+                    },
+                    installAndAwait = { viewport ->
+                        val incomingExtent = FogBackdropGeometry.extent(viewport.mosaic)
+                        val cameraAlreadyOutsideIncoming = !surroundHoldsForCamera(incomingExtent)
+                        if (cameraAlreadyOutsideIncoming && !followingCameraMove.get()) {
+                            // Keep the older globally guarded renderer generation in place. Rejecting a
+                            // stale landing before style mutation avoids needless work; the post-install
+                            // check below still handles movement that happens while a valid S2 renders.
+                            retainCommittedGenerationOrRaiseCover()
+                            currentOnCanonicalFogInstallDecisionForTesting?.invoke(
+                                CanonicalFogInstallDecision(
+                                    generation = generation,
+                                    render = viewport,
+                                    installedExtent = incomingExtent,
+                                    installedSlot = null,
+                                    rejectedBeforeStyleMutation = true,
+                                    coverageInstalledAtDecision = fogCoverageInstalled,
+                                ),
+                            )
+                            requestViewport()
+                            throw StaleCanonicalFogInstallException
+                        }
+                        currentCanonicalFogInstallCheckpointForTesting?.invoke(
+                            CanonicalFogInstallCheckpoint(
+                                phase = CanonicalFogInstallCheckpointPhase.BEFORE_STYLE_INSTALL,
+                                generation = generation,
+                                fogRevision = fogRevision,
+                                render = viewport,
+                                installedExtent = null,
+                                installedSlot = null,
+                            ),
+                        )
+                        styleMayHaveChanged = true
+                        previousSlot = activeFogSlot
+                        preparedSlot = mapView.installFogGenerationAndAwait(
+                            map = checkNotNull(readyMap) { "Map disappeared during canonical fog install" },
+                            style = style,
+                            mosaic = viewport.mosaic,
+                            fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
+                            activeSlot = previousSlot,
+                            installFaultForTesting = fogInstallFaultForTesting,
+                        )
+                    },
+                    onFailure = { failure ->
+                        if (failure !== StaleCanonicalFogInstallException &&
+                            generation == fogViewportGeneration &&
+                            request == fogViewportRequest &&
+                            style === readyStyle
+                        ) {
+                            // A partial target is never published and only adds fog above the complete
+                            // active slot. Preserve that committed generation; the next attempt removes
+                            // the abandoned target before reusing its IDs.
+                            retainCommittedGenerationOrRaiseCover()
+                            fogRenderFailed = true
+                            currentOnFogFailure(failure)
+                        }
+                    },
+                )
+                currentCanonicalFogInstallCheckpointForTesting?.invoke(
+                    CanonicalFogInstallCheckpoint(
+                        phase = CanonicalFogInstallCheckpointPhase.AFTER_STYLE_INSTALL_BEFORE_RECONCILE,
                         generation = generation,
+                        fogRevision = fogRevision,
                         render = rendered,
-                        installedExtent = installedExtent,
-                        installedSlot = installedSlot,
-                        rejectedBeforeStyleMutation = false,
-                        coverageInstalledAtDecision = fogCoverageInstalled,
+                        installedExtent = FogBackdropGeometry.extent(rendered.mosaic),
+                        installedSlot = preparedSlot,
                     ),
                 )
+                if (
+                    generation != fogViewportGeneration ||
+                    request != fogViewportRequest ||
+                    style !== readyStyle
+                ) {
+                    return@canonicalPass CanonicalFogPassOutcome.STOP
+                }
+                val installedExtent = FogBackdropGeometry.extent(rendered.mosaic)
+                val installedSlot = checkNotNull(preparedSlot) {
+                    "Canonical fog rendered without a prepared renderer generation"
+                }
+                activeFogSlot = installedSlot
+                installedSurround = installedExtent
+                // The coverage seam is consulted here and only here: it forces this decision, not the
+                // movement raise or the pre-mutation staleness check, so a forced non-covering answer
+                // cannot leak into paths that must keep answering from real geometry (a transient
+                // install retry once re-ran the pre-check against the forced answer and failed red).
+                val decisionCoverageHolds =
+                    currentFogSurroundCoverageForTesting?.invoke(installedExtent)
+                        ?: surroundHoldsForCamera()
+                if (!decisionCoverageHolds) {
+                    // The canonical reveal window is stale, but this complete slot's exterior guard
+                    // still covers the live camera. Retain renderer coverage and request a better
+                    // window instead of flashing the separately composed opaque cover.
+                    fogCoverageInstalled = true
+                    canonicalFogLoaded = false
+                    currentOnCanonicalFogInstallDecisionForTesting?.invoke(
+                        CanonicalFogInstallDecision(
+                            generation = generation,
+                            render = rendered,
+                            installedExtent = installedExtent,
+                            installedSlot = installedSlot,
+                            rejectedBeforeStyleMutation = false,
+                            coverageInstalledAtDecision = fogCoverageInstalled,
+                        ),
+                    )
+                    installedStateReconciled = true
+                    previousSlot?.let { retired ->
+                        mapView.retireFogGenerationAndAwait(
+                            map = checkNotNull(readyMap) { "Map disappeared while retiring fog" },
+                            style = style,
+                            retiredSlot = retired,
+                        )
+                    }
+                    requestViewport()
+                    return@canonicalPass CanonicalFogPassOutcome.STOP
+                }
+                fogCoverageInstalled = true
+                canonicalFogLoaded = true
+                fogRenderFailed = false
                 installedStateReconciled = true
                 previousSlot?.let { retired ->
                     mapView.retireFogGenerationAndAwait(
@@ -1116,43 +1151,31 @@ internal fun TrailVeilMapSurface(
                         retiredSlot = retired,
                     )
                 }
-                requestViewport()
-                return@LaunchedEffect
-            }
-            fogCoverageInstalled = true
-            canonicalFogLoaded = true
-            fogRenderFailed = false
-            installedStateReconciled = true
-            previousSlot?.let { retired ->
-                mapView.retireFogGenerationAndAwait(
-                    map = checkNotNull(readyMap) { "Map disappeared while retiring fog" },
-                    style = style,
-                    retiredSlot = retired,
+                currentOnFogCoverageInstalledForTesting?.invoke(
+                    InstalledFogCoverageSnapshot(
+                        generation = generation,
+                        extent = installedExtent,
+                        slot = installedSlot,
+                    ),
                 )
-            }
-            currentOnFogCoverageInstalledForTesting?.invoke(
-                InstalledFogCoverageSnapshot(
-                    generation = generation,
-                    extent = installedExtent,
-                    slot = installedSlot,
-                ),
-            )
-            currentOnFogRendered?.invoke(rendered)
-        } finally {
-            if (styleMayHaveChanged && !installedStateReconciled) {
-                // The target slot is additive: cancellation can leave an uncommitted *new* slot,
-                // but it never mutates or removes the published one. Preserve that committed
-                // generation while it still belongs to this style and retains its positive claim;
-                // its finite-extent guard makes that generation globally fail-closed even beyond
-                // the canonical reveal window. Clearing it here caused an avoidable black flash on
-                // every follow-location re-key.
-                // A later attempt removes the abandoned target before reusing its IDs - it is
-                // the ONLY mutation owner for that slot. A synchronous removal here was tried and
-                // reverted: this finally can fire arbitrarily late on a cancelled coroutine, and a
-                // late removal races the superseding effect's half-installed generation in the
-                // same slot, deleting freshly installed layers. Initial install or style
-                // replacement still has no committed slot and raises the cover.
-                retainCommittedGenerationOrRaiseCover()
+                currentOnFogRendered?.invoke(rendered)
+                CanonicalFogPassOutcome.AWAIT_NEXT_REVISION
+            } finally {
+                if (styleMayHaveChanged && !installedStateReconciled) {
+                    // The target slot is additive: cancellation can leave an uncommitted *new* slot,
+                    // but it never mutates or removes the published one. Preserve that committed
+                    // generation while it still belongs to this style and retains its positive claim;
+                    // its finite-extent guard makes that generation globally fail-closed even beyond
+                    // the canonical reveal window. Clearing it here caused an avoidable black flash on
+                    // every follow-location re-key.
+                    // A later attempt removes the abandoned target before reusing its IDs - it is
+                    // the ONLY mutation owner for that slot. A synchronous removal here was tried and
+                    // reverted: this finally can fire arbitrarily late on a cancelled coroutine, and a
+                    // late removal races the superseding effect's half-installed generation in the
+                    // same slot, deleting freshly installed layers. Initial install or style
+                    // replacement still has no committed slot and raises the cover.
+                    retainCommittedGenerationOrRaiseCover()
+                }
             }
         }
     }

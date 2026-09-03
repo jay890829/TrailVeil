@@ -563,7 +563,11 @@ class MapSurfaceTest {
             // 137-484 candidate tile keys across zooms 0-22, so a page can never merge at the 5 ms
             // write cadence, and three verification rounds passed before anyone noticed the gate's
             // own description claimed a mechanism it cannot produce.
-            val streamedRevisions = java.util.Collections.synchronizedList(mutableListOf<Long>())
+            // Phase as well as revision: what the restart pump made unobservable is an install
+            // COMPLETING while content keeps changing, and only the post-install phase says that.
+            val streamedCheckpoints = java.util.Collections.synchronizedList(
+                mutableListOf<Pair<CanonicalFogInstallCheckpointPhase, Long>>(),
+            )
 
             // A canonical render slow enough that many points commit before any of it can finish:
             // points land every few milliseconds, a cold nine-tile pass takes most of a second. If
@@ -637,7 +641,7 @@ class MapSurfaceTest {
                     ),
                     onFogRendered = { render -> renders += render },
                     canonicalFogInstallCheckpointForTesting = { checkpoint ->
-                        streamedRevisions += checkpoint.fogRevision
+                        streamedCheckpoints += checkpoint.phase to checkpoint.fogRevision
                     },
                 )
             }
@@ -663,16 +667,51 @@ class MapSurfaceTest {
                         "too few to have pressured anything",
                     committed.get() >= MINIMUM_STREAMED_COMMITTED_POINTS,
                 )
-                // What the surface saw of the stream, reported rather than asserted - and that
-                // is a deliberate retreat. An assertion that a revision advances was written here
-                // and failed in three configurations: points streamed outside the rendered window
-                // (fixed above), points inside it, and after fifteen further seconds of streaming.
-                // Each time the installs seen carried the same revision. So either merge-driven
-                // restarts do not reach this seam or they do not happen in this fixture, and the
-                // honest thing is to publish the measurement rather than assert a mechanism this
-                // gate has never demonstrated. `P4-029`'s disposition accepts the feed-liveness
-                // residual as disclosed-unbound - named there with the mutation that would expose it.
-                val revisionsSeen = synchronized(streamedRevisions) { streamedRevisions.toList() }
+                // The retreat recorded here is lifted. It said the installs seen always carried
+                // the same revision, so no mechanism could be asserted; that was true because the
+                // reveal merge was then too slow to finish a page under this writer, and because
+                // every merge that did finish cancelled the install in flight. Bounding the merge
+                // made the counter move, and coalescing the passes let an install survive it.
+                //
+                // The pump's signature is that an install never completes under a live stream. Its
+                // absence is what is asserted: two installs reach the post-install checkpoint, and
+                // the content counter moved between them - content changed, and the surface
+                // finished building for it anyway rather than being torn down. Counts and
+                // distinctness only, so a hardware-GPU AVD and a software-GL runner must agree.
+                // The existing timeout is reused, not raised.
+                composeRule.waitUntil(timeoutMillis = STREAMING_CANONICAL_TIMEOUT_MILLIS) {
+                    synchronized(streamedCheckpoints) { streamedCheckpoints.toList() }
+                        .filter { (phase, _) ->
+                            phase ==
+                                CanonicalFogInstallCheckpointPhase
+                                    .AFTER_STYLE_INSTALL_BEFORE_RECONCILE
+                        }
+                        .map { (_, revision) -> revision }
+                        .distinct()
+                        .size >= 2
+                }
+                val checkpointsSeen =
+                    synchronized(streamedCheckpoints) { streamedCheckpoints.toList() }
+                // No further floor is asserted on how far the counter moved, and that is
+                // deliberate. The wait above returns as soon as two completed installs carry
+                // distinct revisions, so any larger span would be measuring how long this harness
+                // took to notice rather than anything the product did - the first measured run
+                // ended at a span of exactly one. What guards vacuity is already asserted: the
+                // writer committed points (above), and the two installs completed at revisions
+                // that differ, so content demonstrably changed between them.
+                assertTrue(
+                    "the two completed installs carried the same revision, so nothing was proven " +
+                        "about an install surviving a content change: checkpoints=$checkpointsSeen",
+                    checkpointsSeen
+                        .filter { (phase, _) ->
+                            phase ==
+                                CanonicalFogInstallCheckpointPhase
+                                    .AFTER_STYLE_INSTALL_BEFORE_RECONCILE
+                        }
+                        .map { (_, revision) -> revision }
+                        .distinct()
+                        .size >= 2,
+                )
 
                 // Measured with the writer still running, unlike the settled check below: this is
                 // the one that says ground was revealed *under* the stream rather than afterwards.
@@ -681,7 +720,7 @@ class MapSurfaceTest {
                 ).pixelCopyFogCoverage()
                 assertTrue(
                     "no ground was revealed while points were still streaming: " +
-                        streamingCoverage.report() + " revisionsSeen=$revisionsSeen",
+                        streamingCoverage.report() + " checkpoints=$checkpointsSeen",
                     streamingCoverage.revealedFraction > MINIMUM_STREAMED_REVEALED_FRACTION,
                 )
             } finally {
