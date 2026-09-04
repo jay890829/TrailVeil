@@ -106,7 +106,19 @@ class GoogleUiScaleBenchmarkTest {
                 val metrics = frameMetrics.remove(activity)
                     ?.getOrNull(FrameMetricsAggregator.TOTAL_INDEX)
                 val summary = summarize(metrics)
-                assertTrue("No UI frame metrics were collected during Google pan/zoom", summary.total > 0)
+                // A count, not a presence check. See [MIN_FRAME_SAMPLES]: a run that
+                // reports too few frames has not measured a slow map, it has failed to
+                // see the map, and its p95 must not be quoted as one.
+                assertTrue(
+                    "Only ${summary.total} frames were sampled during Google pan/zoom, below the " +
+                        "$MIN_FRAME_SAMPLES floor. $PAN_ZOOM_ITERATIONS animations of " +
+                        "${CAMERA_ANIMATION_MILLIS}ms cannot yield this few if the aggregator can " +
+                        "see the map, so frameP95=${summary.p95Millis}ms and " +
+                        "frozenRatio=${summary.frozenRatio} from this run are not " +
+                        "measurements. First thing to check: whether the map draws through the " +
+                        "activity window this aggregator watches.",
+                    summary.total >= MIN_FRAME_SAMPLES,
+                )
                 assertTrue("p95 frame time was invalid: ${summary.p95Millis}", summary.p95Millis >= 0)
                 assertTrue(
                     "Frozen-frame ratio was invalid: ${summary.frozenRatio}",
@@ -480,6 +492,46 @@ class GoogleUiScaleBenchmarkTest {
         /** 10 s for the stopped window; the transition is driven by this test, not awaited on. */
         const val HOST_STOPPED_POLL_COUNT = 100
         const val FROZEN_FRAME_MILLIS = 700
+        /**
+         * The fewest frames a run may report before its p95 stops being a measurement.
+         *
+         * `summary.total > 0` stood here, and two frames satisfied it - which is how a run that
+         * could not see the map at all published a `frameP95` into this project's evidence. The
+         * floor is derived rather than picked, on four independent grounds:
+         *
+         * 1. **Population separation.** Every MapLibre frame count in the record - 2, 40, 60, 60,
+         *    120 - was taken while the aggregator was blind to the map and was counting Compose
+         *    chrome redraws. The largest is 120. Every count from a run that could genuinely see
+         *    its map is 557 (emulator) or 1096 (this phone). 300 sits 2.5x above the blind
+         *    population and 46% below the smallest sighted one.
+         * 2. **Structural.** [PAN_ZOOM_ITERATIONS] x [CAMERA_ANIMATION_MILLIS] is 5.000 s of
+         *    guaranteed serial camera animation inside the sampled window, which is 300 vsyncs at
+         *    60 Hz - and the window is strictly longer than that. A map drawing through the window
+         *    cannot animate for five seconds and yield fewer.
+         * 3. **Statistical.** The nearest-rank p95 leaves 15 frames in the tail at 300 samples. At
+         *    60 it leaves 3, and `P4-008` recorded that same emulator's p95 wandering 36/37/51/37
+         *    ms and attributed the spread to exactly that.
+         * 4. **Surface.** This map is a `TextureView`, so it genuinely draws through the window
+         *    this aggregator watches, and 1 and 2 above are statements about the map itself. That
+         *    is the whole reason this twin could be measured this way and the MapLibre one could
+         *    not.
+         *
+         * Ground 4 originally read *"both twins run an identical script, so a divergent floor
+         * between them could not be justified"*. That was wrong, and the MapLibre twin now holds
+         * a floor of 120 on a different basis: an identical script does not make two different
+         * surfaces yield the same quantity. It counts `present2present` intervals on a
+         * `SurfaceView` layer sampled per animation, whose arithmetic ceiling is near 280 - so
+         * 300 there condemned a healthy map. Divergence between the twins is required by the
+         * measurement, not an oversight in one of them.
+         *
+         * Asserted unconditionally, not only under the enforced gate, because the vacuous runs that
+         * reached the ledger as evidence were engineering-evidence runs.
+         *
+         * Only valid while the two constants above hold. If a genuinely healthy run ever trips
+         * this, lower it to 200 and record the run that forced it - never below 150, since 120
+         * blind frames are on record and a floor at or under that restores the vacuity.
+         */
+        const val MIN_FRAME_SAMPLES = 300
         const val MAX_FRAME_P95_MILLIS = 32
         const val MAX_FROZEN_RATIO = 0.01
         const val CAMERA_TOLERANCE = 0.0001

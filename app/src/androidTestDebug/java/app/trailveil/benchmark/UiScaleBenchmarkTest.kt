@@ -60,14 +60,41 @@ class UiScaleBenchmarkTest {
             // Exclude provider fallback and the initial canonical rebuild from the fixed operation
             // histogram. Readiness itself remains a hard precondition for collecting samples.
             awaitMapState(scenario)
+            // The activity window is kept only as context. It cannot see this map - see
+            // [SurfaceFlingerPresentIntervals] - and the gate below is judged on the map's own
+            // SurfaceFlinger layer instead. Reporting both is what makes the difference legible
+            // rather than something a later reader has to rediscover.
             val frameMetrics = FrameMetricsAggregator(FrameMetricsAggregator.TOTAL_DURATION)
             frameMetrics.add(activity)
             try {
-                performDeterministicPanAndZoom(scenario)
-                val metrics = frameMetrics.remove(activity)
-                    ?.getOrNull(FrameMetricsAggregator.TOTAL_INDEX)
-                val summary = summarize(metrics)
-                assertTrue("No UI frame metrics were collected during MapLibre pan/zoom", summary.total > 0)
+                SurfaceFlingerPresentIntervals.arm()
+                val presented = performDeterministicPanAndZoom(scenario)
+                val windowSummary = summarize(
+                    frameMetrics.remove(activity)?.getOrNull(FrameMetricsAggregator.TOTAL_INDEX),
+                )
+                val summary = summarize(presented.histogram)
+                // Blindness first, and on its own terms. A camera animation that produced no
+                // interval for the map's layer did not measure a slow map - nothing observed the
+                // map at all - and that is a different failure from a slow one, so it is asserted
+                // apart from any threshold on speed. See [MAP_SURFACE_LAYER].
+                assertTrue(
+                    "The map's SurfaceFlinger layer presented during only " +
+                        "${presented.presentingWindows} of $PAN_ZOOM_ITERATIONS camera " +
+                        "animations, so this run did not observe the map for the rest, and " +
+                        "frameP95=${summary.p95Millis}ms is not a measurement of it. First thing " +
+                        "to check: that TimeStats is tracking a layer whose name contains " +
+                        "\"$MAP_SURFACE_LAYER\". For contrast, the activity window - which does " +
+                        "NOT contain this map - reported ${windowSummary.total} frames across " +
+                        "the same animations.",
+                    presented.presentingWindows == PAN_ZOOM_ITERATIONS,
+                )
+                // Then whether there are enough of them for a p95 to mean anything.
+                assertTrue(
+                    "Only ${summary.total} presentation intervals were recorded, below the " +
+                        "$MIN_PRESENT_INTERVALS floor, so frameP95=${summary.p95Millis}ms and " +
+                        "frozenRatio=${summary.frozenRatio} are too thinly sampled to quote.",
+                    summary.total >= MIN_PRESENT_INTERVALS,
+                )
                 assertTrue("p95 frame time was invalid: ${summary.p95Millis}", summary.p95Millis >= 0)
                 assertTrue(
                     "Frozen-frame ratio was invalid: ${summary.frozenRatio}",
@@ -98,11 +125,14 @@ class UiScaleBenchmarkTest {
                         recoveryNumber = recoveryIndex + 1,
                     )
                 }
-                report(summary, enforcePhysicalGate)
+                report(summary, windowSummary, enforcePhysicalGate)
             } finally {
                 // A crash or ANR prevents a lifecycle transition or map-ready callback from
                 // completing, and therefore fails this instrumentation test.
                 frameMetrics.stop()
+                // TimeStats is global to SurfaceFlinger and off by default. Leaving it enabled
+                // would change how the device behaves for everything measured after this test.
+                SurfaceFlingerPresentIntervals.disable()
             }
         }
     }
@@ -129,13 +159,28 @@ class UiScaleBenchmarkTest {
         }
     }
 
-    private fun performDeterministicPanAndZoom(scenario: ActivityScenario<MainActivity>) {
+    /**
+     * Runs the fixed script and returns the map layer's summed presentation intervals.
+     *
+     * The histogram is armed and read around each animation rather than once around the whole
+     * phase. Between animations this test waits for a strictly newer canonical fog generation,
+     * which can take seconds, and a `WHEN_DIRTY` map that has nothing to draw presents nothing -
+     * so a single window would record one enormous interval per wait and score it as a frozen
+     * frame. Measuring only while the camera is actually animating is the same restriction
+     * `P1-002` got by gesturing continuously.
+     */
+    private fun performDeterministicPanAndZoom(
+        scenario: ActivityScenario<MainActivity>,
+    ): PresentedIntervals {
+        val presented = SparseIntArray()
+        var presentingWindows = 0
         val map = awaitMap(scenario)
         var completedFogGeneration = readFogGeneration(scenario)
         repeat(PAN_ZOOM_ITERATIONS) { index ->
             val target = CAMERA_STEPS[index % CAMERA_STEPS.size]
             val idle = CountDownLatch(1)
             val listener = MapLibreMap.OnCameraIdleListener { idle.countDown() }
+            SurfaceFlingerPresentIntervals.clear()
             scenario.onActivity {
                 map.addOnCameraIdleListener(listener)
                 map.animateCamera(
@@ -153,6 +198,15 @@ class UiScaleBenchmarkTest {
                     map.removeOnCameraIdleListener(listener)
                 }
             }
+            // Read while the animation's frames are the newest thing this layer presented, before
+            // the fog wait below can open a gap that would be recorded as one huge interval.
+            val window = SurfaceFlingerPresentIntervals.presentIntervals(MAP_SURFACE_LAYER)
+            // A layer that exists but contributed no interval presented at most once in this
+            // window, which is indistinguishable from not presenting - so counted as neither.
+            if (window != null && window.size > 0) {
+                presentingWindows++
+                SurfaceFlingerPresentIntervals.merge(presented, window)
+            }
             val rendered = awaitMapState(
                 scenario = scenario,
                 expectedCamera = CameraPosition.Builder()
@@ -163,7 +217,14 @@ class UiScaleBenchmarkTest {
             )
             completedFogGeneration = requireNotNull(rendered.fogGeneration)
         }
+        return PresentedIntervals(presented, presentingWindows)
     }
+
+    /** The map layer's summed presentation intervals, and how many windows contributed any. */
+    private data class PresentedIntervals(
+        val histogram: SparseIntArray,
+        val presentingWindows: Int,
+    )
 
     private fun awaitMapState(
         scenario: ActivityScenario<MainActivity>,
@@ -289,7 +350,11 @@ class UiScaleBenchmarkTest {
         return FrameSummary(total, p95Millis, frozen.toDouble() / total)
     }
 
-    private fun report(summary: FrameSummary, enforcePhysicalGate: Boolean) {
+    private fun report(
+        summary: FrameSummary,
+        windowSummary: FrameSummary,
+        enforcePhysicalGate: Boolean,
+    ) {
         val deviceClass = when {
             enforcePhysicalGate -> "designated mid-range physical device"
             isEmulator() -> "emulator; engineering evidence only"
@@ -305,7 +370,9 @@ class UiScaleBenchmarkTest {
                         "lifecycleRecoveries=$LIFECYCLE_RECOVERY_COUNT " +
                         "frameP95=${summary.p95Millis}ms " +
                         "frozenRatio=${"%.4f".format(java.util.Locale.US, summary.frozenRatio)} " +
-                        "frames=${summary.total}; basemap=local-fallback; $deviceClass; " +
+                        "frames=${summary.total} surface=mapSurfaceViewPresentIntervals " +
+                        "activityWindowFrames=${windowSummary.total}; " +
+                        "basemap=local-fallback; $deviceClass; " +
                         if (enforcePhysicalGate) {
                             "mid-range performance gate enforced\n"
                         } else {
@@ -365,6 +432,56 @@ class UiScaleBenchmarkTest {
         const val MAP_STATE_POLL_COUNT = 300
         const val MAP_STATE_POLL_MILLIS = 100L
         const val FROZEN_FRAME_MILLIS = 700
+        /**
+         * The fewest presentation intervals that can carry a p95, for the map's own layer.
+         *
+         * `summary.total > 0` stood here, and two frames satisfied it - which is how a run that
+         * could not see the map at all published a `frameP95` into this project's evidence. What
+         * replaces it has to be derived for the quantity now being counted, and that quantity
+         * changed: these are `present2present` intervals on a `SurfaceView` layer, sampled only
+         * while the camera animates, not frames of the activity window.
+         *
+         * On that basis the arithmetic is tight, and it works against a high floor rather than
+         * for one. Each of the [PAN_ZOOM_ITERATIONS] animations lasts [CAMERA_ANIMATION_MILLIS],
+         * which is 15 vsyncs at 60 Hz, and the first presentation after each `-clear` has no
+         * predecessor inside its own window and yields no interval - so a *perfect* 60 Hz run
+         * tops out near 20 x 14 = 280. The first real run measured 277 (emulator, 2026-09-04),
+         * 99% of that ceiling. A floor of 300 would have condemned a map presenting on
+         * essentially every vsync, and did: that run failed this assertion before the number was
+         * corrected. The lesson is that a floor derived for one basis does not survive a change
+         * of basis, however well argued it was.
+         *
+         * So this floor is now set by what it must never do - report slowness as blindness.
+         * Blindness has its own assertion (`presentingWindows`, which is 0 when the layer is
+         * absent and cannot be confused with a slow map), leaving this one a purely statistical
+         * job: keep enough samples that the nearest-rank p95 has a tail. The slowest run that
+         * could still pass [MAX_FRAME_P95_MILLIS] presents roughly every 32 ms, giving about
+         * 20 x (250/32 - 1) = 136 intervals, so 120 sits just below every run this gate is
+         * capable of passing and cannot fire in place of the p95 assertion. At 120 samples the
+         * p95 leaves 6 in the tail; `P4-008` saw a p95 wander 36/37/51/37 ms at 60 samples, so
+         * this bounds that instability rather than removing it - raise it if a p95 is ever seen
+         * to wander at this count.
+         *
+         * The Google twin keeps a floor of 300 on a different basis, and that divergence is
+         * correct rather than an oversight: it counts activity-window frames of a `TextureView`
+         * that really does draw through the window, against an observed 557-1096.
+         *
+         * Asserted unconditionally, not only under the enforced gate, because the vacuous runs
+         * that reached the ledger as evidence were engineering-evidence runs.
+         */
+        const val MIN_PRESENT_INTERVALS = 120
+
+        /**
+         * Enough of the map layer's SurfaceFlinger name to pick it out of the dump.
+         *
+         * The full name carries a per-instance handle and a layer id (`bf7a79f
+         * SurfaceView[app.trailveil/app.trailveil.MainActivity](BLAST)#57813`), neither of which is
+         * stable across runs, so this matches the part that is: the `SurfaceView[` marker plus the
+         * package. That is enough to separate it from the activity window's own layer, which is
+         * named without the `SurfaceView[` prefix and is exactly the layer this benchmark must not
+         * measure.
+         */
+        const val MAP_SURFACE_LAYER = "SurfaceView[app.trailveil"
         const val MAX_FRAME_P95_MILLIS = 32
         const val MAX_FROZEN_RATIO = 0.01
         const val CAMERA_TOLERANCE = 0.0001
