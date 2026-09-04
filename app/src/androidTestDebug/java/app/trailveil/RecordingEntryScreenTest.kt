@@ -924,6 +924,93 @@ class RecordingEntryScreenTest {
         composeRule.onNodeWithTag(RecordingEntryTestTags.Start).assertIsDisplayed()
         composeRule.onNodeWithTag(RecordingEntryTestTags.Stop).assertDoesNotExist()
         assertEquals(1, startCalls.get())
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+
+        // Finally the map control's OWN start. Without this the case passes with both of the
+        // button's branches wired to `onStop`: every start above came from the menu, and the label
+        // returning to "Start" only says the state moved, not which callback moved it.
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration)
+            .assertContentDescriptionEquals(start)
+            .performClick()
+        assertEquals(2, startCalls.get())
+        assertEquals(1, stopCalls.get())
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration)
+            .assertContentDescriptionEquals(stop)
+    }
+
+    /**
+     * The on-map control never sits dead while the menu offers a live action for the same row.
+     *
+     * An abandoned exploration offers both actions, and startup reconciliation sets `loading`,
+     * which disables Start but not Stop. Preferring Start unconditionally therefore put a dead
+     * button on the map at exactly the moment the menu could still end the row - the on-map
+     * control failing at the one job it has. So the preference yields: Start wins while it is
+     * pressable, Stop takes over when it is not.
+     */
+    @Test
+    fun theMapControlFallsBackToTheActionItCanActuallyRun() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val startCalls = AtomicInteger()
+        val stopCalls = AtomicInteger()
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    firstVisit = false,
+                    loading = true,
+                    startOffered = true,
+                    stopOffered = true,
+                    recordingState = RecordingDisplayState.ABANDONED,
+                ),
+                onStart = { startCalls.incrementAndGet() },
+                onStop = { stopCalls.incrementAndGet() },
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration)
+            .assertIsDisplayed()
+            .assertContentDescriptionEquals(context.getString(R.string.recording_entry_stop))
+            .performClick()
+        assertEquals(1, stopCalls.get())
+        assertEquals(0, startCalls.get())
+    }
+
+    /**
+     * A start already in flight leaves the control visible, named, and inert.
+     *
+     * This is the one shape where disabled-but-visible is right: the action IS offered, it is
+     * momentarily unavailable, and the user is waiting it out rather than choosing something else.
+     * Nothing else in this class renders the button disabled, so without this the whole `enabled`
+     * expression, its label branch and its `disabled()` semantics are unexercised - deleting the
+     * `!state.loading` guard would not have failed a single case.
+     */
+    @Test
+    fun theMapControlStaysVisibleAndInertWhileAStartIsInFlight() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val startCalls = AtomicInteger()
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    firstVisit = false,
+                    starting = true,
+                    startOffered = true,
+                ),
+                onStart = { startCalls.incrementAndGet() },
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration)
+            .assertIsDisplayed()
+            .assertContentDescriptionEquals(context.getString(R.string.recording_entry_starting))
+            .assertIsNotEnabled()
+            .performClick()
+        assertEquals(0, startCalls.get())
     }
 
     /**
@@ -965,11 +1052,18 @@ class RecordingEntryScreenTest {
     }
 
     /**
-     * A control that can never be pressed is furniture. When neither action is offered the map
-     * control is absent, not greyed out - and the recentre button keeps its own corner.
+     * The composable's defensive contract, not a state the product can reach.
+     *
+     * `startControlOffered` and `stopControlOffered` are complementary on `activeSessionId`, so
+     * the route cannot build a state offering neither -
+     * `RecordingPresentationTest#everyDisplayStateOffersAtLeastOneOfTheTwoControls` is where that
+     * invariant is actually asserted. This covers the guard that stands behind it, because this
+     * composable's contract is its parameters rather than its one caller: hand it a state offering
+     * nothing and it draws nothing, since a control that can never be pressed is furniture. Named
+     * for what it is so nobody reads it as evidence the product has such a state.
      */
     @Test
-    fun theMapExplorationControlIsAbsentWhenNeitherActionIsOffered() {
+    fun theMapExplorationControlIsAbsentWhenAStateOffersNeitherAction() {
         composeRule.setContent {
             RecordingEntryScreen(
                 state = RecordingEntryUiState(
@@ -991,8 +1085,12 @@ class RecordingEntryScreenTest {
 
     /**
      * The map control sits BELOW the recentre button, which is what moving the primary action into
-     * thumb reach means. Asserted on geometry rather than on source order, because source order is
-     * not what the user's thumb reaches.
+     * thumb reach means.
+     *
+     * Measured, not read off the source - but the enclosing `Column` does most of the work, so what
+     * this really guards is the two composables being swapped or the column being replaced by
+     * something that stacks them differently. That is a narrow regression, and it is the one that
+     * would silently undo the point of the change.
      */
     @Test
     fun theMapExplorationControlSitsBelowTheRecentreButton() {

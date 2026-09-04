@@ -464,12 +464,20 @@ private fun RecordingEntryMenu(
  *
  * One state offers both actions: an abandoned exploration, where nothing is recording (so Start
  * continues it) but the row is still open (so Stop ends it). A single control cannot show both, so
- * it shows **Start**, which is the action that keeps the user's data, and Stop stays reachable in
+ * it prefers **Start**, which is the action that keeps the user's data, and Stop stays reachable in
  * the menu. That asymmetry is deliberate and is why this is not a plain boolean toggle.
  *
- * Hidden, rather than disabled, when neither action is offered - a control that can never be pressed
- * is furniture. It is disabled, and stays visible, only while an action it IS offering is
- * momentarily unavailable (mid-start, mid-stop), because that is a state the user is waiting out.
+ * The preference yields when Start cannot actually be pressed. During startup reconciliation
+ * `loading` is true, and an abandoned row offers both actions, so preferring Start unconditionally
+ * would put a dead Start on the map while the menu offered a live Stop for the same exploration -
+ * the on-map control failing at the one job it has. So Start wins while it is pressable, and gives
+ * way to Stop when it is not. When neither is pressable it keeps showing the preferred one,
+ * disabled, because that is a state the user is waiting out rather than choosing between.
+ *
+ * The both-absent branch is defensive, not a product state: `startControlOffered` and
+ * `stopControlOffered` are complementary on `activeSessionId`, so the route cannot build a state
+ * offering neither. It is kept because this composable's contract is its parameters, not its only
+ * caller, and a control that can never be pressed is furniture whoever builds the state.
  */
 @Composable
 private fun MapExplorationButton(
@@ -479,15 +487,15 @@ private fun MapExplorationButton(
     modifier: Modifier = Modifier,
 ) {
     val starting = state.starting
-    val showStart = state.startOffered
+    // The same two rules the menu items use, read once here so the two cannot drift apart.
+    val startEnabled = state.startOffered && !state.loading && !starting
+    val stopEnabled = state.stopOffered &&
+        !starting && state.recordingState != RecordingDisplayState.STOPPING
+    val showStart = state.startOffered && (startEnabled || !stopEnabled)
     val showStop = !showStart && state.stopOffered
     if (!showStart && !showStop) return
 
-    val enabled = if (showStart) {
-        !state.loading && !starting
-    } else {
-        !starting && state.recordingState != RecordingDisplayState.STOPPING
-    }
+    val enabled = if (showStart) startEnabled else stopEnabled
     val labelResource = when {
         showStart && starting -> R.string.recording_entry_starting
         showStart -> R.string.recording_entry_start

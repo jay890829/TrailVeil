@@ -620,6 +620,28 @@ class RecordingPresentationTest {
         assertNull(completed.activeSessionLastPointAt)
     }
 
+    /**
+     * Whatever the screen is showing, at least one of the two controls is on offer.
+     *
+     * This is the invariant the on-map control leans on: it can show only one action, so it needs
+     * to know that choosing one never leaves the user with none. The two predicates are
+     * complementary on `activeSessionId` alone - no session means Start, a session means Stop - and
+     * that is worth asserting across every display state rather than inferring from two of them,
+     * because a later state added to the enum could quietly break it and nothing else would notice.
+     */
+    @Test
+    fun everyDisplayStateOffersAtLeastOneOfTheTwoControls() {
+        for (state in RecordingDisplayState.entries) {
+            for (activeSessionId in listOf(null, 7L)) {
+                assertTrue(
+                    "state=$state activeSessionId=$activeSessionId offers neither control",
+                    startControlOffered(state, activeSessionId) ||
+                        stopControlOffered(state, activeSessionId),
+                )
+            }
+        }
+    }
+
     @Test
     fun aLiveRecordingOffersOnlyEndingItAndAnIdleScreenOnlyBeginning() {
         assertTrue(
