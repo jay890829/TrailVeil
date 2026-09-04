@@ -280,6 +280,13 @@ internal data class ExposureFrame(
      * one, however the screen behaved.
      */
     val publishedIntervalMillis: Long?,
+    /**
+     * `map_disposed_at` / `map_entry_destroyed_at`, both written outside the composition's own side
+     * effect. A cover that goes down BECAUSE the surface was torn down is not a cover the product
+     * lowered; see [PublishedTags].
+     */
+    val disposedAtMillis: Long?,
+    val destroyedAtMillis: Long?,
     val channel: String,
     val tally: GestureExposurePixels.Tally,
 ) {
@@ -391,8 +398,20 @@ internal class GestureSurfaceCapturer(private val mapView: MapView) {
         false
     }
 
+    /**
+     * A real copy, or `false` - never "the argument came back, so it must have worked".
+     *
+     * `TextureView.getBitmap(Bitmap)` returns the bitmap it was HANDED, unconditionally; when the
+     * surface is unavailable it simply skips the copy and hands it straight back. The old check was
+     * `!= null`, which is therefore always true. That matters because this class reuses one bitmap
+     * for every capture, so a torn-down surface replayed the last good frame forever and the audit
+     * went on "measuring" a map that no longer existed - which is exactly what happened after the
+     * terminal failure in `V02-007` section 5b. It never produced a false PASS, because a replayed
+     * frame is a covered frame and the case fails on duration anyway, but a hole in the oracle is a
+     * hole. Gated on availability, and on the SDK handing back the buffer that was passed in.
+     */
     private fun copyFromTextureView(view: TextureView, bitmap: Bitmap): Boolean = try {
-        view.getBitmap(bitmap) != null
+        view.isAvailable && view.getBitmap(bitmap) === bitmap && view.isAttachedToWindow
     } catch (_: Exception) {
         false
     }
@@ -490,21 +509,27 @@ internal class GestureExposureSampler(
     fun proofAttempts(): Int = proofAttempts
 
     private fun sampleOnce() {
-        val coverBefore = readSynchronousCover()
+        val before = readPublishedTags()
         val capture = capturer.capture()
-        val coverAfter = readSynchronousCover()
-        val coverUp = coverBefore || coverAfter
-        // Read after the same capture, not before it, so the witnesses describe the same moment;
-        // a difference between them is then the product's, not the sampler's. All in ONE main
-        // thread round trip, so they cannot disagree merely by being read a hop apart.
-        val published = readPublishedTags()
-        val composeCoverUp = published.composeCoverUp
+        val after = readPublishedTags()
+        // Straddling OR on BOTH cover witnesses, not on one of them.
+        //
+        // An earlier version read the synchronous flag either side of the capture and the
+        // composition tag only after it, then claimed in this comment that all three came from one
+        // round trip. Neither half was true: it was three round trips, and the two witnesses were
+        // sampled by different rules, so part of any disagreement between them was the sampler's.
+        // Now every tag is read in one `runOnMainSync`, twice, and both covers use the same rule.
+        val coverUp = before.coverUp || after.coverUp
+        val composeCoverUp = before.composeCoverUp || after.composeCoverUp
+        val published = after
         if (capture == null) {
             frames += ExposureFrame(
                 atMillis = SystemClock.elapsedRealtime(),
                 coverUp = coverUp,
                 composeCoverUp = composeCoverUp,
                 publishedIntervalMillis = published.intervalMillis,
+                disposedAtMillis = published.disposedAt,
+                destroyedAtMillis = published.destroyedAt,
                 channel = GestureExposurePixels.UNJUDGED_CHANNEL,
                 tally = GestureExposurePixels.Tally(0, 0, 0, 0),
             )
@@ -526,6 +551,8 @@ internal class GestureExposureSampler(
             coverUp = coverUp,
             composeCoverUp = composeCoverUp,
             publishedIntervalMillis = published.intervalMillis,
+            disposedAtMillis = published.disposedAt,
+            destroyedAtMillis = published.destroyedAt,
             channel = channel,
             tally = GestureExposurePixels.tally(capture, region, scaled),
         )
@@ -544,27 +571,39 @@ internal class GestureExposureSampler(
     }
 
     /**
-     * The composition tag the terminal deadline is armed on, and the binding's published interval.
+     * Every per-frame tag, in ONE main-thread round trip.
      *
-     * Both in one round trip. The interval is the BINDING's own view: it moves only when
-     * `publishCoverInterval` sees the coordinator's cover fall, so watching it per frame says
-     * whether a fall the screen showed was a fall the binding agreed with - which is the whole
-     * question in `V02-007` section 5b.
+     * The interval is the BINDING's own view: it moves only when `publishCoverInterval` sees the
+     * coordinator's cover fall. The disposal stamps are the product's own, written OUTSIDE the
+     * composition side effect that `V02-007` section 5b proves can stall - `map_disposed_at` in
+     * `onDispose` and `map_entry_destroyed_at` when the MapView is destroyed - so they are the only
+     * way this audit can tell "the cover came down" from "the surface was torn down, which lowers
+     * the cover on its way out". Reading them costs nothing here and closes a question the section
+     * could not otherwise answer.
      */
     private fun readPublishedTags(): PublishedTags {
-        val holder = AtomicReference(PublishedTags(false, null))
+        val holder = AtomicReference(PublishedTags(false, false, null, null, null))
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
             holder.set(
                 PublishedTags(
+                    coverUp = mapView.getTag(R.id.map_fog_synchronous_cover_up) == true,
                     composeCoverUp = mapView.getTag(R.id.map_fog_cover_up) == true,
                     intervalMillis = mapView.getTag(R.id.map_fog_last_cover_interval_ms) as? Long,
+                    disposedAt = mapView.getTag(R.id.map_disposed_at) as? Long,
+                    destroyedAt = mapView.getTag(R.id.map_entry_destroyed_at) as? Long,
                 ),
             )
         }
         return holder.get()
     }
 
-    private data class PublishedTags(val composeCoverUp: Boolean, val intervalMillis: Long?)
+    private data class PublishedTags(
+        val coverUp: Boolean,
+        val composeCoverUp: Boolean,
+        val intervalMillis: Long?,
+        val disposedAt: Long?,
+        val destroyedAt: Long?,
+    )
 
     /**
      * The tag says the cover is up; this says the screen agrees.
@@ -830,6 +869,8 @@ internal data class BareReading(
     val exposedPct: Double,
     val largestClusterPx: Int,
     val analyzedPx: Int,
+    /** See [GestureTrialReport.exclusionsGuessed]; the same caveat applies to this reading. */
+    val exclusionsGuessed: Boolean,
 ) {
     val largestClusterPct: Double
         get() = largestClusterPx * 100.0 / analyzedPx.coerceAtLeast(1)
@@ -837,7 +878,8 @@ internal data class BareReading(
     fun describe(): String =
         "bareChannel=$channel bareZoom=${"%.3f".format(appliedZoom)} " +
             "bareExposedPct=${"%.2f".format(exposedPct)} bareClusterPx=$largestClusterPx " +
-            "bareClusterPct=${"%.3f".format(largestClusterPct)}"
+            "bareClusterPct=${"%.3f".format(largestClusterPct)} " +
+            "bareExclusionsGuessed=$exclusionsGuessed"
 }
 
 /** Everything one trial measured, so a failure names the trial rather than a bare pixel count. */
@@ -869,6 +911,21 @@ internal data class GestureTrialReport(
     val composeCoverShape: String,
     /** When the binding's published interval moved inside the window, if it moved. */
     val intervalShape: String,
+    /** The worst inter-frame gap, and whether the surface stamped itself torn down. */
+    val maxFrameGapMillis: Long,
+    val maxFrameGapStartMillis: Long,
+    val teardownShape: String,
+    /**
+     * Whether a hosted MapView is still in the window when the trial ends.
+     *
+     * The decisive witness for "did the surface go terminal", and the one this audit lacked. A
+     * terminal failure makes the host swap `GoogleHostedMapSurface` for the provider-unavailable
+     * surface, which builds no MapView, so the tree stops carrying one. It does not travel through a
+     * composition side effect and it cannot be faked by a stale tag. `false` here beside a
+     * `disposedSeenAtMs` says the cover came down because the surface was torn down - which is the
+     * product failing closed, not a deadline being missed.
+     */
+    val mapViewPresentAfter: Boolean,
     /** The binding's own account of why the cover was up when the trial ended. */
     val phaseAfter: String?,
     /** Host ON_STOP / ON_START seen while this trial ran. See the harness's counters. */
@@ -882,6 +939,19 @@ internal data class GestureTrialReport(
     val generationAfter: Long?,
     val touchDownsBefore: Int,
     val touchDownsAfter: Int,
+    /**
+     * Whether the SDK decorations this trial excluded were LOCATED or GUESSED.
+     *
+     * `SpikeCaptureSupport.liveExclusionRects` reports it and every caller here used to drop it on
+     * the floor with `.first`, which is how a run that could not find the watermark or the compass
+     * produced a verdict indistinguishable from one that measured them. It matters in both
+     * directions: a guessed rect can sit where no decoration is, hiding real exposed basemap under
+     * an exclusion, or miss the decoration entirely and let it count as a leak. Reported rather
+     * than asserted on, because the guess is an environment fact - the SDK's tag is not this
+     * repository's to guarantee - and failing a fog audit for it would be blaming the fog for the
+     * locator.
+     */
+    val exclusionsGuessed: Boolean,
     val samplerFailure: Throwable?,
 ) {
     val motionEndMillis: Long get() = drive.upAtMillis + kind.animationTailMillis
@@ -943,7 +1013,9 @@ internal data class GestureTrialReport(
             "coverSettled=$coverSettled epoch=$epochBefore->$epochAfter " +
             "binding=$bindingBefore->$bindingAfter phaseAfter=[$phaseAfter] " +
             "coverShape=[$coverShape] composeCoverShape=[$composeCoverShape] " +
-            "intervalShape=[$intervalShape] " +
+            "intervalShape=[$intervalShape] maxFrameGapMs=$maxFrameGapMillis " +
+            "maxFrameGapAtMs=$maxFrameGapStartMillis teardown=[$teardownShape] " +
+            "mapViewPresentAfter=$mapViewPresentAfter " +
             "hostStops=$hostStopsDuringTrial hostStarts=$hostStartsDuringTrial " +
             "coverIntervalMs=$coverIntervalBeforeMillis->$coverIntervalAfterMillis " +
             "coverProof=${coverPixelProof?.describe() ?: "none"} " +
@@ -954,6 +1026,7 @@ internal data class GestureTrialReport(
             "generation=$generationBefore->$generationAfter " +
             "touchDowns=$touchDownsBefore->$touchDownsAfter " +
             "injectedDowns=${drive.injectedDownCount} " +
+            "exclusionsGuessed=$exclusionsGuessed " +
             "samplerFailure=${samplerFailure?.javaClass?.simpleName ?: "none"}"
     }
 }
@@ -972,15 +1045,21 @@ internal class GestureExposureHarness private constructor(
      * ON_STOP / ON_START seen on the host since [attach], counted live.
      *
      * `V02-007` section 5b. The binding's twenty-second cover deadline is cancelled by
-     * `onHostStopped` and re-armed as a *fresh* window by `onHostStarted`, deliberately, so that
-     * backgrounding the phone does not charge the user for time the surface could not use. That is
-     * one of the two ways a deadline can fail to fire on a cover longer than its window, and it is
-     * the only one this audit can rule in or out from the outside. Every other view of the
-     * binding's state travels through a recomposition, which the same run proved can stall for
-     * seconds; a lifecycle event does not.
+     * `onHostStopped` and re-armed as a *fresh* window by `onHostStarted`, so a stop/start cycle
+     * mid-cover would restart the window.
+     *
+     * Read this counter with its limitation in mind: it observes the ACTIVITY's lifecycle, while the
+     * surface arms its binding from `LocalLifecycleOwner`, which inside the navigation host is the
+     * back-stack entry rather than the activity. A back-stack entry can leave STARTED without the
+     * activity doing so, so `hostStops == 0` here does not exclude every stop the binding could have
+     * seen. It stopped mattering when the deadline was shown to have fired on time - there is
+     * nothing left for a re-arm to explain - but the gap is real and is written down rather than
+     * left implied.
      */
     private val hostStops: AtomicInteger,
     private val hostStarts: AtomicInteger,
+    /** Held so a trial can ask whether the surface under audit is still in the tree at all. */
+    private val decorView: View,
 ) {
     fun cameraPosition(): CameraPosition = onMain { map.cameraPosition }
 
@@ -1169,9 +1248,18 @@ internal class GestureExposureHarness private constructor(
         }
     }
 
-    /** Live watermark/compass rects, read per trial on the main thread as the locator needs. */
-    fun exclusionRects(): List<Rect> = onMain {
-        SpikeCaptureSupport.liveExclusionRects(mapView).first
+    /** Whether the window still holds a hosted MapView. See [GestureTrialReport.mapViewPresentAfter]. */
+    private fun hostedMapViewPresent(): Boolean = onMain {
+        decorView.findHostedMapView() != null
+    }
+
+    /**
+     * Live watermark/compass rects, read per trial on the main thread as the locator needs, paired
+     * with whether either of them was guessed rather than found. See
+     * [GestureTrialReport.exclusionsGuessed] for why the flag travels instead of being discarded.
+     */
+    fun exclusionRects(): Pair<List<Rect>, Boolean> = onMain {
+        SpikeCaptureSupport.liveExclusionRects(mapView)
     }
 
     /**
@@ -1186,7 +1274,7 @@ internal class GestureExposureHarness private constructor(
         drive: (GestureExposureHarness) -> GestureDrive,
     ): GestureTrialReport {
         val before = settleAtStartCamera(kind, start)
-        val exclusions = exclusionRects()
+        val (exclusions, exclusionsGuessed) = exclusionRects()
         val startFloors = measureFloor("${kind.label}/${start.name} start", exclusions)
         val touchDownsBefore = touchDownCount()
         val generationBefore = generation()
@@ -1216,6 +1304,26 @@ internal class GestureExposureHarness private constructor(
         }
         val gesture = requireNotNull(driven)
         val after = cameraPosition()
+        // Before measuring anything at the end camera, ask whether there is still a surface to
+        // measure. `V02-007` section 5b: this gesture can drive the surface into terminal failure,
+        // and the host then swaps the map for the provider-unavailable surface - so the end floor
+        // has nothing to read and the floor helper fails with a capture-channel complaint that
+        // names the symptom and hides the cause. This names the cause.
+        val surviving = hostedMapViewPresent()
+        val teardown = teardownShape(frames)
+        assertTrue(
+            "${kind.label}/${start.name}: the surface went TERMINAL during this gesture - no " +
+                "hosted MapView is left in the window, so the map the user was looking at has " +
+                "been replaced by the provider-unavailable surface and will not come back " +
+                "without the surface being rebuilt. This is the product failing closed on its " +
+                "own twenty-second cover deadline, not a " +
+                "harness fault: the fog could not prove a generation for this tilted, zoomed-out " +
+                "camera in time. teardown=[$teardown] " +
+                "coverShape=[${witnessShape(frames) { frame -> frame.coverUp }}] " +
+                "maxFrameGapMs=${maxFrameGapMillis(frames)} " +
+                "maxFrameGapAtMs=${maxFrameGapStartMillis(frames)}",
+            surviving,
+        )
         val endFloors = measureFloor("${kind.label}/${start.name} end", exclusions)
         return GestureTrialReport(
             kind = kind,
@@ -1242,6 +1350,10 @@ internal class GestureExposureHarness private constructor(
             coverShape = witnessShape(frames) { frame -> frame.coverUp },
             composeCoverShape = witnessShape(frames) { frame -> frame.composeCoverUp },
             intervalShape = intervalShape(frames),
+            maxFrameGapMillis = maxFrameGapMillis(frames),
+            maxFrameGapStartMillis = maxFrameGapStartMillis(frames),
+            teardownShape = teardownShape(frames),
+            mapViewPresentAfter = hostedMapViewPresent(),
             phaseAfter = fogPhase(),
             coverIntervalBeforeMillis = coverIntervalBefore,
             coverIntervalAfterMillis = publishedCoverIntervalMillis(),
@@ -1251,6 +1363,7 @@ internal class GestureExposureHarness private constructor(
             generationAfter = generation(),
             touchDownsBefore = touchDownsBefore,
             touchDownsAfter = touchDownCount(),
+            exclusionsGuessed = exclusionsGuessed,
             samplerFailure = sampler.failure(),
         )
     }
@@ -1340,6 +1453,54 @@ internal class GestureExposureHarness private constructor(
             "spanMs=${frames.last().atMillis - origin}"
     }
 
+    /**
+     * The longest gap between consecutive sampled frames.
+     *
+     * `V02-007` section 5b turns on whether the main thread was starved. This audit makes several
+     * `runOnMainSync` round trips per frame, so a looper that could not run a `postDelayed` callback
+     * for two seconds could not have run those either - and the gap would show here. A small maximum
+     * gap beside an overdue deadline says the looper was NOT starved and something else is going on.
+     * Derived from timestamps already captured.
+     */
+    private fun maxFrameGapMillis(frames: List<ExposureFrame>): Long {
+        var worst = 0L
+        frames.zipWithNext { a, b -> worst = maxOf(worst, b.atMillis - a.atMillis) }
+        return worst
+    }
+
+    /**
+     * Where the worst gap sits, in ms from the first frame.
+     *
+     * Size alone does not say what a gap means. A long gap AFTER the surface was torn down is the
+     * teardown, and says nothing about whether a deadline could have run earlier; a long gap
+     * spanning the moment the deadline was due is the starved looper the section hypothesised.
+     */
+    private fun maxFrameGapStartMillis(frames: List<ExposureFrame>): Long {
+        if (frames.size < 2) return -1L
+        val origin = frames.first().atMillis
+        var worst = 0L
+        var at = -1L
+        frames.zipWithNext { a, b ->
+            val gap = b.atMillis - a.atMillis
+            if (gap > worst) {
+                worst = gap
+                at = a.atMillis - origin
+            }
+        }
+        return at
+    }
+
+    /** When a torn-down surface first stamped itself, in ms from the first sampled frame. */
+    private fun teardownShape(frames: List<ExposureFrame>): String {
+        if (frames.isEmpty()) return "none"
+        val origin = frames.first().atMillis
+        val disposed = frames.firstOrNull { frame -> frame.disposedAtMillis != null }
+        val destroyed = frames.firstOrNull { frame -> frame.destroyedAtMillis != null }
+        if (disposed == null && destroyed == null) return "intact"
+        return "disposedSeenAtMs=${disposed?.let { it.atMillis - origin }} " +
+            "destroyedSeenAtMs=${destroyed?.let { it.atMillis - origin }}"
+    }
+
     /** When the binding's published interval first changed, in ms from the first sampled frame. */
     private fun intervalShape(frames: List<ExposureFrame>): String {
         if (frames.isEmpty()) return "none"
@@ -1352,12 +1513,17 @@ internal class GestureExposureHarness private constructor(
     }
 
     /**
-     * How many times the witness went down-to-up across the trial.
+     * How many times the witness went down-to-up across the trial, AS SAMPLED.
      *
-     * The longest run alone cannot separate one long cover from a string of short ones, and that
-     * is exactly the distinction `V02-007` section 5b turns on: the product's deadline is re-armed
-     * from scratch on every rising edge, so many rises with a long visible blank means the deadline
-     * was restarted rather than missed, while one rise means it was armed once and did not fire.
+     * The longest run alone cannot separate one long cover from a string of short ones, and that is
+     * a distinction `V02-007` section 5b turns on: the deadline is re-armed from scratch on every
+     * rising edge, so many rises with a long blank means it was restarted rather than missed.
+     *
+     * What this CANNOT do is prove there was no dip. Frames land roughly every 120 ms, so a fall and
+     * a rise inside one sampling period are invisible to it, and that is precisely the case section
+     * 5b's first candidate names. `coverRises == 1` therefore means "no dip longer than a sampling
+     * period was observed", never "no dip". Ruling that out needs a counter the product increments
+     * itself; the honest reading is written down in the section rather than claimed away here.
      */
     private fun coverRises(
         frames: List<ExposureFrame>,
@@ -1502,12 +1668,15 @@ internal class GestureExposureHarness private constructor(
                     "map would be indistinguishable from a basemap leak",
                 channel in GestureExposurePixels.SURFACE_CHANNELS,
             )
+            val decor = AtomicReference<View>()
+            scenario.onActivity { activity -> decor.set(activity.window.decorView) }
             return GestureExposureHarness(
                 mapView = mapView,
                 map = requireNotNull(mapRef.get()),
                 capturer = capturer,
                 hostStops = stops,
                 hostStarts = starts,
+                decorView = requireNotNull(decor.get()),
             )
         }
 
@@ -1621,11 +1790,11 @@ internal object GestureExposureBareReference {
                 "audited camera",
             abs(settledCamera.zoom - camera.zoom) <= CALIBRATION_ZOOM_TOLERANCE,
         )
-        val exclusionsHolder = AtomicReference<List<Rect>>()
+        val exclusionsHolder = AtomicReference<Pair<List<Rect>, Boolean>>()
         instrumentation.runOnMainSync {
-            exclusionsHolder.set(SpikeCaptureSupport.liveExclusionRects(mapView).first)
+            exclusionsHolder.set(SpikeCaptureSupport.liveExclusionRects(mapView))
         }
-        val exclusions = requireNotNull(exclusionsHolder.get())
+        val (exclusions, exclusionsGuessed) = requireNotNull(exclusionsHolder.get())
         var worst: GestureExposurePixels.Tally? = null
         repeat(SAMPLE_COUNT) {
             val bitmap = capturer.capture()
@@ -1665,6 +1834,7 @@ internal object GestureExposureBareReference {
             exposedPct = tally.exposedPct,
             largestClusterPx = tally.largestClusterPx,
             analyzedPx = tally.analyzedPx,
+            exclusionsGuessed = exclusionsGuessed,
         )
     }
 
