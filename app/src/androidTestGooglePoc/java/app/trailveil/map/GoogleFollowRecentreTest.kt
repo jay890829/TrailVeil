@@ -305,10 +305,26 @@ class GoogleFollowRecentreTest {
                 easeTarget.set(GeoPoint(point.latitude, point.longitude))
                 GoogleMapSurfaceTestHooks.followLocationState.value = easeTarget.get()
             }
+            // "The ticket is free" is not a finish on its own: it is equally true of the state
+            // BEFORE the ease is dispatched, so a bare wait on the tag was satisfied by its first
+            // poll and returned before the animation had begun - leaving the arrival assertions
+            // below to race a flight that was still airborne. A finished ease is the ticket free
+            // AND the camera somewhere other than where the ease started, which no pre-ease state
+            // satisfies.
             assertTrue(
                 "follow EASE did not finish",
                 awaitUntil(5_000L) {
-                    mapView.getTag(app.trailveil.R.id.map_camera_flight_active) == false
+                    val camera = readCameraOnMain(
+                        scenario,
+                        mapRef,
+                        AtomicReference<com.google.android.gms.maps.model.CameraPosition>(),
+                    )
+                    val movedLatitude =
+                        kotlin.math.abs(camera.target.latitude - beforeEase.latitude) > 0.00001
+                    val movedLongitude =
+                        kotlin.math.abs(camera.target.longitude - beforeEase.longitude) > 0.00001
+                    (movedLatitude || movedLongitude) &&
+                        mapView.getTag(app.trailveil.R.id.map_camera_flight_active) == false
                 },
             )
             assertTrue(
@@ -321,6 +337,37 @@ class GoogleFollowRecentreTest {
                     )
                     kotlin.math.abs(camera.target.latitude - beforeEase.latitude) > 0.00001 ||
                         kotlin.math.abs(camera.target.longitude - beforeEase.longitude) > 0.00001
+                },
+            )
+            // Motion is not arrival. The fix sits a fifth of the shorter viewport edge from the
+            // centre - past the follow dead zone, still well inside the screen - so a camera that
+            // merely drifted toward it passes the movement check above and still leaves the walking
+            // user off their own map. The tolerance is a fifth of the displacement the fix asked
+            // for, which at this zoom is tens of pixels: loose enough for the ease animation's own
+            // rounding, tight enough that only a camera that landed on the fix passes. The floor
+            // keeps a degenerate viewport from turning the fraction into a sub-pixel demand.
+            val easeArrival = requireNotNull(easeTarget.get())
+            val easeDisplacement = kotlin.math.hypot(
+                easeArrival.latitude - beforeEase.latitude,
+                easeArrival.longitude - beforeEase.longitude,
+            )
+            val easeTolerance = maxOf(
+                easeDisplacement * EASE_ARRIVAL_TOLERANCE_FRACTION,
+                EASE_ARRIVAL_TOLERANCE_FLOOR_DEGREES,
+            )
+            assertTrue(
+                "follow EASE moved the camera but never settled on the fix it was given " +
+                    "(displacement=$easeDisplacement tolerance=$easeTolerance)",
+                awaitUntil(5_000L) {
+                    val camera = readCameraOnMain(
+                        scenario,
+                        mapRef,
+                        AtomicReference<com.google.android.gms.maps.model.CameraPosition>(),
+                    )
+                    kotlin.math.hypot(
+                        camera.target.latitude - easeArrival.latitude,
+                        camera.target.longitude - easeArrival.longitude,
+                    ) <= easeTolerance
                 },
             )
             assertEquals(false, mapView.getTag(app.trailveil.R.id.map_fog_synchronous_cover_up))
@@ -500,6 +547,166 @@ class GoogleFollowRecentreTest {
                 AtomicReference<com.google.android.gms.maps.model.CameraPosition>(),
             ).zoom
             assertEquals(zoomBeforeNull, zoomAfterNull, 0.1f)
+        }
+    }
+
+    /**
+     * A second recentre press inside the first flight must not let the superseded flight's
+     * cancellation clear the guard that keeps follow steps out of a programmed flight.
+     *
+     * The supersede itself is already covered; what is not is the moment the defect lives in. The
+     * replacement claims, then the first flight's `onCancel` dispatches (SP10 measured that order
+     * in every valid supersede pair) and its CAS release must be rejected. A boolean claim would
+     * clear here instead, and the very next fix would take the camera off the target the user
+     * pressed for. So the latch is sampled across that window rather than read once, and a fix is
+     * delivered while the replacement is still airborne to prove the guard actually held.
+     */
+    @Test
+    fun aFixDuringTheSecondFlightNeverUnlatchesTheSupersededFirstFlightsGuard() {
+        val first = GeoPoint(25.0330, 121.5654)
+        val second = GeoPoint(-33.8688, 151.2093)
+        val midFlightFix = GeoPoint(40.7128, -74.0060)
+        val mapRef = AtomicReference<com.google.android.gms.maps.GoogleMap>()
+        val mapViewRef = AtomicReference<MapView>()
+        val ready = CountDownLatch(1)
+        GoogleMapSurfaceTestHooks.decision.set(ProviderStartupDecision(true, null))
+        // Long enough that both sampling windows and the fix delivery sit inside the replacement
+        // flight, so the latch is sampled while a flight is genuinely airborne.
+        GoogleMapSurfaceTestHooks.cameraRequestDurationMillis = SUPERSEDE_FLIGHT_MILLIS
+        GoogleMapSurfaceTestHooks.onMapReady.set {
+            mapRef.set(it)
+            ready.countDown()
+        }
+        GoogleMapSurfaceTestHooks.onMapViewCreated.set { mapViewRef.set(it) }
+
+        ActivityScenario.launch(GoogleMapSurfaceTestActivity::class.java).use { scenario ->
+            assertTrue("Google map did not become ready", ready.await(30, TimeUnit.SECONDS))
+            val mapView = requireNotNull(mapViewRef.get())
+            scenario.onActivity {
+                GoogleMapSurfaceTestHooks.cameraRequestState.value = MapCameraRequest(
+                    requestId = 61L,
+                    point = first,
+                    zoom = 11.0,
+                )
+            }
+            assertTrue(
+                "first recenter never claimed the host ticket",
+                awaitUntil(2_000L) {
+                    mapView.getTag(app.trailveil.R.id.map_camera_flight_active) == true
+                },
+            )
+            // Anti-vacuity: a first flight that had already landed is not superseded by anything,
+            // and the cancellation this case is about would never be dispatched.
+            assertFalse(
+                "first flight had already landed, so the second press superseded nothing",
+                cameraMatches(
+                    readCameraOnMain(
+                        scenario,
+                        mapRef,
+                        AtomicReference<com.google.android.gms.maps.model.CameraPosition>(),
+                    ),
+                    first,
+                    zoom = 11.0f,
+                ),
+            )
+            scenario.onActivity {
+                GoogleMapSurfaceTestHooks.cameraRequestState.value = MapCameraRequest(
+                    requestId = 62L,
+                    point = second,
+                    zoom = 14.0,
+                )
+            }
+            // The replacement claims on the next composition dispatch and the superseded flight's
+            // cancellation follows within microseconds of that claim, so sampling from the state
+            // write would race the claim itself. Nothing re-latches a guard that was wrongly
+            // cleared - it stays cleared for the rest of the replacement flight - so the window is
+            // taken just after the claim instead, where a cleared latch is still plainly visible.
+            SystemClock.sleep(REPLACEMENT_CLAIM_SETTLE_MILLIS)
+            // The positive witness each sampling window needs. All-true samples say the guard was
+            // latched; on their own they cannot say the flight it was latched for was the
+            // REPLACEMENT rather than something already landed, and a window that opened after the
+            // replacement arrived would sample a state in which nothing is being diverted. The
+            // replacement is airborne exactly while it has not yet reached its own target and
+            // zoom, so that is read once, immediately before the window opens.
+            val airborneAtStaleCancelWindow = !cameraMatches(
+                readCameraOnMain(
+                    scenario,
+                    mapRef,
+                    AtomicReference<com.google.android.gms.maps.model.CameraPosition>(),
+                ),
+                second,
+                zoom = 14.0f,
+            )
+            val acrossTheStaleCancel = sampleFlightLatch(mapView)
+            assertTrue(
+                "the replacement flight had already landed when the stale-cancel window opened, " +
+                    "so its samples cross no cancellation at all",
+                airborneAtStaleCancelWindow,
+            )
+            assertEquals(
+                "the superseded first flight's cancellation unlatched the follow guard: " +
+                    "$acrossTheStaleCancel",
+                emptyList<Any?>(),
+                acrossTheStaleCancel.filter { sample -> sample != true },
+            )
+            // The fix the defect needs: delivered after the stale cancellation has dispatched and
+            // while the replacement still has most of its flight left to be diverted through.
+            val airborneAtFixDelivery = !cameraMatches(
+                readCameraOnMain(
+                    scenario,
+                    mapRef,
+                    AtomicReference<com.google.android.gms.maps.model.CameraPosition>(),
+                ),
+                second,
+                zoom = 14.0f,
+            )
+            scenario.onActivity {
+                GoogleMapSurfaceTestHooks.followLocationState.value = midFlightFix
+            }
+            val withTheFixPending = sampleFlightLatch(mapView)
+            assertTrue(
+                "the mid-flight fix was delivered after the replacement had already landed, so " +
+                    "nothing could have been diverted and the window proves nothing",
+                airborneAtFixDelivery,
+            )
+            assertEquals(
+                "the guard was dropped while the replacement flight was still airborne with a " +
+                    "follow fix pending: $withTheFixPending",
+                emptyList<Any?>(),
+                withTheFixPending.filter { sample -> sample != true },
+            )
+            assertTrue(
+                "the replacement flight did not land its target and zoom after the mid-flight fix",
+                awaitUntil(10_000L) {
+                    cameraMatches(
+                        readCameraOnMain(
+                            scenario,
+                            mapRef,
+                            AtomicReference<com.google.android.gms.maps.model.CameraPosition>(),
+                        ),
+                        second,
+                        zoom = 14.0f,
+                    )
+                },
+            )
+            assertTrue(
+                "host flight ticket remained active after the replacement completed",
+                awaitUntil(5_000L) {
+                    mapView.getTag(app.trailveil.R.id.map_camera_flight_active) == false
+                },
+            )
+            // A fix refused during a flight is refused, not queued: releasing the ticket must not
+            // hand the camera to a step the user never asked for.
+            SystemClock.sleep(SUPPRESSED_FIX_SETTLE_MILLIS)
+            val settled = readCameraOnMain(
+                scenario,
+                mapRef,
+                AtomicReference<com.google.android.gms.maps.model.CameraPosition>(),
+            )
+            assertTrue(
+                "the suppressed fix moved the camera once the flight released: $settled",
+                cameraMatches(settled, second, zoom = 14.0f),
+            )
         }
     }
 
@@ -754,6 +961,26 @@ class GoogleFollowRecentreTest {
         return condition()
     }
 
+    /**
+     * Every value the host flight latch published over one fixed window.
+     *
+     * The interesting question about a superseded flight is not "is the guard latched now" - the
+     * replacement's own callback will latch it again either way - but "was it ever dropped while
+     * the replacement was airborne". A single sample cannot see that; the window can.
+     */
+    private fun sampleFlightLatch(
+        mapView: MapView,
+        windowMillis: Long = LATCH_SAMPLE_WINDOW_MILLIS,
+    ): List<Any?> {
+        val samples = ArrayList<Any?>()
+        val deadline = SystemClock.elapsedRealtime() + windowMillis
+        while (SystemClock.elapsedRealtime() < deadline) {
+            samples += mapView.getTag(app.trailveil.R.id.map_camera_flight_active)
+            SystemClock.sleep(LATCH_SAMPLE_INTERVAL_MILLIS)
+        }
+        return samples
+    }
+
     private fun tapScreen(x: Int, y: Int) {
         bestEffortClearStuckInjectedPointers()
         val automation = InstrumentationRegistry.getInstrumentation().uiAutomation
@@ -839,5 +1066,28 @@ class GoogleFollowRecentreTest {
         return (0 until childCount).any { index ->
             getChildAt(index).containsClassName(marker)
         }
+    }
+
+    private companion object {
+        /** A fifth of the displacement the follow fix asked for; see the EASE arrival assertion. */
+        const val EASE_ARRIVAL_TOLERANCE_FRACTION = 0.2
+
+        /**
+         * About three camera pixels at exploration zoom, so a degenerate viewport cannot turn the
+         * fractional tolerance above into a sub-pixel demand.
+         */
+        const val EASE_ARRIVAL_TOLERANCE_FLOOR_DEGREES = 0.00002
+
+        /** Long enough that both latch windows and the mid-flight fix land inside the flight. */
+        const val SUPERSEDE_FLIGHT_MILLIS = 3_000
+
+        const val LATCH_SAMPLE_WINDOW_MILLIS = 400L
+        const val LATCH_SAMPLE_INTERVAL_MILLIS = 20L
+
+        /** Room for the recomposition that hands the replacement flight its ticket. */
+        const val REPLACEMENT_CLAIM_SETTLE_MILLIS = 250L
+
+        /** Time a refused follow fix is given to reappear as motion once the ticket frees. */
+        const val SUPPRESSED_FIX_SETTLE_MILLIS = 1_500L
     }
 }

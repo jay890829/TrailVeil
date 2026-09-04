@@ -30,7 +30,7 @@ internal class GoogleMapSurfaceTestActivity : ComponentActivity() {
                     modifier = Modifier.fillMaxSize(),
                     fogRequired = GoogleMapSurfaceTestHooks.fogRequired,
                     fogRuntime = GoogleMapSurfaceTestHooks.fogRuntime,
-                    fallbackTimeoutMillis = 30_000L,
+                    fallbackTimeoutMillis = GoogleMapSurfaceTestHooks.fallbackTimeoutMillis,
                     fogCoverTimeoutMillisForTesting =
                         GoogleMapSurfaceTestHooks.fogCoverTimeoutMillis,
                     providerStartupDecisionForTesting = GoogleMapSurfaceTestHooks.decision.get(),
@@ -43,6 +43,15 @@ internal class GoogleMapSurfaceTestActivity : ComponentActivity() {
                     trackOverlay = GoogleMapSurfaceTestHooks.trackOverlay,
                     onUserMovedCamera = {
                         GoogleMapSurfaceTestHooks.userMovedCount.incrementAndGet()
+                    },
+                    // Consulted per attach rather than captured, so a case can arm the fault after
+                    // a generation has already been proven and release it again without disturbing
+                    // the composition. Nothing is thrown while the hook is null.
+                    fogInstallFaultForTesting = {
+                        GoogleMapSurfaceTestHooks.fogInstallFault?.invoke()
+                    },
+                    onTerminalFailureForTesting = { reason ->
+                        GoogleMapSurfaceTestHooks.onTerminalFailure.get()?.invoke(reason)
                     },
                     onMapReadyForTesting = { map ->
                         GoogleMapSurfaceTestHooks.onMapReady.get()?.invoke(map)
@@ -81,6 +90,7 @@ internal class GoogleMapSurfaceTestActivity : ComponentActivity() {
 internal object GoogleMapSurfaceTestHooks {
     val decision = AtomicReference<ProviderStartupDecision?>(null)
     val onMapReady = AtomicReference<((GoogleMap) -> Unit)?>(null)
+    val onTerminalFailure = AtomicReference<((ProviderFallbackReason) -> Unit)?>(null)
     val onMapViewCreated = AtomicReference<((MapView) -> Unit)?>(null)
     val onMapLoadState = AtomicReference<((BasemapLoadState) -> Unit)?>(null)
     val onFogState = AtomicReference<((GoogleCanonicalFogState) -> Unit)?>(null)
@@ -92,11 +102,27 @@ internal object GoogleMapSurfaceTestHooks {
     @Volatile var fogRequired: Boolean = false
     @Volatile var fogRuntime: FogRuntime? = null
     @Volatile var fogCoverTimeoutMillis: Long = 20_000L
+    /**
+     * The host's basemap load deadline. Generous by default so ordinary cases are never raced by
+     * it; a case that drives a MISSED deadline shortens it so its own window stays bounded and
+     * stays clearly inside [fogCoverTimeoutMillis], which would otherwise terminate the surface
+     * for an unrelated reason.
+     */
+    @Volatile var fallbackTimeoutMillis: Long = 30_000L
     @Volatile var cameraRequest: MapCameraRequest? = null
     @Volatile var currentLocation: GeoPoint? = null
     @Volatile var followLocation: GeoPoint? = null
     @Volatile var trackOverlay: MapTrackOverlay? = null
     @Volatile var cameraRequestDurationMillis: Int? = null
+
+    /**
+     * Rejects the next canonical overlay installs by throwing; `null` lets every install through.
+     *
+     * Read on the main thread inside the overlay attach, written from the instrumentation thread,
+     * hence `@Volatile`. [reset] releases it, so a case that fails an assertion with a fault still
+     * armed cannot leave later cases faulting installs for no stated reason.
+     */
+    @Volatile var fogInstallFault: (() -> Unit)? = null
     val currentLocationState = mutableStateOf<GeoPoint?>(null)
     val followLocationState = mutableStateOf<GeoPoint?>(null)
     val cameraRequestState = mutableStateOf<MapCameraRequest?>(null)
@@ -108,6 +134,7 @@ internal object GoogleMapSurfaceTestHooks {
     fun reset() {
         decision.set(null)
         onMapReady.set(null)
+        onTerminalFailure.set(null)
         onMapViewCreated.set(null)
         onMapLoadState.set(null)
         onFogState.set(null)
@@ -118,11 +145,13 @@ internal object GoogleMapSurfaceTestHooks {
         fogRequired = false
         fogRuntime = null
         fogCoverTimeoutMillis = 20_000L
+        fallbackTimeoutMillis = 30_000L
         cameraRequest = null
         currentLocation = null
         followLocation = null
         trackOverlay = null
         cameraRequestDurationMillis = null
+        fogInstallFault = null
         currentLocationState.value = null
         followLocationState.value = null
         cameraRequestState.value = null

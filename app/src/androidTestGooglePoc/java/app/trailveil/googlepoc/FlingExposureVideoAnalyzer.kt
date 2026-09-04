@@ -17,6 +17,23 @@ import kotlin.math.abs
  * signature space plus H.264 tolerance; MARKER is the magenta clapper window; everything else is
  * EXPOSED. Exposure requires an 8-connected cluster >= [CLUSTER_MINIMUM_PX] and a per-frame
  * exposed area above the measured noise floor.
+ *
+ * `V02-007` promotion note (condition (b) of the MapLibre-parity inventory's NA argument). It sits
+ * on the analyzer rather than on [exposureLooksLikeBasemap], where it used to sit, for the reason
+ * that makes it worth reading at all: that function has no caller in the spike it describes - the
+ * falsify arm inlines the same comparison - so a promoter following the code would never open it.
+ * This analyzer's sensitivity control, the answer to "can the oracle see bare basemap at all?", is
+ * the substitute accepted for the MapLibre removal-control A/Bs
+ * (`removingTheFiniteExtentGuardReproducesTheCrossingLeak` and
+ * `removingTheFiniteGuardReproducesAWrappedWorldLeakBelowZoomOne`), which have no object to act on
+ * where fog is one opaque TileOverlay. That substitute is NOT self-enforcing: unlike SP1's
+ * `oracleSensitive`, it lives behind a separate mode argument
+ * (`trailveilFlingExposureMode=falsify` in `GoogleFogFlingExposureSpikeTest`), which detaches the
+ * overlay and requires >= 30% exposure on >= 90% of frames. So any promotion of SP5 from an opt-in
+ * `measurementValid` harness to a default gate must invoke falsify mode explicitly, as its own
+ * run: a promoted gate that only runs `measure` carries no sensitivity arm, and a silently blinded
+ * analyzer would report "no exposure" forever while claiming to stand in for those two MapLibre
+ * cases.
  */
 object FlingExposureVideoAnalyzer {
 
@@ -234,7 +251,15 @@ object FlingExposureVideoAnalyzer {
         return largest
     }
 
-    /** Marker-agnostic delta check used by the calibration/falsify paths. */
+    /**
+     * Marker-agnostic delta check used by the calibration/falsify paths.
+     *
+     * The `V02-007` condition-(b) promotion note this predicate carries is on the object KDoc,
+     * because `GoogleFogFlingExposureSpikeTest.runFalsify` inlines
+     * `exposedPx * 100.0 / mapArea >= FALSIFY_MINIMUM_PCT` against its own copy of that constant
+     * rather than calling this, leaving `FlingExposureVideoAnalyzerFixtureTest` as the only caller
+     * here. Routing the falsify arm through this function is what would make the two one thing.
+     */
     fun exposureLooksLikeBasemap(stat: FrameStat, mapArea: Int, thresholdPct: Double): Boolean =
         stat.exposedPx * 100.0 / mapArea >= thresholdPct
 

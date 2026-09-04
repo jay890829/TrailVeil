@@ -8,6 +8,7 @@ import android.os.Bundle
 import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowInsets
 import android.widget.ImageView
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -133,6 +134,115 @@ class GoogleAttributionVisibleTest {
         )
         mainScreenshot.recycle()
         detailScreenshot.recycle()
+    }
+
+    /**
+     * `V02-007`: the measurement half of MapLibre's
+     * `MapAccessibilityBaselineTest#attributionAndLogoStayAboveTheNavigationBar`.
+     *
+     * That case measures two views against the window's navigation-bar inset. Only one half ports.
+     * There is no Google analogue of the tappable attribution CONTROL - the "i" affordance is a
+     * MapLibre widget; the Maps SDK exposes no such view, and TrailVeil carries the Google terms
+     * in its own disclosure sheet instead
+     * (`GoogleRecordingEntryScreenTest#theDisclosureNamesGoogleMapsAndItsTerms`),
+     * so there is nothing here whose tappability could be measured and nothing is invented in its
+     * place. The logo half does port, and it is the half the sibling pixel case above cannot see:
+     * that case proves the logo is DRAWN by matching its own reference pixels, which a logo lifted
+     * too little still satisfies wherever the navigation bar is translucent. This measures the
+     * lift itself, against the same inset arithmetic the MapLibre case uses.
+     */
+    @Test
+    fun theEntryGoogleLogoStaysAboveTheNavigationBarInset() {
+        // Loud, not skipped, and for the same reason its sibling above is: this case is what an
+        // inventory row is recorded closed on, and a keyless run that skipped it would look
+        // exactly like a run that proved it. The class's other keyed case already fails on this
+        // predicate, so nothing new goes red - only the abstention that hid inside a green class.
+        assertTrue(
+            "measuring the real entry logo requires the keyed googlePoc runtime",
+            BuildConfig.GOOGLE_MAPS_POC_KEY_CONFIGURED,
+        )
+        dismissDisclosureIfShown()
+        val mapView = awaitMapView(minHeight = 1)
+        assertTrue("entry map did not observe the real OnMapLoadedCallback", awaitMapLoaded(mapView))
+        // The lift is applied by `GoogleFogSafetyOverlay.positionAttributionAboveSystemBars`, from
+        // the ONLINE transition and from every MapView layout change, so the settled position is
+        // the claim; a bounded wait reaches it without granting a stuck logo a pass.
+        val settled = awaitLogoAboveNavigationBar(mapView)
+        // Two preconditions this measurement is worthless without, asserted rather than merely
+        // printed in the failure message. The locator is a bounded size/position heuristic over
+        // every ImageView under the map, so a second match would mean the view being measured is
+        // whichever one the walk reached first rather than the logo. And the map itself has to
+        // reach at least as far down as the limit: an entry map that stopped short of the
+        // navigation bar would clear it with no lift applied at all, and this case would report
+        // the absent lift as a pass.
+        assertTrue(
+            "the attribution locator matched ${settled.candidateCount} ImageViews, so the " +
+                "measured view is not identified: $settled",
+            settled.candidateCount == 1,
+        )
+        assertTrue(
+            "the entry map bottom ${settled.mapBottom} does not reach the navigation-bar limit " +
+                "${settled.limit}, so nothing here required a lift: $settled",
+            settled.mapBottom >= settled.limit,
+        )
+        assertTrue(
+            "Google logo bottom ${settled.logoBottom} is not above the navigation bar " +
+                "(limit ${settled.limit}, inset ${settled.navigationInset}, " +
+                "logo height ${settled.logoHeight}, map bottom ${settled.mapBottom})",
+            settled.logoHeight > 0 && settled.logoBottom <= settled.limit,
+        )
+    }
+
+    private fun awaitLogoAboveNavigationBar(mapView: MapView): LogoInsetObservation {
+        val deadline = SystemClock.uptimeMillis() + ATTRIBUTION_TIMEOUT_MILLIS
+        var last = measureLogoAgainstNavigationBar(mapView)
+        while (SystemClock.uptimeMillis() < deadline) {
+            // The unambiguous settled state is what this returns early on, so a second candidate
+            // that exists only while the SDK is still laying itself out cannot decide the verdict;
+            // one that is still there at the deadline is returned and fails the identity check.
+            if (
+                last != null &&
+                last.candidateCount == 1 &&
+                last.logoHeight > 0 &&
+                last.logoBottom <= last.limit
+            ) {
+                return last
+            }
+            SystemClock.sleep(POLL_MILLIS)
+            last = measureLogoAgainstNavigationBar(mapView)
+        }
+        return last ?: throw AssertionError(
+            "no Google logo view was ever found on the entry map: " +
+                "load=${mapView.getTag(app.trailveil.R.id.map_basemap_load_state)} " +
+                "cover=${mapView.getTag(app.trailveil.R.id.map_fog_synchronous_cover_up)}",
+        )
+    }
+
+    /** Same arithmetic as the MapLibre baseline: the decor's bottom, less the navigation inset. */
+    private fun measureLogoAgainstNavigationBar(mapView: MapView): LogoInsetObservation? {
+        val observation = AtomicReference<LogoInsetObservation?>()
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val attribution = readAttribution(mapView)
+            val logo = attribution.candidate
+            val insets = mapView.rootWindowInsets
+            if (logo != null && insets != null) {
+                val navigationInset = insets.getInsets(WindowInsets.Type.navigationBars()).bottom
+                val decor = composeRule.activity.window.decorView
+                val decorLocation = IntArray(2).also(decor::getLocationOnScreen)
+                val logoBounds = logo.boundsOnScreen()
+                observation.set(
+                    LogoInsetObservation(
+                        logoBottom = logoBounds.bottom,
+                        logoHeight = logoBounds.height(),
+                        limit = decorLocation[1] + decor.height - navigationInset,
+                        navigationInset = navigationInset,
+                        mapBottom = mapView.boundsOnScreen().bottom,
+                        candidateCount = attribution.candidateCount,
+                    ),
+                )
+            }
+        }
+        return observation.get()
     }
 
     @Test
@@ -574,6 +684,15 @@ class GoogleAttributionVisibleTest {
         val samples: Int,
         val matches: Int,
         val matchRatio: Double,
+    )
+
+    private data class LogoInsetObservation(
+        val logoBottom: Int,
+        val logoHeight: Int,
+        val limit: Int,
+        val navigationInset: Int,
+        val mapBottom: Int,
+        val candidateCount: Int,
     )
 
     private data class ClipObservation(

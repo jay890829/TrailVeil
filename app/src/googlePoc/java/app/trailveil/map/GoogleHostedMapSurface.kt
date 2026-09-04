@@ -143,6 +143,7 @@ internal fun GoogleHostedMapSurface(
     onFogRendered: ((FogViewportRender) -> Unit)?,
     onFogFailure: (Throwable) -> Unit,
     onTerminalFailure: (ProviderFallbackReason) -> Unit,
+    fogInstallFaultForTesting: (() -> Unit)?,
     onMapReadyForTesting: ((GoogleMap) -> Unit)?,
     onMapViewCreatedForTesting: ((MapView) -> Unit)?,
     onMapLoadStateForTesting: ((BasemapLoadState) -> Unit)?,
@@ -610,6 +611,12 @@ internal fun GoogleHostedMapSurface(
                             onProofObserved = { observation ->
                                 currentOnFogProofForTesting?.invoke(observation)
                             },
+                            // Read once, when this binding is built. Deliberately not a
+                            // DisposableEffect key: re-keying would tear down and rebuild the whole
+                            // map binding, which is not what arming an install fault should mean. A
+                            // host that needs to arm and release one mid-composition therefore
+                            // passes a stable lambda that consults its own switch.
+                            installFaultForTesting = fogInstallFaultForTesting,
                             exclusionZonesForProof = newBinding::exclusionZonesForProof,
                             onUnprovableProofPlan = newBinding::hideOverlaysUntilProof,
                             onProofAccepted = { generation ->

@@ -10,6 +10,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import app.trailveil.BuildConfig
+import app.trailveil.R
 import com.google.android.gms.maps.MapView
 import java.io.FileInputStream
 import java.util.concurrent.CountDownLatch
@@ -85,14 +86,31 @@ class GoogleProviderUnavailableSurfaceTest {
             )
             val deadline = SystemClock.elapsedRealtime() + 4_000L
             var mapStillPresent = true
+            // `V02-007`: watching only for the map to disappear would be satisfied just as well by
+            // a guard that composed NOTHING over the unknown ground, which is the half MapLibre's
+            // `requiredFogKeepsUnknownAreaCoveredUntilRuntimeIsReady` owns. Witness it from the
+            // same poll, through the view tag the surface publishes for the synchronous opaque
+            // ViewOverlay drawable - the thing that actually hides SDK pixels within a frame.
+            // Sampling it here costs nothing; an out-of-band Compose query before this loop is
+            // what an earlier attempt did, and it consumed the bounded window it was measuring.
+            var opaqueCoverSeen = false
             do {
                 scenario.onActivity { activity ->
-                    mapStillPresent = activity.window.decorView.containsMapView()
+                    val mapView = activity.window.decorView.findMapView()
+                    mapStillPresent = mapView != null
+                    if (mapView?.getTag(R.id.map_fog_synchronous_cover_up) == true) {
+                        opaqueCoverSeen = true
+                    }
                 }
                 if (!mapStillPresent) break
                 SystemClock.sleep(50L)
             } while (SystemClock.elapsedRealtime() < deadline)
             assertFalse("missing FogRuntime left the safety cover unbounded", mapStillPresent)
+            assertTrue(
+                "the guarded map was torn down without the opaque cover ever being raised over " +
+                    "the unknown ground it was hiding",
+                opaqueCoverSeen,
+            )
         }
     }
 
@@ -206,5 +224,13 @@ class GoogleProviderUnavailableSurfaceTest {
         if (this is MapView) return true
         if (this !is ViewGroup) return false
         return (0 until childCount).any { index -> getChildAt(index).containsMapView() }
+    }
+
+    private fun View.findMapView(): MapView? {
+        if (this is MapView) return this
+        if (this !is ViewGroup) return null
+        return (0 until childCount).firstNotNullOfOrNull { index ->
+            getChildAt(index).findMapView()
+        }
     }
 }

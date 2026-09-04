@@ -54,7 +54,9 @@ internal fun TrailVeilMapSurface(
     onUserMovedCamera: () -> Unit = {},
     onFogRendered: ((FogViewportRender) -> Unit)? = null,
     onFogFailure: (Throwable) -> Unit = {},
+    fogInstallFaultForTesting: (() -> Unit)? = null,
     providerStartupDecisionForTesting: ProviderStartupDecision? = null,
+    onTerminalFailureForTesting: ((ProviderFallbackReason) -> Unit)? = null,
     onMapReadyForTesting: ((GoogleMap) -> Unit)? = null,
     onMapViewCreatedForTesting: ((MapView) -> Unit)? = null,
     onMapLoadStateForTesting: ((BasemapLoadState) -> Unit)? = null,
@@ -107,7 +109,14 @@ internal fun TrailVeilMapSurface(
             onUserMovedCamera = onUserMovedCamera,
             onFogRendered = onFogRendered,
             onFogFailure = onFogFailure,
-            onTerminalFailure = { failure -> runtimeFailure = failure },
+            // Observed BEFORE the state write, so a case can attribute the terminal surface to
+            // the deadline that produced it. MAP_LOAD_TIMEOUT and INITIALIZATION_FAILURE render
+            // the same copy, so the surface on screen cannot say which one arrived.
+            onTerminalFailure = { failure ->
+                onTerminalFailureForTesting?.invoke(failure)
+                runtimeFailure = failure
+            },
+            fogInstallFaultForTesting = fogInstallFaultForTesting,
             onMapReadyForTesting = onMapReadyForTesting,
             onMapViewCreatedForTesting = onMapViewCreatedForTesting,
             onMapLoadStateForTesting = onMapLoadStateForTesting,

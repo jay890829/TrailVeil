@@ -84,6 +84,14 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private val exclusionZonesForProof: () -> List<FogProbeExclusionZone> = { emptyList() },
     private val onUnprovableProofPlan: () -> Boolean = { false },
     private val onProofAccepted: (Long) -> Unit = {},
+    /**
+     * Rejects one canonical overlay install by throwing; `null` in every production composition.
+     *
+     * The neutral surface's own `fogInstallFaultForTesting` parameter reaches the binding here, so
+     * the injection point is a constructor argument rather than process state: a surface whose
+     * host passed nothing cannot observe that this seam exists.
+     */
+    private val installFaultForTesting: (() -> Unit)? = null,
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -191,6 +199,19 @@ internal class GoogleCanonicalFogSurfaceBinding(
             }
             providers[generationId] = targetProvider
             overlays[generationId] = overlay
+            // Null on every production attach. A host that did pass a fault fails the generation
+            // from HERE, after the replacement overlay is attached and recorded, so the failure
+            // takes the whole route a post-attach install failure takes: the coordinator sees
+            // `overlayAttached`, so `failPending` runs `cancelRebuild` AND `removeOverlay`, which
+            // is what releases this provider's observers again. The old generation is already
+            // demoted and this generation's delivery barrier has begun, exactly as they would be
+            // when a real install fails part way through, so the proven generation underneath
+            // stays complete and presented while the retry runs.
+            val injectedRejection = installFaultRejectionOrNull()
+            if (injectedRejection != null) {
+                handler.post { failGeneration(generationId, injectedRejection) }
+                return
+            }
             lastRequestAtNanos = SystemClock.elapsedRealtimeNanos()
             scheduleDeliveryQuietCheck(generationId)
         }
@@ -866,6 +887,24 @@ internal class GoogleCanonicalFogSurfaceBinding(
         installTimeout?.let(handler::removeCallbacks)
         installTimeout = null
         installTimeoutGeneration = null
+    }
+
+    /**
+     * The failure this attach must report, or `null` when no fault was installed or the installed
+     * fault let this attach through.
+     *
+     * `Exception`, never `Throwable`: a fault is test code, and a JUnit `AssertionError` thrown out
+     * of it is a broken test, not a fog install failure. Swallowing one into the retry path would
+     * bury the assertion that actually failed behind a fog-failure breadcrumb.
+     */
+    private fun installFaultRejectionOrNull(): Throwable? {
+        val fault = installFaultForTesting ?: return null
+        return try {
+            fault()
+            null
+        } catch (rejection: Exception) {
+            rejection
+        }
     }
 
     private fun failGeneration(generationId: Long, failure: Throwable) {
