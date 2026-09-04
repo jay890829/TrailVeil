@@ -15,6 +15,7 @@ import androidx.core.graphics.createBitmap
 import androidx.core.graphics.get
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.findViewTreeLifecycleOwner
 import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
@@ -931,6 +932,8 @@ internal data class GestureTrialReport(
     /** Host ON_STOP / ON_START seen while this trial ran. See the harness's counters. */
     val hostStopsDuringTrial: Int,
     val hostStartsDuringTrial: Int,
+    /** Which lifecycle those two were counted on - `NavBackStackEntry`, or the activity. */
+    val hostLifecycle: String,
     val coverIntervalBeforeMillis: Long?,
     val coverIntervalAfterMillis: Long?,
     val coverPixelProof: CoverPixelProof?,
@@ -1017,6 +1020,7 @@ internal data class GestureTrialReport(
             "maxFrameGapAtMs=$maxFrameGapStartMillis teardown=[$teardownShape] " +
             "mapViewPresentAfter=$mapViewPresentAfter " +
             "hostStops=$hostStopsDuringTrial hostStarts=$hostStartsDuringTrial " +
+            "hostLifecycle=$hostLifecycle " +
             "coverIntervalMs=$coverIntervalBeforeMillis->$coverIntervalAfterMillis " +
             "coverProof=${coverPixelProof?.describe() ?: "none"} " +
             "coverProofAttempts=$coverProofAttempts " +
@@ -1048,16 +1052,21 @@ internal class GestureExposureHarness private constructor(
      * `onHostStopped` and re-armed as a *fresh* window by `onHostStarted`, so a stop/start cycle
      * mid-cover would restart the window.
      *
-     * Read this counter with its limitation in mind: it observes the ACTIVITY's lifecycle, while the
-     * surface arms its binding from `LocalLifecycleOwner`, which inside the navigation host is the
-     * back-stack entry rather than the activity. A back-stack entry can leave STARTED without the
-     * activity doing so, so `hostStops == 0` here does not exclude every stop the binding could have
-     * seen. It stopped mattering when the deadline was shown to have fired on time - there is
-     * nothing left for a re-arm to explain - but the gap is real and is written down rather than
-     * left implied.
+     * Counted on the lifecycle the BINDING arms from, which is not always the activity's.
+     *
+     * `GoogleHostedMapSurface` arms from `LocalLifecycleOwner`, and inside the navigation host that
+     * is the back-stack entry, not the activity. A back-stack entry can leave STARTED without the
+     * activity doing so, so a counter on the activity would report `hostStops == 0` for a stop the
+     * binding did see - which is exactly the wrong direction for a witness whose job is to rule a
+     * re-arm out. `AndroidView` publishes the composition's owner onto the view tree it creates, so
+     * asking the MapView for its view-tree lifecycle owner gets the same object the binding holds.
+     * Which one was found is reported as `hostLifecycle` rather than assumed; the activity is the
+     * fallback, and it is named as a fallback when it is used.
      */
     private val hostStops: AtomicInteger,
     private val hostStarts: AtomicInteger,
+    /** Which lifecycle the two counters above are actually watching. */
+    private val hostLifecycleOwner: String,
     /** Held so a trial can ask whether the surface under audit is still in the tree at all. */
     private val decorView: View,
 ) {
@@ -1347,6 +1356,7 @@ internal class GestureExposureHarness private constructor(
             bindingAfter = bindingInstance(),
             hostStopsDuringTrial = hostStops.get() - hostStopsBefore,
             hostStartsDuringTrial = hostStarts.get() - hostStartsBefore,
+            hostLifecycle = hostLifecycleOwner,
             coverShape = witnessShape(frames) { frame -> frame.coverUp },
             composeCoverShape = witnessShape(frames) { frame -> frame.composeCoverUp },
             intervalShape = intervalShape(frames),
@@ -1648,8 +1658,21 @@ internal class GestureExposureHarness private constructor(
             )
             val stops = AtomicInteger(0)
             val starts = AtomicInteger(0)
+            val lifecycleOwnerName = AtomicReference("unknown")
             scenario.onActivity { activity ->
-                activity.lifecycle.addObserver(
+                // The owner the composition gave the map, not the activity - see the harness's
+                // KDoc on `hostStops`. `AndroidView` publishes `LocalLifecycleOwner` onto the view
+                // tree, so this is the same object `GoogleHostedMapSurface` armed its binding from.
+                val composed = mapView.findViewTreeLifecycleOwner()
+                val owner = composed ?: activity
+                lifecycleOwnerName.set(
+                    when {
+                        composed == null -> "activity(fallback:noViewTreeOwner)"
+                        composed === activity -> "activity"
+                        else -> composed.javaClass.simpleName
+                    },
+                )
+                owner.lifecycle.addObserver(
                     LifecycleEventObserver { _, event ->
                         when (event) {
                             Lifecycle.Event.ON_STOP -> stops.incrementAndGet()
@@ -1676,6 +1699,7 @@ internal class GestureExposureHarness private constructor(
                 capturer = capturer,
                 hostStops = stops,
                 hostStarts = starts,
+                hostLifecycleOwner = lifecycleOwnerName.get(),
                 decorView = requireNotNull(decor.get()),
             )
         }
