@@ -34,9 +34,12 @@ import com.google.android.gms.maps.MapView
  *    is absent the compass is left exactly where the SDK put it; a missing decoration is a cosmetic
  *    regression, and guessing at an untagged view could move something else.
  *
- * Applying is idempotent: the translation is computed from where the view currently is, so a second
- * pass over an already-placed compass moves it by zero. Translation is a draw-time property and does
- * not request layout, so re-applying inside a layout callback cannot loop.
+ * Applying is idempotent **while both views are in the window**: the translation is computed from
+ * where the view currently is, so a second pass over an already-placed compass moves it by zero.
+ * That is a property of the measurement, not of the arithmetic - a view with no AttachInfo reports
+ * its position as the screen origin, and a delta computed against that is wrong every time it is
+ * taken, so `apply` checks attachment before it measures anything. Translation is a draw-time
+ * property and does not request layout, so re-applying inside a layout callback cannot loop.
  */
 internal class GoogleCompassPlacement(
     private val mapView: MapView,
@@ -45,6 +48,7 @@ internal class GoogleCompassPlacement(
     private var topInsetPx = 0
     private var endInsetPx = 0
     private var rightToLeft = false
+    private var insetsReceived = false
     private var released = false
     private val layoutListener = ViewTreeObserver.OnGlobalLayoutListener { apply() }
 
@@ -99,6 +103,7 @@ internal class GoogleCompassPlacement(
         topInsetPx = topPx
         endInsetPx = endPx
         this.rightToLeft = rightToLeft
+        insetsReceived = true
         apply()
     }
 
@@ -119,7 +124,33 @@ internal class GoogleCompassPlacement(
 
     private fun apply() {
         if (released) return
-        val view = compass ?: findCompass(mapView)?.also { found -> compass = found } ?: return
+        // Nothing is placed until the caller has said where. The composition's insets arrive in a
+        // `SideEffect`, and the Compose applier inserts the `AndroidView`'s view - firing
+        // `onViewAttachedToWindow` below - BEFORE it dispatches side effects, so the first apply of
+        // this object's life would otherwise run against the field defaults and place the compass at
+        // the map's corner with no inset at all. Leaving it where the SDK put it until the screen
+        // has spoken is the correct fallback, and it is the same fallback used when the compass
+        // cannot be found.
+        if (!insetsReceived) return
+        // Neither view can be measured unless it is in a window. `getLocationOnScreen` returns
+        // (0, 0) for a view with no AttachInfo, so a detached view reads as sitting at the screen
+        // origin and the delta below becomes most of a map width of nonsense. Two ways that is
+        // reachable, and both are why the cached view is re-validated rather than trusted:
+        //
+        // 1. At the instant of attachment. `ViewGroup.dispatchAttachedToWindow` notifies the
+        //    attach-state listeners on ITSELF before it walks its children, so when this class's
+        //    `onViewAttachedToWindow` fires the compass underneath still has no AttachInfo. A
+        //    re-attached MapView keeps its measured width, so the size guard below would not have
+        //    caught it.
+        // 2. If the SDK ever swaps its decoration view while the MapView stays attached. The cache
+        //    is cleared on detach and on release, neither of which happens here, so a stale view
+        //    would be measured at the origin forever - a constant nonzero delta re-applied on every
+        //    global layout of the window, accumulating without bound on a view nobody can see,
+        //    while the live compass is never placed at all.
+        if (!mapView.isAttachedToWindow) return
+        val cached = compass?.takeIf { view -> view.tag == COMPASS_TAG && view.isAttachedToWindow }
+        val view = cached ?: findCompass(mapView)?.also { found -> compass = found } ?: return
+        if (!view.isAttachedToWindow) return
         if (view.width <= 0 || view.height <= 0) return
         val map = mapView.boundsOnScreen()
         if (map.isEmpty) return

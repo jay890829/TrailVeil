@@ -223,6 +223,58 @@ class GoogleEntryScreenCompassPlacementTest {
         )
     }
 
+    /**
+     * A compass the SDK takes away must not be translated forever afterwards.
+     *
+     * The placement caches the view it found and re-runs on every layout pass of the window, so it
+     * depends on its own arithmetic being self-correcting: the translation is computed from where
+     * the compass CURRENTLY is, which converges only while the measurement is real.
+     * `getLocationOnScreen` reports (0, 0) for a view that is not in a window, so once the cached
+     * view leaves the hierarchy every pass computes the same large delta against the screen origin
+     * and `translationX +=` applies it again - drift with no bound but the number of layout passes,
+     * on a view nobody can see, while the live compass is never placed at all.
+     *
+     * A settled screen cannot show this, which is why nothing here caught it and a reviewer did.
+     * So this manufactures the one condition that produces it - the SDK replacing its own
+     * decoration view - by removing the located compass from its parent, then drives layout passes
+     * and asserts the orphan was left alone. Removing an SDK decoration is safe: it is not read by
+     * the camera, the fog, or anything this suite asserts on, and the case ends immediately after.
+     *
+     * Layout passes are forced rather than waited for, because a settled window may not lay out
+     * again on its own and a case that asserts across zero passes asserts nothing.
+     */
+    @Test
+    fun aCompassTheSdkTakesAwayIsNotTranslatedForever() {
+        SpikeScenarioSupport.assumeKeyConfigured()
+        host(entryScreen)
+        val mapView = awaitMapView()
+        val map = awaitMap(mapView)
+        revealCompass(map)
+        awaitCompass(mapView)
+
+        val compass = requireNotNull(onMain { mapView.findViewWithTag<View>(COMPASS_TAG) }) {
+            "the compass was located by tag a moment ago and is now unreachable by the same tag"
+        }
+        val orphanedAt = onMain {
+            (compass.parent as? ViewGroup)?.removeView(compass)
+            compass.translationX to compass.translationY
+        }
+
+        repeat(LAYOUT_PASSES) {
+            onMain { mapView.requestLayout() }
+            composeRule.waitForIdle()
+        }
+
+        val settledAt = onMain { compass.translationX to compass.translationY }
+        assertTrue(
+            "A compass removed from the hierarchy was translated from $orphanedAt to $settledAt " +
+                "across $LAYOUT_PASSES layout passes. It is measured at the screen origin because " +
+                "it has no AttachInfo, so the delta is the same every pass and the drift is bound " +
+                "only by how long the window lives.",
+            settledAt == orphanedAt,
+        )
+    }
+
     private fun host(content: @Composable () -> Unit) {
         composeRule.runOnUiThread { hosted.value = content }
         composeRule.waitForIdle()
@@ -338,10 +390,16 @@ class GoogleEntryScreenCompassPlacementTest {
         const val MAP_TIMEOUT_MILLIS = 30_000L
         const val MAP_SETTLE_MILLIS = 1_500L
 
+        /** The tag the Maps SDK sets on its compass; `GoogleCompassPlacement` keys on it too. */
+        const val COMPASS_TAG = "GoogleMapCompass"
+
         /** The height `RecordingHistoryScreens` gives its track card. */
         val DETAIL_MAP_HEIGHT = 280.dp
 
         /** The placement is integer pixel arithmetic; this is density rounding, not slack. */
         const val PLACEMENT_TOLERANCE_PX = 2
+
+        /** Enough passes that a per-pass drift of even one pixel is unmistakable. */
+        const val LAYOUT_PASSES = 20
     }
 }
