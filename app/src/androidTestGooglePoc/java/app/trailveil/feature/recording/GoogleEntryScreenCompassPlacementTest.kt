@@ -3,17 +3,28 @@ package app.trailveil.feature.recording
 import android.os.SystemClock
 import android.view.View
 import android.view.ViewGroup
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.test.ComposeTimeoutException
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.googlepoc.SpikeCaptureSupport
 import app.trailveil.googlepoc.SpikeScenarioSupport
 import app.trailveil.map.GoogleMapSurfaceTestActivity
 import app.trailveil.map.GoogleMapSurfaceTestHooks
+import app.trailveil.map.MAP_CONTROL_INSET
+import app.trailveil.map.TrailVeilMapSurface
 import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.GoogleMap
 import com.google.android.gms.maps.MapView
@@ -21,6 +32,7 @@ import com.google.android.gms.maps.model.CameraPosition
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Rule
@@ -62,10 +74,24 @@ import org.junit.runner.RunWith
  *    harness host, so it hosts the screen instead: the same composable, the same theme, the same
  *    window, through the content hook that activity now carries.
  *
+ * A second case covers the OTHER surface the placement now moves: the history detail map, which is
+ * embedded in a scrolling card rather than full-bleed. Its compass is placed against the MAP's own
+ * bounds, not the window's, and nothing else in this suite would notice if those two were confused -
+ * on a full-bleed map they coincide.
+ *
  * Abstains rather than passes when the key is not configured or the SDK never lays the compass out.
  */
 @RunWith(AndroidJUnit4::class)
 class GoogleEntryScreenCompassPlacementTest {
+    /**
+     * What the harness activity is currently hosting, swapped per case.
+     *
+     * The activity reads its content hook once, in `onCreate`, so the hook cannot carry a different
+     * composable per case directly. It carries this holder instead, and each case sets the holder:
+     * one activity launch, one recomposition, two very different screens.
+     */
+    private val hosted = mutableStateOf<@Composable () -> Unit>({})
+
     /**
      * Ordered before the activity rule, because the activity reads the hook in `onCreate` and a
      * `@Before` method runs after the rule has already launched it.
@@ -74,7 +100,7 @@ class GoogleEntryScreenCompassPlacementTest {
     val hostContent = object : ExternalResource() {
         override fun before() {
             GoogleMapSurfaceTestHooks.reset()
-            GoogleMapSurfaceTestHooks.content.set(entryScreen)
+            GoogleMapSurfaceTestHooks.content.set { hosted.value() }
         }
 
         override fun after() = GoogleMapSurfaceTestHooks.reset()
@@ -82,6 +108,8 @@ class GoogleEntryScreenCompassPlacementTest {
 
     @get:Rule(order = 1)
     internal val composeRule = createAndroidComposeRule<GoogleMapSurfaceTestActivity>()
+
+    private val embeddedMapView = AtomicReference<MapView>()
 
     private val entryScreen: @Composable () -> Unit = {
         RecordingEntryScreen(
@@ -102,20 +130,11 @@ class GoogleEntryScreenCompassPlacementTest {
     @Test
     fun theCompassSitsBelowTheMenuAndNoNoticeReachesIt() {
         SpikeScenarioSupport.assumeKeyConfigured()
+        host(entryScreen)
         composeRule.onNodeWithTag(RecordingEntryTestTags.LocationNotice).assertIsDisplayed()
         val mapView = awaitMapView()
         val map = awaitMap(mapView)
-        // Delta 1: without a bearing the SDK compass has no size, so there is nothing to place or
-        // to measure. The camera a user rotates is the camera this asserts on.
-        onMain {
-            map.moveCamera(
-                CameraUpdateFactory.newCameraPosition(
-                    CameraPosition.builder(map.cameraPosition)
-                        .bearing(COMPASS_REVEAL_BEARING)
-                        .build(),
-                ),
-            )
-        }
+        revealCompass(map)
 
         val compass = awaitCompass(mapView)
         val mapOrigin = onMain {
@@ -147,23 +166,126 @@ class GoogleEntryScreenCompassPlacementTest {
         }
     }
 
+    /**
+     * `V02-007`: the history detail map is embedded, and its compass is placed against the map.
+     *
+     * The entry screen's map is full-bleed, so the MapView's origin and the window's coincide and a
+     * placement computed in window coordinates would pass there by accident. The detail map is a
+     * 280dp card in the middle of a scrolling column: its origin is nowhere near the window's, and
+     * `compassEndInset` has to be spent from the CARD's end edge or the compass lands outside the
+     * card - or off-screen. That is the arithmetic this asserts, in pixels, against the map's own
+     * bounds, at the default insets the detail screen actually passes.
+     */
+    @Test
+    fun theEmbeddedDetailMapPlacesItsCompassAgainstTheMapNotTheWindow() {
+        SpikeScenarioSupport.assumeKeyConfigured()
+        host {
+            Box(modifier = Modifier.fillMaxSize()) {
+                TrailVeilMapSurface(
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .fillMaxWidth()
+                        .height(DETAIL_MAP_HEIGHT),
+                    savedStateKey = "trailveil.map.compass.embedded",
+                    // What `RecordingHistoryScreens` passes for the track card. The compass insets
+                    // are left at their defaults there, so they are left at their defaults here.
+                    rendersIntoTheWindow = true,
+                    onMapViewCreatedForTesting = { view -> embeddedMapView.set(view) },
+                )
+            }
+        }
+
+        val mapView = awaitEmbeddedMapView()
+        val map = awaitMap(mapView)
+        revealCompass(map)
+        val compass = awaitCompass(mapView)
+        val bounds = compass.boundsInMapViewPx
+        val inset = with(composeRule.density) { MAP_CONTROL_INSET.roundToPx() }
+        val width = onMain { mapView.width }
+        val height = onMain { mapView.height }
+        val describe = "compass=[${compass.strategy} ${compass.viewClass} $bounds " +
+            "visible=${compass.visible} path=${compass.hierarchyPath}] " +
+            "map=${width}x$height inset=${inset}px"
+
+        assertTrue(
+            "The compass sits ${bounds.top}px from the card's top edge, not ${inset}px. $describe",
+            abs(bounds.top - inset) <= PLACEMENT_TOLERANCE_PX,
+        )
+        assertTrue(
+            "The compass's end edge is ${width - bounds.right}px from the card's end edge, not " +
+                "${inset}px - an inset spent from the WINDOW's edge rather than the map's would " +
+                "read exactly like this. $describe",
+            abs((width - bounds.right) - inset) <= PLACEMENT_TOLERANCE_PX,
+        )
+        assertTrue(
+            "The compass is not inside the card at all. $describe",
+            bounds.top >= 0 && bounds.bottom <= height && bounds.left >= 0 && bounds.right <= width,
+        )
+    }
+
+    private fun host(content: @Composable () -> Unit) {
+        composeRule.runOnUiThread { hosted.value = content }
+        composeRule.waitForIdle()
+    }
+
+    /**
+     * Delta 1: without a bearing the SDK compass has no size, so there is nothing to place or to
+     * measure. The camera a user rotates is the camera these cases assert on.
+     */
+    private fun revealCompass(map: GoogleMap) {
+        onMain {
+            map.moveCamera(
+                CameraUpdateFactory.newCameraPosition(
+                    CameraPosition.builder(map.cameraPosition)
+                        .bearing(COMPASS_REVEAL_BEARING)
+                        .build(),
+                ),
+            )
+        }
+    }
+
+    /**
+     * Abstains when the compass never gains a size, rather than failing.
+     *
+     * The abstention has to be reached through the timeout, not after it. `waitUntil` THROWS on
+     * expiry, and `found` is only ever true for a located view, so an SDK that never lays its
+     * compass out ends this method at the throw and the `assumeTrue` below it can never fire - the
+     * class KDoc promised an abstention that the code could not deliver. Catching the timeout is
+     * what makes the promise true; the assumption is kept as well, because the locator can also
+     * return a guessed rect with `found=false` inside the window.
+     */
     private fun awaitCompass(mapView: MapView): SpikeCaptureSupport.LocatorObservation {
         var last: SpikeCaptureSupport.LocatorObservation? = null
-        composeRule.waitUntil(timeoutMillis = COMPASS_TIMEOUT_MILLIS) {
-            val observation = onMain { SpikeCaptureSupport.locateCompass(mapView) }
-            last = observation
-            observation.found &&
-                observation.boundsInMapViewPx.width() > 0 &&
-                observation.boundsInMapViewPx.height() > 0
+        val laidOut = try {
+            composeRule.waitUntil(timeoutMillis = COMPASS_TIMEOUT_MILLIS) {
+                val observation = onMain { SpikeCaptureSupport.locateCompass(mapView) }
+                last = observation
+                observation.found &&
+                    observation.boundsInMapViewPx.width() > 0 &&
+                    observation.boundsInMapViewPx.height() > 0
+            }
+            true
+        } catch (_: ComposeTimeoutException) {
+            false
         }
-        val observation = requireNotNull(last)
+        val observation = last
         assumeTrue(
-            "the Maps SDK never laid its compass out on this device, so there is no placement to " +
-                "measure; abstaining rather than asserting on a guessed rectangle " +
-                "(strategy=${observation.strategy} bounds=${observation.boundsInMapViewPx})",
-            observation.strategy != FALLBACK_STRATEGY,
+            "the Maps SDK never laid its compass out on this device within " +
+                "${COMPASS_TIMEOUT_MILLIS}ms, so there is no placement to measure; abstaining " +
+                "rather than asserting on a guessed rectangle (laidOut=$laidOut " +
+                "strategy=${observation?.strategy} bounds=${observation?.boundsInMapViewPx})",
+            laidOut && observation != null &&
+                observation.strategy != SpikeCaptureSupport.FALLBACK_STRATEGY,
         )
-        return observation
+        return requireNotNull(observation)
+    }
+
+    private fun awaitEmbeddedMapView(): MapView {
+        composeRule.waitUntil(timeoutMillis = MAP_TIMEOUT_MILLIS) {
+            val view = embeddedMapView.get()
+            view != null && onMain { view.width > 0 && view.height > 0 }
+        }
+        return requireNotNull(embeddedMapView.get())
     }
 
     private fun awaitMapView(): MapView {
@@ -215,6 +337,11 @@ class GoogleEntryScreenCompassPlacementTest {
         const val COMPASS_TIMEOUT_MILLIS = 20_000L
         const val MAP_TIMEOUT_MILLIS = 30_000L
         const val MAP_SETTLE_MILLIS = 1_500L
-        const val FALLBACK_STRATEGY = "fallbackRect"
+
+        /** The height `RecordingHistoryScreens` gives its track card. */
+        val DETAIL_MAP_HEIGHT = 280.dp
+
+        /** The placement is integer pixel arithmetic; this is density rounding, not slack. */
+        const val PLACEMENT_TOLERANCE_PX = 2
     }
 }

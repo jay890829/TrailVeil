@@ -20,6 +20,9 @@ import kotlin.math.abs
 object SpikeCaptureSupport {
     const val EXCLUSION_MARGIN_PX = 8
 
+    /** The strategy name a locator reports when it found nothing and returned a guessed rect. */
+    const val FALLBACK_STRATEGY = "fallbackRect"
+
     /** Any pixel inside the whole palette family (all 63 signatures + placeholder) +- video/GL
      *  tolerance. Labels/roads/POIs differ from this window by >= 40 per channel. */
     fun isFogFamily(pixel: Int, tolerance: Int = 6): Boolean {
@@ -153,7 +156,7 @@ object SpikeCaptureSupport {
         )
         return LocatorObservation(
             found = false,
-            strategy = "fallbackRect",
+            strategy = FALLBACK_STRATEGY,
             viewClass = "none",
             hierarchyPath = "none",
             boundsInMapViewPx = rect,
@@ -162,7 +165,17 @@ object SpikeCaptureSupport {
         )
     }
 
-    /** Chain: tag "GoogleMapCompass" -> top-left-quadrant ImageView -> dp-scaled default rect. */
+    /**
+     * Chain: tag "GoogleMapCompass" -> top-corner ImageView -> dp-scaled default rect.
+     *
+     * EITHER top corner, in both untagged strategies. This locator was written against the SDK's
+     * shipped placement, which is top-START, and scanned only that third of the width. `V02-007`
+     * gave the Google surface a `GoogleCompassPlacement` that honours the neutral signature's
+     * `compassEndInset` and translates the compass to the top-END corner, so a scan pinned to START
+     * finds nothing on the very surface these captures audit, falls through to a START-corner
+     * guess, and excludes a rectangle the compass is no longer in - leaving the real compass inside
+     * the audited region, where it reads as exposed basemap.
+     */
     fun locateCompass(mapView: MapView): LocatorObservation {
         findByTag(mapView, "GoogleMapCompass")?.let { view ->
             return observation(mapView, view, "tag")
@@ -170,19 +183,15 @@ object SpikeCaptureSupport {
         findBy(mapView) { view ->
             view is ImageView && view.drawable != null && view.isShown &&
                 view.boundsIn(mapView).let { rect ->
-                    rect.centerY() < mapView.height / 3 && rect.centerX() < mapView.width / 3
+                    rect.centerY() < mapView.height / 3 &&
+                        (rect.centerX() < mapView.width / 3 ||
+                            rect.centerX() > mapView.width * 2 / 3)
                 }
         }?.let { view -> return observation(mapView, view, "imageScan") }
-        val density = mapView.resources.displayMetrics.density
-        val rect = Rect(
-            (6 * density).toInt(),
-            (6 * density).toInt(),
-            (54 * density).toInt(),
-            (54 * density).toInt(),
-        )
+        val rect = compassFallbackRects(mapView).first
         return LocatorObservation(
             found = false,
-            strategy = "fallbackRect",
+            strategy = FALLBACK_STRATEGY,
             viewClass = "none",
             hierarchyPath = "none",
             boundsInMapViewPx = rect,
@@ -191,13 +200,44 @@ object SpikeCaptureSupport {
         )
     }
 
+    /**
+     * Both corners the compass can occupy, START first, as dp-scaled default rects.
+     *
+     * Only reached when the compass was not located at all. That happens for one of two reasons and
+     * the two put it in opposite corners: the SDK never laid it out (nothing is drawn, either rect
+     * is harmless), or the tag went away in an SDK update - in which case `GoogleCompassPlacement`
+     * failed to find it by the same tag, did not move it, and left it in the SDK's own START
+     * corner, while a build whose placement DID run has it at END. A guess cannot tell those apart,
+     * so callers that exclude a region exclude both.
+     */
+    private fun compassFallbackRects(mapView: MapView): Pair<Rect, Rect> {
+        val density = mapView.resources.displayMetrics.density
+        val inset = (6 * density).toInt()
+        val size = (48 * density).toInt()
+        val start = Rect(inset, inset, inset + size, inset + size)
+        val end = Rect(
+            mapView.width - inset - size,
+            inset,
+            mapView.width - inset,
+            inset + size,
+        )
+        return start to end
+    }
+
     /** Live per-capture exclusion rects (+margin); fallback rects are included deliberately so
-     *  an in-surface watermark can never masquerade as a label leak. */
+     *  an in-surface watermark can never masquerade as a label leak. A compass that fell back
+     *  contributes BOTH corners it could be in - see [compassFallbackRects]. */
     fun liveExclusionRects(mapView: MapView): Pair<List<Rect>, Boolean> {
         val watermark = locateWatermark(mapView)
         val compass = locateCompass(mapView)
-        val fallbackUsed = watermark.strategy == "fallbackRect" || compass.strategy == "fallbackRect"
-        val rects = listOf(watermark.boundsInMapViewPx, compass.boundsInMapViewPx).map { rect ->
+        val compassGuessed = compass.strategy == FALLBACK_STRATEGY
+        val fallbackUsed = watermark.strategy == FALLBACK_STRATEGY || compassGuessed
+        val compassRects = if (compassGuessed) {
+            compassFallbackRects(mapView).toList()
+        } else {
+            listOf(compass.boundsInMapViewPx)
+        }
+        val rects = (listOf(watermark.boundsInMapViewPx) + compassRects).map { rect ->
             Rect(
                 rect.left - EXCLUSION_MARGIN_PX,
                 rect.top - EXCLUSION_MARGIN_PX,

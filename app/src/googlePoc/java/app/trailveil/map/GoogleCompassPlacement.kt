@@ -44,30 +44,77 @@ internal class GoogleCompassPlacement(
     private var compass: View? = null
     private var topInsetPx = 0
     private var endInsetPx = 0
+    private var rightToLeft = false
     private var released = false
     private val layoutListener = ViewTreeObserver.OnGlobalLayoutListener { apply() }
 
-    init {
-        mapView.viewTreeObserver.addOnGlobalLayoutListener(layoutListener)
+    /**
+     * Registration follows the window, not this object's lifetime.
+     *
+     * A `ViewTreeObserver` read from an ATTACHED view is the window's - shared, long-lived; one read
+     * from a DETACHED view is a throwaway the view carries until it next attaches. Registering in
+     * `init` and removing in [release] gets that backwards at the end, because Compose detaches the
+     * `AndroidView` before it runs `onDispose`: by then `mapView.viewTreeObserver` hands back a fresh
+     * floating observer, `isAlive` is true on it, the removal succeeds against the wrong object, and
+     * the real listener stays on the window's observer holding this placement - and the MapView with
+     * it - for as long as the window lives. Not hypothetical on this surface: the terminal-failure
+     * path in `V02-007` section 5b swaps the map out while the activity lives on.
+     *
+     * Attaching and detaching in step with the view fixes it, because `onViewDetachedFromWindow` runs
+     * while the AttachInfo is still set, so the observer removed there is the one that was added.
+     */
+    private val attachListener = object : View.OnAttachStateChangeListener {
+        override fun onViewAttachedToWindow(view: View) {
+            if (released) return
+            view.viewTreeObserver.addOnGlobalLayoutListener(layoutListener)
+            apply()
+        }
+
+        override fun onViewDetachedFromWindow(view: View) {
+            removeLayoutListener(view)
+            // The SDK rebuilds its decorations across a detach, so a cached view would be stale.
+            compass = null
+        }
     }
 
-    /** The screen's requested insets, in pixels from the map's own top and end edges. */
-    fun setInsets(topPx: Int, endPx: Int) {
+    init {
+        mapView.addOnAttachStateChangeListener(attachListener)
+        if (mapView.isAttachedToWindow) {
+            mapView.viewTreeObserver.addOnGlobalLayoutListener(layoutListener)
+        }
+    }
+
+    /**
+     * The screen's requested insets, in pixels from the map's own top and end edges, plus the
+     * direction that decides which edge "end" is.
+     *
+     * [rightToLeft] comes from the CALLER - the composition's `LocalLayoutDirection`, the same one
+     * that resolves `Alignment.End` for the menu button this compass is placed under - and not from
+     * the SDK view's own resolved direction. The two can disagree: the SDK is free to lay its
+     * decorations out LTR inside a mirrored screen, and reading the view would then put the compass
+     * on the opposite edge from the control it is meant to sit beneath.
+     */
+    fun setInsets(topPx: Int, endPx: Int, rightToLeft: Boolean) {
         if (released) return
         topInsetPx = topPx
         endInsetPx = endPx
+        this.rightToLeft = rightToLeft
         apply()
     }
 
     fun release() {
         if (released) return
         released = true
-        if (mapView.viewTreeObserver.isAlive) {
-            mapView.viewTreeObserver.removeOnGlobalLayoutListener(layoutListener)
-        }
+        mapView.removeOnAttachStateChangeListener(attachListener)
+        removeLayoutListener(mapView)
         // Left where it was rather than reset: this composition is going away, and a compass that
-        // jumps back under the menu button on the way out is worse than one that stays put.
+        // jumps back to the corner it came from on the way out is worse than one that stays put.
         compass = null
+    }
+
+    private fun removeLayoutListener(view: View) {
+        val observer = view.viewTreeObserver
+        if (observer.isAlive) observer.removeOnGlobalLayoutListener(layoutListener)
     }
 
     private fun apply() {
@@ -77,17 +124,17 @@ internal class GoogleCompassPlacement(
         val map = mapView.boundsOnScreen()
         if (map.isEmpty) return
         val bounds = view.boundsOnScreen()
-        // The END edge, resolved from the layout direction, not from wherever the SDK left it.
+        // The END edge, taken from the caller's layout direction - not from wherever the SDK left
+        // the view, and not from the view's own resolved direction.
         //
         // Measured on the API 36 Play Store image, the Maps SDK puts its compass at the top START
-        // corner - `V02-005-design.md` records that as an accepted parity delta against the other
-        // actual's top-END placement. `compassEndInset` names an END inset, and the screen spends it to
-        // stack the compass under its own menu button, which is an END-corner control. Honouring the
-        // parameter literally puts the two providers' compasses in the same corner and closes that
-        // delta rather than carrying it; a first version of this pinned the compass to whichever
-        // edge it was already nearest, which honoured the top inset and left the compass under the
-        // notice card.
-        val rightToLeft = view.layoutDirection == View.LAYOUT_DIRECTION_RTL
+        // corner. `V02-005-design.md` recorded that as a parity delta against the other actual's
+        // top-END placement, carried rather than closed; the owner accepted closing it on
+        // 2026-09-04. `compassEndInset` names an END inset, and the screen spends it stacking the
+        // compass beneath its own menu button, which is an END-corner control. Honouring the
+        // parameter literally puts both actuals' compasses in the same corner; a first version of
+        // this pinned the compass to whichever edge it was already nearest, which honoured the top
+        // inset and left the compass under the widest notice card.
         val deltaX = if (rightToLeft) {
             (map.left + endInsetPx) - bounds.left
         } else {

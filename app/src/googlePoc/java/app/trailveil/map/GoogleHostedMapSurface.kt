@@ -28,7 +28,9 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -235,9 +237,13 @@ internal fun GoogleHostedMapSurface(
     // what carries a CHANGED inset to it.
     val compassTopInsetPx = with(LocalDensity.current) { compassTopInset.roundToPx() }
     val compassEndInsetPx = with(LocalDensity.current) { compassEndInset.roundToPx() }
+    // The composition's direction, which is what resolves `Alignment.End` for the screen's own
+    // controls, rather than the SDK view's - so the compass lands on the same edge as the button
+    // it is placed beneath even if the SDK lays its decorations out unmirrored.
+    val compassRightToLeft = LocalLayoutDirection.current == LayoutDirection.Rtl
 
     SideEffect {
-        compassPlacement.setInsets(compassTopInsetPx, compassEndInsetPx)
+        compassPlacement.setInsets(compassTopInsetPx, compassEndInsetPx, compassRightToLeft)
         synchronousFogCover.setVisible(fogRequired && fogCoverUp)
         val overlayGeometryChanged = binding?.updateOverlays(
             currentLocation = currentLocation,
