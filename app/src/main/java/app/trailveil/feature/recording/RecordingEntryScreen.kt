@@ -20,6 +20,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExtendedFloatingActionButton
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -41,6 +42,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.disabled
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -131,6 +133,15 @@ internal object RecordingEntryTestTags {
     const val StartNoticeDismiss = "recording_entry_start_notice_dismiss"
     const val RecordingState = "recording_entry_recording_state"
     const val Recenter = "recording_entry_recenter"
+
+    /**
+     * The map's own start/stop control, distinct from the menu items above.
+     *
+     * Deliberately NOT [Start] / [Stop]: those tags are on the menu items, and a `onNodeWithTag`
+     * that matched two nodes would fail every existing test that uses them. Same state, same
+     * callbacks, different tag.
+     */
+    const val MapExploration = "recording_entry_map_exploration"
     const val History = "recording_entry_history"
     const val Menu = "recording_entry_menu"
     const val Privacy = "recording_entry_privacy"
@@ -321,15 +332,27 @@ internal fun RecordingEntryScreen(
                     }
                 }
             }
-            RecenterButton(
-                enabled = state.canRecenter,
-                following = state.followingLocation,
-                onClick = onRecenter,
+            // Recentre above, exploration below: the exploration control is the screen's primary
+            // action, and Material puts the primary action closest to the thumb.
+            Column(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
                     .safeDrawingPadding()
                     .padding(16.dp),
-            )
+                horizontalAlignment = Alignment.End,
+                verticalArrangement = Arrangement.spacedBy(ControlSpacing),
+            ) {
+                RecenterButton(
+                    enabled = state.canRecenter,
+                    following = state.followingLocation,
+                    onClick = onRecenter,
+                )
+                MapExplorationButton(
+                    state = state,
+                    onStart = onStart,
+                    onStop = onStop,
+                )
+            }
         }
     }
 
@@ -429,6 +452,86 @@ private fun RecordingEntryMenu(
             )
         }
     }
+}
+
+/**
+ * The map's own exploration control: the menu's Start/Stop, put where the thumb is.
+ *
+ * It shares [RecordingEntryUiState] and the same `onStart`/`onEnd` callbacks with the menu, so the
+ * two cannot disagree - starting from either place moves the same state and both controls follow it
+ * on the next composition. That is the whole of "keep them in sync"; there is no second source of
+ * truth to reconcile, and adding one is how they would drift.
+ *
+ * One state offers both actions: an abandoned exploration, where nothing is recording (so Start
+ * continues it) but the row is still open (so Stop ends it). A single control cannot show both, so
+ * it shows **Start**, which is the action that keeps the user's data, and Stop stays reachable in
+ * the menu. That asymmetry is deliberate and is why this is not a plain boolean toggle.
+ *
+ * Hidden, rather than disabled, when neither action is offered - a control that can never be pressed
+ * is furniture. It is disabled, and stays visible, only while an action it IS offering is
+ * momentarily unavailable (mid-start, mid-stop), because that is a state the user is waiting out.
+ */
+@Composable
+private fun MapExplorationButton(
+    state: RecordingEntryUiState,
+    onStart: () -> Unit,
+    onStop: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val starting = state.starting
+    val showStart = state.startOffered
+    val showStop = !showStart && state.stopOffered
+    if (!showStart && !showStop) return
+
+    val enabled = if (showStart) {
+        !state.loading && !starting
+    } else {
+        !starting && state.recordingState != RecordingDisplayState.STOPPING
+    }
+    val labelResource = when {
+        showStart && starting -> R.string.recording_entry_starting
+        showStart -> R.string.recording_entry_start
+        else -> R.string.recording_entry_stop
+    }
+    val icon = if (showStart) {
+        R.drawable.ic_exploration_start
+    } else {
+        R.drawable.ic_exploration_stop
+    }
+    val label = stringResource(labelResource)
+    ExtendedFloatingActionButton(
+        onClick = { if (enabled) if (showStart) onStart() else onStop() },
+        modifier = modifier
+            .semantics {
+                // Stated, not inherited. This button's own label does not reach the merged
+                // semantics node the way a plain Button's does - measured on API 36, where the
+                // node carries Role and OnClick but no Text at all - so a screen reader would
+                // announce an unlabelled button. Read from the same string resource the button
+                // draws, so the two cannot drift.
+                contentDescription = label
+                if (!enabled) disabled()
+            }
+            .testTag(RecordingEntryTestTags.MapExploration),
+        containerColor = if (enabled) {
+            MaterialTheme.colorScheme.primaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceContainerHighest
+        },
+        contentColor = if (enabled) {
+            MaterialTheme.colorScheme.onPrimaryContainer
+        } else {
+            MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.38f)
+        },
+        icon = {
+            Icon(
+                painter = painterResource(icon),
+                // The label already names the action; a second reading of it would make a screen
+                // reader say the same words twice.
+                contentDescription = null,
+            )
+        },
+        text = { Text(text = label) },
+    )
 }
 
 @Composable

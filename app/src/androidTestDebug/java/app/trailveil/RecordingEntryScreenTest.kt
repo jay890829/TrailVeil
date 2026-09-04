@@ -8,6 +8,7 @@ import androidx.compose.runtime.SideEffect
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.assertContentDescriptionEquals
 import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.junit4.StateRestorationTester
 import androidx.compose.ui.test.junit4.v2.createComposeRule
@@ -854,5 +855,168 @@ class RecordingEntryScreenTest {
         composeRule.onNodeWithTag(RecordingEntryTestTags.Recenter).assertIsNotEnabled()
         composeRule.onNodeWithTag(RecordingEntryTestTags.Recenter).performClick()
         assertEquals(0, recenterCalls.get())
+    }
+
+    /**
+     * The map control and the menu item are the same action, reached two ways.
+     *
+     * The point of the on-map control is that a user never has to open a menu to begin, and the
+     * risk it introduces is two controls that can disagree about what the app is doing. They cannot
+     * here, because both read one [RecordingEntryUiState] and call one callback - so this
+     * drives the
+     * state and asserts BOTH agree, rather than pressing one and hoping the other noticed.
+     */
+    @Test
+    fun theMapExplorationControlAndTheMenuAlwaysOfferTheSameAction() {
+        val startCalls = AtomicInteger()
+        val stopCalls = AtomicInteger()
+        val recording = mutableStateOf(false)
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    firstVisit = false,
+                    startOffered = !recording.value,
+                    stopOffered = recording.value,
+                ),
+                onStart = {
+                    startCalls.incrementAndGet()
+                    recording.value = true
+                },
+                onStop = {
+                    stopCalls.incrementAndGet()
+                    recording.value = false
+                },
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val start = context.getString(R.string.recording_entry_start)
+        val stop = context.getString(R.string.recording_entry_stop)
+
+        // Not recording: the map control offers Start.
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration)
+            .assertIsDisplayed()
+            .assertContentDescriptionEquals(start)
+
+        // Drive it from the MENU. Clicking the item closes the menu itself, so nothing has to
+        // guess at how a dropdown is dismissed.
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Start)
+            .assertIsDisplayed()
+            .performClick()
+        assertEquals(1, startCalls.get())
+
+        // The map control followed the menu.
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration)
+            .assertIsDisplayed()
+            .assertContentDescriptionEquals(stop)
+
+        // Now drive it from the MAP control.
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration).performClick()
+        assertEquals(1, stopCalls.get())
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration)
+            .assertContentDescriptionEquals(start)
+
+        // And the menu followed the map control.
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Start).assertIsDisplayed()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Stop).assertDoesNotExist()
+        assertEquals(1, startCalls.get())
+    }
+
+    /**
+     * An abandoned exploration offers both actions. One control cannot show both, so it shows the
+     * one that keeps the user's data, and the other stays reachable where it always was.
+     */
+    @Test
+    fun theMapControlOffersStartOnAnAbandonedExplorationAndLeavesStopToTheMenu() {
+        val startCalls = AtomicInteger()
+        val stopCalls = AtomicInteger()
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    firstVisit = false,
+                    startOffered = true,
+                    stopOffered = true,
+                    recordingState = RecordingDisplayState.ABANDONED,
+                ),
+                onStart = startCalls::incrementAndGet,
+                onStop = stopCalls::incrementAndGet,
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration)
+            .assertIsDisplayed()
+            .assertContentDescriptionEquals(
+                InstrumentationRegistry.getInstrumentation().targetContext
+                    .getString(R.string.recording_entry_start),
+            )
+            .performClick()
+        assertEquals(1, startCalls.get())
+        assertEquals(0, stopCalls.get())
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Stop).assertIsDisplayed()
+    }
+
+    /**
+     * A control that can never be pressed is furniture. When neither action is offered the map
+     * control is absent, not greyed out - and the recentre button keeps its own corner.
+     */
+    @Test
+    fun theMapExplorationControlIsAbsentWhenNeitherActionIsOffered() {
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(
+                    firstVisit = false,
+                    startOffered = false,
+                    stopOffered = false,
+                ),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration).assertDoesNotExist()
+        composeRule.onNodeWithTag(RecordingEntryTestTags.Recenter).assertIsDisplayed()
+    }
+
+    /**
+     * The map control sits BELOW the recentre button, which is what moving the primary action into
+     * thumb reach means. Asserted on geometry rather than on source order, because source order is
+     * not what the user's thumb reaches.
+     */
+    @Test
+    fun theMapExplorationControlSitsBelowTheRecentreButton() {
+        composeRule.setContent {
+            RecordingEntryScreen(
+                state = RecordingEntryUiState(firstVisit = false, canRecenter = true),
+                onStart = {},
+                onStop = {},
+                onLocationAction = {},
+                onDismissLocationNotice = {},
+                onNotificationAction = {},
+            )
+        }
+
+        val recentre = composeRule.onNodeWithTag(RecordingEntryTestTags.Recenter)
+            .getUnclippedBoundsInRoot()
+        val exploration = composeRule.onNodeWithTag(RecordingEntryTestTags.MapExploration)
+            .getUnclippedBoundsInRoot()
+        with(composeRule.density) {
+            assertTrue(
+                "The exploration control (top=${exploration.top.roundToPx()}px) is not below the " +
+                    "recentre button (bottom=${recentre.bottom.roundToPx()}px)",
+                exploration.top.roundToPx() >= recentre.bottom.roundToPx(),
+            )
+        }
     }
 }
