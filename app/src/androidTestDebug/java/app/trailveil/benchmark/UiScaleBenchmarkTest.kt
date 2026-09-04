@@ -525,15 +525,24 @@ class UiScaleBenchmarkTest {
          * So the quantity that is stable under stalling is asserted directly: the worst window's
          * interval count. The value is derived to interlock with [MAX_FRAME_P95_MILLIS] rather
          * than to duplicate it. A window that presents at exactly the 32 ms p95 limit yields about
-         * `250/32 = 7.8` intervals, so a floor of 6 sits just below the slowest window the p95
-         * gate could pass and cannot fire in its place. Above it, the two assertions close on each
-         * other: with every window at 6 or more, at most two of twenty can run at 36 ms before the
-         * pooled p95 exceeds 32 and fails - against eight fully stalled windows that passed
-         * before.
+         * `250/32 - 1 = 6.8` intervals, so a floor of 6 sits just below the slowest window the
+         * p95 gate could pass and cannot fire in its place. Above it the two assertions close on
+         * each other: with every window at 6 or more, at most two of twenty can run at 36 ms
+         * before the pooled p95 exceeds 32 and fails - against eight fully stalled windows that
+         * passed before.
+         *
+         * The `- 1` is the same no-predecessor deduction [MIN_PRESENT_INTERVALS] applies, and it
+         * was missing here until a docs audit caught the two derivations disagreeing. It is not
+         * bookkeeping: the measured emulator run averages 13.85 intervals per window at 60 Hz,
+         * which is `250/16.67 - 1 = 14` and not `250/16.67 = 15`, so the deduction is what the
+         * data shows. Correcting it narrows the margin below the slowest passing window from 1.8
+         * intervals to 0.8 - the floor still cannot fire in the p95's place, but only just. If a
+         * run ever trips this floor while the p95 assertion passes, that margin is the reason:
+         * lower this to 5 and record the run.
          *
          * Measured, not assumed: the leanest window observed on the emulator is reported by every
          * run as `leanestWindow=` and recorded in `V02-007-gates.md`. Raise this only with a run
-         * that forced it, and never above the 7.8 that would make it fire in place of the p95.
+         * that forced it, and never above the 6.8 that would make it fire in place of the p95.
          */
         const val MIN_INTERVALS_PER_WINDOW = 6
 
