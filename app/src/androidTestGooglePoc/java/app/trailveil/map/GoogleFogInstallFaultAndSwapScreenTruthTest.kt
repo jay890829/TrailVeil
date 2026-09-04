@@ -517,7 +517,22 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         // a defect. This asks a different question: how big is the largest single patch that read
         // as neither fog nor cover, measured against the one the settled floor already carries.
         val worstCluster = samples.maxOfOrNull { sample -> sample.largestUncoveredCluster } ?: 0
-        val ceiling = baselineCluster + CLUSTER_MARGIN_CELLS
+        // The floor has to leave the rule able to fire. It is a measurement of this scene, so a
+        // scene whose settled frames already carry a tile-sized patch would push the ceiling above
+        // the smallest defect this rule exists to catch and disable it silently. Asserted rather
+        // than assumed, and asserted against the defect size rather than against the recorded
+        // figure, so a noisier scene fails calibration instead of quietly relaxing the bound.
+        assertTrue(
+            "the settled floor at this camera already carries a contiguous uncovered patch of " +
+                "$baselineCluster sampled cells, at or past the $TILE_HOLE_CELLS one uncovered " +
+                "zoom-16 tile would occupy, so no shape bound derived from it could still catch " +
+                "such a tile. frames=${samples.size} " + describe(mapView),
+            baselineCluster < TILE_HOLE_CELLS,
+        )
+        // Relative to this scene's own floor, but never above the defect size: the floor keeps the
+        // rule from firing on ordinary label variation, and the cap keeps a drifting floor from
+        // lifting the rule past the hole it is for.
+        val ceiling = minOf(baselineCluster + CLUSTER_MARGIN_CELLS, TILE_HOLE_CELLS - 1)
         assertTrue(
             "a presented frame carried one contiguous patch of $worstCluster sampled cells that " +
                 "read as neither fog nor cover, past the $ceiling this scene allows " +
@@ -625,6 +640,13 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             // Everything in this window that is not the map, located live in the same round
             // trip as the geometry it is measured against, and all of it drawn ABOVE the fog
             // overlay by design so none of it can ever read as fog.
+            //
+            // `bars` is window-relative and `origin` is screen-relative, so the two agree only for
+            // a window at the screen origin, which is what this unexported harness activity always
+            // is. In a freeform or multi-window host the shift would be wrong; an over-wide band
+            // would exclude map and an inverted one excludes nothing, and neither can turn a bare
+            // frame into a covered one, so it degrades toward abstention rather than toward a
+            // false pass.
             //
             // The shape rule below is why this matters. Measured on the API 36 AVD: with nothing
             // excluded, every settled frame carried one contiguous 224-cell uncovered patch, and
@@ -1051,13 +1073,21 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
          * and a largest uncovered patch of **36** cells. Both cases' audited frames measured 36 as
          * well, so neither the faulted install nor the swap adds anything to it.
          *
-         * The margin is set from the smallest defect that must fail, not from that zero delta. One
-         * zoom-16 tile left uncovered is 256 px square, which across this 1080x2400 map is about
-         * 11 of the 48 sampled columns by 8 of the 80 sampled rows: roughly 97 cells. A margin of
-         * 40 puts the alarm at 76 - a shade over twice the measured floor, and comfortably below
-         * the smallest hole a user could actually see.
+         * The margin is set from the smallest defect that must fail, not from that zero delta:
+         * [TILE_HOLE_CELLS]. A margin of 40 puts the alarm at 76 on a 36-cell floor, comfortably
+         * below that hole. The floor is not perfectly stable - a later run measured 49 - so the
+         * ceiling is additionally capped at the hole size itself, and the floor is asserted to sit
+         * below it, rather than trusting the recorded figure to stay where it was.
          */
         const val CLUSTER_MARGIN_CELLS = 40
+
+        /**
+         * One uncovered zoom-16 tile, in sampled cells: the smallest hole that must always fail.
+         *
+         * A tile is 256 px square. Across this 1080 x 2400 map that is about 11 of the 48 sampled
+         * columns by 8 of the 80 sampled rows, so roughly 97 cells.
+         */
+        const val TILE_HOLE_CELLS = 97
         const val GRID_COLUMNS = 48
         const val GRID_ROWS = 80
         const val COVER_RED = 0x3C

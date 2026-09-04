@@ -22,6 +22,17 @@ import androidx.compose.ui.test.junit4.ComposeTestRule
  *
  * The same reading explains why such a case can pass alone and fail in a suite: `waitForIdle()`
  * does advance the clock a little, so a short wait sometimes lands and a long one never does.
+ *
+ * ### Which waits already wind it, and which do not
+ *
+ * `ComposeTestRule.waitUntil` drives the clock itself while it polls, so a case built out of
+ * `waitUntil` is not exposed to this even under an empty rule; the other classes in this source set
+ * that install one - the reveal-latency and process-death restoration cases - wait that way, and
+ * neither waits on a host deadline. What is exposed is a hand-rolled loop of `SystemClock.sleep`
+ * with or without `waitForIdle`, which is what both defective cases had. Prefer `waitUntil` for
+ * anything the composition itself produces; reach for [pumpComposition] and [awaitPumping] when the
+ * wait also has to pass real time for something outside the composition - the Maps SDK loading a
+ * basemap, a tile arriving, a deadline the host counts with `delay`.
  */
 internal fun ComposeTestRule.pumpComposition(stepMillis: Long = DEFAULT_PUMP_STEP_MILLIS) {
     mainClock.advanceTimeBy(stepMillis)

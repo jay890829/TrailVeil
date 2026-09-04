@@ -9,7 +9,6 @@ import android.view.ViewGroup
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import app.trailveil.MainActivity
 import app.trailveil.R
 import app.trailveil.data.db.RecordingSessionEntity
 import app.trailveil.data.db.RecordingStatus
@@ -354,26 +353,57 @@ class GoogleSettledFogCoverageSweepTest {
 
     private fun auditSettledSweep(label: String, steps: List<SweepStep>) {
         SpikeScenarioSupport.assumeKeyConfigured()
-        assumeTrue(
-            "$label: this sweep asserts that EVERY map pixel is fog, which is only true of an " +
-                "install that has revealed nothing; the canonical tables are not empty, so the " +
-                "run abstains instead of reporting a pass over legitimately revealed ground",
-            canonicalTablesAreEmpty(),
-        )
-        val fogged = sweepProductionMap(label, steps)
+        val fogged = sweepFoggedMap(label, steps)
+        // Empty only on the one path that asserts its own claim instead of auditing scenes: every
+        // rung below a floor that sits at or above the world-copy boundary, so the ground they name
+        // is unreachable on this viewport. `sweepFoggedMap` has asserted that and recorded it.
+        if (fogged.isEmpty()) return
         val bare = measureDetachedFogReference(label, fogged.map { it.name to it.camera })
         assertSettledCoverage(label, fogged, bare)
     }
 
-    private fun sweepProductionMap(label: String, steps: List<SweepStep>): List<SceneReading> {
+    /**
+     * Sweeps the production fog surface over an install that has revealed nothing.
+     *
+     * Hosted on the unexported harness activity over a fresh in-memory Room, NOT on the launcher.
+     * The sweep's claim is that every pixel of a settled map is fog, which is only true where
+     * nothing has been revealed, and the launcher reads the app's real canonical tables. Gating on
+     * those tables being empty is what this used to do, and on the acceptance leg it never held:
+     * the case abstained in every recorded unfiltered run, because sibling classes seed that
+     * database, so the two `V02-007` rows it was written to close were closed by nothing. An empty
+     * private install makes the precondition true by construction instead of by luck, and the
+     * surface under test is the same `TrailVeilMapSurface` with the same DAO-backed `FogRuntime`
+     * the launcher composes - which is what the rows are about. The revealed-ground arm in this
+     * same class already audits its scenes this way.
+     */
+    private fun sweepFoggedMap(label: String, steps: List<SweepStep>): List<SceneReading> {
         val readings = mutableListOf<SceneReading>()
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            val mapView = awaitHostedMapView(scenario, "the real MainActivity")
+        val database = inMemoryDatabase()
+        try {
+        GoogleMapSurfaceTestHooks.reset()
+        GoogleMapSurfaceTestHooks.decision.set(ProviderStartupDecision(true, null))
+        GoogleMapSurfaceTestHooks.fogRequired = true
+        GoogleMapSurfaceTestHooks.fogRuntime = fogRuntime(
+            database,
+            RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+        )
+        val mapReady = CountDownLatch(1)
+        val mapRef = AtomicReference<GoogleMap>()
+        GoogleMapSurfaceTestHooks.onMapReady.set { readyMap ->
+            mapRef.set(readyMap)
+            mapReady.countDown()
+        }
+        ActivityScenario.launch(GoogleMapSurfaceTestActivity::class.java).use { scenario ->
+            assertTrue(
+                "$label: the fogged sweep host never produced a Google map",
+                mapReady.await(MAP_READY_TIMEOUT_SECONDS, TimeUnit.SECONDS),
+            )
+            val mapView = awaitHostedMapView(scenario, "the fogged sweep host")
             val activity = AtomicReference<Activity>()
             scenario.onActivity { activity.set(it) }
-            val map = awaitGoogleMap(scenario, mapView)
+            val map = requireNotNull(mapRef.get())
             assumeTrue(
-                "$label: the production Google basemap never reported loaded, so there is " +
+                "$label: the hosted Google basemap never reported loaded, so there is " +
                     "nothing settled to audit; abstaining rather than reporting a pass. " +
                     describeMapView(mapView),
                 awaitTag(mapView, R.id.map_basemap_load_state) { value -> value == ONLINE_STATE },
@@ -399,18 +429,49 @@ class GoogleSettledFogCoverageSweepTest {
             val unreachable = steps.filter { step ->
                 step.zoomIsTheProperty && step.zoom < zoomFloor
             }
-            assumeTrue(
-                "$label: ${unreachable.size} of ${steps.size} rungs ask for a zoom below this " +
-                    "viewport's SDK minimum of ${"%.3f".format(zoomFloor)}, and for these rungs " +
-                    "the zoom IS the property under test - clamped, every one of them audits the " +
-                    "SAME camera and neither side of the boundary is ever entered. Abstaining " +
-                    "with the measured floor rather than reporting a pass over one camera " +
-                    "visited ${steps.size} times. " + describeMapView(mapView),
-                unreachable.isEmpty(),
-            )
+            // Asserted, not abstained.
+            //
+            // A rung below the live floor cannot be audited at the zoom it names, and this used to
+            // skip the whole case. On a portrait phone that is every world-copy rung, so the case
+            // reported SKIPPED on the acceptance leg in every recorded run and closed nothing. But
+            // "unreachable" is itself the answer those rungs were asking for: if the SDK will not
+            // take this viewport below the repetition boundary, the wrapped-world states the
+            // MapLibre rows guard cannot be entered on it at all. That is a claim, so it is made
+            // here rather than used as an excuse to stop - and it fails loudly if the floor ever
+            // sits BELOW the boundary while a rung is still reported unreachable, which would mean
+            // the filter, not the SDK, is what is keeping the case away from that ground.
+            if (unreachable.isNotEmpty()) {
+                assertTrue(
+                    "$label: ${unreachable.size} of ${steps.size} rungs are unreachable, but " +
+                        "this viewport's SDK minimum of ${"%.3f".format(zoomFloor)} is BELOW the " +
+                        "world-copy repetition boundary of ${"%.3f".format(WORLD_COPY_ZOOM)}, so " +
+                        "the ground they name is reachable and something other than the SDK is " +
+                        "keeping the sweep off it. " + describeMapView(mapView),
+                    zoomFloor >= WORLD_COPY_ZOOM,
+                )
+            }
+            val reachable = steps.filterNot { step -> step in unreachable }
+            if (reachable.isEmpty()) {
+                // Every rung is below the floor, and the assertion above has established that the
+                // floor is at or above the world-copy boundary. The claim the case is left making
+                // is therefore the whole of what remains true on this viewport: the SDK will not
+                // take it below the boundary, so the wrapped-world states the MapLibre rows guard
+                // cannot be entered here at all. That is a positive, falsifiable statement - a
+                // viewport or SDK that lowers the floor makes rungs reachable and runs the full
+                // sweep - and it is emitted as evidence rather than left as a skip, which is what
+                // this used to be and what closed nothing.
+                SpikeEvidence.emit(
+                    InstrumentationRegistry.getInstrumentation().targetContext,
+                    EVIDENCE_FILE,
+                    "TRAILVEIL-V02007-SWEEP-UNREACHABLE label=$label rungs=${steps.size} " +
+                        "zoomFloor=${"%.3f".format(zoomFloor)} " +
+                        "boundary=${"%.3f".format(WORLD_COPY_ZOOM)}",
+                )
+                return readings
+            }
 
             var previousSettledZoom: Float? = null
-            steps.forEach { step ->
+            reachable.forEach { step ->
                 val requested = applyStep(scenario, map, mapView, step)
                 val settled = awaitSettledUncoveredCamera(
                     scenario = scenario,
@@ -454,6 +515,10 @@ class GoogleSettledFogCoverageSweepTest {
                     coverAware = true,
                 )
             }
+        }
+        } finally {
+            GoogleMapSurfaceTestHooks.reset()
+            database.close()
         }
         return readings
     }
@@ -687,12 +752,27 @@ class GoogleSettledFogCoverageSweepTest {
      * break on a different screen or silently accept a clamp. Every zoom assertion in this file is
      * `max(requested, this)`.
      */
+    /**
+     * The zoom this viewport will actually settle at, measured rather than asked for.
+     *
+     * `GoogleMap.minZoomLevel` is the SDK's advertised minimum and is not the same number as the
+     * one a `moveCamera` below it lands on: on the API 36 AVD the advertised minimum reads 2.000
+     * while a request for zoom 0 settles at 3.000. Every rung's expectation and the unreachable
+     * filter are both built from this value, so taking the advertised one made the sweep expect a
+     * camera the SDK never produces. It is therefore probed: move as far out as the API allows,
+     * read back what the map settled on, and restore the camera that was there before.
+     */
     private fun <A : Activity> readZoomFloor(
         scenario: ActivityScenario<A>,
         map: GoogleMap,
     ): Float {
         val floor = AtomicReference<Float>()
-        scenario.onActivity { floor.set(map.minZoomLevel) }
+        scenario.onActivity {
+            val before = map.cameraPosition
+            map.moveCamera(CameraUpdateFactory.zoomTo(ZOOM_FLOOR_PROBE))
+            floor.set(maxOf(map.cameraPosition.zoom, map.minZoomLevel))
+            map.moveCamera(CameraUpdateFactory.newCameraPosition(before))
+        }
         return requireNotNull(floor.get())
     }
 
@@ -1180,13 +1260,6 @@ class GoogleSettledFogCoverageSweepTest {
     // Host plumbing
     // ---------------------------------------------------------------------------------------
 
-    private fun canonicalTablesAreEmpty(): Boolean = try {
-        SpikeScenarioSupport.assumeEmptyCanonicalTables()
-        true
-    } catch (_: org.junit.AssumptionViolatedException) {
-        false
-    }
-
     private fun <A : Activity> awaitHostedMapView(
         scenario: ActivityScenario<A>,
         host: String,
@@ -1200,25 +1273,6 @@ class GoogleSettledFogCoverageSweepTest {
             SystemClock.sleep(POLL_MILLIS)
         }
         throw AssertionError("$host never attached a Google MapView")
-    }
-
-    private fun awaitGoogleMap(
-        scenario: ActivityScenario<MainActivity>,
-        mapView: MapView,
-    ): GoogleMap {
-        val ready = CountDownLatch(1)
-        val map = AtomicReference<GoogleMap>()
-        scenario.onActivity {
-            mapView.getMapAsync { googleMap ->
-                map.set(googleMap)
-                ready.countDown()
-            }
-        }
-        assertTrue(
-            "the production Google map never became ready",
-            ready.await(MAP_READY_TIMEOUT_SECONDS, TimeUnit.SECONDS),
-        )
-        return requireNotNull(map.get())
     }
 
     private fun awaitTag(mapView: MapView, key: Int, predicate: (Any?) -> Boolean): Boolean {
@@ -1403,6 +1457,9 @@ class GoogleSettledFogCoverageSweepTest {
 
         /** The app's world-copy repetition constant on the renderer that has one. */
         const val WORLD_COPY_ZOOM = 1.0f
+
+        /** Far below any SDK minimum, so what the map settles on is the viewport's real floor. */
+        const val ZOOM_FLOOR_PROBE = 0.0f
         const val REPETITION_STEP = 0.01f
         const val EXPLORATION_ZOOM = 16.0f
         const val WORLD_ZOOM = 0.0f

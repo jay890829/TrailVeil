@@ -577,10 +577,18 @@ internal class GestureExposureSampler(
         /**
          * The cover-proof grid, over the judged region rather than over the centre.
          *
-         * 12 x 20 = 240 points at roughly one per 90 px on a 1080 x 2400 map, so a bare band has
-         * to be narrower than that to slip between rows - far thinner than any cover-bounds defect
-         * would leave. Kept well under the leak oracle's own stride-based sampling, because this
-         * runs inline on the capture thread between frames.
+         * 240 points over `GestureExposurePixels.regionFor`, which for a composited capture is
+         * the chrome-free band: full width, but only 0.34 to 0.70 of the height, because the entry
+         * screen's own controls draw ABOVE the cover outside it and would read as a mismatch.
+         *
+         * So this widened the proof horizontally, from a third of the width to nearly all of it,
+         * and left its vertical extent roughly where it already was. A bare band INSIDE that
+         * region has to be narrower than one row - about 90 px on a 1080 x 2400 map - to slip
+         * between samples, which no cover-bounds defect would leave. A bare band at the very top
+         * or bottom of the map is outside the region and is not sampled here at all. That residual
+         * is real and is recorded in the task's evidence rather than claimed away: for the kinds
+         * that require the cover to rise, the whole-frame witness is the leak rule, and that rule
+         * is skipped by construction while every in-window frame is covered.
          */
         const val COVER_PROOF_GRID_COLUMNS = 12
         const val COVER_PROOF_GRID_ROWS = 20
@@ -1481,8 +1489,14 @@ internal object GestureExposureVerdict {
      * over never-visited ground on an install with no canonical history, so their refresh component
      * sits at or below the 10k figure, and the cover additionally spans one snapshot proof.
      * 12,000 ms therefore keeps better than a 2x margin over the worst refresh recorded at any
-     * scale while still failing well before the product's own terminal deadline. Tighten it once
-     * real per-gesture intervals are recorded; every trial streams its own.
+     * UNTILTED scale while still failing well before the product's own terminal deadline.
+     *
+     * Corrected by this task's own measurement, because the derivation above was overstated for
+     * the pose the composite row actually reaches: a programmatic move to a tilted, zoomed-out
+     * camera - no gesture, no screen readback - publishes 6,419 ms on this emulator against
+     * 1,989 ms untilted, so the real margin there is 1.87x. The number stands, because the
+     * composite measures 14.1 s alone and 21.4 s in a suite against either figure. Tighten it once
+     * real per-gesture intervals are recorded at each pose; every trial streams its own.
      */
     const val COVER_INTERVAL_BOUND_MILLIS = 12_000L
 
