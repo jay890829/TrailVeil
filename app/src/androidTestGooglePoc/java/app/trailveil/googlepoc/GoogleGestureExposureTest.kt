@@ -289,10 +289,6 @@ class GoogleGestureExposureTest {
                         harness.diagnostics(),
                     basemapOnline,
                 )
-                // The entry route flies the camera once, to the newest accepted point, the first
-                // time one exists. Letting that one-shot land before the first trial keeps it from
-                // arriving on top of a start camera and rewriting the scene mid-audit.
-                harness.awaitStableCamera()
                 // The launcher's OWN first canonical install, waited for before any trial starts.
                 //
                 // Without this the first trial's readiness gate carries two claims at once: that
@@ -309,6 +305,19 @@ class GoogleGestureExposureTest {
                     harness.awaitUntil(FIRST_GENERATION_TIMEOUT_MILLIS) {
                         harness.generation() != null
                     },
+                )
+                // The entry route flies the camera once, to the newest accepted point, the first
+                // time one exists. Letting that one-shot land before the first trial keeps it from
+                // arriving on top of a start camera and rewriting the scene mid-audit. Waited for
+                // AFTER the first generation, and on the flight flag as well as on camera
+                // stillness: before the flight has started the camera is trivially still, so a
+                // stillness-only wait here returned immediately and left the flight free to land
+                // inside an audited gesture.
+                assertTrue(
+                    "$label: the launcher's camera never went quiet - either it kept moving or a " +
+                        "programmed flight stayed in progress - so a trial starting here would be " +
+                        "audited while the entry route was still flying. " + harness.diagnostics(),
+                    harness.awaitQuietCamera(),
                 )
                 trials.forEach { trial ->
                     reports += harness.runTrial(kind, trial.camera) { live ->
@@ -716,14 +725,14 @@ class GoogleGestureExposureTest {
             val openedAt = SystemClock.elapsedRealtime()
             // From zero tilt only one travel direction moves the pitch, and which one is the
             // detector's convention: alternate per attempt rather than encode a guess.
-            val shoved = attemptShove(
+            val tiltAtShoveDown = attemptShove(
                 harness = harness,
                 canvas = canvas,
                 tally = tally,
                 minimumTiltDegrees = minimumTiltDegrees,
                 upward = attempt % 2 == 0,
             )
-            if (shoved) {
+            if (tiltAtShoveDown != null) {
                 // No settle between the lift and the re-grab: the claim is that the tilt survives
                 // an IMMEDIATE re-grab, and a settle would let an idle rebuild stand in for it.
                 SystemClock.sleep(REGRAB_GAP_MILLIS)
@@ -736,7 +745,11 @@ class GoogleGestureExposureTest {
                     endSpanFraction = COMPOSITE_PINCH_END_SPAN_FRACTION,
                     downAtMillis = openedAt,
                 )
-                if (drive != null) return drive
+                // Carried so the trial's tilt is judged from THIS attempt's own DOWN. Attempts
+                // do not re-settle the start camera, so a rejected attempt's tilt is still on the
+                // camera when the next one opens, and measuring from the settled start camera
+                // would let that residue discharge the row's claim.
+                if (drive != null) return drive.copy(tiltAtAcceptedDownDegrees = tiltAtShoveDown)
             }
             SystemClock.sleep(GESTURE_RETRY_SETTLE_MILLIS)
         }
@@ -749,13 +762,14 @@ class GoogleGestureExposureTest {
         )
     }
 
+    /** The tilt read at this attempt's own DOWN when the shove was accepted, else null. */
     private fun attemptShove(
         harness: GestureExposureHarness,
         canvas: GestureCanvas,
         tally: DriveTally,
         minimumTiltDegrees: Float,
         upward: Boolean,
-    ): Boolean = FlingGestureInjector.withStream { stream ->
+    ): Float? = FlingGestureInjector.withStream { stream ->
         // A horizontally separated pair travelling vertically together: unmistakably a shove to a
         // detector that rejects near-vertical pairs, and the one shape a stacked pinch cannot be.
         val gap = canvas.width * SHOVE_POINTER_GAP_FRACTION
@@ -785,7 +799,7 @@ class GoogleGestureExposureTest {
         if (engagement < MINIMUM_SHOVE_ENGAGEMENT_DEGREES) {
             stream.liftAll(pairAt(currentY))
             tally.notes += "shove${if (upward) "Up" else "Down"}=${format(engagement)}"
-            return@withStream false
+            return@withStream null
         }
         var step = 0
         while (step < GESTURE_MEASURED_STEPS) {
@@ -803,7 +817,7 @@ class GoogleGestureExposureTest {
         }
         stream.liftAll(pairAt(currentY))
         tally.notes += "shoveTilt=${format(abs(harness.cameraPosition().tilt - tiltAtDown))}"
-        true
+        tiltAtDown
     }
 
     // ---- shared helpers -------------------------------------------------------------------------

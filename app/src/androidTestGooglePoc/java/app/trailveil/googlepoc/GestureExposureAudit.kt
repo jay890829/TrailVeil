@@ -517,12 +517,27 @@ internal class GestureExposureSampler(
         val bitmap = capture.bitmap
         try {
             if (!readSynchronousCover()) return
-            val centreX = bitmap.width / 2
-            val centreY = bitmap.height / 2
-            val offsetsX = listOf(-bitmap.width / 6, 0, bitmap.width / 6)
-            val offsetsY = listOf(-bitmap.height / 6, 0, bitmap.height / 6)
-            val readings = offsetsY.flatMap { dy ->
-                offsetsX.map { dx -> (centreX + dx) to (centreY + dy) }
+            // Sampled across the SAME region the leak oracle judges, not over the middle third of
+            // each axis.
+            //
+            // Nine central points discharged the whole covered half of the contract, and for the
+            // four kinds that require the cover to rise there is nothing else: every in-window
+            // frame is covered, so the leak rule is skipped by construction and this is the only
+            // thing looking at pixels. A cover that drew the right colour in the centre and left a
+            // band bare at an edge - which is exactly what a `FogCoverDrawable.setBounds` racing a
+            // layout produces - passed all of them. `GestureExposurePixels.regionFor` is the
+            // audit's own chrome-free window for this capture channel, so widening to it adds no
+            // app furniture and no new justification: it is the region this class has already
+            // argued is map.
+            val region = GestureExposurePixels.regionFor(bitmap, capture.method)
+            val readings = (0 until COVER_PROOF_GRID_ROWS).flatMap { row ->
+                (0 until COVER_PROOF_GRID_COLUMNS).map { column ->
+                    val x = region.left +
+                        region.width() * (2 * column + 1) / (2 * COVER_PROOF_GRID_COLUMNS)
+                    val y = region.top +
+                        region.height() * (2 * row + 1) / (2 * COVER_PROOF_GRID_ROWS)
+                    x to y
+                }
             }.map { (x, y) ->
                 val inside = x in 0 until bitmap.width && y in 0 until bitmap.height
                 Triple(x to y, inside, if (inside) bitmap[x, y] else 0)
@@ -533,8 +548,14 @@ internal class GestureExposureSampler(
             val proof = CoverPixelProof(
                 samples = readings.size,
                 mismatched = mismatched,
-                detail = "bitmap=${bitmap.width}x${bitmap.height} readings=[" +
-                    readings.joinToString(" ") { (point, inside, pixel) ->
+                // Only the mismatches are spelled out. A full grid of matching readings is
+                // hundreds of identical hex words and would bury the one that differs.
+                detail = "bitmap=${bitmap.width}x${bitmap.height} " +
+                    "grid=${COVER_PROOF_GRID_COLUMNS}x${COVER_PROOF_GRID_ROWS} " +
+                    "region=${region.width()}x${region.height()} mismatches=[" +
+                    readings.filter { (_, inside, pixel) ->
+                        !inside || !GestureExposurePixels.isExactSafetyCover(pixel)
+                    }.joinToString(" ") { (point, inside, pixel) ->
                         "${point.first},${point.second}=" +
                             if (inside) String.format("%08X", pixel) else "OUT_OF_BITMAP"
                     } +
@@ -552,6 +573,17 @@ internal class GestureExposureSampler(
 
     private companion object {
         const val SAMPLER_JOIN_TIMEOUT_MILLIS = 15_000L
+
+        /**
+         * The cover-proof grid, over the judged region rather than over the centre.
+         *
+         * 12 x 20 = 240 points at roughly one per 90 px on a 1080 x 2400 map, so a bare band has
+         * to be narrower than that to slip between rows - far thinner than any cover-bounds defect
+         * would leave. Kept well under the leak oracle's own stride-based sampling, because this
+         * runs inline on the capture thread between frames.
+         */
+        const val COVER_PROOF_GRID_COLUMNS = 12
+        const val COVER_PROOF_GRID_ROWS = 20
 
         /**
          * Deliberate idle between captures. A `PixelCopy` of a full-screen surface costs tens of
@@ -667,6 +699,17 @@ internal data class GestureDrive(
     val upAtMillis: Long,
     val injectedDownCount: Int,
     val attempts: Int,
+    /**
+     * The camera tilt read at the ACCEPTED attempt's first DOWN, for composites that retry.
+     *
+     * A retried composite does not re-settle the start camera between attempts, so a rejected
+     * attempt's tilt is still on the camera when the next one opens. Judging the trial's tilt from
+     * the settled start camera therefore lets a residue from an attempt whose gesture was never
+     * accepted discharge the row's claim, which is that the tilt of THIS interaction survives the
+     * re-grab. Null for kinds that do not tilt, where the settled start camera is the right
+     * baseline.
+     */
+    val tiltAtAcceptedDownDegrees: Float? = null,
 )
 
 /** The settled reference at one camera on one channel: the scale a leak is judged against. */
@@ -761,7 +804,12 @@ internal data class GestureTrialReport(
 
     val zoomDelta: Float get() = after.zoom - before.zoom
 
-    val tiltDelta: Float get() = after.tilt - before.tilt
+    /**
+     * Measured from the accepted attempt's own DOWN when the drive recorded one, so a rejected
+     * earlier attempt's tilt residue cannot discharge this trial's claim.
+     */
+    val tiltDelta: Float
+        get() = after.tilt - (drive.tiltAtAcceptedDownDegrees ?: before.tilt)
 
     /** Signed shortest turn, so 350 -> 10 degrees reads as +20 rather than -340. */
     val bearingDelta: Float
@@ -951,9 +999,9 @@ internal class GestureExposureHarness private constructor(
             awaitUntil(COVER_SETTLE_TIMEOUT_MILLIS) { coverUp() == false },
         )
         assertTrue(
-            "${kind.label}/${start.name}: the start scene never held still - camera, cover, " +
-                "generation or the programmed-flight flag kept changing across " +
-                "$CAMERA_STABLE_POLLS consecutive polls. " + diagnostics(),
+            "${kind.label}/${start.name}: the start scene never held still - camera, cover or " +
+                "the programmed-flight flag kept changing across $CAMERA_STABLE_POLLS " +
+                "consecutive polls. " + diagnostics(),
             awaitSettledScene(generationBeforeMove),
         )
         return cameraPosition()
@@ -964,6 +1012,15 @@ internal class GestureExposureHarness private constructor(
         return previous == null || current != previous
     }
 
+    /**
+     * Camera, cover and flight flag all quiet across consecutive polls.
+     *
+     * The generation conjunct is carried for symmetry with the wait above, not because it adds
+     * anything: the edge - a generation newer than the one on screen before the move - has already
+     * been proven by then, and re-testing the same predicate against the same snapshot holds by
+     * construction. Camera stillness, the cover being down and no flight in progress are what this
+     * gate actually decides.
+     */
     private fun awaitSettledScene(generationBeforeMove: Long?): Boolean {
         var stable = 0
         var previous: CameraPosition? = null
@@ -1097,6 +1154,33 @@ internal class GestureExposureHarness private constructor(
         }
         if (previousCovered && runStart >= 0L) longest = maxOf(longest, previousAt - runStart)
         return longest
+    }
+
+    /**
+     * Camera held still AND no programmed flight in progress, across consecutive polls.
+     *
+     * [awaitStableCamera] answers only the first half and discards its own timeout, so before the
+     * launcher's one-shot flight to the newest accepted point has STARTED the camera is trivially
+     * stable and that wait returns on its first four polls - leaving the flight free to land in the
+     * middle of an audited gesture, which rewrites the scene the trial names. Reported rather than
+     * discarded, so a flight that never quiets fails the case instead of silently being audited.
+     */
+    fun awaitQuietCamera(timeoutMillis: Long = CAMERA_SETTLE_TIMEOUT_MILLIS): Boolean {
+        var previous: CameraPosition? = null
+        var stable = 0
+        return awaitUntil(timeoutMillis) {
+            val current = cameraPosition()
+            val last = previous
+            previous = current
+            stable = if (
+                last != null && sameCamera(last, current) && !flightActive()
+            ) {
+                stable + 1
+            } else {
+                0
+            }
+            stable >= CAMERA_STABLE_POLLS
+        }
     }
 
     fun awaitStableCamera(): CameraPosition {
