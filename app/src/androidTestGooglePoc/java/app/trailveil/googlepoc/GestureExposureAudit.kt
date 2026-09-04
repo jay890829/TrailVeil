@@ -288,6 +288,20 @@ internal data class ExposureFrame(
      */
     val disposedAtMillis: Long?,
     val destroyedAtMillis: Long?,
+    /**
+     * `map_basemap_load_state` as of this frame.
+     *
+     * Present because "the hosted MapView is gone" has more than one cause and this frame is the
+     * last chance to tell them apart. Two of the candidates dominate. The cover deadline
+     * (`onCoverDeadlineExceeded`) fires against a map that has loaded and whose fog cannot prove a
+     * generation. `MAP_LOAD_TIMEOUT` is a SEPARATE and much shorter deadline in
+     * `GoogleHostedMapSurface`, armed on a `LaunchedEffect` re-keyed by this very state, and it can
+     * only fire while the basemap is NOT online - which is exactly the condition a tilted,
+     * zoomed-out camera provokes by forcing a reload. So the last state observed before a teardown
+     * discriminates between them, and reading it in the same round trip as the covers means it
+     * cannot be a different instant's answer.
+     */
+    val basemapLoadState: String?,
     val channel: String,
     val tally: GestureExposurePixels.Tally,
 ) {
@@ -531,6 +545,7 @@ internal class GestureExposureSampler(
                 publishedIntervalMillis = published.intervalMillis,
                 disposedAtMillis = published.disposedAt,
                 destroyedAtMillis = published.destroyedAt,
+                basemapLoadState = published.basemapLoadState,
                 channel = GestureExposurePixels.UNJUDGED_CHANNEL,
                 tally = GestureExposurePixels.Tally(0, 0, 0, 0),
             )
@@ -554,6 +569,7 @@ internal class GestureExposureSampler(
             publishedIntervalMillis = published.intervalMillis,
             disposedAtMillis = published.disposedAt,
             destroyedAtMillis = published.destroyedAt,
+            basemapLoadState = published.basemapLoadState,
             channel = channel,
             tally = GestureExposurePixels.tally(capture, region, scaled),
         )
@@ -583,7 +599,7 @@ internal class GestureExposureSampler(
      * could not otherwise answer.
      */
     private fun readPublishedTags(): PublishedTags {
-        val holder = AtomicReference(PublishedTags(false, false, null, null, null))
+        val holder = AtomicReference(PublishedTags(false, false, null, null, null, null))
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
             holder.set(
                 PublishedTags(
@@ -592,6 +608,7 @@ internal class GestureExposureSampler(
                     intervalMillis = mapView.getTag(R.id.map_fog_last_cover_interval_ms) as? Long,
                     disposedAt = mapView.getTag(R.id.map_disposed_at) as? Long,
                     destroyedAt = mapView.getTag(R.id.map_entry_destroyed_at) as? Long,
+                    basemapLoadState = mapView.getTag(R.id.map_basemap_load_state) as? String,
                 ),
             )
         }
@@ -604,6 +621,8 @@ internal class GestureExposureSampler(
         val intervalMillis: Long?,
         val disposedAt: Long?,
         val destroyedAt: Long?,
+        /** `map_basemap_load_state`. See [ExposureFrame.basemapLoadState]. */
+        val basemapLoadState: String?,
     )
 
     /**
@@ -934,6 +953,13 @@ internal data class GestureTrialReport(
     val hostStartsDuringTrial: Int,
     /** Which lifecycle those two were counted on - `NavBackStackEntry`, or the activity. */
     val hostLifecycle: String,
+    /**
+     * The last basemap load state observed in this trial. See [ExposureFrame.basemapLoadState].
+     *
+     * `ONLINE` here beside a terminal teardown rules `MAP_LOAD_TIMEOUT` out; anything else leaves it
+     * live. It does not identify the cause on its own and is not asserted on.
+     */
+    val lastBasemapState: String?,
     val coverIntervalBeforeMillis: Long?,
     val coverIntervalAfterMillis: Long?,
     val coverPixelProof: CoverPixelProof?,
@@ -1020,7 +1046,7 @@ internal data class GestureTrialReport(
             "maxFrameGapAtMs=$maxFrameGapStartMillis teardown=[$teardownShape] " +
             "mapViewPresentAfter=$mapViewPresentAfter " +
             "hostStops=$hostStopsDuringTrial hostStarts=$hostStartsDuringTrial " +
-            "hostLifecycle=$hostLifecycle " +
+            "hostLifecycle=$hostLifecycle lastBasemapState=$lastBasemapState " +
             "coverIntervalMs=$coverIntervalBeforeMillis->$coverIntervalAfterMillis " +
             "coverProof=${coverPixelProof?.describe() ?: "none"} " +
             "coverProofAttempts=$coverProofAttempts " +
@@ -1067,8 +1093,18 @@ internal class GestureExposureHarness private constructor(
     private val hostStarts: AtomicInteger,
     /** Which lifecycle the two counters above are actually watching. */
     private val hostLifecycleOwner: String,
-    /** Held so a trial can ask whether the surface under audit is still in the tree at all. */
-    private val decorView: View,
+    /**
+     * Held so a trial can ask whether the surface under audit is still in the tree at all.
+     *
+     * The SCENARIO, not the decor view it currently shows. A decor view read once at attach is a
+     * stale reference the moment the activity is recreated - and section 4 records this process
+     * running against its growth limit across a sixteen-minute suite, so recreation is not
+     * hypothetical. A stale decor view holds no MapView and never will, so the witness would report
+     * a terminal failure that never happened. Reporting a teardown that did not occur is exactly
+     * the failure `V02-007` section 5b withdrew a conclusion over; it is not one to leave in the
+     * witness that replaced it.
+     */
+    private val scenario: ActivityScenario<MainActivity>,
 ) {
     fun cameraPosition(): CameraPosition = onMain { map.cameraPosition }
 
@@ -1257,9 +1293,20 @@ internal class GestureExposureHarness private constructor(
         }
     }
 
-    /** Whether the window still holds a hosted MapView. See [GestureTrialReport.mapViewPresentAfter]. */
-    private fun hostedMapViewPresent(): Boolean = onMain {
-        decorView.findHostedMapView() != null
+    /**
+     * Whether the window still holds a hosted MapView. See [GestureTrialReport.mapViewPresentAfter].
+     *
+     * Asked through the scenario so the CURRENT activity answers, not the one that was on screen
+     * when the harness attached. `onActivity` already dispatches to the main thread, so this must
+     * not be wrapped in `onMain` as the other readers are - that would be a main-thread call
+     * waiting on the main thread.
+     */
+    private fun hostedMapViewPresent(): Boolean {
+        val holder = AtomicReference(false)
+        scenario.onActivity { activity ->
+            holder.set(activity.window.decorView.findHostedMapView() != null)
+        }
+        return holder.get()
     }
 
     /**
@@ -1316,18 +1363,27 @@ internal class GestureExposureHarness private constructor(
         // Before measuring anything at the end camera, ask whether there is still a surface to
         // measure. `V02-007` section 5b: this gesture can drive the surface into terminal failure,
         // and the host then swaps the map for the provider-unavailable surface - so the end floor
-        // has nothing to read and the floor helper fails with a capture-channel complaint that
-        // names the symptom and hides the cause. This names the cause.
+        // has nothing to read and the floor helper fails with a capture-channel complaint about its
+        // capture channel, which is the symptom of a surface that is gone rather than the fact.
+        //
+        // This states the FACT and stops there. It deliberately does not name which deadline fired:
+        // at least seven paths latch `terminal` and swap the same surface in - the cover deadline,
+        // four distinct overlay-removal failures, the composition-terminal branch of `failPending`,
+        // and two host paths that never touch the coordinator at all, including a `MAP_LOAD_TIMEOUT`
+        // whose own deadline is four times shorter. Nothing sampled here distinguishes them, so
+        // naming one would be attributing a cause this audit cannot see. The last basemap state
+        // before the teardown is reported because it is the one witness that narrows the field:
+        // `MAP_LOAD_TIMEOUT` can only fire while the basemap is not online.
         val surviving = hostedMapViewPresent()
         val teardown = teardownShape(frames)
         assertTrue(
             "${kind.label}/${start.name}: the surface went TERMINAL during this gesture - no " +
                 "hosted MapView is left in the window, so the map the user was looking at has " +
                 "been replaced by the provider-unavailable surface and will not come back " +
-                "without the surface being rebuilt. This is the product failing closed on its " +
-                "own twenty-second cover deadline, not a " +
-                "harness fault: the fog could not prove a generation for this tilted, zoomed-out " +
-                "camera in time. teardown=[$teardown] " +
+                "without the surface being rebuilt. Which deadline fired is NOT established by " +
+                "this run; see `V02-007` section 5b for the candidates and what separates them. " +
+                "teardown=[$teardown] " +
+                "lastBasemapState=${lastBasemapState(frames)} " +
                 "coverShape=[${witnessShape(frames) { frame -> frame.coverUp }}] " +
                 "maxFrameGapMs=${maxFrameGapMillis(frames)} " +
                 "maxFrameGapAtMs=${maxFrameGapStartMillis(frames)}",
@@ -1357,6 +1413,7 @@ internal class GestureExposureHarness private constructor(
             hostStopsDuringTrial = hostStops.get() - hostStopsBefore,
             hostStartsDuringTrial = hostStarts.get() - hostStartsBefore,
             hostLifecycle = hostLifecycleOwner,
+            lastBasemapState = lastBasemapState(frames),
             coverShape = witnessShape(frames) { frame -> frame.coverUp },
             composeCoverShape = witnessShape(frames) { frame -> frame.composeCoverUp },
             intervalShape = intervalShape(frames),
@@ -1510,6 +1567,10 @@ internal class GestureExposureHarness private constructor(
         return "disposedSeenAtMs=${disposed?.let { it.atMillis - origin }} " +
             "destroyedSeenAtMs=${destroyed?.let { it.atMillis - origin }}"
     }
+
+    /** The last basemap load state any frame saw, or null if no frame ever carried one. */
+    private fun lastBasemapState(frames: List<ExposureFrame>): String? =
+        frames.lastOrNull { frame -> frame.basemapLoadState != null }?.basemapLoadState
 
     /** When the binding's published interval first changed, in ms from the first sampled frame. */
     private fun intervalShape(frames: List<ExposureFrame>): String {
@@ -1691,8 +1752,6 @@ internal class GestureExposureHarness private constructor(
                     "map would be indistinguishable from a basemap leak",
                 channel in GestureExposurePixels.SURFACE_CHANNELS,
             )
-            val decor = AtomicReference<View>()
-            scenario.onActivity { activity -> decor.set(activity.window.decorView) }
             return GestureExposureHarness(
                 mapView = mapView,
                 map = requireNotNull(mapRef.get()),
@@ -1700,7 +1759,7 @@ internal class GestureExposureHarness private constructor(
                 hostStops = stops,
                 hostStarts = starts,
                 hostLifecycleOwner = lifecycleOwnerName.get(),
-                decorView = requireNotNull(decor.get()),
+                scenario = scenario,
             )
         }
 
