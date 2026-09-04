@@ -2,8 +2,10 @@ package app.trailveil.map
 
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.graphics.Rect
 import android.os.Bundle
 import android.os.SystemClock
+import android.view.WindowInsets
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -194,7 +196,12 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                         state.installedGeneration?.toString() == hosted.proven
                 },
             )
-            assertBareFrameNeverPresented(hosted.baseline, samples, hosted.mapView)
+            assertBareFrameNeverPresented(
+                hosted.baseline,
+                hosted.baselineCluster,
+                samples,
+                hosted.mapView,
+            )
             val lastFailure = tagOnMain(hosted.mapView, R.id.map_fog_last_failure) as? String
             assertTrue(
                 "the fog failure the surface reported is not the one this case injected, so the " +
@@ -214,11 +221,26 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                     describeStates(faultedStates),
                 abandoned.isNotEmpty(),
             )
+            // Watched across the recovery rather than waited for afterwards. The cover is
+            // already down when the recovery starts - the faulted window asserted that on every
+            // sampled frame, and the retry arm by construction never touches it - so "the cover
+            // fell" was satisfiable on its first poll by retained state and could not fail. What
+            // can fail, and is what the retry arm actually owes, is that the cover never RISES: a
+            // replacement that blanks the map on its way in is the regression this class guards.
+            var coverRoseDuringRecovery: String? = null
             val installedNewer = awaitTag(
                 hosted.mapView,
                 R.id.map_fog_canonical_generation,
                 RECOVERY_POLLS,
-            ) { value -> value != null && value != hosted.proven }
+            ) { value ->
+                val tags = readTags(hosted.mapView)
+                if (coverRoseDuringRecovery == null && (tags.coverUp || tags.synchronousCoverUp)) {
+                    coverRoseDuringRecovery =
+                        "coverUp=${tags.coverUp} syncCoverUp=${tags.synchronousCoverUp} " +
+                            "generation=${tags.generation} pendingSlot=${tags.pendingSlot}"
+                }
+                value != null && value != hosted.proven
+            }
             assertTrue(
                 "releasing the install fault never installed a newer generation, so the retry " +
                     "never recovered: " + describe(hosted.mapView),
@@ -227,23 +249,28 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             val recovered = requireNotNull(
                 tagOnMain(hosted.mapView, R.id.map_fog_canonical_generation),
             ).toString()
+            // A regression guard on the id allocator, and recorded as no more than that: ids come
+            // from `++nextGeneration` in `FogTileProviderAdapter`, so an abandoned id cannot be
+            // reissued today and this line cannot fail in this run. It fails the day that changes.
             assertTrue(
                 "an abandoned faulted attempt's id became the published generation: " +
                     "recovered=$recovered abandoned=$abandoned",
                 recovered !in abandoned,
             )
-            val coverFell = awaitTag(hosted.mapView, R.id.map_fog_cover_up, TAG_POLLS) { value ->
-                value == false
-            }
-            assertTrue(
-                "the recovered generation left the safety cover up: " + describe(hosted.mapView),
-                coverFell,
+            assertNull(
+                "the retry raised the opaque cover on its way in, so the map was blanked while a " +
+                    "complete proven generation was available to keep presenting: " +
+                    coverRoseDuringRecovery + " " + describe(hosted.mapView),
+                coverRoseDuringRecovery,
             )
             report(
                 "fog_install_fault rejectedAttaches=$rejectedAttaches " +
                     "auditedFrames=${samples.size} publishedStates=${faultedStates.size} " +
                     "baseline=${percent(hosted.baseline)} " +
                     "worst=${percent(samples.minOf { sample -> sample.coveredFraction })} " +
+                    "baselineCluster=${hosted.baselineCluster} " +
+                    "worstCluster=${samples.maxOf { it.largestUncoveredCluster }}/" +
+                    "${samples.first().analyzedPoints} " +
                     "abandonedGenerations=${abandoned.size}",
             )
         }
@@ -326,7 +353,12 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             // The floor is only a reference for these frames if the scene did not change under
             // them. This is the assertion whose absence made the first version of this case red.
             assertCameraNeverDrifted(hosted, "the swap window")
-            assertBareFrameNeverPresented(hosted.baseline, samples, hosted.mapView)
+            assertBareFrameNeverPresented(
+                hosted.baseline,
+                hosted.baselineCluster,
+                samples,
+                hosted.mapView,
+            )
             val settled = readTags(hosted.mapView)
             assertTrue(
                 "the swap left the safety cover up: " + describe(hosted.mapView),
@@ -336,7 +368,10 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                 "fog_generation_swap auditedFrames=${samples.size} " +
                     "inFlightFrames=${samples.count { sample -> sample.pendingSlot != null }} " +
                     "baseline=${percent(hosted.baseline)} " +
-                    "worst=${percent(samples.minOf { sample -> sample.coveredFraction })}",
+                    "worst=${percent(samples.minOf { sample -> sample.coveredFraction })} " +
+                    "baselineCluster=${hosted.baselineCluster} " +
+                    "worstCluster=${samples.maxOf { it.largestUncoveredCluster }}/" +
+                    "${samples.first().analyzedPoints}",
             )
         }
     }
@@ -357,6 +392,7 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         val proven: String,
         val camera: CameraPosition,
         val baseline: Double,
+        val baselineCluster: Int,
     )
 
     /**
@@ -376,6 +412,7 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
     private data class ScreenSample(
         val coveredFraction: Double,
         val analyzedPoints: Int,
+        val largestUncoveredCluster: Int,
         val generation: String?,
         val pendingSlot: String?,
         val coverUp: Boolean,
@@ -417,7 +454,7 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             val map = awaitMap()
             val camera = awaitParkedCamera(map, mapView)
             val proven = awaitQuiescentProvenGeneration(mapView)
-            val baseline = calibrate(mapView)
+            val (baseline, baselineCluster) = calibrate(mapView)
             assertTrue(
                 "only ${percent(baseline)} of the settled hosted map reads as fog or cover, so " +
                     "this oracle could not tell a bare frame from a covered one: " +
@@ -444,6 +481,7 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                     proven = proven,
                     camera = camera,
                     baseline = baseline,
+                    baselineCluster = baselineCluster,
                 ),
             )
         }
@@ -458,6 +496,7 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
      */
     private fun assertBareFrameNeverPresented(
         baseline: Double,
+        baselineCluster: Int,
         samples: List<ScreenSample>,
         mapView: MapView,
     ) {
@@ -472,6 +511,20 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                 "pendingSlot=${worst?.pendingSlot} coverUp=${worst?.coverUp} " +
                 "syncCoverUp=${worst?.synchronousCoverUp} " + describe(mapView),
             !bare,
+        )
+        // The shape rule. The area rule above sums the whole frame, so a contiguous bare patch and
+        // label pixels sprinkled across the map are the same number to it, and only one of them is
+        // a defect. This asks a different question: how big is the largest single patch that read
+        // as neither fog nor cover, measured against the one the settled floor already carries.
+        val worstCluster = samples.maxOfOrNull { sample -> sample.largestUncoveredCluster } ?: 0
+        val ceiling = baselineCluster + CLUSTER_MARGIN_CELLS
+        assertTrue(
+            "a presented frame carried one contiguous patch of $worstCluster sampled cells that " +
+                "read as neither fog nor cover, past the $ceiling this scene allows " +
+                "($baselineCluster measured on the settled floor at this same camera, plus a " +
+                "$CLUSTER_MARGIN_CELLS cell margin). frames=${samples.size} " +
+                "analyzedPoints=${samples.firstOrNull()?.analyzedPoints} " + describe(mapView),
+            worstCluster <= ceiling,
         )
     }
 
@@ -493,15 +546,27 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         )
     }
 
-    /** The lowest fog-or-cover fraction of several settled frames, so the floor is not optimistic. */
-    private fun calibrate(mapView: MapView): Double {
+    /**
+     * The settled floor, as an area and as a shape.
+     *
+     * Both halves take the WORST of several settled frames - the lowest covered area and the
+     * largest uncovered cluster - so neither is optimistic, and the shape half is what makes the
+     * later cluster bound a measurement of this scene rather than a guess about it.
+     */
+    private fun calibrate(mapView: MapView): Pair<Double, Int> {
         val readings = ArrayList<Double>()
+        var cluster = 0
         repeat(CALIBRATION_SAMPLES) {
-            sampleScreen(mapView)?.let { sample -> readings += sample.coveredFraction }
+            sampleScreen(mapView)?.let { sample ->
+                readings += sample.coveredFraction
+                if (sample.largestUncoveredCluster > cluster) {
+                    cluster = sample.largestUncoveredCluster
+                }
+            }
             SystemClock.sleep(CALIBRATION_GAP_MILLIS)
         }
         check(readings.isNotEmpty()) { "no calibration frame could be captured" }
-        return readings.min()
+        return readings.min() to cluster
     }
 
     /**
@@ -551,21 +616,49 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         val origin = IntArray(2)
         val size = IntArray(2)
         val tags = AtomicReference<PublishedTags?>(null)
+        val exclusions = AtomicReference<List<Rect>>(emptyList())
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
             mapView.getLocationOnScreen(origin)
             size[0] = mapView.width
             size[1] = mapView.height
             tags.set(publishedTags(mapView))
+            // Everything in this window that is not the map, located live in the same round
+            // trip as the geometry it is measured against, and all of it drawn ABOVE the fog
+            // overlay by design so none of it can ever read as fog.
+            //
+            // The shape rule below is why this matters. Measured on the API 36 AVD: with nothing
+            // excluded, every settled frame carried one contiguous 224-cell uncovered patch, and
+            // the SDK watermark and compass accounted for 17 of it. The rest is the system bars,
+            // which this activity draws under - a full-width band across the top of the map. A
+            // shape bound derived from a 200-cell band could not catch any hole smaller than the
+            // band, which is most of them, so the band is removed instead of tolerated.
+            val rects = ArrayList(SpikeCaptureSupport.liveExclusionRects(mapView).first)
+            mapView.rootWindowInsets
+                ?.getInsets(WindowInsets.Type.systemBars())
+                ?.let { bars ->
+                    // Window coordinates, shifted into the MapView's own. An empty or inverted
+                    // rect - which is what a MapView already inset by the bars produces - contains
+                    // nothing, so a surface that does not draw under them costs nothing here.
+                    rects += Rect(0, 0, mapView.width, bars.top - origin[1])
+                    rects += Rect(
+                        0,
+                        mapView.rootView.height - bars.bottom - origin[1],
+                        mapView.width,
+                        mapView.height,
+                    )
+                }
+            exclusions.set(rects)
         }
         if (size[0] <= 0 || size[1] <= 0) return null
         val published = tags.get() ?: return null
         val bitmap = InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
             ?: return null
         return try {
-            tally(bitmap, origin, size)?.let { (analyzed, covered) ->
+            tally(bitmap, origin, size, exclusions.get())?.let { counted ->
                 ScreenSample(
-                    coveredFraction = covered.toDouble() / analyzed,
-                    analyzedPoints = analyzed,
+                    coveredFraction = counted.covered.toDouble() / counted.analyzed,
+                    analyzedPoints = counted.analyzed,
+                    largestUncoveredCluster = counted.largestUncoveredCluster,
                     generation = published.generation,
                     pendingSlot = published.pendingSlot,
                     coverUp = published.coverUp,
@@ -577,22 +670,91 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         }
     }
 
-    private fun tally(bitmap: Bitmap, origin: IntArray, size: IntArray): Pair<Int, Int>? {
+    /**
+     * What one frame read as, both as an area and as a shape.
+     *
+     * The area alone cannot separate a contiguous bare seam from noise spread thinly over the
+     * whole map, and the two have opposite meanings: label pixels the fog family does not claim
+     * are expected everywhere, while a hole big enough to see is the defect this class exists to
+     * catch. [largestUncoveredCluster] is the shape half.
+     */
+    private data class ScreenTally(
+        val analyzed: Int,
+        val covered: Int,
+        val largestUncoveredCluster: Int,
+    )
+
+    private fun tally(
+        bitmap: Bitmap,
+        origin: IntArray,
+        size: IntArray,
+        exclusions: List<Rect>,
+    ): ScreenTally? {
         var analyzed = 0
         var covered = 0
+        val uncovered = BooleanArray(GRID_ROWS * GRID_COLUMNS)
         val row = IntArray(bitmap.width)
         for (gridY in 0 until GRID_ROWS) {
-            val y = origin[1] + size[1] * (2 * gridY + 1) / (2 * GRID_ROWS)
+            val withinMapY = size[1] * (2 * gridY + 1) / (2 * GRID_ROWS)
+            val y = origin[1] + withinMapY
             if (y < 0 || y >= bitmap.height) continue
             bitmap.getPixels(row, 0, bitmap.width, 0, y, bitmap.width, 1)
             for (gridX in 0 until GRID_COLUMNS) {
-                val x = origin[0] + size[0] * (2 * gridX + 1) / (2 * GRID_COLUMNS)
+                val withinMapX = size[0] * (2 * gridX + 1) / (2 * GRID_COLUMNS)
+                val x = origin[0] + withinMapX
                 if (x < 0 || x >= bitmap.width) continue
+                if (exclusions.any { rect -> rect.contains(withinMapX, withinMapY) }) continue
                 analyzed += 1
-                if (isFogOrCover(row[x])) covered += 1
+                if (isFogOrCover(row[x])) covered += 1 else uncovered[gridY * GRID_COLUMNS + gridX] = true
             }
         }
-        return if (analyzed == 0) null else analyzed to covered
+        return if (analyzed == 0) {
+            null
+        } else {
+            ScreenTally(analyzed, covered, largestUncoveredCluster(uncovered))
+        }
+    }
+
+    /**
+     * Size of the largest 4-connected run of sampled cells that read as neither fog nor cover.
+     *
+     * A cell that was never sampled - one whose grid point fell outside the screenshot - is left
+     * false, so it is a barrier rather than a bridge: an unsampled band can never join two
+     * unrelated holes into one apparently larger one.
+     */
+    private fun largestUncoveredCluster(uncovered: BooleanArray): Int {
+        val seen = BooleanArray(uncovered.size)
+        val stack = IntArray(uncovered.size)
+        var largest = 0
+        for (start in uncovered.indices) {
+            if (!uncovered[start] || seen[start]) continue
+            var depth = 0
+            var size = 0
+            seen[start] = true
+            stack[depth++] = start
+            while (depth > 0) {
+                val index = stack[--depth]
+                size += 1
+                val gridX = index % GRID_COLUMNS
+                if (gridX > 0) {
+                    val left = index - 1
+                    if (uncovered[left] && !seen[left]) { seen[left] = true; stack[depth++] = left }
+                }
+                if (gridX < GRID_COLUMNS - 1) {
+                    val right = index + 1
+                    if (uncovered[right] && !seen[right]) { seen[right] = true; stack[depth++] = right }
+                }
+                val up = index - GRID_COLUMNS
+                if (up >= 0 && uncovered[up] && !seen[up]) { seen[up] = true; stack[depth++] = up }
+                val down = index + GRID_COLUMNS
+                if (down < uncovered.size && uncovered[down] && !seen[down]) {
+                    seen[down] = true
+                    stack[depth++] = down
+                }
+            }
+            if (size > largest) largest = size
+        }
+        return largest
     }
 
     /** Fog tiles carry the generation palette; the safety cover carries its own single colour. */
@@ -876,6 +1038,26 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         /** A settled map below this is chrome, not fog, and cannot host a bare-frame oracle. */
         const val MINIMUM_SETTLED_COVERAGE = 0.60
         const val COVERAGE_MARGIN = 0.08
+
+        /**
+         * How much larger than the settled floor's own largest uncovered patch an audited frame's
+         * patch may be, in sampled grid cells.
+         *
+         * The floor is measured in the same run at the same camera, on a frame with a proven
+         * generation installed and both covers down, so it already carries whatever this scene
+         * legitimately shows through the fog - Google's labels composite above the tile overlay by
+         * design. Recorded on the API 36 Play Store AVD with the system bars and the SDK's
+         * watermark and compass excluded: 3,440 sampled cells, a settled floor of 84.8 % covered,
+         * and a largest uncovered patch of **36** cells. Both cases' audited frames measured 36 as
+         * well, so neither the faulted install nor the swap adds anything to it.
+         *
+         * The margin is set from the smallest defect that must fail, not from that zero delta. One
+         * zoom-16 tile left uncovered is 256 px square, which across this 1080x2400 map is about
+         * 11 of the 48 sampled columns by 8 of the 80 sampled rows: roughly 97 cells. A margin of
+         * 40 puts the alarm at 76 - a shade over twice the measured floor, and comfortably below
+         * the smallest hole a user could actually see.
+         */
+        const val CLUSTER_MARGIN_CELLS = 40
         const val GRID_COLUMNS = 48
         const val GRID_ROWS = 80
         const val COVER_RED = 0x3C
