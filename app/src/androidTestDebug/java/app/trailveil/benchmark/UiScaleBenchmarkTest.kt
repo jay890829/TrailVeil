@@ -88,6 +88,19 @@ class UiScaleBenchmarkTest {
                         "the same animations.",
                     presented.presentingWindows == PAN_ZOOM_ITERATIONS,
                 )
+                // Then the worst single animation, which the pooled histogram cannot express.
+                // A stalled window contributes ONE interval where a healthy one contributes
+                // fourteen, so pooling lets the windows that behaved outvote the ones that did
+                // not. See [MIN_INTERVALS_PER_WINDOW].
+                assertTrue(
+                    "The worst camera animation produced only ${presented.leanestWindow} " +
+                        "presentation intervals, below the $MIN_INTERVALS_PER_WINDOW per-window " +
+                        "floor. The map stalled during at least one animation, and a pooled " +
+                        "frameP95=${summary.p95Millis}ms cannot show that, because a stalled " +
+                        "window contributes fewer samples than a healthy one and is outvoted by " +
+                        "them.",
+                    presented.leanestWindow >= MIN_INTERVALS_PER_WINDOW,
+                )
                 // Then whether there are enough of them for a p95 to mean anything.
                 assertTrue(
                     "Only ${summary.total} presentation intervals were recorded, below the " +
@@ -125,7 +138,7 @@ class UiScaleBenchmarkTest {
                         recoveryNumber = recoveryIndex + 1,
                     )
                 }
-                report(summary, windowSummary, enforcePhysicalGate)
+                report(summary, windowSummary, presented.leanestWindow, enforcePhysicalGate)
             } finally {
                 // A crash or ANR prevents a lifecycle transition or map-ready callback from
                 // completing, and therefore fails this instrumentation test.
@@ -174,6 +187,7 @@ class UiScaleBenchmarkTest {
     ): PresentedIntervals {
         val presented = SparseIntArray()
         var presentingWindows = 0
+        var leanestWindow = Int.MAX_VALUE
         val map = awaitMap(scenario)
         var completedFogGeneration = readFogGeneration(scenario)
         repeat(PAN_ZOOM_ITERATIONS) { index ->
@@ -203,10 +217,19 @@ class UiScaleBenchmarkTest {
             val window = SurfaceFlingerPresentIntervals.presentIntervals(MAP_SURFACE_LAYER)
             // A layer that exists but contributed no interval presented at most once in this
             // window, which is indistinguishable from not presenting - so counted as neither.
-            if (window != null && window.size > 0) {
+            val windowIntervals = window?.let { histogram ->
+                var count = 0
+                repeat(histogram.size) { index -> count += histogram.valueAt(index) }
+                count
+            } ?: 0
+            if (windowIntervals > 0) {
                 presentingWindows++
-                SurfaceFlingerPresentIntervals.merge(presented, window)
+                SurfaceFlingerPresentIntervals.merge(presented, requireNotNull(window))
             }
+            // Tracked per window, not only pooled. See [MIN_INTERVALS_PER_WINDOW]: a stalled
+            // animation contributes FEWER samples than a healthy one, so pooling lets the windows
+            // that behaved outvote the ones that did not.
+            leanestWindow = minOf(leanestWindow, windowIntervals)
             val rendered = awaitMapState(
                 scenario = scenario,
                 expectedCamera = CameraPosition.Builder()
@@ -217,13 +240,22 @@ class UiScaleBenchmarkTest {
             )
             completedFogGeneration = requireNotNull(rendered.fogGeneration)
         }
-        return PresentedIntervals(presented, presentingWindows)
+        return PresentedIntervals(
+            histogram = presented,
+            presentingWindows = presentingWindows,
+            leanestWindow = if (leanestWindow == Int.MAX_VALUE) 0 else leanestWindow,
+        )
     }
 
-    /** The map layer's summed presentation intervals, and how many windows contributed any. */
+    /**
+     * The map layer's presentation intervals: pooled, per-window presence, and the worst window.
+     *
+     * [leanestWindow] exists because the pooled histogram cannot express the failure it guards.
+     */
     private data class PresentedIntervals(
         val histogram: SparseIntArray,
         val presentingWindows: Int,
+        val leanestWindow: Int,
     )
 
     private fun awaitMapState(
@@ -353,6 +385,7 @@ class UiScaleBenchmarkTest {
     private fun report(
         summary: FrameSummary,
         windowSummary: FrameSummary,
+        leanestWindow: Int,
         enforcePhysicalGate: Boolean,
     ) {
         val deviceClass = when {
@@ -370,7 +403,8 @@ class UiScaleBenchmarkTest {
                         "lifecycleRecoveries=$LIFECYCLE_RECOVERY_COUNT " +
                         "frameP95=${summary.p95Millis}ms " +
                         "frozenRatio=${"%.4f".format(java.util.Locale.US, summary.frozenRatio)} " +
-                        "frames=${summary.total} surface=mapSurfaceViewPresentIntervals " +
+                        "frames=${summary.total} leanestWindow=$leanestWindow " +
+                        "surface=mapSurfaceViewPresentIntervals " +
                         "activityWindowFrames=${windowSummary.total}; " +
                         "basemap=local-fallback; $deviceClass; " +
                         if (enforcePhysicalGate) {
@@ -470,6 +504,38 @@ class UiScaleBenchmarkTest {
          * that reached the ledger as evidence were engineering-evidence runs.
          */
         const val MIN_PRESENT_INTERVALS = 120
+
+        /**
+         * The fewest presentation intervals a SINGLE camera animation may contribute.
+         *
+         * [MIN_PRESENT_INTERVALS] pools all twenty windows, and a pooled percentile cannot see the
+         * failure this gate exists to catch. The reason is that the sample count is itself a
+         * function of the badness: a healthy 250 ms window contributes about fourteen intervals,
+         * while a window in which the map presented only twice contributes exactly one. The
+         * windows that behaved therefore outvote the ones that stalled, and the arithmetic is not
+         * close - worked against `summarize`, twelve healthy windows and **eight fully stalled
+         * ones** produce a pool of {16ms: 168, 250ms: 8}, whose nearest-rank p95 is 16 ms and
+         * whose frozen ratio is 0.0. Every other assertion passes: blindness sees twenty
+         * presenting windows because one interval is enough, and 176 clears the pooled floor of
+         * 120. Forty percent of the scripted workload can be stalled while the evidence line reads
+         * `frameP95=16ms frozenRatio=0.0000`. That is the same class of vacuity this whole change
+         * set out to remove, reintroduced one level down, and it was found by adversarial review
+         * rather than by a run.
+         *
+         * So the quantity that is stable under stalling is asserted directly: the worst window's
+         * interval count. The value is derived to interlock with [MAX_FRAME_P95_MILLIS] rather
+         * than to duplicate it. A window that presents at exactly the 32 ms p95 limit yields about
+         * `250/32 = 7.8` intervals, so a floor of 6 sits just below the slowest window the p95
+         * gate could pass and cannot fire in its place. Above it, the two assertions close on each
+         * other: with every window at 6 or more, at most two of twenty can run at 36 ms before the
+         * pooled p95 exceeds 32 and fails - against eight fully stalled windows that passed
+         * before.
+         *
+         * Measured, not assumed: the leanest window observed on the emulator is reported by every
+         * run as `leanestWindow=` and recorded in `V02-007-gates.md`. Raise this only with a run
+         * that forced it, and never above the 7.8 that would make it fire in place of the p95.
+         */
+        const val MIN_INTERVALS_PER_WINDOW = 6
 
         /**
          * Enough of the map layer's SurfaceFlinger name to pick it out of the dump.
