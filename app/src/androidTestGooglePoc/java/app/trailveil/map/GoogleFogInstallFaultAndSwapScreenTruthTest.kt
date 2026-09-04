@@ -1074,20 +1074,26 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
          * well, so neither the faulted install nor the swap adds anything to it.
          *
          * The margin is set from the smallest defect that must fail, not from that zero delta:
-         * [TILE_HOLE_CELLS]. A margin of 40 puts the alarm at 76 on a 36-cell floor, comfortably
-         * below that hole. The floor is not perfectly stable - a later run measured 49 - so the
-         * ceiling is additionally capped at the hole size itself, and the floor is asserted to sit
-         * below it, rather than trusting the recorded figure to stay where it was.
+         * [TILE_HOLE_CELLS]. A margin of 40 puts the alarm at 76 on a 36-cell floor, below the 88
+         * cells the smallest such hole is guaranteed to occupy. The floor is not perfectly stable -
+         * a later run measured 49, which would put the alarm at 89 and let that hole through - so
+         * the ceiling is additionally capped one cell below the hole size, and the floor itself is
+         * asserted to sit under it, rather than trusting the recorded figure to stay where it was.
          */
         const val CLUSTER_MARGIN_CELLS = 40
 
         /**
          * One uncovered zoom-16 tile, in sampled cells: the smallest hole that must always fail.
          *
-         * A tile is 256 px square. Across this 1080 x 2400 map that is about 11 of the 48 sampled
-         * columns by 8 of the 80 sampled rows, so roughly 97 cells.
+         * The GUARANTEED count, not the average one. A tile is 256 px square; the grid samples this
+         * 1080 x 2400 map every 1080/48 = 22.5 px across and every 2400/80 = 30 px down. An
+         * interval 256 px long contains at least `floor(256 / spacing)` sample points wherever it
+         * happens to fall, so a tile-sized hole is guaranteed to cover at least 11 columns by 8
+         * rows: **88** cells. It averages nearer 97 and can reach 108, but a bound built on the
+         * average lets an unluckily aligned tile through, which is the one alignment an attacker of
+         * this rule would pick.
          */
-        const val TILE_HOLE_CELLS = 97
+        const val TILE_HOLE_CELLS = 88
         const val GRID_COLUMNS = 48
         const val GRID_ROWS = 80
         const val COVER_RED = 0x3C

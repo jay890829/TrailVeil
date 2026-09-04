@@ -82,10 +82,12 @@ import org.junit.runner.RunWith
  * 4. `moveCamera` CLAMPS into the SDK's own zoom range, and the viewport-dependent minimum on a
  *    full-screen phone map is somewhere near 2. Reading the camera back after the move and comparing
  *    everything downstream against that post-clamp value would let every rung of a ladder collapse
- *    onto one identical camera and still report green. So the floor is measured once from the live
- *    map (`GoogleMap.minZoomLevel`) and every scene asserts that it settled at `max(requested,
- *    floor)`, exactly as the MapLibre original does; a sweep whose zoom IS the property abstains,
- *    naming the floor, rather than passing over a camera it never reached.
+ *    onto one identical camera and still report green. So the floor is PROBED once on the live map
+ *    - driven as far out as the API allows and read back, because `GoogleMap.minZoomLevel`
+ *    advertises a number the SDK does not honour (2.000 advertised, 3.000 settled on the API 36
+ *    AVD) - and every scene asserts that it settled where that floor says it should. Rungs whose
+ *    zoom IS the property are held to the zoom they named rather than to the clamped one, because
+ *    expecting the clamp leaves the assertion unable to detect a clamp.
  *
  * The per-scene floor and the sensitivity control are the same measurement. A second pass replays
  * each scene's *applied* camera on [GoogleMapSurfaceTestActivity] with `fogRequired` false - the
@@ -105,10 +107,13 @@ import org.junit.runner.RunWith
  * COVERED verdicts falsifiable: the detector demonstrably fires on bare ground, and demonstrably
  * does not fire on the label load of a correctly fogged frame.
  *
- * Runs in the unfiltered googlePoc suite. It abstains - never passes - when the key is not
- * configured, when the install carries revealed history, when the basemap never reports loaded, when
- * the SDK's minimum zoom makes the requested rungs unreachable, or when the map surface cannot be
- * read back directly (the composited screenshot channel cannot tell app chrome from a basemap leak).
+ * Runs in the unfiltered googlePoc suite, over its own private in-memory install rather than over
+ * the launcher's, so "this install has revealed nothing" holds by construction instead of being a
+ * precondition an unfiltered suite makes impossible. It abstains - never passes - when the key is
+ * not configured, when the basemap never reports loaded, or when the map surface cannot be read
+ * back directly (the composited screenshot channel cannot tell app chrome from a basemap leak).
+ * Rungs the SDK will not take this viewport to no longer abstain: the case proves the refusal and
+ * audits the lowest zoom it will reach.
  */
 @RunWith(AndroidJUnit4::class)
 class GoogleSettledFogCoverageSweepTest {
@@ -144,10 +149,15 @@ class GoogleSettledFogCoverageSweepTest {
      * asserts install bookkeeping and snapshot probe blocks.
      *
      * Here the zoom IS the property: a rung a hundredth either side of the boundary is meaningless
-     * if both clamp to the same camera. Every rung is therefore marked [SweepStep.zoomIsTheProperty]
-     * and the case abstains, naming the measured minimum, on any viewport whose SDK floor sits at or
-     * above the boundary - which is what a portrait phone gives, since the SDK's floor is the zoom
-     * at which one world copy still covers the taller axis and wrapped copies never appear.
+     * if both clamp to the same camera. Every rung is therefore marked [SweepStep.zoomIsTheProperty].
+     *
+     * On a portrait phone the SDK's floor sits well above the boundary - the floor is the zoom at
+     * which one world copy still covers the taller axis, so wrapped copies never appear - and every
+     * rung is unreachable. The case does not abstain there, and does not pass over an empty audit
+     * either. It proves the SDK really refuses a below-boundary request by making one and requiring
+     * it to clamp, then audits the lowest zoom this viewport WILL reach. What it does NOT exercise
+     * on such a viewport is the wrapped-world regime, so the two PARTIAL parity rows about world
+     * copies below zoom one stay un-upgraded; `V02-007-gates.md` records that.
      */
     @Test
     fun bothSidesOfTheWorldCopyRepetitionBoundaryStaySettledAndFullyFogged() {
@@ -354,10 +364,16 @@ class GoogleSettledFogCoverageSweepTest {
     private fun auditSettledSweep(label: String, steps: List<SweepStep>) {
         SpikeScenarioSupport.assumeKeyConfigured()
         val fogged = sweepFoggedMap(label, steps)
-        // Empty only on the one path that asserts its own claim instead of auditing scenes: every
-        // rung below a floor that sits at or above the world-copy boundary, so the ground they name
-        // is unreachable on this viewport. `sweepFoggedMap` has asserted that and recorded it.
-        if (fogged.isEmpty()) return
+        // Never empty. Every path through `sweepFoggedMap` either abstains, fails, or audits at
+        // least one settled scene - including the one where every rung sits below this viewport's
+        // floor, which audits the lowest zoom it can reach instead of returning nothing. Asserted
+        // rather than assumed, because a green result over zero scenes is a failure this case has
+        // already shipped once.
+        assertTrue(
+            "$label: the sweep audited no scene at all, so nothing below this point ran and a " +
+                "green result would be asserting nothing.",
+            fogged.isNotEmpty(),
+        )
         val bare = measureDetachedFogReference(label, fogged.map { it.name to it.camera })
         assertSettledCoverage(label, fogged, bare)
     }
@@ -429,43 +445,91 @@ class GoogleSettledFogCoverageSweepTest {
             val unreachable = steps.filter { step ->
                 step.zoomIsTheProperty && step.zoom < zoomFloor
             }
-            // Asserted, not abstained.
-            //
-            // A rung below the live floor cannot be audited at the zoom it names, and this used to
-            // skip the whole case. On a portrait phone that is every world-copy rung, so the case
-            // reported SKIPPED on the acceptance leg in every recorded run and closed nothing. But
-            // "unreachable" is itself the answer those rungs were asking for: if the SDK will not
-            // take this viewport below the repetition boundary, the wrapped-world states the
-            // MapLibre rows guard cannot be entered on it at all. That is a claim, so it is made
-            // here rather than used as an excuse to stop - and it fails loudly if the floor ever
-            // sits BELOW the boundary while a rung is still reported unreachable, which would mean
-            // the filter, not the SDK, is what is keeping the case away from that ground.
+            // The filter above is a consistency guard, not this case's claim. It can only fire
+            // if the measured floor lands inside the 0.01-wide window between a rung and the
+            // boundary, which no full-screen Google viewport occupies, so nothing load-bearing is
+            // allowed to rest on it.
             if (unreachable.isNotEmpty()) {
                 assertTrue(
                     "$label: ${unreachable.size} of ${steps.size} rungs are unreachable, but " +
-                        "this viewport's SDK minimum of ${"%.3f".format(zoomFloor)} is BELOW the " +
-                        "world-copy repetition boundary of ${"%.3f".format(WORLD_COPY_ZOOM)}, so " +
-                        "the ground they name is reachable and something other than the SDK is " +
-                        "keeping the sweep off it. " + describeMapView(mapView),
+                        "this viewport's measured floor of ${"%.3f".format(zoomFloor)} is BELOW " +
+                        "the world-copy repetition boundary of " +
+                        "${"%.3f".format(WORLD_COPY_ZOOM)}, so the ground they name is reachable " +
+                        "and something other than the SDK is keeping the sweep off it. " +
+                        describeMapView(mapView),
                     zoomFloor >= WORLD_COPY_ZOOM,
                 )
             }
             val reachable = steps.filterNot { step -> step in unreachable }
             if (reachable.isEmpty()) {
-                // Every rung is below the floor, and the assertion above has established that the
-                // floor is at or above the world-copy boundary. The claim the case is left making
-                // is therefore the whole of what remains true on this viewport: the SDK will not
-                // take it below the boundary, so the wrapped-world states the MapLibre rows guard
-                // cannot be entered here at all. That is a positive, falsifiable statement - a
-                // viewport or SDK that lowers the floor makes rungs reachable and runs the full
-                // sweep - and it is emitted as evidence rather than left as a skip, which is what
-                // this used to be and what closed nothing.
+                // Every rung is below the floor, which on a portrait phone is all of them.
+                //
+                // Two earlier versions of this branch were wrong in opposite directions. The
+                // first asserted that some rung was reachable, and failed on the device. The
+                // second replaced it with `zoomFloor >= WORLD_COPY_ZOOM` and returned - the guard
+                // above, unfailable here - so the case reported green having audited no scene at
+                // all. Neither is acceptable: one fails a working product, the other passes
+                // without looking. Both are recorded here rather than left in the history.
+                //
+                // What is at once true on this viewport and falsifiable is the MECHANISM. Ask the
+                // SDK for the ground the rungs name and require it to refuse. If a below-boundary
+                // zoom were ever honoured the camera would settle there, this fails, and the
+                // rungs should have been reachable in the first place.
+                val anchor = requireNotNull(steps.mapNotNull { step -> step.target }.firstOrNull()) {
+                    "$label: every rung is a scroll, so there is no camera to probe the clamp with"
+                }
+                val probe = SweepStep(
+                    name = "belowBoundaryClampProbe",
+                    target = anchor,
+                    zoom = WORLD_COPY_ZOOM - REPETITION_STEP,
+                )
+                val clamped = applyStep(scenario, map, mapView, probe)
+                assertTrue(
+                    "$label: a camera requested at " +
+                        "${"%.3f".format(WORLD_COPY_ZOOM - REPETITION_STEP)}, below the " +
+                        "world-copy repetition boundary, settled at " +
+                        "${"%.3f".format(clamped.zoom)} rather than at this viewport's measured " +
+                        "floor of ${"%.3f".format(zoomFloor)}. The SDK did not clamp it, so the " +
+                        "ground below the boundary IS reachable here and the rungs this case " +
+                        "skipped should have run. " + describeMapView(mapView),
+                    abs(clamped.zoom - zoomFloor) <= ZOOM_APPLIED_TOLERANCE,
+                )
+                // And it audits ground rather than returning nothing. The lowest zoom this
+                // viewport reaches is the closest it can come to the boundary, at a dateline
+                // camera the ladder never visits, so full fog there is the reachable half of what
+                // these rungs were asking for. It is NOT the wrapped-world regime: the two
+                // PARTIAL parity rows about world copies below zoom one stay un-upgraded, which
+                // `V02-007-gates.md` records.
+                val floorStep = SweepStep(
+                    name = "lowestReachableZoom",
+                    target = anchor,
+                    zoom = zoomFloor,
+                )
+                val floorApplied = applyStep(scenario, map, mapView, floorStep)
+                val floorSettled = awaitSettledUncoveredCamera(
+                    scenario = scenario,
+                    map = map,
+                    mapView = mapView,
+                    scene = floorStep.name,
+                    applied = floorApplied,
+                )
                 SpikeEvidence.emit(
                     InstrumentationRegistry.getInstrumentation().targetContext,
                     EVIDENCE_FILE,
                     "TRAILVEIL-V02007-SWEEP-UNREACHABLE label=$label rungs=${steps.size} " +
                         "zoomFloor=${"%.3f".format(zoomFloor)} " +
-                        "boundary=${"%.3f".format(WORLD_COPY_ZOOM)}",
+                        "boundary=${"%.3f".format(WORLD_COPY_ZOOM)} " +
+                        "clampedTo=${"%.3f".format(clamped.zoom)} auditedLowestReachable=true",
+                )
+                readings += captureScene(
+                    label = label,
+                    scene = floorStep.name,
+                    scenario = scenario,
+                    activity = requireNotNull(activity.get()),
+                    mapView = mapView,
+                    camera = floorSettled,
+                    requestedZoom = zoomFloor,
+                    coverAware = true,
                 )
                 return readings
             }
@@ -744,14 +808,6 @@ class GoogleSettledFogCoverageSweepTest {
         return requireNotNull(applied.get())
     }
 
-    /**
-     * How far out THIS viewport allows, measured from the live map rather than assumed.
-     *
-     * The SDK keeps one world copy covering the view, so the minimum belongs to the display and the
-     * map's size, not to this app - which is exactly why a hard-coded expectation would either
-     * break on a different screen or silently accept a clamp. Every zoom assertion in this file is
-     * `max(requested, this)`.
-     */
     /**
      * The zoom this viewport will actually settle at, measured rather than asked for.
      *
