@@ -4,6 +4,7 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Modifier
 import app.trailveil.map.fog.GeoPoint
@@ -26,6 +27,11 @@ internal class GoogleMapSurfaceTestActivity : ComponentActivity() {
         super.onCreate(planted ?: savedInstanceState)
         setContent {
             TrailVeilTheme {
+                val screen = GoogleMapSurfaceTestHooks.content.get()
+                if (screen != null) {
+                    screen()
+                    return@TrailVeilTheme
+                }
                 TrailVeilMapSurface(
                     modifier = Modifier.fillMaxSize(),
                     fogRequired = GoogleMapSurfaceTestHooks.fogRequired,
@@ -98,6 +104,20 @@ internal object GoogleMapSurfaceTestHooks {
     val onOverlayVisibility = AtomicReference<((Boolean) -> Unit)?>(null)
     val onOverlayObservation =
         AtomicReference<((GoogleMapOverlayObservation) -> Unit)?>(null)
+
+    /**
+     * Replaces this activity's whole content, themed as the app themes it.
+     *
+     * `V02-007`. `createComposeRule` launches `androidx.activity.ComponentActivity` from the test
+     * apk, and instrumentation targeting `app.trailveil` cannot start an activity that resolves in
+     * `app.trailveil.test`. The artifact that declares it, `compose-ui-test-manifest`, would have
+     * to be a dependency of the APP for that activity to exist app-side - and this build type
+     * becomes the shipped Google variant in `V02-008`, so it does not get one. This activity is
+     * already the variant's unexported harness host; letting a case supply the composable it wants
+     * hosted costs one branch here and adds no new surface. Cleared by [reset], because a
+     * composable left behind would silently replace the map for every case after it.
+     */
+    val content = AtomicReference<(@Composable () -> Unit)?>(null)
     val userMovedCount = AtomicInteger(0)
     @Volatile var fogRequired: Boolean = false
     @Volatile var fogRuntime: FogRuntime? = null
@@ -141,6 +161,7 @@ internal object GoogleMapSurfaceTestHooks {
         onFogProof.set(null)
         onOverlayVisibility.set(null)
         onOverlayObservation.set(null)
+        content.set(null)
         userMovedCount.set(0)
         fogRequired = false
         fogRuntime = null
