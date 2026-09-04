@@ -45,10 +45,9 @@ internal fun TrailVeilMapSurface(
     cameraRequest: MapCameraRequest? = null,
     currentLocation: GeoPoint? = null,
     followLocation: GeoPoint? = null,
-    // The neutral signature is shared across actuals. The other one spends these on an SDK margin
-    // call; this one translates the SDK's own compass view, because the Maps SDK's only inset lever
-    // is `setPadding` and padding moves the logical camera centre the fog is built on. See
-    // `GoogleCompassPlacement`. Formerly accepted and unused (design §8); closed by `V02-007`.
+    // Accepted and unused until the hosted map lands: the neutral signature is shared across
+    // actuals, and the production one places its in-map compass with these insets. Recorded
+    // deviation, design §8.
     compassTopInset: Dp = MAP_CONTROL_INSET,
     compassEndInset: Dp = MAP_CONTROL_INSET,
     trackOverlay: MapTrackOverlay? = null,
@@ -107,8 +106,6 @@ internal fun TrailVeilMapSurface(
             currentLocation = currentLocation,
             followLocation = followLocation,
             trackOverlay = trackOverlay,
-            compassTopInset = compassTopInset,
-            compassEndInset = compassEndInset,
             onUserMovedCamera = onUserMovedCamera,
             onFogRendered = onFogRendered,
             onFogFailure = onFogFailure,

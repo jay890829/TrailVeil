@@ -28,7 +28,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -140,8 +139,6 @@ internal fun GoogleHostedMapSurface(
     currentLocation: GeoPoint?,
     followLocation: GeoPoint?,
     trackOverlay: MapTrackOverlay?,
-    compassTopInset: Dp,
-    compassEndInset: Dp,
     onUserMovedCamera: () -> Unit,
     onFogRendered: ((FogViewportRender) -> Unit)?,
     onFogFailure: (Throwable) -> Unit,
@@ -223,21 +220,12 @@ internal fun GoogleHostedMapSurface(
     val detailFitEpoch = remember(mapView) { AtomicLong(0L) }
     val detailFitRequestId = remember(mapView) { AtomicLong(Long.MIN_VALUE) }
     val synchronousFogCover = remember(mapView) { GoogleFogSafetyOverlay(mapView) }
-    val compassPlacement = remember(mapView) { GoogleCompassPlacement(mapView) }
     var binding by remember(mapView) { mutableStateOf<GoogleMapSurfaceBinding?>(null) }
     var fogBinding by remember(mapView) {
         mutableStateOf<GoogleCanonicalFogSurfaceBinding?>(null)
     }
 
-    // Re-stated on every composition rather than launched once: the SDK gives its compass no
-    // size until the camera carries a bearing or a tilt, so the first placement usually lands on a
-    // zero-size view. `GoogleCompassPlacement` also watches layout passes for that reason; this is
-    // what carries a CHANGED inset to it.
-    val compassTopInsetPx = with(LocalDensity.current) { compassTopInset.roundToPx() }
-    val compassEndInsetPx = with(LocalDensity.current) { compassEndInset.roundToPx() }
-
     SideEffect {
-        compassPlacement.setInsets(compassTopInsetPx, compassEndInsetPx)
         synchronousFogCover.setVisible(fogRequired && fogCoverUp)
         val overlayGeometryChanged = binding?.updateOverlays(
             currentLocation = currentLocation,
@@ -443,7 +431,6 @@ internal fun GoogleHostedMapSurface(
             fogBinding?.release()
             fogBinding = null
             synchronousFogCover.release()
-            compassPlacement.release()
             lifecycle.removeObserver(observer)
             registry.unregisterSavedStateProvider(savedStateKey)
             context.applicationContext.unregisterComponentCallbacks(callbacks)
