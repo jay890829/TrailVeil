@@ -166,17 +166,127 @@ class GoogleSettledFogCoverageSweepTest {
      * it. The revealed frame must show a large solid non-fog block; the control frame must not, and
      * must be an order of magnitude quieter than the revealed one by the same measure.
      *
-     * This is what makes a COVERED verdict in the other two cases evidence rather than a tautology:
-     * an overlay that covered everything unconditionally, or an oracle blind to this basemap, would
-     * fail the revealed half; an overlay that leaked would fail the control half.
+     * The revealed half alone would not attribute anything: "this camera reads as bare" is
+     * satisfied identically by a reveal that worked and by a generation that failed to cover that
+     * camera. So the same camera is audited a second time on a second hosted surface over an
+     * install that has revealed nothing, and must read as fogged there. With that pair in place an
+     * overlay that covered everything unconditionally, or an oracle blind to this basemap, fails
+     * the revealed half; an overlay that leaked fails the empty-install half; and a COVERED verdict
+     * in the other two cases is evidence rather than a tautology.
      */
     @Test
     fun revealedGroundReadsAsRevealedWhileUnvisitedGroundBesideItStaysFogged() {
         SpikeScenarioSupport.assumeKeyConfigured()
         val context = InstrumentationRegistry.getInstrumentation().targetContext
+        // Two hosted surfaces, one over a canonical reveal and one over an empty install, audited
+        // at the SAME camera. That pairing is what the arm rests on: "something reads as bare at
+        // the patch" is satisfied identically by a reveal that worked and by a generation that
+        // failed to cover that camera, and only the empty install separates them.
+        val revealedScenes = auditRevealScenes(
+            label = "revealedGround",
+            withDatabase = { database -> revealPatch(database) },
+            scenes = listOf(
+                "revealedPatch" to REVEALED_PATCH_CENTRE,
+                "unrevealedControl" to REVEALED_CONTROL_CENTRE,
+            ),
+        )
+        val emptyScenes = auditRevealScenes(
+            label = "unrevealedInstall",
+            withDatabase = { },
+            scenes = listOf("unrevealedSameCamera" to REVEALED_PATCH_CENTRE),
+        )
+        val revealed = requireNotNull(revealedScenes["revealedPatch"])
+        val control = requireNotNull(revealedScenes["unrevealedControl"])
+        val sameCamera = requireNotNull(emptyScenes["unrevealedSameCamera"])
+
+        val line = "TRAILVEIL-V02007-SWEEP-REVEAL " +
+            "revealedChannel=${revealed.captureMethod} " +
+            "controlChannel=${control.captureMethod} " +
+            "sameCameraChannel=${sameCamera.captureMethod} " +
+            "revealedLargestClusterPct=${"%.3f".format(revealed.largestClusterPct)} " +
+            "controlLargestClusterPct=${"%.3f".format(control.largestClusterPct)} " +
+            "sameCameraLargestClusterPct=${"%.3f".format(sameCamera.largestClusterPct)} " +
+            "revealedSolidSidePx=${revealed.largestSolidSquareSidePx} " +
+            "controlSolidSidePx=${control.largestSolidSquareSidePx} " +
+            "sameCameraSolidSidePx=${sameCamera.largestSolidSquareSidePx} " +
+            "revealedClusteredPct=${"%.2f".format(revealed.clusteredExposedPct)} " +
+            "controlClusteredPct=${"%.2f".format(control.clusteredExposedPct)} " +
+            "revealedExposedPct=${"%.2f".format(revealed.exposedPct)} " +
+            "controlExposedPct=${"%.2f".format(control.exposedPct)} " +
+            "sameCameraExposedPct=${"%.2f".format(sameCamera.exposedPct)}"
+        SpikeEvidence.emit(context, EVIDENCE_FILE, line)
+
+        assertTrue(
+            "$line\nrevealedPatch: the canonical reveal recorded before this surface composed " +
+                "produced a largest non-fog cluster of only " +
+                "${"%.3f".format(revealed.largestClusterPct)}% of the analyzed map area, under " +
+                "the ${REVEALED_MINIMUM_CLUSTER_PCT}% a revealed patch this size must occupy, so " +
+                "either the reveal never reached the screen or this oracle cannot see basemap on " +
+                "this image - in which case every COVERED verdict in the other two cases is " +
+                "unfalsified.",
+            revealed.largestClusterPct >= REVEALED_MINIMUM_CLUSTER_PCT,
+        )
+        assertTrue(
+            "$line\nrevealedPatch: the largest SOLID non-fog square on the revealed patch was " +
+                "${revealed.largestSolidSquareSidePx}px on a side, under the " +
+                "${SOLID_BLOCK_MINIMUM_SIDE_PX}px the sweep's shape rule fires at, so that rule " +
+                "is not shown able to fire at all in this run",
+            revealed.largestSolidSquareSidePx >= SOLID_BLOCK_MINIMUM_SIDE_PX,
+        )
+        assertTrue(
+            "$line\nunrevealedControl: a settled camera over ground this install has never " +
+                "revealed carried a solid non-fog square ${control.largestSolidSquareSidePx}px " +
+                "on a side, at or above the ${SOLID_BLOCK_MINIMUM_SIDE_PX}px block rule; " +
+                "unexplored ground is being presented as revealed.",
+            control.largestSolidSquareSidePx < SOLID_BLOCK_MINIMUM_SIDE_PX,
+        )
+        assertTrue(
+            "$line\nunrevealedControl: the revealed patch's largest cluster " +
+                "(${"%.3f".format(revealed.largestClusterPct)}%) is not " +
+                "${REVEALED_MARGIN_MULTIPLE}x the unrevealed control's " +
+                "(${"%.3f".format(control.largestClusterPct)}%), so this oracle does not " +
+                "separate revealed ground from the label load of a fogged frame and its COVERED " +
+                "verdicts carry no information",
+            revealed.largestClusterPct >= control.largestClusterPct * REVEALED_MARGIN_MULTIPLE,
+        )
+        // The A/B that makes the revealed half evidence rather than an observation. Same camera,
+        // same zoom, same oracle, same capture channel; the only difference is whether the install
+        // had ever visited this ground. A generation that simply failed to cover this camera would
+        // read as bare in BOTH runs and fail here, which the far-away control cannot detect.
+        assertTrue(
+            "$line\nunrevealedSameCamera: the SAME camera over an install that has revealed " +
+                "nothing carried a solid non-fog square ${sameCamera.largestSolidSquareSidePx}px " +
+                "on a side, at or above the ${SOLID_BLOCK_MINIMUM_SIDE_PX}px block rule, so what " +
+                "the revealed run read as a reveal is what an empty install reads as too and the " +
+                "revealed half attributes nothing to the reveal",
+            sameCamera.largestSolidSquareSidePx < SOLID_BLOCK_MINIMUM_SIDE_PX,
+        )
+        assertTrue(
+            "$line\nunrevealedSameCamera: the revealed patch's largest cluster " +
+                "(${"%.3f".format(revealed.largestClusterPct)}%) is not " +
+                "${REVEALED_MARGIN_MULTIPLE}x the same camera's over an empty install " +
+                "(${"%.3f".format(sameCamera.largestClusterPct)}%), so the reveal is not what " +
+                "opened that ground",
+            revealed.largestClusterPct >= sameCamera.largestClusterPct * REVEALED_MARGIN_MULTIPLE,
+        )
+    }
+
+    /**
+     * Hosts one surface over its own in-memory install and audits the named scenes on it.
+     *
+     * [withDatabase] runs before the surface composes, so a reveal it writes is already canonical
+     * when the first generation is built; passing an empty body is what produces the never-visited
+     * control install that the same-camera A/B above rests on.
+     */
+    private fun auditRevealScenes(
+        label: String,
+        withDatabase: (TrailVeilDatabase) -> Unit,
+        scenes: List<Pair<String, LatLng>>,
+    ): Map<String, SceneReading> {
         val database = inMemoryDatabase()
+        val readings = LinkedHashMap<String, SceneReading>()
         try {
-            revealPatch(database)
+            withDatabase(database)
             GoogleMapSurfaceTestHooks.reset()
             GoogleMapSurfaceTestHooks.decision.set(ProviderStartupDecision(true, null))
             GoogleMapSurfaceTestHooks.fogRequired = true
@@ -192,105 +302,50 @@ class GoogleSettledFogCoverageSweepTest {
             }
             ActivityScenario.launch(GoogleMapSurfaceTestActivity::class.java).use { scenario ->
                 assertTrue(
-                    "revealedGround: the hosted surface never produced a Google map",
+                    "$label: the hosted surface never produced a Google map",
                     mapReady.await(MAP_READY_TIMEOUT_SECONDS, TimeUnit.SECONDS),
                 )
                 val map = requireNotNull(mapRef.get())
-                val mapView = awaitHostedMapView(scenario, "the revealed-ground host")
+                val mapView = awaitHostedMapView(scenario, "the $label host")
                 val activity = AtomicReference<Activity>()
                 scenario.onActivity { activity.set(it) }
                 val basemapOnline = awaitTag(mapView, R.id.map_basemap_load_state) { value ->
                     value == ONLINE_STATE
                 }
                 assumeTrue(
-                    "revealedGround: the hosted Google basemap never reported loaded, so there " +
-                        "is nothing settled to audit; abstaining rather than reporting a pass. " +
+                    "$label: the hosted Google basemap never reported loaded, so there is " +
+                        "nothing settled to audit; abstaining rather than reporting a pass. " +
                         describeMapView(mapView),
                     basemapOnline,
                 )
-                // The opening generation is waited for BEFORE either scene, so both scenes have a
+                // The opening generation is waited for BEFORE any scene, so every scene has a
                 // generation to advance past. Without it the first scene could settle on the
                 // opening one, whose published keys do not include this camera's - the
                 // generation-bound provider answers those fail-closed and opaque, which is the
                 // product working and would read here as a reveal that never happened.
                 assertTrue(
-                    "revealedGround: the hosted surface loaded its basemap but never published a " +
+                    "$label: the hosted surface loaded its basemap but never published a " +
                         "canonical fog generation. " + describeMapView(mapView),
                     awaitTag(mapView, R.id.map_fog_canonical_generation) { value -> value != null },
                 )
                 val zoomFloor = readZoomFloor(scenario, map)
-                val revealed = auditRevealScene(
-                    scene = "revealedPatch",
-                    scenario = scenario,
-                    map = map,
-                    mapView = mapView,
-                    activity = requireNotNull(activity.get()),
-                    target = REVEALED_PATCH_CENTRE,
-                    zoomFloor = zoomFloor,
-                )
-                val control = auditRevealScene(
-                    scene = "unrevealedControl",
-                    scenario = scenario,
-                    map = map,
-                    mapView = mapView,
-                    activity = requireNotNull(activity.get()),
-                    target = REVEALED_CONTROL_CENTRE,
-                    zoomFloor = zoomFloor,
-                )
-                val line = "TRAILVEIL-V02007-SWEEP-REVEAL " +
-                    "zoomFloor=${"%.3f".format(zoomFloor)} " +
-                    "revealedChannel=${revealed.captureMethod} " +
-                    "controlChannel=${control.captureMethod} " +
-                    "revealedLargestClusterPct=${"%.3f".format(revealed.largestClusterPct)} " +
-                    "controlLargestClusterPct=${"%.3f".format(control.largestClusterPct)} " +
-                    "revealedSolidSidePx=${revealed.largestSolidSquareSidePx} " +
-                    "controlSolidSidePx=${control.largestSolidSquareSidePx} " +
-                    "revealedClusteredPct=${"%.2f".format(revealed.clusteredExposedPct)} " +
-                    "controlClusteredPct=${"%.2f".format(control.clusteredExposedPct)} " +
-                    "revealedExposedPct=${"%.2f".format(revealed.exposedPct)} " +
-                    "controlExposedPct=${"%.2f".format(control.exposedPct)}"
-                SpikeEvidence.emit(context, EVIDENCE_FILE, line)
-
-                assertTrue(
-                    "$line\nrevealedPatch: the canonical reveal recorded before this surface " +
-                        "composed produced a largest non-fog cluster of only " +
-                        "${"%.3f".format(revealed.largestClusterPct)}% of the analyzed map area, " +
-                        "under the ${REVEALED_MINIMUM_CLUSTER_PCT}% a revealed patch this size " +
-                        "must occupy, so either the reveal never reached the screen or this " +
-                        "oracle cannot see basemap on this image - in which case every COVERED " +
-                        "verdict in the other two cases is unfalsified. " + describeMapView(mapView),
-                    revealed.largestClusterPct >= REVEALED_MINIMUM_CLUSTER_PCT,
-                )
-                assertTrue(
-                    "$line\nrevealedPatch: the largest SOLID non-fog square on the revealed " +
-                        "patch was ${revealed.largestSolidSquareSidePx}px on a side, under the " +
-                        "${SOLID_BLOCK_MINIMUM_SIDE_PX}px the sweep's shape rule fires at, so " +
-                        "that rule is not shown able to fire at all in this run",
-                    revealed.largestSolidSquareSidePx >= SOLID_BLOCK_MINIMUM_SIDE_PX,
-                )
-                assertTrue(
-                    "$line\nunrevealedControl: a settled camera over ground this install has " +
-                        "never revealed carried a solid non-fog square " +
-                        "${control.largestSolidSquareSidePx}px on a side, at or above the " +
-                        "${SOLID_BLOCK_MINIMUM_SIDE_PX}px block rule; unexplored ground is being " +
-                        "presented as revealed. " + describeMapView(mapView),
-                    control.largestSolidSquareSidePx < SOLID_BLOCK_MINIMUM_SIDE_PX,
-                )
-                assertTrue(
-                    "$line\nunrevealedControl: the revealed patch's largest cluster " +
-                        "(${"%.3f".format(revealed.largestClusterPct)}%) is not " +
-                        "${REVEALED_MARGIN_MULTIPLE}x the unrevealed control's " +
-                        "(${"%.3f".format(control.largestClusterPct)}%), so this oracle does not " +
-                        "separate revealed ground from the label load of a fogged frame and its " +
-                        "COVERED verdicts carry no information",
-                    revealed.largestClusterPct >=
-                        control.largestClusterPct * REVEALED_MARGIN_MULTIPLE,
-                )
+                scenes.forEach { (scene, target) ->
+                    readings[scene] = auditRevealScene(
+                        scene = scene,
+                        scenario = scenario,
+                        map = map,
+                        mapView = mapView,
+                        activity = requireNotNull(activity.get()),
+                        target = target,
+                        zoomFloor = zoomFloor,
+                    )
+                }
             }
         } finally {
             GoogleMapSurfaceTestHooks.reset()
             database.close()
         }
+        return readings
     }
 
     // ---------------------------------------------------------------------------------------
@@ -334,8 +389,15 @@ class GoogleSettledFogCoverageSweepTest {
             // clamped camera and report every rung green. The floor belongs to the viewport, not to
             // this app, so it is measured from the live map rather than assumed.
             val zoomFloor = readZoomFloor(scenario, map)
+            // Exact, not tolerant. `ZOOM_APPLIED_TOLERANCE` is 0.05 while the rungs that
+            // straddle the world-copy boundary are `REPETITION_STEP` = 0.01 apart, so a tolerant
+            // filter leaves a band five times the separation in which a rung below the floor is
+            // NOT abstained, is clamped up to the floor, and then satisfies the assertion below
+            // because that assertion expects `max(requested, floor)`. That is B4's original defect
+            // surviving in a narrower band; a rung asking for anything under the measured floor
+            // cannot be audited at the zoom it names, however close it is.
             val unreachable = steps.filter { step ->
-                step.zoomIsTheProperty && step.zoom < zoomFloor - ZOOM_APPLIED_TOLERANCE
+                step.zoomIsTheProperty && step.zoom < zoomFloor
             }
             assumeTrue(
                 "$label: ${unreachable.size} of ${steps.size} rungs ask for a zoom below this " +
@@ -357,12 +419,19 @@ class GoogleSettledFogCoverageSweepTest {
                     scene = step.name,
                     applied = requested,
                 )
-                // A targeted step must land on `max(requested, floor)`; a scroll step must not move
+                // A targeted step must land on the zoom it named; a scroll step must not move
                 // the zoom at all, which is what makes `SweepStep.zoom` live on those rows too.
-                val expectedZoom = if (step.target != null) {
-                    maxOf(step.zoom, zoomFloor)
-                } else {
-                    previousSettledZoom ?: maxOf(step.zoom, zoomFloor)
+                //
+                // Rungs where the zoom IS the property are held to `step.zoom` itself rather than
+                // to `max(step.zoom, floor)`. Expecting the clamped value makes the assertion
+                // unable to detect a clamp at all - it only detects a clamp landing somewhere
+                // other than the floor - which left every clamp check resting on the filter above.
+                // Those rungs are already abstained when they sit below the floor, so this can
+                // only fire on a clamp the filter did not predict, which is exactly what it is for.
+                val expectedZoom = when {
+                    step.target != null && step.zoomIsTheProperty -> step.zoom
+                    step.target != null -> maxOf(step.zoom, zoomFloor)
+                    else -> previousSettledZoom ?: maxOf(step.zoom, zoomFloor)
                 }
                 assertTrue(
                     "$label/${step.name}: the camera settled at zoom " +

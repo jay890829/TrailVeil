@@ -290,13 +290,21 @@ class GoogleDegradedBasemapTerminalSurfaceTest {
             )
             val elapsed = compositionTerminalAt - compositionStartedAt
             val wallElapsed = terminalAt - startedAt
+            // The upper half of the attribution is carried by the loop bound and by the reason
+            // assertion below, NOT by a comparison against the cover deadline: `terminalAt` is
+            // only ever assigned inside a loop that stops at
+            // FALLBACK_TIMEOUT_MILLIS + TERMINAL_SLACK_MILLIS of composition clock, so
+            // `elapsed < COVER_TIMEOUT_MILLIS` would hold by construction and could never fail.
+            // A terminal produced by the cover deadline instead reports through the
+            // `terminalAt == UNSET_MILLIS` branch above, with its own message. What is worth
+            // guarding is the arrangement itself: if the observation window is ever widened past
+            // the cover deadline, the loop stops being an attribution at all.
             assertTrue(
-                "[terminalReasons=$terminalReasons wallMs=$wallElapsed] the terminal surface " +
-                    "arrived ${elapsed}ms of composition clock after the MapView " +
-                    "appeared, at or " +
-                    "past the ${COVER_TIMEOUT_MILLIS}ms fog-cover deadline, so it cannot be " +
-                    "attributed to the ${FALLBACK_TIMEOUT_MILLIS}ms basemap deadline",
-                elapsed < COVER_TIMEOUT_MILLIS,
+                "the observation window of " +
+                    "${FALLBACK_TIMEOUT_MILLIS + TERMINAL_SLACK_MILLIS}ms reaches the " +
+                    "${COVER_TIMEOUT_MILLIS}ms fog-cover deadline, so a terminal surface observed " +
+                    "inside it is no longer attributable to the basemap deadline",
+                FALLBACK_TIMEOUT_MILLIS + TERMINAL_SLACK_MILLIS < COVER_TIMEOUT_MILLIS,
             )
             // `V02-007` M2: MAP_LOAD_TIMEOUT and INITIALIZATION_FAILURE render the SAME string, so
             // the surface on screen cannot say which one produced it. A fog fault with nothing
