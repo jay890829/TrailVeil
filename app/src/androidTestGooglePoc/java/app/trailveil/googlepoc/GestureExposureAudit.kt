@@ -13,6 +13,8 @@ import android.view.View
 import android.view.ViewGroup
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.get
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
@@ -29,6 +31,7 @@ import java.util.Collections
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import org.junit.Assert.assertTrue
@@ -250,14 +253,41 @@ internal object GestureExposurePixels {
 /** One sampled frame: what the screen held, and whether the cover was up while it was taken. */
 internal data class ExposureFrame(
     val atMillis: Long,
+    /**
+     * `map_fog_synchronous_cover_up`: the flag the `ViewOverlay` drawable sets in the same call
+     * that raises it. This is the witness for "the user is looking at a blanked map", and it is
+     * what every cover clause in this file is judged on.
+     */
     val coverUp: Boolean,
+    /**
+     * `map_fog_cover_up`: the COMPOSITION's view of the same cover, read in the same round trip.
+     *
+     * `V02-007` section 5b. The product's twenty-second terminal cover deadline is armed on a
+     * rising edge of *this* one and cancelled on its falling edge; it does not accumulate. The
+     * acceptance run recorded 21,565 ms on [coverUp] with no terminal failure and no published
+     * interval, and three mechanisms could produce that - a dip shorter than the sampling period
+     * re-arming a fresh window, no published edge at all, or the binding's epoch gate suppressing
+     * both the publication and the decision. They are distinguishable only by watching the armed
+     * witness beside the visible one, which is what this field exists for. It is measured and
+     * reported; nothing is asserted on it yet, and no existing clause was weakened to add it.
+     */
+    val composeCoverUp: Boolean,
+    /**
+     * `map_fog_last_cover_interval_ms` as of this frame.
+     *
+     * The binding writes it only when the coordinator's cover falls, so a change inside the window
+     * dates that fall to a frame. A window in which it never changes says the binding never saw
+     * one, however the screen behaved.
+     */
+    val publishedIntervalMillis: Long?,
     val channel: String,
     val tally: GestureExposurePixels.Tally,
 ) {
     val judged: Boolean get() = tally.analyzedPx > 0
 
     fun describe(): String =
-        "[at=$atMillis cover=$coverUp channel=$channel ${tally.describe()}]"
+        "[at=$atMillis cover=$coverUp compose=$composeCoverUp " +
+            "interval=$publishedIntervalMillis channel=$channel ${tally.describe()}]"
 }
 
 /**
@@ -464,10 +494,17 @@ internal class GestureExposureSampler(
         val capture = capturer.capture()
         val coverAfter = readSynchronousCover()
         val coverUp = coverBefore || coverAfter
+        // Read after the same capture, not before it, so the witnesses describe the same moment;
+        // a difference between them is then the product's, not the sampler's. All in ONE main
+        // thread round trip, so they cannot disagree merely by being read a hop apart.
+        val published = readPublishedTags()
+        val composeCoverUp = published.composeCoverUp
         if (capture == null) {
             frames += ExposureFrame(
                 atMillis = SystemClock.elapsedRealtime(),
                 coverUp = coverUp,
+                composeCoverUp = composeCoverUp,
+                publishedIntervalMillis = published.intervalMillis,
                 channel = GestureExposurePixels.UNJUDGED_CHANNEL,
                 tally = GestureExposurePixels.Tally(0, 0, 0, 0),
             )
@@ -487,6 +524,8 @@ internal class GestureExposureSampler(
         frames += ExposureFrame(
             atMillis = SystemClock.elapsedRealtime(),
             coverUp = coverUp,
+            composeCoverUp = composeCoverUp,
+            publishedIntervalMillis = published.intervalMillis,
             channel = channel,
             tally = GestureExposurePixels.tally(capture, region, scaled),
         )
@@ -503,6 +542,29 @@ internal class GestureExposureSampler(
         }
         return holder.get()
     }
+
+    /**
+     * The composition tag the terminal deadline is armed on, and the binding's published interval.
+     *
+     * Both in one round trip. The interval is the BINDING's own view: it moves only when
+     * `publishCoverInterval` sees the coordinator's cover fall, so watching it per frame says
+     * whether a fall the screen showed was a fall the binding agreed with - which is the whole
+     * question in `V02-007` section 5b.
+     */
+    private fun readPublishedTags(): PublishedTags {
+        val holder = AtomicReference(PublishedTags(false, null))
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            holder.set(
+                PublishedTags(
+                    composeCoverUp = mapView.getTag(R.id.map_fog_cover_up) == true,
+                    intervalMillis = mapView.getTag(R.id.map_fog_last_cover_interval_ms) as? Long,
+                ),
+            )
+        }
+        return holder.get()
+    }
+
+    private data class PublishedTags(val composeCoverUp: Boolean, val intervalMillis: Long?)
 
     /**
      * The tag says the cover is up; this says the screen agrees.
@@ -790,6 +852,28 @@ internal data class GestureTrialReport(
     val frames: List<ExposureFrame>,
     val coverRose: Boolean,
     val longestCoveredRunMillis: Long,
+    /** The same longest run measured on the composition witness the deadline is armed on. */
+    val longestComposeCoveredRunMillis: Long,
+    /** Rising edges of each witness across the trial. See `coverRises`. */
+    val coverRises: Int,
+    val composeCoverRises: Int,
+    /** False where sampling stopped with the cover still up; see [longestCoveredRunMillis]. */
+    val coverSettled: Boolean,
+    /** Composition epoch and binding identity across the trial. See `effectEpoch`. */
+    val epochBefore: String?,
+    val epochAfter: String?,
+    val bindingBefore: String?,
+    val bindingAfter: String?,
+    /** Where each witness was up within the sampled window. See `witnessShape`. */
+    val coverShape: String,
+    val composeCoverShape: String,
+    /** When the binding's published interval moved inside the window, if it moved. */
+    val intervalShape: String,
+    /** The binding's own account of why the cover was up when the trial ended. */
+    val phaseAfter: String?,
+    /** Host ON_STOP / ON_START seen while this trial ran. See the harness's counters. */
+    val hostStopsDuringTrial: Int,
+    val hostStartsDuringTrial: Int,
     val coverIntervalBeforeMillis: Long?,
     val coverIntervalAfterMillis: Long?,
     val coverPixelProof: CoverPixelProof?,
@@ -854,6 +938,13 @@ internal data class GestureTrialReport(
             "worstInWindowClusterPx=" +
             "${inWindow.filter { !it.coverUp }.maxOfOrNull { it.tally.largestClusterPx } ?: 0} " +
             "coverRose=$coverRose longestCoveredRunMs=$longestCoveredRunMillis " +
+            "longestComposeCoveredRunMs=$longestComposeCoveredRunMillis " +
+            "coverRises=$coverRises composeCoverRises=$composeCoverRises " +
+            "coverSettled=$coverSettled epoch=$epochBefore->$epochAfter " +
+            "binding=$bindingBefore->$bindingAfter phaseAfter=[$phaseAfter] " +
+            "coverShape=[$coverShape] composeCoverShape=[$composeCoverShape] " +
+            "intervalShape=[$intervalShape] " +
+            "hostStops=$hostStopsDuringTrial hostStarts=$hostStartsDuringTrial " +
             "coverIntervalMs=$coverIntervalBeforeMillis->$coverIntervalAfterMillis " +
             "coverProof=${coverPixelProof?.describe() ?: "none"} " +
             "coverProofAttempts=$coverProofAttempts " +
@@ -877,6 +968,19 @@ internal class GestureExposureHarness private constructor(
     val mapView: MapView,
     val map: GoogleMap,
     private val capturer: GestureSurfaceCapturer,
+    /**
+     * ON_STOP / ON_START seen on the host since [attach], counted live.
+     *
+     * `V02-007` section 5b. The binding's twenty-second cover deadline is cancelled by
+     * `onHostStopped` and re-armed as a *fresh* window by `onHostStarted`, deliberately, so that
+     * backgrounding the phone does not charge the user for time the surface could not use. That is
+     * one of the two ways a deadline can fail to fire on a cover longer than its window, and it is
+     * the only one this audit can rule in or out from the outside. Every other view of the
+     * binding's state travels through a recomposition, which the same run proved can stall for
+     * seconds; a lifecycle event does not.
+     */
+    private val hostStops: AtomicInteger,
+    private val hostStarts: AtomicInteger,
 ) {
     fun cameraPosition(): CameraPosition = onMain { map.cameraPosition }
 
@@ -905,6 +1009,28 @@ internal class GestureExposureHarness private constructor(
     fun publishedCoverIntervalMillis(): Long? = onMain {
         mapView.getTag(R.id.map_fog_last_cover_interval_ms) as? Long
     }
+
+    /**
+     * The composition effect epoch and the binding instance behind the fog surface.
+     *
+     * `V02-007` section 5b. `map_fog_last_cover_interval_ms` is published by the binding on the
+     * cover's falling edge, and every binding starts with its own `lastPublishedCoverUp = false`.
+     * A binding replaced mid-trial therefore sees a falling edge it never saw rise, publishes
+     * nothing, and leaves the previous binding's interval standing - which is exactly the pair the
+     * acceptance run recorded: a cover the screen watched rise and fall, beside an interval that
+     * did not move. Read before and after each trial so that reading is checkable rather than
+     * inferred.
+     */
+    fun effectEpoch(): String? = onMain {
+        mapView.getTag(R.id.map_fog_effect_epoch)?.toString()
+    }
+
+    fun bindingInstance(): String? = onMain {
+        mapView.getTag(R.id.map_fog_binding_instance)?.toString()
+    }
+
+    /** `pending=..,reason=..,terminal=..,retry=..` - why the cover is up, and whether it gave up. */
+    fun fogPhase(): String? = onMain { mapView.getTag(R.id.map_fog_phase)?.toString() }
 
     fun touchDownCount(): Int = onMain {
         (mapView.getTag(R.id.map_touch_down_count) as? Int) ?: 0
@@ -1065,14 +1191,23 @@ internal class GestureExposureHarness private constructor(
         val touchDownsBefore = touchDownCount()
         val generationBefore = generation()
         val coverIntervalBefore = publishedCoverIntervalMillis()
+        val epochBefore = effectEpoch()
+        val bindingBefore = bindingInstance()
+        val hostStopsBefore = hostStops.get()
+        val hostStartsBefore = hostStarts.get()
         val sampler = GestureExposureSampler(mapView, capturer, exclusions)
         var driven: GestureDrive? = null
         var frames: List<ExposureFrame> = emptyList()
+        var coverSettled = false
         sampler.start()
         try {
             driven = drive(this)
             SystemClock.sleep(POST_GESTURE_SAMPLE_MILLIS)
-            awaitUntil(COVER_SETTLE_TIMEOUT_MILLIS) { coverUp() == false }
+            // Recorded, not discarded. A false here means sampling stopped with the cover still
+            // up, so the longest run below is a LOWER BOUND on a cover that never fell rather than
+            // a measurement of one that did - a different claim, and one the report should not be
+            // able to make silently.
+            coverSettled = awaitUntil(COVER_SETTLE_TIMEOUT_MILLIS) { coverUp() == false }
             SystemClock.sleep(POST_COVER_SAMPLE_MILLIS)
         } finally {
             // Outside the try the sampler would outlive a throwing driver, leaving a readback loop
@@ -1093,6 +1228,21 @@ internal class GestureExposureHarness private constructor(
             frames = frames,
             coverRose = frames.any { frame -> frame.coverUp },
             longestCoveredRunMillis = longestCoveredRun(frames),
+            longestComposeCoveredRunMillis =
+                longestCoveredRun(frames) { frame -> frame.composeCoverUp },
+            coverRises = coverRises(frames) { frame -> frame.coverUp },
+            composeCoverRises = coverRises(frames) { frame -> frame.composeCoverUp },
+            coverSettled = coverSettled,
+            epochBefore = epochBefore,
+            epochAfter = effectEpoch(),
+            bindingBefore = bindingBefore,
+            bindingAfter = bindingInstance(),
+            hostStopsDuringTrial = hostStops.get() - hostStopsBefore,
+            hostStartsDuringTrial = hostStarts.get() - hostStartsBefore,
+            coverShape = witnessShape(frames) { frame -> frame.coverUp },
+            composeCoverShape = witnessShape(frames) { frame -> frame.composeCoverUp },
+            intervalShape = intervalShape(frames),
+            phaseAfter = fogPhase(),
             coverIntervalBeforeMillis = coverIntervalBefore,
             coverIntervalAfterMillis = publishedCoverIntervalMillis(),
             coverPixelProof = sampler.coverPixelProof(),
@@ -1147,21 +1297,80 @@ internal class GestureExposureHarness private constructor(
         return surface
     }
 
-    private fun longestCoveredRun(frames: List<ExposureFrame>): Long {
+    private fun longestCoveredRun(
+        frames: List<ExposureFrame>,
+        covered: (ExposureFrame) -> Boolean = ExposureFrame::coverUp,
+    ): Long {
         var longest = 0L
         var runStart = -1L
         var previousCovered = false
         var previousAt = 0L
         frames.forEach { frame ->
-            if (frame.coverUp && !previousCovered) runStart = frame.atMillis
-            if (!frame.coverUp && previousCovered && runStart >= 0L) {
+            val isCovered = covered(frame)
+            if (isCovered && !previousCovered) runStart = frame.atMillis
+            if (!isCovered && previousCovered && runStart >= 0L) {
                 longest = maxOf(longest, previousAt - runStart)
             }
-            previousCovered = frame.coverUp
+            previousCovered = isCovered
             previousAt = frame.atMillis
         }
         if (previousCovered && runStart >= 0L) longest = maxOf(longest, previousAt - runStart)
         return longest
+    }
+
+    /**
+     * Where a witness was up, in milliseconds from the first sampled frame.
+     *
+     * `V02-007` section 5b. The longest run alone cannot say WHICH end of the trial a witness was
+     * up at, and the reproduction turns on exactly that: the two witnesses reported runs 6,792 ms
+     * apart with one rise each, which is either a late rise on one or an early fall on the other,
+     * and those are opposite findings. Derived from the frames already captured, so it costs
+     * nothing on the device.
+     */
+    private fun witnessShape(
+        frames: List<ExposureFrame>,
+        covered: (ExposureFrame) -> Boolean,
+    ): String {
+        if (frames.isEmpty()) return "none"
+        val origin = frames.first().atMillis
+        val up = frames.filter(covered)
+        if (up.isEmpty()) return "never"
+        return "first=${up.first().atMillis - origin} last=${up.last().atMillis - origin} " +
+            "atFirstFrame=${covered(frames.first())} atLastFrame=${covered(frames.last())} " +
+            "spanMs=${frames.last().atMillis - origin}"
+    }
+
+    /** When the binding's published interval first changed, in ms from the first sampled frame. */
+    private fun intervalShape(frames: List<ExposureFrame>): String {
+        if (frames.isEmpty()) return "none"
+        val origin = frames.first().atMillis
+        val start = frames.first().publishedIntervalMillis
+        val changed = frames.firstOrNull { frame -> frame.publishedIntervalMillis != start }
+            ?: return "unchanged=$start"
+        return "from=$start to=${changed.publishedIntervalMillis} " +
+            "atMs=${changed.atMillis - origin}"
+    }
+
+    /**
+     * How many times the witness went down-to-up across the trial.
+     *
+     * The longest run alone cannot separate one long cover from a string of short ones, and that
+     * is exactly the distinction `V02-007` section 5b turns on: the product's deadline is re-armed
+     * from scratch on every rising edge, so many rises with a long visible blank means the deadline
+     * was restarted rather than missed, while one rise means it was armed once and did not fire.
+     */
+    private fun coverRises(
+        frames: List<ExposureFrame>,
+        covered: (ExposureFrame) -> Boolean,
+    ): Int {
+        var rises = 0
+        var previousCovered = false
+        frames.forEach { frame ->
+            val isCovered = covered(frame)
+            if (isCovered && !previousCovered) rises += 1
+            previousCovered = isCovered
+        }
+        return rises
     }
 
     /**
@@ -1271,6 +1480,19 @@ internal class GestureExposureHarness private constructor(
                 "the production launcher map never became ready",
                 ready.await(MAP_READY_TIMEOUT_SECONDS, TimeUnit.SECONDS),
             )
+            val stops = AtomicInteger(0)
+            val starts = AtomicInteger(0)
+            scenario.onActivity { activity ->
+                activity.lifecycle.addObserver(
+                    LifecycleEventObserver { _, event ->
+                        when (event) {
+                            Lifecycle.Event.ON_STOP -> stops.incrementAndGet()
+                            Lifecycle.Event.ON_START -> starts.incrementAndGet()
+                            else -> Unit
+                        }
+                    },
+                )
+            }
             val capturer = GestureSurfaceCapturer(mapView)
             val channel = capturer.open()
             assertTrue(
@@ -1284,6 +1506,8 @@ internal class GestureExposureHarness private constructor(
                 mapView = mapView,
                 map = requireNotNull(mapRef.get()),
                 capturer = capturer,
+                hostStops = stops,
+                hostStarts = starts,
             )
         }
 
