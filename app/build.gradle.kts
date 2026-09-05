@@ -842,10 +842,13 @@ fun registerProviderBoundaryCheck(variant: String, google: Boolean) {
                     check(googleMapsClasses == 0) {
                         "$variant APK contains $googleMapsClasses Google Maps SDK class references"
                     }
-                    // The API-key manifest marker cannot live in dex, so it is not probed here; its
-                    // absence from these variants is asserted on the merged manifest by
-                    // verifyGooglePocMergedManifest. The key VALUE is what dex and the resource
-                    // table could carry, and that is probed below - presence only, never printed.
+                    // The API-key manifest marker cannot live in dex, so it is not probed here.
+                    // Its absence from these variants' merged manifests is asserted by
+                    // verifyGooglePocMergedManifest whenever a Google variant is packaged (and by
+                    // the keyless CI job explicitly), and by the publish script's own apkanalyzer
+                    // manifest audit on the release candidate; a bare `assembleRelease` carries
+                    // neither. The key VALUE is what dex and the resource table could carry, and
+                    // that is probed below - presence only, never printed.
                     val keyShaped = Regex("""AIza[A-Za-z0-9_-]{35}""")
                     check(!keyShaped.containsMatchIn(String(arsc, Charsets.ISO_8859_1))) {
                         "$variant APK's resource table contains a Google API key-shaped string"
@@ -1082,6 +1085,10 @@ dependencies {
     debugImplementation(libs.compose.ui.test.manifest)
 
     googleBuildTypes.forEach { variant ->
+        // Pinned on purpose. `GoogleMapWarmup` relies on this version invoking the renderer
+        // grant callback INLINE inside MapsInitializer.initialize (read from the bytecode by the
+        // V02-008 verifiers); a version that posted it would reopen the latent first-composition
+        // gap recorded in `ProviderRuntimeGate`. Re-read that comment before bumping.
         add("${variant}Implementation", "com.google.android.gms:play-services-maps:20.0.0")
         add("${variant}Implementation", "androidx.startup:startup-runtime:1.2.0")
     }

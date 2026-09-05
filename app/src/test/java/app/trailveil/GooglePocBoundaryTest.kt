@@ -174,10 +174,14 @@ class GooglePocBoundaryTest {
         )
         // Every dependency line that names an engine must be one whose configuration is spelled
         // from a build-type variable - `add("{variant}Implementation", ...)` inside one of the two
-        // forEach loops asserted above. That is the whole allowed shape. `implementation(`,
-        // `add("implementation", ...)`, `debugImplementation(` and `api(` all fail it, which the
-        // previous prefix match let through (V02-008 verifier note). Comment lines are skipped so
-        // the build script may explain the rule in prose without tripping it.
+        // forEach loops asserted above. `implementation(`, `add("implementation", ...)`,
+        // `debugImplementation(` and `debugApi(` all fail it, which the previous prefix match let
+        // through (V02-008 verifier note). It is a line filter, not a parser: a string-invoked
+        // `"implementation"(...)`, a declaration split across lines, or the right spelling inside
+        // the WRONG loop all pass it (measured by the delta verifier). Those land in the APK and
+        // fail the packaged-APK boundary check, which is the gate this task rests on; this test is
+        // the fast one that names the line. Comment lines are skipped so the build script may
+        // explain the rule in prose without tripping it.
         val engineMarkers = listOf("libs.maplibre", "org.maplibre", "play-services-maps")
         val dependencyShapes = listOf("add(", "implementation(", "api(", "compileOnly(", "runtimeOnly(")
         val offenders = moduleScript.lines()
