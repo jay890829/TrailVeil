@@ -106,10 +106,14 @@ private fun readGooglePocKeyConfiguration(): GooglePocKeyBuildConfiguration {
             propertiesFile.inputStream().use(::load)
         }
         val key = properties.getProperty("debugApiKey")?.trim()
+        // An empty value is not a configured fingerprint. `Properties.load` returns "" for a
+        // `debugApiKeySha256=` line, which the README's own template shows, so without this the
+        // documented file would resolve INVALID_KEY and compile the sentinel over a good key.
         val expectedFingerprint = properties
             .getProperty("debugApiKeySha256")
             ?.trim()
             ?.lowercase()
+            ?.takeIf(String::isNotEmpty)
         when {
             key.isNullOrEmpty() -> GooglePocKeyBuildConfiguration(
                 key = null,
