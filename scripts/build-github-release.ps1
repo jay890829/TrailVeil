@@ -255,25 +255,30 @@ try {
         }
     }
 
-    # V02-008: refuse a googlePoc output explicitly. Only the OpenFreeMap (MapLibre) variant is
+    # V02-008: refuse a Google output explicitly. Only the OpenFreeMap (MapLibre) variant is
     # published; a Google APK is built by whoever supplies the key and must never reach a release.
     # Three independent places a key or the Maps SDK would show: the merged manifest's key marker,
     # the dex package list, and the string resource the key is compiled into.
+    #
+    # There are two Google build types now - googlePoc and the release-configured googleRelease -
+    # and every check below is on what the APK CONTAINS, so neither is named and neither can slip
+    # past by being the one that was not thought of. The BuildConfig audit above already pins
+    # BUILD_TYPE to "release", which refuses both by a fourth, independent route.
     $manifestXml = @(Invoke-CheckedNative -FilePath $apkanalyzer `
         -ArgumentList @('manifest', 'print', $candidateApk) `
         -Description 'Release manifest provider audit') -join "`n"
     if ($manifestXml -match 'com\.google\.android\.geo\.API_KEY') {
-        throw 'Refusing to release: the candidate APK declares the Google Maps API-key marker (a googlePoc output).'
+        throw 'Refusing to release: the candidate APK declares the Google Maps API-key marker, so it is a Google build.'
     }
     if ($manifestXml -match 'app\.trailveil\.googlepoc\.') {
-        throw 'Refusing to release: the candidate APK carries the Google PoC components (a googlePoc output).'
+        throw 'Refusing to release: the candidate APK carries the Google PoC components, so it is a Google build.'
     }
     $dexPackages = @(Invoke-CheckedNative -FilePath $apkanalyzer `
         -ArgumentList @('dex', 'packages', $candidateApk) `
         -Description 'Release dex package audit')
     $googleMapsPackages = @($dexPackages | Where-Object { $_ -match '\bcom\.google\.android\.gms\.maps\b' })
     if ($googleMapsPackages.Count -ne 0) {
-        throw 'Refusing to release: the candidate APK packages the Google Maps SDK (a googlePoc output).'
+        throw 'Refusing to release: the candidate APK packages the Google Maps SDK, so it is a Google build.'
     }
     $mapLibrePackages = @($dexPackages | Where-Object { $_ -match '\borg\.maplibre\.android\b' })
     if ($mapLibrePackages.Count -eq 0) {
@@ -318,7 +323,7 @@ try {
     $resources = @(Invoke-CheckedNative -FilePath $aapt2 `
         -ArgumentList @('dump', 'resources', $candidateApk) -Description 'Release resource audit')
     $resourceText = $resources -join "`n"
-    # V02-008, the third place: the googlePoc build type compiles the key (or its missing-key
+    # V02-008, the third place: both Google build types compile the key (or its missing-key
     # sentinel) into a string resource. Neither the resource nor a key-shaped value may exist here.
     foreach ($googleResourceMarker in 'trailveil_google_maps_poc_api_key', 'TRAILVEIL_GOOGLE_MAPS_POC_MISSING_KEY') {
         if ($resourceText.Contains($googleResourceMarker)) {
