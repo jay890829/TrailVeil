@@ -2,6 +2,7 @@ import java.io.File
 import java.nio.file.Files
 import java.security.MessageDigest
 import java.util.Properties
+import java.util.zip.ZipFile
 import javax.xml.parsers.DocumentBuilderFactory
 
 plugins {
@@ -645,6 +646,149 @@ tasks.configureEach {
         dependsOn(verifyGooglePocMergedManifest)
     }
 }
+
+/**
+ * Proves, on the packaged APK, that a variant carries exactly one map provider.
+ *
+ * `V02-008`. The source-scanning boundary tests cannot see this: a Gradle configuration is
+ * invisible to a source scan, and while `implementation(libs.maplibre.opengl)` was unscoped every
+ * source-level assertion passed while the Google APK carried four `libmaplibre.so`, 1657
+ * `Lorg/maplibre/` class descriptors and MapLibre's 76 KB notices. Google Maps Platform Terms
+ * 3.2.3(e) are about what is IN the application, so the assertion belongs on the artifact.
+ *
+ * Every absence is paired with a presence read the same way, so a reader that has gone blind -
+ * wrong file, empty input, a probe that no longer matches anything - fails its own positive control
+ * instead of passing silently.
+ *
+ * Release builds shorten resource paths (`res/raw/maplibre_third_party_notices.txt` becomes
+ * something like `res/Il.txt`), so entry names are checked only for native libraries, which keep
+ * theirs. Everything else is read from the dex bytes, `resources.arsc`, and resource CONTENT.
+ */
+fun registerProviderBoundaryCheck(variant: String, google: Boolean) {
+    val capitalised = variant.replaceFirstChar(Char::uppercase)
+    val apkDirectory = layout.buildDirectory.dir("outputs/apk/$variant")
+    val check = tasks.register("verify${capitalised}ProviderBoundary") {
+        group = "verification"
+        description = "Proves the $variant APK carries exactly one map provider"
+        outputs.upToDateWhen { false }
+        doLast {
+            val apk = apkDirectory.get().asFile.listFiles()
+                ?.singleOrNull { it.isFile && it.extension == "apk" }
+            checkNotNull(apk) {
+                "expected exactly one APK in ${apkDirectory.get().asFile}"
+            }
+            ZipFile(apk).use { zip ->
+                val entries = zip.entries().toList()
+                fun bytesOf(name: String): ByteArray =
+                    entries.single { it.name == name }.let { zip.getInputStream(it).readBytes() }
+
+                val dex = entries.filter { it.name.matches(Regex("""classes\d*\.dex""")) }
+                check(dex.isNotEmpty()) { "$variant APK has no dex; this check would prove nothing" }
+                val dexBytes = dex.map { entry -> zip.getInputStream(entry).readBytes() }
+                fun dexCount(probe: String): Int {
+                    val needle = probe.toByteArray(Charsets.UTF_8)
+                    return dexBytes.sumOf { bytes ->
+                        var found = 0
+                        var index = 0
+                        while (true) {
+                            val at = bytes.indexOfSlice(needle, index)
+                            if (at < 0) break
+                            found++
+                            index = at + 1
+                        }
+                        found
+                    }
+                }
+
+                val nativeLibraries = entries.map { it.name }
+                    .filter { it.startsWith("lib/") }
+                    .map { it.substringAfterLast('/') }
+                    .toSet()
+                val arsc = entries.singleOrNull { it.name == "resources.arsc" }
+                    ?.let { zip.getInputStream(it).readBytes() } ?: ByteArray(0)
+                check(arsc.isNotEmpty()) {
+                    "$variant APK has no resources.arsc; this check would prove nothing"
+                }
+                fun arscNames(probe: String): Boolean =
+                    arsc.indexOfSlice(probe.toByteArray(Charsets.UTF_8)) >= 0
+                val resourceContentNamesMapLibre = entries
+                    .filter { it.name.startsWith("res/") && !it.isDirectory && it.size < 1_000_000 }
+                    .any { entry ->
+                        zip.getInputStream(entry).readBytes()
+                            .indexOfSlice("MapLibre".toByteArray(Charsets.UTF_8)) >= 0
+                    }
+
+                val mapLibreClasses = dexCount("Lorg/maplibre/")
+                val googleMapsClasses = dexCount("Lcom/google/android/gms/maps/")
+                val mapLibreNative = nativeLibraries.any { it.contains("maplibre") }
+
+                if (google) {
+                    // Positive control first: if this reader cannot find the provider that IS
+                    // here, its findings about the one that is not are worthless.
+                    check(googleMapsClasses > 0) {
+                        "$variant APK contains no Google Maps SDK classes, so this reader is blind"
+                    }
+                    check(mapLibreClasses == 0) {
+                        "$variant APK contains $mapLibreClasses MapLibre class references"
+                    }
+                    check(!mapLibreNative) {
+                        "$variant APK packages a MapLibre native library: $nativeLibraries"
+                    }
+                    check(dexCount("tiles.openfreemap.org") == 0) {
+                        "$variant APK contains the OpenFreeMap style URI"
+                    }
+                    check(!arscNames("maplibre")) {
+                        "$variant APK's resource table names a MapLibre resource"
+                    }
+                    check(!resourceContentNamesMapLibre) {
+                        "$variant APK packages a resource whose content names MapLibre"
+                    }
+                } else {
+                    check(mapLibreClasses > 0) {
+                        "$variant APK contains no MapLibre classes, so this reader is blind"
+                    }
+                    check(mapLibreNative) {
+                        "$variant APK packages no MapLibre native library, so this reader is blind"
+                    }
+                    check(googleMapsClasses == 0) {
+                        "$variant APK contains $googleMapsClasses Google Maps SDK class references"
+                    }
+                    check(dexCount("com.google.android.geo.API_KEY") == 0) {
+                        "$variant APK names the Google Maps API-key marker"
+                    }
+                    // The value is never printed, only its presence.
+                    val keyShaped = Regex("""AIza[A-Za-z0-9_-]{35}""")
+                    check(!keyShaped.containsMatchIn(String(arsc, Charsets.ISO_8859_1))) {
+                        "$variant APK's resource table contains a Google API key-shaped string"
+                    }
+                }
+                logger.lifecycle(
+                    "$variant provider boundary: maplibreClasses=$mapLibreClasses " +
+                        "googleMapsClasses=$googleMapsClasses maplibreNative=$mapLibreNative",
+                )
+            }
+        }
+    }
+    tasks.configureEach {
+        if (name == "assemble$capitalised") {
+            finalizedBy(check)
+        }
+    }
+}
+
+fun ByteArray.indexOfSlice(needle: ByteArray, from: Int = 0): Int {
+    if (needle.isEmpty() || needle.size > size) return -1
+    outer@ for (start in from..(size - needle.size)) {
+        for (offset in needle.indices) {
+            if (this[start + offset] != needle[offset]) continue@outer
+        }
+        return start
+    }
+    return -1
+}
+
+openFreeMapBuildTypes.forEach { variant -> registerProviderBoundaryCheck(variant, google = false) }
+googleBuildTypes.forEach { variant -> registerProviderBoundaryCheck(variant, google = true) }
 
 val instrumentationTestManifest = layout.projectDirectory.file(
     "src/androidTest/instrumentation-test-manifest.txt",
