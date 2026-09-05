@@ -90,6 +90,7 @@ import org.junit.runner.RunWith
 import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.camera.CameraPosition
 import org.maplibre.android.geometry.LatLng
+import org.maplibre.android.gestures.StandardScaleGestureDetector
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
 import org.maplibre.android.style.layers.Property
@@ -4073,7 +4074,8 @@ class MapSurfaceTest {
             }
             if (expectZoomIn) {
                 assertTrue(
-                    "The gesture did not zoom in, so this measured nothing " +
+                    "The gesture zoomed in by only ${endZoom - startCameraZoom} levels against " +
+                        "the $minimumZoomChange this case requires, so this measured nothing " +
                         "(start=$startCameraZoom end=$endZoom)",
                     endZoom - startCameraZoom >= minimumZoomChange,
                 )
@@ -4086,7 +4088,8 @@ class MapSurfaceTest {
                 }
             } else if (expectZoomOut) {
                 assertTrue(
-                    "The gesture did not zoom out, so this measured nothing " +
+                    "The gesture zoomed out by only ${startCameraZoom - endZoom} levels against " +
+                        "the $minimumZoomChange this case requires, so this measured nothing " +
                         "(start=$startCameraZoom end=$endZoom)",
                     startCameraZoom - endZoom >= minimumZoomChange,
                 )
@@ -4267,10 +4270,27 @@ class MapSurfaceTest {
             PinchSpanEdge.SHORTEST -> PINCH_END_SPAN_FRACTION
             PinchSpanEdge.TALLEST -> LONG_PINCH_END_SPAN_FRACTION
         }
-        val startSpan = shorterEdge *
-            if (zoomIn) closeSpanFraction else openSpanFraction
-        val endSpan = shorterEdge *
-            if (zoomIn) openSpanFraction else closeSpanFraction
+        // Fingers closer than MapLibre's minimum span are not a gesture at all: the gestures
+        // library discards those events before its scale detector sees them, so any travel the
+        // stream spends below that line moves nothing. Measured on the CI geometry: the old tall
+        // sweep's last move (43 px) left the camera exactly where the move before it (104 px) did.
+        // The tall path therefore ends just above the floor, resolved from the same display
+        // metrics the library resolves it from, so every audited move is live travel.
+        val minAnalysedSpan = android.util.TypedValue.applyDimension(
+            android.util.TypedValue.COMPLEX_UNIT_MM,
+            MAPLIBRE_GESTURE_MIN_SPAN_MM,
+            view.resources.displayMetrics,
+        )
+        val closeSpan = when (spanEdge) {
+            PinchSpanEdge.SHORTEST -> shorterEdge * closeSpanFraction
+            PinchSpanEdge.TALLEST -> maxOf(
+                shorterEdge * closeSpanFraction,
+                minAnalysedSpan * LONG_PINCH_END_SPAN_ABOVE_FLOOR,
+            )
+        }
+        val openSpan = shorterEdge * openSpanFraction
+        val startSpan = if (zoomIn) closeSpan else openSpan
+        val endSpan = if (zoomIn) openSpan else closeSpan
         val zoomAtTouchDown = map.cameraPosition.zoom
 
         // Every event in the stream is built the same way, including the first and the last. A
@@ -4311,6 +4331,21 @@ class MapSurfaceTest {
             )
         }
 
+        // The move on which MapLibre's scale listener accepts the gesture is the base every later
+        // move telescopes from, so it fixes how much travel this stream can deliver. MapLibre
+        // reports that move to [MapLibreMap.OnScaleListener.onScaleBegin] with its span; capture it
+        // so a begin that slipped under load is detected and retried rather than measured.
+        val beginSpan = java.util.concurrent.atomic.AtomicReference<Float?>(null)
+        val beginListener = object : MapLibreMap.OnScaleListener {
+            override fun onScaleBegin(detector: StandardScaleGestureDetector) {
+                beginSpan.compareAndSet(null, detector.currentSpan)
+            }
+
+            override fun onScale(detector: StandardScaleGestureDetector) = Unit
+            override fun onScaleEnd(detector: StandardScaleGestureDetector) = Unit
+        }
+        composeRule.runOnUiThread { map.addOnScaleListener(beginListener) }
+
         var currentSpan = startSpan
         var streamEnded = false
         try {
@@ -4334,11 +4369,18 @@ class MapSurfaceTest {
         // Engagement first, with nothing measured. An attempt that never reaches MapLibre's scale
         // detector is abandoned here, so a restarted pinch cannot contribute a frame — and the
         // frames that are measured all belong to one gesture over one installed overlay.
-        // Engage with the inward travel already proven by the ordinary pinch. Expanding the tall
+        // Engage inward, the direction already proven by the ordinary pinch. Expanding the tall
         // stream first let the move detector own all four attempts on API 36, while a five-percent
         // inward probe remained below its effective touch slop. The >=4.0 zoom assertion remains
         // the authority on whether the tall stream leaves enough measured travel afterwards.
-        val engageSpan = startSpan + (endSpan - startSpan) * PINCH_ENGAGE_TRAVEL
+        // The tall path engages in gentler steps: the closer the begin move sits to the opened
+        // span, the more of the sweep is delivered. The ordinary pinch keeps its travel - its
+        // engage speed is 1.75 px/ms against MapLibre's 1.575 px/ms begin gate and cannot shrink.
+        val engageTravel = when (spanEdge) {
+            PinchSpanEdge.SHORTEST -> PINCH_ENGAGE_TRAVEL
+            PinchSpanEdge.TALLEST -> LONG_PINCH_ENGAGE_TRAVEL
+        }
+        val engageSpan = startSpan + (endSpan - startSpan) * engageTravel
         repeat(PINCH_ENGAGE_MOVES) { move ->
             val span = startSpan + (engageSpan - startSpan) * (move + 1) / PINCH_ENGAGE_MOVES
             send(MotionEvent.ACTION_MOVE, 2, span, SystemClock.uptimeMillis())
@@ -4363,12 +4405,30 @@ class MapSurfaceTest {
             Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
             return false
         }
+        if (spanEdge == PinchSpanEdge.TALLEST) {
+            // MapLibre never begins on the first move - the gestures library latches its start
+            // span there - and begins on the second unless that move arrived slower than
+            // 0.6 dp/ms, which one delayed injection under a loaded runner is enough to cause.
+            // Then it begins on the third, the base drops by one step, and every level this
+            // stream delivers is short by the same ratio: 4.046 became 3.988 against a 4.0 floor,
+            // five times on the hosted `map-0` shard. A slipped begin is a stream that cannot
+            // deliver what its geometry promises, so it is retried, not measured.
+            val earliestBeginSpan = startSpan + (engageSpan - startSpan) * 2 / PINCH_ENGAGE_MOVES
+            val began = beginSpan.get()?.div(DETECTOR_SPAN_PER_POINTER_DISTANCE)
+            if (began == null || began < earliestBeginSpan - BEGIN_SPAN_TOLERANCE_PX) {
+                lift(engageSpan)
+                streamEnded = true
+                Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+                return false
+            }
+        }
         onEngaged?.invoke()
 
-        // The tall stream spends enough inward travel to engage reliably that only about 3.7
-        // levels remain. Once the scale detector owns the uninterrupted stream, reopen to the
-        // original span and use the whole inward path for the per-move audit. These setup moves
-        // stay near zoom 16, inside the already-proven surround; every move of the acceptance path
+        // Once the scale detector owns the uninterrupted stream, reopen to the original span and
+        // use the whole inward path for the per-move audit. Reopening costs nothing: every move
+        // after begin telescopes, so the delivered travel is fixed by the span at begin and the
+        // last span the detector analyses, not by the path between them. These setup moves stay
+        // near zoom 16, inside the already-proven surround; every move of the acceptance path
         // from the reopened span to [endSpan] is still audited below.
         currentSpan = engageSpan
             val measuredStartSpan = if (spanEdge == PinchSpanEdge.TALLEST) {
@@ -4401,6 +4461,7 @@ class MapSurfaceTest {
             streamEnded = true
             return true
         } finally {
+            composeRule.runOnUiThread { map.removeOnScaleListener(beginListener) }
             if (!streamEnded) {
                 // A failure can occur before POINTER_DOWN or after POINTER_UP. Probe both legal
                 // stuck states instead of assuming that two pointers are still down.
@@ -9203,8 +9264,51 @@ class MapSurfaceTest {
 
         const val PINCH_START_SPAN_FRACTION = 0.75f
         const val PINCH_END_SPAN_FRACTION = 0.06f
-        const val LONG_PINCH_START_SPAN_FRACTION = 0.82f
+        /**
+         * How far apart the long pinch opens, as a fraction of the tall edge.
+         *
+         * With [MAPLIBRE_GESTURE_MIN_SPAN_MM] this fixes how many zoom levels the gesture can
+         * deliver at all. MapLibre applies `ln(span / previousSpan) / ln(pi/2) x 0.65` per analysed
+         * move, which telescopes to `1.439 x ln(span at begin / last analysed span)`. At 0.82 the
+         * begin span was 1733 px on the CI geometry and the last analysed span 104 px, a ceiling
+         * of 4.046 levels - 0.046 above the 4.0 the long-pinch cases require - and one
+         * load-dependent step inside that gap took the `map-0` shard red five times. At 0.90 the
+         * begin span is ~1979 px and the sweep ends just above the floor, for ~4.17. The pointers
+         * open at 0.0725 and 0.9275 of the view height, clear of the edge slop.
+         */
+        const val LONG_PINCH_START_SPAN_FRACTION = 0.90f
+
+        /** A lower bound only; the tall path never sends fingers closer than the detector's floor. */
         const val LONG_PINCH_END_SPAN_FRACTION = 0.019f
+
+        /**
+         * `mapbox_internalMinSpan24` in `maplibre-android-gestures` 0.0.4: two fingers closer than
+         * this are not a gesture, and `MultiFingerGesture` drops the event before the scale
+         * detector sees it. Resolved through [android.util.TypedValue] from the view's display
+         * metrics, exactly as the library resolves it, so the floor lands where the library's does
+         * on any density (99.2 px at 420 dpi).
+         */
+        const val MAPLIBRE_GESTURE_MIN_SPAN_MM = 6f
+
+        /** The tall sweep ends this far above the floor, so its last move is analysed, not dropped. */
+        const val LONG_PINCH_END_SPAN_ABOVE_FLOOR = 1.10f
+
+        /**
+         * What `StandardScaleGestureDetector.currentSpan` reports per pixel between two fingers.
+         * `analyzeMovement` sums each pointer's distance from the focal point, doubles it, and
+         * takes the hypotenuse; the focal point is the pointers' mean, so two fingers `d` apart
+         * read as `2d`. The tall path's begin geometry is in finger distance, so the reported span
+         * is divided by this before the comparison. Confirmed on the trace: a begin on the second
+         * engage move at 1979 px reported 3958.
+         */
+        const val DETECTOR_SPAN_PER_POINTER_DISTANCE = 2f
+
+        /**
+         * Slack on the begin-span check, in pixels. The engage moves are ~36 px apart, so a begin
+         * one move late reads ~36 px low; half a pixel separates float rounding from that.
+         */
+        const val BEGIN_SPAN_TOLERANCE_PX = 0.5f
+
         /**
          * How many times a pinch may be started over before the test gives up. Injected two-finger
          * streams do not always reach MapLibre's scale detector — about one attempt in three ends
@@ -9315,6 +9419,13 @@ class MapSurfaceTest {
         const val PINCH_ENGAGE_MOVES = 8
         const val PINCH_REOPEN_MOVES = 8
         const val PINCH_ENGAGE_TRAVEL = 0.30f
+
+        /**
+         * The tall path's engage travel. Smaller steps put the begin move nearer the opened span,
+         * which is where the delivered travel comes from; 0.15 over eight moves is ~36 px per
+         * 16 ms step on the CI geometry, 2.3 px/ms against the 1.575 px/ms begin gate.
+         */
+        const val LONG_PINCH_ENGAGE_TRAVEL = 0.15f
         const val MINIMUM_PINCH_ENGAGEMENT = 0.03
         const val PINCH_RETRY_SETTLE_MILLIS = 2_500L
         const val QUICK_ZOOM_TRAVEL_FRACTION = 0.45f
