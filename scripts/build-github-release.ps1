@@ -60,6 +60,15 @@ function Assert-NativeHelperContract {
 
 $repositoryRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $distributionDirectory = Join-Path $repositoryRoot 'app/build/github-release'
+# V02-008: the Google variant is built by whoever holds a key and is never published, because a
+# built Google APK carries that key uncompressed in resources.arsc. Gradle writes every variant's
+# APK under app/build/outputs/apk/, so the directory this script hands to a release upload must
+# never be that tree or anything inside it.
+$gradleApkOutputRoot = [System.IO.Path]::GetFullPath((Join-Path $repositoryRoot 'app/build/outputs'))
+$distributionFullPath = [System.IO.Path]::GetFullPath($distributionDirectory)
+if ($distributionFullPath.StartsWith($gradleApkOutputRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+    throw "Refusing to distribute from the Gradle output tree: $distributionFullPath"
+}
 # A failed or dirty invocation must not leave a prior candidate looking current.
 if (Test-Path -LiteralPath $distributionDirectory) {
     $priorReadyMarker = Join-Path $distributionDirectory 'RELEASE-READY.txt'
@@ -246,6 +255,31 @@ try {
         }
     }
 
+    # V02-008: refuse a googlePoc output explicitly. Only the OpenFreeMap (MapLibre) variant is
+    # published; a Google APK is built by whoever supplies the key and must never reach a release.
+    # Three independent places a key or the Maps SDK would show: the merged manifest's key marker,
+    # the dex package list, and the string resource the key is compiled into.
+    $manifestXml = @(Invoke-CheckedNative -FilePath $apkanalyzer `
+        -ArgumentList @('manifest', 'print', $candidateApk) `
+        -Description 'Release manifest provider audit') -join "`n"
+    if ($manifestXml -match 'com\.google\.android\.geo\.API_KEY') {
+        throw 'Refusing to release: the candidate APK declares the Google Maps API-key marker (a googlePoc output).'
+    }
+    if ($manifestXml -match 'app\.trailveil\.googlepoc\.') {
+        throw 'Refusing to release: the candidate APK carries the Google PoC components (a googlePoc output).'
+    }
+    $dexPackages = @(Invoke-CheckedNative -FilePath $apkanalyzer `
+        -ArgumentList @('dex', 'packages', $candidateApk) `
+        -Description 'Release dex package audit')
+    $googleMapsPackages = @($dexPackages | Where-Object { $_ -match '\bcom\.google\.android\.gms\.maps\b' })
+    if ($googleMapsPackages.Count -ne 0) {
+        throw 'Refusing to release: the candidate APK packages the Google Maps SDK (a googlePoc output).'
+    }
+    $mapLibrePackages = @($dexPackages | Where-Object { $_ -match '\borg\.maplibre\.android\b' })
+    if ($mapLibrePackages.Count -eq 0) {
+        throw 'Refusing to release: the candidate APK does not package MapLibre, so it is not the OpenFreeMap variant.'
+    }
+
     $permissions = @(Invoke-CheckedNative -FilePath $apkanalyzer `
         -ArgumentList @('manifest', 'permissions', $candidateApk) `
         -Description 'Release permission audit') | Sort-Object -Unique
@@ -284,6 +318,16 @@ try {
     $resources = @(Invoke-CheckedNative -FilePath $aapt2 `
         -ArgumentList @('dump', 'resources', $candidateApk) -Description 'Release resource audit')
     $resourceText = $resources -join "`n"
+    # V02-008, the third place: the googlePoc build type compiles the key (or its missing-key
+    # sentinel) into a string resource. Neither the resource nor a key-shaped value may exist here.
+    foreach ($googleResourceMarker in 'trailveil_google_maps_poc_api_key', 'TRAILVEIL_GOOGLE_MAPS_POC_MISSING_KEY') {
+        if ($resourceText.Contains($googleResourceMarker)) {
+            throw "Refusing to release: the candidate APK compiles the Google Maps key resource ($googleResourceMarker)."
+        }
+    }
+    if ($resourceText -match 'AIza[A-Za-z0-9_-]{35}') {
+        throw 'Refusing to release: the candidate APK contains a Google API key-shaped string.'
+    }
     $noticeEntryMatch = [regex]::Match(
         $resourceText,
         'raw/maplibre_third_party_notices[\s\S]*?\(file\)\s+(\S+)'
@@ -352,6 +396,8 @@ try {
         "internalVersionCode=$($internalVersionCode[0].Trim())",
         "abis=$($abis -join ',')",
         "maplibreAndroidNoticeSha256=$packagedNoticeDigest",
+        'provider=openfreemap',
+        'googleMapsMarkers=absent',
         'permissions:'
     ) + ($permissions | ForEach-Object { "  $_" })
     [IO.File]::WriteAllLines(

@@ -121,9 +121,13 @@ private fun readGooglePocKeyConfiguration(): GooglePocKeyBuildConfiguration {
                 reason = GooglePocKeyBuildReason.INVALID_KEY,
             )
 
-            expectedFingerprint == null ||
+            // `V02-008`: the fingerprint is a typo self-check for whoever wrote the file, not a
+            // second secret. Every builder supplies their own key, so requiring each of them to
+            // hash it would be friction without a safety gain; it is enforced only when present.
+            expectedFingerprint != null && (
                 !googlePocKeyFingerprintPattern.matches(expectedFingerprint) ||
-                key.sha256Hex() != expectedFingerprint -> GooglePocKeyBuildConfiguration(
+                    key.sha256Hex() != expectedFingerprint
+                ) -> GooglePocKeyBuildConfiguration(
                 key = null,
                 reason = GooglePocKeyBuildReason.INVALID_KEY,
             )
@@ -156,12 +160,12 @@ private fun googlePocKeyGuidance(configuration: GooglePocKeyBuildConfiguration):
 ) {
     GooglePocKeyBuildReason.VALID -> ""
     GooglePocKeyBuildReason.MISSING_KEY ->
-        "Add debugApiKey and debugApiKeySha256 to ~/.trailveil/maps/google-maps.properties, or set " +
-            "TRAILVEIL_GOOGLE_MAPS_PROPERTIES to an absolute external properties file."
+        "Add debugApiKey to ~/.trailveil/maps/google-maps.properties (debugApiKeySha256 is " +
+            "optional), or set TRAILVEIL_GOOGLE_MAPS_PROPERTIES to an absolute external properties file."
 
     GooglePocKeyBuildReason.INVALID_KEY ->
-        "debugApiKey is invalid or does not match debugApiKeySha256. " +
-            "Use an external file and rebuild the googlePoc variant."
+        "debugApiKey is not a Google API key, or it does not match the debugApiKeySha256 you " +
+            "configured. Fix the external file and rebuild the googlePoc variant."
 
     GooglePocKeyBuildReason.CONFIG_PATH_NOT_ABSOLUTE ->
         "TRAILVEIL_GOOGLE_MAPS_PROPERTIES must be an absolute path outside this repository."
@@ -422,6 +426,11 @@ val mergedManifestFiles = mapOf(
         "intermediates/merged_manifests/googlePoc/processGooglePocManifest/AndroidManifest.xml",
     ),
 )
+// The key's one sink. The manifest keeps the `@string` reference; this generated resource holds
+// the value aapt links into resources.arsc, so it is the file that proves what a build resolved.
+val googlePocKeyResValues = layout.buildDirectory.file(
+    "generated/res/resValues/googlePoc/values/gradleResValues.xml",
+)
 val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifest") {
     group = "verification"
     description = "Proves Google Maps markers exist only in the isolated googlePoc manifest"
@@ -430,13 +439,50 @@ val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifes
         "processInternalManifest",
         "processReleaseManifest",
         "processGooglePocManifest",
+        "generateGooglePocResValues",
     )
     inputs.files(mergedManifestFiles.values)
+    inputs.file(googlePocKeyResValues)
     outputs.upToDateWhen { false }
+    val keyReason = googlePocKeyConfiguration.reason
     doLast {
         val googleManifest = mergedManifestFiles.getValue("googlePoc").get().asFile.readText()
         check("com.google.android.geo.API_KEY" in googleManifest) {
             "googlePoc merged manifest is missing the Google Maps API-key marker"
+        }
+        check("android:value=\"@string/trailveil_google_maps_poc_api_key\"" in googleManifest) {
+            "googlePoc merged manifest does not bind the key marker to the generated key resource"
+        }
+        // `V02-008` (c): assert the VALUE the build resolved, so a keyless build is proven keyless
+        // rather than assumed keyless because the runner happened to hold no key. The sentinel
+        // must be there when no valid key was configured, and a key-shaped, non-sentinel value
+        // when one was. The value itself is never printed, on either branch.
+        val resValues = googlePocKeyResValues.get().asFile.readText()
+        val keyResource = Regex(
+            """<string\b[^>]*\bname="trailveil_google_maps_poc_api_key"[^>]*>([^<]*)</string>""",
+        ).find(resValues)
+        checkNotNull(keyResource) {
+            "googlePoc resValues do not define trailveil_google_maps_poc_api_key"
+        }
+        val resolvedValue = keyResource.groupValues[1]
+        // The reason is safe to print and worth printing: a CI log then shows that the keyless
+        // job really resolved MISSING_KEY. The value never is, on any branch.
+        logger.lifecycle(
+            "googlePoc key resolved as ${keyReason.name} " +
+                (if (resolvedValue == googlePocMissingKeySentinel) "(sentinel)" else "(key-shaped)"),
+        )
+        if (keyReason == GooglePocKeyBuildReason.VALID) {
+            check(
+                resolvedValue != googlePocMissingKeySentinel &&
+                    googlePocKeyPattern.matches(resolvedValue),
+            ) {
+                "googlePoc key resource does not hold a key although the key reason is VALID"
+            }
+        } else {
+            check(resolvedValue == googlePocMissingKeySentinel) {
+                "googlePoc key resource is not the missing-key sentinel although the key reason " +
+                    "is ${keyReason.name}"
+            }
         }
         // `V02-005` stage 2 inverted this block: the production MainActivity IS the googlePoc
         // launcher now, and the PoC Activity must remain present but never launchable.

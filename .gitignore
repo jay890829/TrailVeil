@@ -39,6 +39,12 @@ internal-signing-fingerprint.*
 internal-signing-custody.*
 internal-signing-recovery.*
 **/google-maps.properties
+# V02-008: common names for secret carriers; none of these is a TrailVeil input today, and the
+# only key the build reads lives outside the checkout, so a copy here can only be a mistake.
+secrets.properties
+.env
+.env.*
+google-services.json
 
 # Local device-capture helpers for a specific investigation; never part of the product.
 capture-p4-029.ps1

@@ -18,7 +18,7 @@ The development requirements and current limitations are summarized below.
 
 ## Map providers, terms and data
 
-TrailVeil draws its basemap with one of two providers. The shipped `debug`, `internal` and `release` builds use MapLibre Native with the OpenFreeMap Liberty style; the `googlePoc` build uses the Google Maps SDK for Android. The planned end state is dual-provider: Google by default with OpenFreeMap as the automatic fallback and as a deliberate choice, never both on one screen. Whichever provider is active, TrailVeil app code never transmits stored tracks, history or precise coordinates; the basemap provider necessarily receives requests for the map area being viewed. The in-app disclosure (the first-run sheet and the "Privacy and data" menu entry) names the active provider and the terms below.
+TrailVeil draws its basemap with one of two providers. The shipped `debug`, `internal` and `release` builds use MapLibre Native with the OpenFreeMap Liberty style; the `googlePoc` build uses the Google Maps SDK for Android. The decided end state is two provider-exclusive builds of the same application - a Google build and an OpenFreeMap build - installed one over the other (same application ID and signer, so history and preferences survive the switch), never both on one screen and with no in-app switch. Only the OpenFreeMap build is published as a release APK; the Google build is built by whoever supplies a Google Maps key (see [Google Maps key](#google-maps-key)). Whichever provider is active, TrailVeil app code never transmits stored tracks, history or precise coordinates; the basemap provider necessarily receives requests for the map area being viewed. The in-app disclosure (the first-run sheet and the "Privacy and data" menu entry) names the active provider and the terms below.
 
 ### Google Maps build
 
@@ -149,3 +149,27 @@ The pinned public certificate SHA-256 is `307963f32352e6565889982c2b6021af960c94
 The Android package identity is `app.trailveil` and is independent of the repository owner's account name. Keep the key-custody/recovery record outside Git with the protected key backup; publish only the certificate fingerprint.
 
 GitHub Actions is configured to run the equivalent debug build, lint, and JVM checks on JDK 17 with SDK Platform 37.0 and Build Tools 36.0.0, plus the instrumentation suite on an API 36 emulator. App-signing material is intentionally not available to CI; release APKs are built locally and only the signed public artifact is uploaded to GitHub Releases.
+
+## Google Maps key
+
+Only the OpenFreeMap build is published: it needs no key. The Google Maps build (the `googlePoc` build type) compiles a Google Maps API key into its resources, so whoever builds it supplies their own key, and no prebuilt Google APK is published - a built Google APK carries the key uncompressed in `resources.arsc`. Gradle reads the key at configuration time from a properties file outside the repository. By default:
+
+```text
+~/.trailveil/maps/google-maps.properties
+```
+
+Set `TRAILVEIL_GOOGLE_MAPS_PROPERTIES` to an absolute path outside the checkout to use another file. The file contains:
+
+```properties
+# Required: an Android Maps SDK key, 39 characters starting with AIza.
+debugApiKey=replace-with-your-own-key
+# Optional typo self-check: the lowercase hex SHA-256 of the key text. Enforced only when present.
+debugApiKeySha256=
+```
+
+In Google Cloud, restrict the key to Android apps with package name `app.trailveil` and the SHA-1 of the certificate that signs your build (the debug certificate for `googlePoc`). The key is a build input by construction: the Maps SDK resolves it from a compiled resource, so there is no runtime entry and nothing in the app ever asks for it.
+
+The build never fails for lack of a key; it fails closed. With no file, an unreadable file, a relative override path, a file inside the repository, a malformed key, or a fingerprint that does not match, the sentinel `TRAILVEIL_GOOGLE_MAPS_POC_MISSING_KEY` is compiled instead, `BuildConfig.GOOGLE_MAPS_POC_KEY_CONFIGURED` is `false` with the reason in `GOOGLE_MAPS_POC_KEY_REASON`, and the map slot shows the provider-unavailable surface while recording and history keep working. `verifyGooglePocMergedManifest` asserts that resolution on every googlePoc assembly - the sentinel when no valid key was configured, a key-shaped value when one was - and the hosted "Google PoC keyless build" job runs it with no key anywhere.
+
+Never commit the properties file (the repository ignores `**/google-maps.properties`, `secrets.properties`, `.env` and `google-services.json` as defense in depth), and never publish a built Google APK. `scripts/build-github-release.ps1` refuses any candidate that carries the Google Maps key marker, the Maps SDK or the key resource, and distributes only from a directory outside Gradle's output tree.
+
