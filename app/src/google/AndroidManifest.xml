@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    `V02-008`: the manifest every Google build type needs, and nothing else.
+
+    A build type contributes exactly one manifest, so the harness build type cannot merge this file
+    AND its own; `src/googlePoc/AndroidManifest.xml` therefore repeats these entries and adds the
+    two harness Activities. That repetition is guarded rather than trusted:
+    `verifyGooglePocMergedManifest` asserts every entry below on EVERY Google variant's merged
+    manifest, so the two files cannot drift apart without a build failure that names the missing
+    entry.
+-->
+<manifest
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <application>
+        <uses-library
+            android:name="org.apache.http.legacy"
+            android:required="false" />
+        <meta-data
+            android:name="com.google.android.geo.API_KEY"
+            android:value="@string/trailveil_google_maps_poc_api_key" />
+        <provider
+            android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data
+                android:name="app.trailveil.map.GoogleMapWarmup"
+                android:value="androidx.startup" />
+        </provider>
+    </application>
+</manifest>

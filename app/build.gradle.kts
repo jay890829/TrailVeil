@@ -462,14 +462,22 @@ android {
             getByName("test${variant.replaceFirstChar(Char::uppercase)}")
                 .kotlin.srcDir("src/testMapLibre/java")
         }
-        // `V02-008`: the Google variants share one source tree and one manifest overlay. The
-        // release-configured one is a second build type rather than a copy of the sources, so the
-        // build that ships and the build the instrumentation suites drive cannot drift apart.
+        // `V02-008`: the Google variants share one production source tree, so the build that
+        // ships and the build the instrumentation suites drive cannot drift apart.
         googleBuildTypes.forEach { variant ->
-            getByName(variant).kotlin.srcDir("src/googlePoc/java")
-            getByName(variant).res.srcDir("src/googlePoc/res")
-            getByName(variant).manifest.srcFile("src/googlePoc/AndroidManifest.xml")
+            getByName(variant).kotlin.srcDir("src/google/java")
+            getByName(variant).res.srcDir("src/google/res")
         }
+        // The de-launchered engineering harness - the PoC Activity, the surface test host and the
+        // stage-3 spike seams - is compiled into the harness build type ALONE, so a
+        // release-configured Google build carries neither the code nor its diagnostic strings.
+        // Each build type contributes exactly one manifest, which is why the harness one repeats
+        // the shared entries rather than merging them; `verifyGooglePocMergedManifest` asserts
+        // every shared entry on every Google variant, so the repetition cannot drift.
+        getByName("googlePoc").kotlin.srcDir("src/googlePoc/java")
+        getByName("googlePoc").res.srcDir("src/googlePoc/res")
+        getByName("googlePoc").manifest.srcFile("src/googlePoc/AndroidManifest.xml")
+        getByName("googleRelease").manifest.srcFile("src/google/AndroidManifest.xml")
     }
 
     compileOptions {
@@ -596,17 +604,35 @@ val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifes
             check("android.intent.category.LAUNCHER" in mainActivity) {
                 "$googleVariant merged manifest does not make MainActivity the launcher"
             }
-            val pocActivity = activityBlocks.singleOrNull {
-                "app.trailveil.googlepoc.GoogleMapsPocActivity" in it
-            }
-            checkNotNull(pocActivity) {
-                "$googleVariant merged manifest lost the retained PoC engineering harness Activity"
-            }
-            check("android.intent.category.LAUNCHER" !in pocActivity) {
-                "the de-launchered PoC Activity regained a launcher intent-filter in $googleVariant"
-            }
-            check("android:exported=\"false\"" in pocActivity) {
-                "the retained PoC Activity must stay unexported in $googleVariant"
+            // `V02-008` split the harness out of the shipped Google sources, so the two Google
+            // variants part company here: the harness build type must still carry the engineering
+            // Activities, and the release-configured one must carry neither. An absence asserted
+            // on one variant and a presence on the other, from the same read.
+            val harnessActivities = listOf(
+                "app.trailveil.googlepoc.GoogleMapsPocActivity",
+                "app.trailveil.map.GoogleMapSurfaceTestActivity",
+            )
+            if (googleVariant == "googlePoc") {
+                harnessActivities.forEach { harnessActivity ->
+                    val block = activityBlocks.singleOrNull { harnessActivity in it }
+                    checkNotNull(block) {
+                        "$googleVariant merged manifest lost the retained engineering Activity " +
+                            harnessActivity
+                    }
+                    check("android.intent.category.LAUNCHER" !in block) {
+                        "$harnessActivity regained a launcher intent-filter in $googleVariant"
+                    }
+                    check("android:exported=\"false\"" in block) {
+                        "$harnessActivity must stay unexported in $googleVariant"
+                    }
+                }
+            } else {
+                harnessActivities.forEach { harnessActivity ->
+                    check(activityBlocks.none { harnessActivity in it }) {
+                        "$googleVariant merged manifest declares the engineering Activity " +
+                            "$harnessActivity, which no release-configured build may carry"
+                    }
+                }
             }
             check("app.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES" !in googleManifest) {
                 "$googleVariant merged manifest unexpectedly exposes the other provider's notices"
@@ -750,6 +776,37 @@ fun registerProviderBoundaryCheck(variant: String, google: Boolean) {
                     // named no alternative at all would satisfy a blanket ban and fail the user.
                     check(arscNames("OpenFreeMap")) {
                         "$variant APK never names the build its failure surfaces point at"
+                    }
+                    // `V02-008`: the engineering harness ships in the harness build type and
+                    // nowhere else. Asserted on the artifact rather than on the source sets,
+                    // because a source split is a claim about where files live and this is the
+                    // claim that actually matters - what a release-configured Google build
+                    // contains. Present on one variant, absent on the other, same reader.
+                    val harnessProbes = listOf(
+                        "GoogleMapsPocActivity",
+                        "GoogleMapSurfaceTestActivity",
+                        "GoogleFogSpikePixelClassifier",
+                        "probeCanonicalSnapshotForTesting",
+                    )
+                    if (variant == "googlePoc") {
+                        harnessProbes.forEach { probe ->
+                            check(dexCount(probe) > 0) {
+                                "$variant APK lost the engineering harness symbol $probe, so " +
+                                    "the absence asserted on the release variant proves nothing"
+                            }
+                        }
+                        check(arscNames("google_poc_map_click")) {
+                            "$variant APK lost the harness diagnostic strings"
+                        }
+                    } else {
+                        harnessProbes.forEach { probe ->
+                            check(dexCount(probe) == 0) {
+                                "$variant APK carries the engineering harness symbol $probe"
+                            }
+                        }
+                        check(!arscNames("google_poc_")) {
+                            "$variant APK carries the harness diagnostic strings"
+                        }
                     }
                 } else {
                     check(mapLibreClasses > 0) {

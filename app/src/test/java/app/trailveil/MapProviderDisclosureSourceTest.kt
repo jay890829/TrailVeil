@@ -23,7 +23,9 @@ class MapProviderDisclosureSourceTest {
 
     @Test
     fun everyProviderSourceSetDefinesTheDisclosureInBothLocales() {
-        for (sourceSet in listOf("mapLibre", "googlePoc")) {
+        // `V02-008`: the Google disclosure lives in `src/google`, shared by both Google build
+        // types. `src/googlePoc` is the harness alone and defines none of these keys.
+        for (sourceSet in listOf("mapLibre", "google")) {
             for (locale in locales) {
                 val strings = stringsOf(sourceSet, locale)
                 for (key in keys) {
@@ -48,7 +50,7 @@ class MapProviderDisclosureSourceTest {
     @Test
     fun theGoogleDisclosureNamesTheDocumentsTheMapsPlatformTermsRequire() {
         for (locale in locales) {
-            val strings = stringsOf("googlePoc", locale)
+            val strings = stringsOf("google", locale)
             assertTrue(strings.getValue("map_provider_disclosure_name").contains("Google"))
             assertTrue(strings.getValue("map_provider_privacy_body").contains("policies.google.com/privacy"))
             assertTrue(strings.getValue("map_provider_terms_body").contains("maps.google.com/help/terms_maps"))

@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- `V02-008`: the retained engineering harness's own copy, compiled into the `googlePoc` build
+     type alone. Diagnostic strings, not product copy: they name build configuration and SDK
+     callbacks, which is exactly why they must not reach a release-configured build. -->
 <resources>
-    <string name="map_loading">正在載入線上底圖…</string>
-    <string name="map_fog_unavailable">探索圖層無法使用，未知區域會保持遮蔽</string>
     <string name="google_poc_loading">正在載入 Google 地圖…</string>
     <string name="google_poc_map_loaded">Google 地圖已載入；拖曳或點按地圖即可觀察回呼。</string>
     <string name="google_poc_camera_gesture_started">相機手勢已開始（原因=%1$d）</string>
@@ -19,16 +20,4 @@
     <string name="google_poc_reason_load_timeout">Google 地圖未在時限內完成載入。</string>
     <string name="google_poc_fallback_without_guidance">Google Maps PoC 無法使用。\n%1$s\n\n探索記錄與歷史資料仍保存在本機，且未受影響。</string>
     <string name="google_poc_fallback_with_guidance">Google Maps PoC 無法使用。\n%1$s\n\n%2$s\n\n探索記錄與歷史資料仍保存在本機，且未受影響。</string>
-    <string name="map_provider_unavailable_missing_key">線上地圖目前無法使用：此版本未設定地圖金鑰。</string>
-    <string name="map_provider_unavailable_invalid_key">線上地圖目前無法使用：此版本的地圖金鑰無效。</string>
-    <string name="map_provider_unavailable_no_network">線上地圖目前無法使用：沒有可用的網際網路連線。</string>
-    <string name="map_provider_unavailable_no_play_services">線上地圖目前無法使用：這台裝置缺少或停用了相容的 Google Play 服務。</string>
-    <string name="map_provider_unavailable_initialization_failure">線上地圖無法啟動。</string>
-    <string name="map_provider_unavailable_load_timeout">線上地圖未在時限內完成載入。</string>
-    <string name="map_provider_unavailable_legacy_renderer">線上地圖無法使用：此裝置僅提供 Google 舊版地圖引擎，無法穩定繪製地圖。</string>
-    <string name="map_provider_unavailable_keyless_build">TrailVeil 的 OpenFreeMap 版本不需要 Google 地圖金鑰，也不需要 Google Play 服務就能顯示地圖：github.com/jay890829/TrailVeil/releases</string>
-    <string name="map_provider_unavailable_reassurance">足跡記錄與探索歷史都保存在這台裝置上，功能不受影響。</string>
-    <string name="map_provider_disclosure_name">Google 地圖</string>
-    <string name="map_provider_privacy_body">此版本顯示的是 Google 地圖。底圖請求會傳送到 Google，並透露你正在瀏覽的大約區域。Maps SDK 也會把裝置資訊（系統版本與型號）、你的 IP 位址、一組假名化的 SDK 識別碼、當機回報，以及拖曳與縮放等地圖操作事件傳送給 Google，由 Google 依其隱私權政策處理（policies.google.com/privacy）。TrailVeil 絕不會把你記錄的路線傳給 Google。地圖載入會計入 TrailVeil 開發者的 Google Cloud 專案與金鑰，而不是你；目前行動 App 的地圖載入免費且不限次數，若日後改變，TrailVeil 必須改變地圖的提供方式，而不是向你收費。</string>
-    <string name="map_provider_terms_body">Google 地圖內容適用 Google 地圖附加服務條款（maps.google.com/help/terms_maps）。地圖上的 Google 標誌是 Google 的出處標示，會一直保持可見。TrailVeil 不使用 Google 帳號、Places 查詢、地圖樣式 ID 或任何廣告 SDK。</string>
 </resources>

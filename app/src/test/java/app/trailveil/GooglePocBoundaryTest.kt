@@ -13,6 +13,41 @@ class GooglePocBoundaryTest {
         assertFalse(manifest.contains("com.google.android.geo.API_KEY"))
     }
 
+    /**
+     * `V02-008`: a build type contributes exactly one manifest, so the harness build type's
+     * manifest repeats the shared Google entries rather than merging them. That duplication is
+     * cheap and legible, but it can drift, so it is asserted rather than trusted: every shared
+     * entry must appear in BOTH files, and the engineering Activities in the harness one alone.
+     * `verifyGooglePocMergedManifest` makes the same claim on the merged manifests AGP produces.
+     */
+    @Test
+    fun bothGoogleManifestsCarryTheSharedEntriesAndOnlyTheHarnessOneCarriesTheHarness() {
+        val shared = File(moduleRoot(), "src/google/AndroidManifest.xml").readText()
+        val harness = File(moduleRoot(), "src/googlePoc/AndroidManifest.xml").readText()
+        listOf(
+            "com.google.android.geo.API_KEY",
+            "android:value=\"@string/trailveil_google_maps_poc_api_key\"",
+            "android:name=\"org.apache.http.legacy\"",
+            "app.trailveil.map.GoogleMapWarmup",
+        ).forEach { entry ->
+            assertTrue("src/google manifest is missing $entry", shared.contains(entry))
+            assertTrue("src/googlePoc manifest is missing $entry", harness.contains(entry))
+        }
+        listOf(
+            ".googlepoc.GoogleMapsPocActivity",
+            ".map.GoogleMapSurfaceTestActivity",
+        ).forEach { harnessActivity ->
+            assertTrue(
+                "src/googlePoc manifest lost $harnessActivity",
+                harness.contains(harnessActivity),
+            )
+            assertFalse(
+                "src/google manifest declares the engineering Activity $harnessActivity",
+                shared.contains(harnessActivity),
+            )
+        }
+    }
+
     @Test
     fun GooglePoCManifestOwnsTheKeyMarkerAndDefersTheLauncherToProduction() {
         val manifest = File(moduleRoot(), "src/googlePoc/AndroidManifest.xml").readText()
@@ -47,16 +82,20 @@ class GooglePocBoundaryTest {
     @Test
     fun googlePoCSourcesContainNoOtherProviderMarkers() {
         // The inverse boundary: near Google content no other basemap may render, so no MapLibre
-        // or OpenFreeMap marker may appear anywhere in the googlePoc source tree, save the one
-        // documented copy element above. The overlay manifest is exempt as a file: `V02-008` moved
-        // the notices meta-data into the MapLibre source set, so this manifest names neither
-        // provider today, but the exemption predates that and is cheaper to keep than to re-earn.
-        val googlePocRoot = File(moduleRoot(), "src/googlePoc")
+        // or OpenFreeMap marker may appear anywhere in EITHER Google source tree, save the one
+        // documented copy element above. `V02-008` split them - `src/google` is the production
+        // half both Google build types compile, `src/googlePoc` the harness half only one does -
+        // and both are scanned, so moving a marker across the split escapes nothing. The overlay
+        // manifests are exempt as files: `V02-008` moved the notices meta-data into the MapLibre
+        // source set, so neither names a provider today, but the exemption predates that and is
+        // cheaper to keep than to re-earn.
+        val googleRoots = listOf("src/google", "src/googlePoc").map { File(moduleRoot(), it) }
         val forbiddenMarkers = listOf("maplibre", "openfreemap")
         val pointerElement = Regex(
             """<string [^>]*name="$keylessBuildPointer"[^>]*>[^<]*</string>""",
         )
-        val offenders = googlePocRoot.walkTopDown()
+        val offenders = googleRoots.asSequence()
+            .flatMap { root -> root.walkTopDown() }
             .filter { file ->
                 file.isFile &&
                     file.extension in setOf("kt", "java", "xml", "json") &&
@@ -73,11 +112,11 @@ class GooglePocBoundaryTest {
                 }
                 forbiddenMarkers
                     .filter { marker -> text.contains(marker, ignoreCase = true) }
-                    .map { marker -> "${file.relativeTo(googlePocRoot)}: $marker" }
+                    .map { marker -> "${file.relativeTo(File(moduleRoot(), "src"))}: $marker" }
             }
             .toList()
 
-        assertTrue("non-Google provider markers leaked into src/googlePoc: $offenders", offenders.isEmpty())
+        assertTrue("non-Google provider markers leaked into the Google trees: $offenders", offenders.isEmpty())
     }
 
     /**
@@ -87,7 +126,7 @@ class GooglePocBoundaryTest {
      */
     @Test
     fun everyLocaleOfTheGoogleVariantNamesTheBuildItPointsAt() {
-        val stringFiles = File(moduleRoot(), "src/googlePoc/res").walkTopDown()
+        val stringFiles = File(moduleRoot(), "src/google/res").walkTopDown()
             .filter { it.isFile && it.name == "strings.xml" }
             .toList()
         assertTrue("no googlePoc string resources found", stringFiles.size >= 2)

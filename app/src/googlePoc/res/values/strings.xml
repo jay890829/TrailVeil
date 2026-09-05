@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- `V02-008`: the retained engineering harness's own copy, compiled into the `googlePoc` build
+     type alone. Diagnostic strings, not product copy: they name build configuration and SDK
+     callbacks, which is exactly why they must not reach a release-configured build. -->
 <resources>
-    <string name="map_loading">Loading the online basemap…</string>
-    <string name="map_fog_unavailable">Exploration overlay unavailable — unknown areas stay hidden</string>
     <string name="google_poc_loading">Loading Google map…</string>
     <string name="google_poc_map_loaded">Google map loaded; pan or tap to observe callbacks.</string>
     <string name="google_poc_camera_gesture_started">Camera gesture started (reason=%1$d)</string>
@@ -19,26 +20,4 @@
     <string name="google_poc_reason_load_timeout">The Google map did not finish loading in time.</string>
     <string name="google_poc_fallback_without_guidance">Google Maps PoC unavailable.\n%1$s\n\nRecording and history remain local and unchanged.</string>
     <string name="google_poc_fallback_with_guidance">Google Maps PoC unavailable.\n%1$s\n\n%2$s\n\nRecording and history remain local and unchanged.</string>
-    <string name="map_provider_unavailable_missing_key">The online map is unavailable: this build has no map key configured.</string>
-    <string name="map_provider_unavailable_invalid_key">The online map is unavailable: this build’s map key is not valid.</string>
-    <string name="map_provider_unavailable_no_network">The online map is unavailable: no validated internet connection.</string>
-    <string name="map_provider_unavailable_no_play_services">The online map is unavailable: compatible Google Play services are missing or disabled on this device.</string>
-    <string name="map_provider_unavailable_initialization_failure">The online map could not start.</string>
-    <string name="map_provider_unavailable_load_timeout">The online map did not finish loading in time.</string>
-    <string name="map_provider_unavailable_legacy_renderer">The online map is unavailable: this device only offers Google’s legacy map renderer, which cannot draw the map reliably.</string>
-    <!-- `V02-008`: every terminal reason that belongs to this provider names the keyless build,
-         which is the only place in this source set allowed to name it - the boundary test exempts
-         this one string element and nothing else, so the note stays marker-free too. The copy
-         deliberately promises nothing about keeping existing data across the switch: the keyless
-         build carries the project's signature and a build of THIS variant carries whichever key
-         its builder supplied, so whether one installs over the other depends on who built this
-         APK, which the copy cannot know. -->
-    <string name="map_provider_unavailable_keyless_build">The TrailVeil OpenFreeMap build draws a map without a Google map key and without Google Play services: github.com/jay890829/TrailVeil/releases</string>
-    <string name="map_provider_unavailable_reassurance">Recording and exploration history stay on this device and keep working.</string>
-    <!-- `V02-006`: the disclosure the shared privacy sheet composes for the active basemap. The
-         two URLs are the ones Google Maps Platform Terms 3.2.2(a) require the application to
-         name; the data list mirrors the Maps SDK for Android Play data disclosure. -->
-    <string name="map_provider_disclosure_name">Google Maps</string>
-    <string name="map_provider_privacy_body">This build shows Google Maps. Basemap requests go to Google and reveal the approximate area being viewed. The Maps SDK also sends Google device details (OS version and model), your IP address, a pseudonymous SDK identifier, crash reports and map-interaction events such as panning and zooming; Google handles them under the Google Privacy Policy (policies.google.com/privacy). TrailVeil never sends your recorded route to Google. Map loads are attributed to the TrailVeil developer\'s Google Cloud project and key, not to you; they are currently free and unlimited for mobile apps, and if that ever changed TrailVeil would have to change how the map is provided rather than charge you.</string>
-    <string name="map_provider_terms_body">Google Maps content is subject to the Google Maps Additional Terms of Service (maps.google.com/help/terms_maps). The Google logo on the map is Google\'s attribution and stays visible. TrailVeil uses no Google account, no Places lookups, no map styling ID and no advertising SDK.</string>
 </resources>

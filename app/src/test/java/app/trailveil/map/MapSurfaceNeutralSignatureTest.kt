@@ -46,7 +46,9 @@ class MapSurfaceNeutralSignatureTest {
         "onFogFailure: (Throwable) -> Unit = {}",
     )
 
-    private val expectedActualDirectories = listOf("mapLibre", "googlePoc")
+    // `V02-008`: the Google actual lives in `src/google`, the tree both Google build types
+    // compile. `src/googlePoc` is the engineering harness and declares no actual.
+    private val expectedActualDirectories = listOf("mapLibre", "google")
 
     @Test
     fun everyExpectedActualExistsAndNoneRemainsInMain() {

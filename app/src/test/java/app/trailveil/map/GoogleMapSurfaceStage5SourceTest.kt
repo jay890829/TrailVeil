@@ -75,7 +75,7 @@ class GoogleMapSurfaceStage5SourceTest {
     }
 
     private fun googleSource(name: String): String = moduleRoot()
-        .resolve("src/googlePoc/java/app/trailveil/map/$name")
+        .resolve("src/google/java/app/trailveil/map/$name")
         .readText()
 
     private fun mapLibreSource(): String = moduleRoot()

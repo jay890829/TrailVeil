@@ -110,7 +110,9 @@ class FogMoveStartReachabilityTest {
         "app/src/main/java/app/trailveil/map/fog/FogOverlaySurfaceCoordinator.kt",
     ).readText()
 
-    private fun googlePocRoot(): File = File(repositoryRoot(), "app/src/googlePoc/java")
+    // `V02-008`: the Google provider bindings this case reads are in the shared production
+    // tree; the harness half has no binding to reach a generation from.
+    private fun googlePocRoot(): File = File(repositoryRoot(), "app/src/google/java")
 
     private fun repositoryRoot(): File {
         val cwd = File(requireNotNull(System.getProperty("user.dir")))

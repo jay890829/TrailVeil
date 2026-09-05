@@ -264,6 +264,11 @@ try {
     # and every check below is on what the APK CONTAINS, so neither is named and neither can slip
     # past by being the one that was not thought of. The BuildConfig audit above already pins
     # BUILD_TYPE to "release", which refuses both by a fourth, independent route.
+    #
+    # One asymmetry worth stating: since `V02-008` split the engineering harness out of the shipped
+    # Google sources, only a googlePoc output carries the PoC components, so that check alone no
+    # longer refuses a googleRelease APK. The key marker, the Maps SDK and the key resource all
+    # still do, and any one of them is enough.
     $manifestXml = @(Invoke-CheckedNative -FilePath $apkanalyzer `
         -ArgumentList @('manifest', 'print', $candidateApk) `
         -Description 'Release manifest provider audit') -join "`n"

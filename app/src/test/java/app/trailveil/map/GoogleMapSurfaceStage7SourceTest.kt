@@ -108,7 +108,8 @@ class GoogleMapSurfaceStage7SourceTest {
         assertTrue(policy.contains("canProve = false"))
     }
 
-    private fun googleSource(name: String): String = source("src/googlePoc/java/app/trailveil/map/$name")
+    private fun googleSource(name: String): String =
+        source("src/google/java/app/trailveil/map/$name")
 
     private fun moduleSource(name: String): String = source("src/main/java/app/trailveil/map/fog/$name")
 

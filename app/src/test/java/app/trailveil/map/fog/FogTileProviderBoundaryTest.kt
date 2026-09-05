@@ -93,7 +93,7 @@ class FogTileProviderBoundaryTest {
         val repository = repositoryRoot()
         return File(
             repository,
-            "app/src/googlePoc/java/app/trailveil/googlepoc/GoogleFogTileProvider.kt",
+            "app/src/google/java/app/trailveil/googlepoc/GoogleFogTileProvider.kt",
         ).readText()
     }
 

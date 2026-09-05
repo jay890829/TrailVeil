@@ -12,7 +12,7 @@ class GoogleFogStage6SourceTest {
     fun productionBindingUsesActualRequestsMultiLodWindowsAndDualOverlays() {
         val binding = googleSource("GoogleCanonicalFogSurfaceBinding.kt")
         val provider = moduleRoot()
-            .resolve("src/googlePoc/java/app/trailveil/googlepoc/GoogleFogTileProvider.kt")
+            .resolve("src/google/java/app/trailveil/googlepoc/GoogleFogTileProvider.kt")
             .readText()
 
         listOf(
@@ -420,8 +420,11 @@ class GoogleFogStage6SourceTest {
     @Test
     fun ownerVisibleLabelsAndPoisRemainDefaultWithoutPlacesIntegration() {
         val surfaceBinding = googleSource("GoogleMapSurfaceBinding.kt")
-        val googleRoot = moduleRoot().resolve("src/googlePoc")
-        val source = googleRoot.walkTopDown()
+        // `V02-008` split the tree: both halves are scanned, so moving a banned call into
+        // the harness source set does not escape the ban.
+        val source = listOf("src/google", "src/googlePoc")
+            .map(moduleRoot()::resolve)
+            .flatMap { root -> root.walkTopDown() }
             .filter { file -> file.isFile && file.extension == "kt" }
             .joinToString("\n") { file -> file.readText() }
 
@@ -434,7 +437,10 @@ class GoogleFogStage6SourceTest {
         // same call added from GoogleHostedMapSurface or the canonical fog binding would have
         // passed. Ban them across every production map source, exempting only the unexported
         // engineering PoC, which the owner decision explicitly allows to keep diagnostic listeners.
-        val productionMapSources = googleRoot.resolve("java/app/trailveil/map")
+        // `V02-008`: the production map sources are `src/google` alone now. That IS the exemption
+        // the comment above describes - the harness lives in `src/googlePoc` and is not scanned
+        // here - so the ban became structural instead of a filename carve-out.
+        val productionMapSources = moduleRoot().resolve("src/google/java/app/trailveil/map")
             .walkTopDown()
             .filter { file -> file.isFile && file.extension == "kt" }
             .toList()
@@ -485,7 +491,7 @@ class GoogleFogStage6SourceTest {
     }
 
     private fun googleSource(name: String): String = moduleRoot()
-        .resolve("src/googlePoc/java/app/trailveil/map/$name")
+        .resolve("src/google/java/app/trailveil/map/$name")
         .readText()
 
     private fun moduleRoot(): File {
