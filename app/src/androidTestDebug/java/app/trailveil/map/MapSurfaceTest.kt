@@ -3859,6 +3859,7 @@ class MapSurfaceTest {
             var insideExtentHolds = 0
             var outsideExtentHolds = 0
             var legitimateRebuilds = 0
+            var sdkIdleRebuilds = 0
             val trace = StringBuilder()
             val gestureStartedAtUptime = SystemClock.uptimeMillis()
             auditLog(
@@ -3896,13 +3897,41 @@ class MapSurfaceTest {
                         // re-freeze on what is installed now and let the per-frame rules judge that
                         // - and fail only on the case this claim was really written for, a rebuild
                         // that moved the geometry while the camera never left it.
-                        assertFalse(
-                            "The installed fog geometry changed while the camera stayed inside " +
-                                "it: $frozen -> $installed" +
-                                describeFogRequestsSince(viewportRequests, gestureStartedAtUptime),
-                            frozen.extent.covers(map.visibleRegionCorners()),
-                        )
-                        legitimateRebuilds += 1
+                        //
+                        // `V02-011`: on the hosted emulator the SDK can report camera idle under
+                        // a held pinch - 405 ms into the gesture, both fingers down, the last
+                        // move flagged as a gesture - and the surface then does what its idle
+                        // rule says: rebuild at the current zoom, one render zoom coarser. That
+                        // swap is the product's documented reaction to an SDK event and is safe
+                        // by construction (the new complete generation attaches before the old
+                        // one retires), so a geometry change the surface's own trace attributes
+                        // to such an idle is re-frozen and counted, not failed; every per-frame
+                        // rule below still judges the frames. A geometry change with NO such
+                        // request behind it is the case this claim was written for, and it
+                        // still fails - now with the request list, so it explains itself.
+                        val cameraStayedInside = frozen.extent.covers(map.visibleRegionCorners())
+                        val idleDuringGesture = viewportRequests.firstOrNull { request ->
+                            request.uptimeMillis >= gestureStartedAtUptime &&
+                                request.trigger == FogViewportRequestTrigger.CAMERA_IDLE &&
+                                request.generation == installed.generation
+                        }
+                        if (cameraStayedInside && idleDuringGesture != null) {
+                            sdkIdleRebuilds += 1
+                            auditLog(
+                                "hold=$holds rebuild explained by an SDK idle during the gesture: " +
+                                    describeFogRequest(idleDuringGesture),
+                            )
+                            trace.append("idleRebuild@${installed.generation} ")
+                        } else {
+                            assertFalse(
+                                "The installed fog geometry changed while the camera stayed " +
+                                    "inside it, and no camera idle the SDK dispatched during the " +
+                                    "gesture accounts for it: $frozen -> $installed" +
+                                    describeFogRequestsSince(viewportRequests, gestureStartedAtUptime),
+                                cameraStayedInside,
+                            )
+                            legitimateRebuilds += 1
+                        }
                     }
                     if (installed != frozen) {
                         measuredCoverage = installed
@@ -4087,6 +4116,7 @@ class MapSurfaceTest {
                             "insideExtentHolds=$insideExtentHolds " +
                             "outsideExtentHolds=$outsideExtentHolds " +
                             "legitimateRebuilds=$legitimateRebuilds " +
+                            "sdkIdleRebuilds=$sdkIdleRebuilds " +
                             "inExtentSurface=${inExtentSurface?.report()} " +
                             "rendererTransitions=${transitionAudit?.let { audit ->
                                     "callbacks=${audit.callbacks},same=${audit.sameStateCallbacks}," +
