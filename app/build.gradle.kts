@@ -316,8 +316,19 @@ fun requireInternalSigningConfiguration() {
     }
 }
 
+/**
+ * Every build type signed by the lifetime distribution key.
+ *
+ * `V02-008` added `googleRelease` to it. The guard below matches whole task names, so a build type
+ * missing from this list does not fail loudly - `requireInternalSigningConfiguration` simply stops
+ * running for it, and the first sign of trouble is an AGP signing error with a worse message or an
+ * artifact signed by something unexpected. The `require` after `buildTypes` closes that by making
+ * the build check its own list against the signing configuration it actually assigned.
+ */
+private val distributionSignedBuildTypes = listOf("internal", "release", "googleRelease")
+
 val signedDistributionTaskNames = buildSet {
-    listOf("Internal", "Release").forEach { variant ->
+    distributionSignedBuildTypes.map { it.replaceFirstChar(Char::uppercase) }.forEach { variant ->
         add("assemble$variant")
         add("bundle$variant")
         add("install$variant")
@@ -412,6 +423,19 @@ android {
             versionNameSuffix = "-google"
             matchingFallbacks += listOf("release")
             applyGoogleMapsKey()
+        }
+    }
+
+    // `V02-008`: the list that drives the keystore guard must name every build type that actually
+    // carries the distribution signing config. Checked here rather than trusted, because a build
+    // type missing from the list disarms the guard silently.
+    buildTypes.forEach { buildType ->
+        if (buildType.signingConfig?.name == "internal") {
+            val assembleTask = "assemble${buildType.name.replaceFirstChar(Char::uppercase)}"
+            require(requiresDistributionSigning(assembleTask)) {
+                "${buildType.name} is signed by the distribution key but is missing from " +
+                    "distributionSignedBuildTypes, so the keystore guard would not fire for it"
+            }
         }
     }
 
