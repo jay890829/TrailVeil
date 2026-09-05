@@ -4,6 +4,18 @@ import android.content.Context
 import androidx.startup.Initializer
 import com.google.android.gms.maps.MapsInitializer
 
+/**
+ * The renderer this process was granted, or [ProviderRenderer.UNREPORTED] until the callback runs.
+ *
+ * `MapsInitializer`'s renderer preference is process-wide and latched on the first call, so the
+ * grant is a process fact rather than a per-composition one, and this is the only place that knows
+ * it. `V02-008`: the map surface consults it, and a legacy grant is terminal - `V02-005` stage 9
+ * measured that renderer on six images and never got a green run out of it.
+ */
+@Volatile
+internal var grantedGoogleRenderer: ProviderRenderer = ProviderRenderer.UNREPORTED
+    private set
+
 /** Loads the renderer/dynamite path at process startup for warm history returns. */
 class GoogleMapWarmup : Initializer<Unit> {
     override fun create(context: Context) {
@@ -20,7 +32,20 @@ class GoogleMapWarmup : Initializer<Unit> {
         // at all, and this failure is not swallowed in effect — the real map path hits the same
         // broken SDK moments later and reports it through the surface the user can actually see.
         try {
-            MapsInitializer.initialize(context.applicationContext)
+            // `V02-008`: the three-argument call, so the GRANTED renderer is observed rather than
+            // assumed. No preference is requested - asking for one is a test-harness affordance,
+            // and production takes whatever the device offers and then decides whether it can use
+            // it. The callback arrives on the main looper, possibly after this returns, which is
+            // why the grant is a volatile process-wide value and not a return.
+            MapsInitializer.initialize(
+                context.applicationContext,
+                MapsInitializer.Renderer.LATEST,
+            ) { renderer ->
+                grantedGoogleRenderer = when (renderer) {
+                    MapsInitializer.Renderer.LEGACY -> ProviderRenderer.LEGACY
+                    MapsInitializer.Renderer.LATEST -> ProviderRenderer.LATEST
+                }
+            }
         } catch (_: Exception) {
             // Intentionally ignored; see above.
         } catch (_: LinkageError) {

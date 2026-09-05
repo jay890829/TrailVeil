@@ -112,4 +112,58 @@ class ProviderRuntimeGateTest {
             ProviderFallbackReason.MAP_LOAD_TIMEOUT.message(),
         )
     }
+
+    @Test
+    fun aLegacyRendererGrantIsTerminalAndNamesItself() {
+        val legacy = ProviderRuntimeGate.startupDecision(
+            keyConfigured = true,
+            keyReason = "VALID",
+            hasValidatedNetwork = true,
+            hasCompatibleServices = true,
+            grantedRenderer = ProviderRenderer.LEGACY,
+        )
+
+        assertFalse(legacy.initializeMap)
+        assertEquals(ProviderFallbackReason.LEGACY_RENDERER, legacy.fallbackReason)
+    }
+
+    @Test
+    fun anUnreportedRendererIsNotAFailure() {
+        // The grant arrives on the main looper and may not have landed on the first composition.
+        // A provider that has not answered yet is not a provider that answered badly.
+        listOf(ProviderRenderer.UNREPORTED, ProviderRenderer.LATEST).forEach { renderer ->
+            val decision = ProviderRuntimeGate.startupDecision(
+                keyConfigured = true,
+                keyReason = "VALID",
+                hasValidatedNetwork = true,
+                hasCompatibleServices = true,
+                grantedRenderer = renderer,
+            )
+
+            assertTrue("$renderer must initialize the map", decision.initializeMap)
+            assertNull(decision.fallbackReason)
+        }
+    }
+
+    @Test
+    fun aMissingKeyOutranksALegacyRendererGrant() {
+        // A device with no key has a more useful answer than "the renderer is old", and the
+        // renderer is only knowable once the provider has been asked at all.
+        val decision = ProviderRuntimeGate.startupDecision(
+            keyConfigured = false,
+            keyReason = "MISSING_KEY",
+            hasValidatedNetwork = true,
+            hasCompatibleServices = true,
+            grantedRenderer = ProviderRenderer.LEGACY,
+        )
+
+        assertEquals(ProviderFallbackReason.MISSING_KEY, decision.fallbackReason)
+    }
+
+    @Test
+    fun everyFallbackReasonHasALocalMessage() {
+        ProviderFallbackReason.entries.forEach { reason ->
+            assertTrue("$reason has no message", reason.message().isNotBlank())
+        }
+    }
 }

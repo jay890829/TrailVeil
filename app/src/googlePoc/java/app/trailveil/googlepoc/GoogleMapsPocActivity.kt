@@ -1098,6 +1098,7 @@ class GoogleMapsPocActivity : ComponentActivity(), OnMapReadyCallback {
 
 @StringRes
 private fun ProviderFallbackReason.messageResource(): Int = when (this) {
+    ProviderFallbackReason.LEGACY_RENDERER -> R.string.google_poc_reason_legacy_renderer
     ProviderFallbackReason.MISSING_KEY -> R.string.google_poc_reason_missing_key
     ProviderFallbackReason.STRUCTURALLY_INVALID_KEY -> R.string.google_poc_reason_invalid_key
     ProviderFallbackReason.NO_VALIDATED_NETWORK -> R.string.google_poc_reason_no_network

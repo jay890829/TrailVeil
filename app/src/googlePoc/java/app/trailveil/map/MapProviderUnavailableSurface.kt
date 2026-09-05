@@ -85,4 +85,6 @@ internal fun ProviderFallbackReason.unavailableMessageResource(): Int = when (th
         R.string.map_provider_unavailable_initialization_failure
     ProviderFallbackReason.MAP_LOAD_TIMEOUT ->
         R.string.map_provider_unavailable_initialization_failure
+    ProviderFallbackReason.LEGACY_RENDERER ->
+        R.string.map_provider_unavailable_legacy_renderer
 }

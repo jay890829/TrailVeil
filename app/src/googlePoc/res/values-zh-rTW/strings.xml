@@ -10,6 +10,7 @@
     <string name="google_poc_camera_changed">相機：緯度=%1$.6f，經度=%2$.6f，縮放=%3$.2f</string>
     <string name="google_poc_camera_idle">相機已停止：緯度=%1$.6f，經度=%2$.6f，縮放=%3$.2f</string>
     <string name="google_poc_poi_click">地標名稱=%1$s，Place ID=%2$s，經緯度=%3$.6f,%4$.6f</string>
+    <string name="google_poc_reason_legacy_renderer">授予舊版引擎</string>
     <string name="google_poc_reason_missing_key">尚未設定外部 API 金鑰。</string>
     <string name="google_poc_reason_invalid_key">外部 API 金鑰無效。</string>
     <string name="google_poc_reason_no_network">沒有可通過驗證的網際網路連線。</string>
@@ -23,6 +24,7 @@
     <string name="map_provider_unavailable_no_network">線上地圖目前無法使用：沒有可用的網際網路連線。</string>
     <string name="map_provider_unavailable_no_play_services">線上地圖目前無法使用：這台裝置缺少或停用了相容的 Google Play 服務。</string>
     <string name="map_provider_unavailable_initialization_failure">線上地圖無法啟動。</string>
+    <string name="map_provider_unavailable_legacy_renderer">線上地圖無法使用：此裝置僅提供 Google 舊版地圖引擎，無法穩定繪製地圖。</string>
     <string name="map_provider_unavailable_reassurance">足跡記錄與探索歷史都保存在這台裝置上，功能不受影響。</string>
     <string name="map_provider_disclosure_name">Google 地圖</string>
     <string name="map_provider_privacy_body">此版本顯示的是 Google 地圖。底圖請求會傳送到 Google，並透露你正在瀏覽的大約區域。Maps SDK 也會把裝置資訊（系統版本與型號）、你的 IP 位址、一組假名化的 SDK 識別碼、當機回報，以及拖曳與縮放等地圖操作事件傳送給 Google，由 Google 依其隱私權政策處理（policies.google.com/privacy）。TrailVeil 絕不會把你記錄的路線傳給 Google。地圖載入會計入 TrailVeil 開發者的 Google Cloud 專案與金鑰，而不是你；目前行動 App 的地圖載入免費且不限次數，若日後改變，TrailVeil 必須改變地圖的提供方式，而不是向你收費。</string>

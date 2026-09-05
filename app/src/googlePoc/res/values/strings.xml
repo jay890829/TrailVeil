@@ -10,6 +10,7 @@
     <string name="google_poc_camera_changed">Camera lat=%1$.6f, lng=%2$.6f, zoom=%3$.2f</string>
     <string name="google_poc_camera_idle">Camera idle lat=%1$.6f, lng=%2$.6f, zoom=%3$.2f</string>
     <string name="google_poc_poi_click">POI name=%1$s, placeId=%2$s, latLng=%3$.6f,%4$.6f</string>
+    <string name="google_poc_reason_legacy_renderer">Legacy renderer granted</string>
     <string name="google_poc_reason_missing_key">No external API key is configured.</string>
     <string name="google_poc_reason_invalid_key">The external API key is invalid.</string>
     <string name="google_poc_reason_no_network">A validated internet connection is unavailable.</string>
@@ -23,6 +24,7 @@
     <string name="map_provider_unavailable_no_network">The online map is unavailable: no validated internet connection.</string>
     <string name="map_provider_unavailable_no_play_services">The online map is unavailable: compatible Google Play services are missing or disabled on this device.</string>
     <string name="map_provider_unavailable_initialization_failure">The online map could not start.</string>
+    <string name="map_provider_unavailable_legacy_renderer">The online map is unavailable: this device only offers Google’s legacy map renderer, which cannot draw the map reliably.</string>
     <string name="map_provider_unavailable_reassurance">Recording and exploration history stay on this device and keep working.</string>
     <!-- `V02-006`: the disclosure the shared privacy sheet composes for the active basemap. The
          two URLs are the ones Google Maps Platform Terms 3.2.2(a) require the application to

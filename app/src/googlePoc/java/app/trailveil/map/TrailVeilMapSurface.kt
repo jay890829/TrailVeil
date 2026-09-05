@@ -149,6 +149,7 @@ private fun startupDecision(context: Context): ProviderStartupDecision {
         hasCompatibleServices = GoogleApiAvailability.getInstance()
             .isGooglePlayServicesAvailable(context) == ConnectionResult.SUCCESS,
         initializeWithoutValidatedNetwork = true,
+        grantedRenderer = grantedGoogleRenderer,
     )
 }
 
