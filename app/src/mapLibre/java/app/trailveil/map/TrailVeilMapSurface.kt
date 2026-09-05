@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Bitmap
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import androidx.compose.foundation.background
@@ -237,6 +238,48 @@ internal data class InstalledFogCoverageSnapshot(
     val slot: FogGenerationSlot,
 )
 
+/**
+ * Why the surface published a new canonical viewport request, or invalidated its generation
+ * without one. `V02-011`: three hosted shard runs saw a canonical re-install land during a held
+ * pinch, and nothing recorded which of these paths had asked for it - the per-test logcat carried
+ * no fog decision at all. Observed only through [FogViewportRequestTrace]; production passes no
+ * observer, so nothing here runs outside a test.
+ */
+internal enum class FogViewportRequestTrigger {
+    /** Listeners attached: the first request for this map. */
+    ATTACH,
+    CAMERA_IDLE,
+    CAMERA_MOVE_CANCELLED,
+    /** A programmed move began: the claim is invalidated and the rebuild waits for idle. */
+    PROGRAMMED_MOVE_STARTED,
+    /** A render or sync failed: the generation is invalidated behind the committed slot. */
+    RENDER_FAILURE,
+    /** Coverage installed, but the camera had already moved beyond it. */
+    INSTALLED_BEHIND_CAMERA,
+    /** A rendered viewport was already stale before its style mutation and was rejected. */
+    STALE_BEFORE_STYLE_MUTATION,
+    /** A viewport was installed, judged not to hold for the camera, and the older slot retired. */
+    INSTALLED_NOT_HOLDING,
+    /** `canonicalViewportRequestForTesting` published a request directly. */
+    TESTING_REQUEST,
+}
+
+/**
+ * One viewport request or generation bump. Deliberately carries no position: a zoom and a
+ * generation are enough to line the surface's decisions up against a harness's holds, and the
+ * hosted logs this feeds are public.
+ */
+internal data class FogViewportRequestTrace(
+    val trigger: FogViewportRequestTrigger,
+    /** `fogViewportGeneration` after the bump. */
+    val generation: Long,
+    /** The camera zoom at the time, when a map was ready. */
+    val mapZoom: Double?,
+    /** Whether the last camera move MapLibre reported began as a gesture. */
+    val lastMoveWasGesture: Boolean,
+    val uptimeMillis: Long,
+)
+
 private data class PreparedFogGeneration(
     val mosaic: FogTileMosaic,
     val previousSlot: FogGenerationSlot?,
@@ -318,6 +361,7 @@ internal fun TrailVeilMapSurface(
     canonicalViewportRequestForTesting: FogViewportRequest? = null,
     fogSurroundCoverageForTesting: ((FogSurroundExtent) -> Boolean)? = null,
     suppressFogCameraReactionsForTesting: Boolean = false,
+    onFogViewportRequestedForTesting: ((FogViewportRequestTrace) -> Unit)? = null,
 ) {
     require(fallbackTimeoutMillis > 0L) { "fallbackTimeoutMillis must be positive" }
     require(savedStateKey.isNotBlank()) { "savedStateKey must not be blank" }
@@ -365,6 +409,9 @@ internal fun TrailVeilMapSurface(
     var readyStyle by remember(mapView, provider) { mutableStateOf<Style?>(null) }
     var fallbackRequested by remember(mapView, provider) { mutableStateOf(false) }
     val compositionActive = remember(mapView) { AtomicBoolean(true) }
+    // Whether the last camera move MapLibre reported began as a gesture. Written by the
+    // move-started listener below, read by the per-frame move listener and by the `V02-011` trace.
+    val lastMoveWasGesture = remember(mapView) { AtomicBoolean(false) }
     val styleGenerationActive = remember(mapView, provider) { AtomicBoolean(true) }
     val currentOnFogRendered by rememberUpdatedState(onFogRendered)
     val currentOnFogFailure by rememberUpdatedState(onFogFailure)
@@ -372,6 +419,9 @@ internal fun TrailVeilMapSurface(
     val currentOnMapViewCreatedForTesting by rememberUpdatedState(onMapViewCreatedForTesting)
     val currentOnFogCoverageInstalledForTesting by rememberUpdatedState(
         onFogCoverageInstalledForTesting,
+    )
+    val currentOnFogViewportRequestedForTesting by rememberUpdatedState(
+        onFogViewportRequestedForTesting,
     )
     val currentOnFogCoverageStateComposedForTesting by rememberUpdatedState(
         onFogCoverageStateComposedForTesting,
@@ -633,25 +683,43 @@ internal fun TrailVeilMapSurface(
     // installed is not the same as coverage being enough: a re-render can land while a gesture has
     // already carried the camera past what the installed surround holds, and lowering the cover on
     // the strength of a successful install alone would uncover a map that is leaking.
-    fun publishViewportRequest(request: FogViewportRequest) {
+    // `V02-011`: every generation bump reports itself to the test seam, with the trigger that
+    // asked for it. A no-op in production, where the seam is null.
+    fun traceViewportGeneration(trigger: FogViewportRequestTrigger) {
+        currentOnFogViewportRequestedForTesting?.invoke(
+            FogViewportRequestTrace(
+                trigger = trigger,
+                generation = fogViewportGeneration,
+                mapZoom = readyMap?.cameraPosition?.zoom,
+                lastMoveWasGesture = lastMoveWasGesture.get(),
+                uptimeMillis = SystemClock.uptimeMillis(),
+            ),
+        )
+    }
+
+    fun publishViewportRequest(request: FogViewportRequest, trigger: FogViewportRequestTrigger) {
         followingCameraMove.set(false)
         canonicalFogLoaded = false
         fogRenderFailed = false
         fogPlaceholderReadyGeneration = -1L
         fogViewportRequest = request
         fogViewportGeneration += 1L
+        traceViewportGeneration(trigger)
     }
 
-    fun requestViewport() {
+    fun requestViewport(trigger: FogViewportRequestTrigger) {
         val map = readyMap ?: return
         publishViewportRequest(
             currentCanonicalViewportRequestForTesting ?: map.fogViewportRequest(),
+            trigger,
         )
     }
 
     LaunchedEffect(readyMap, canonicalViewportRequestForTesting) {
         if (readyMap != null) {
-            canonicalViewportRequestForTesting?.let(::publishViewportRequest)
+            canonicalViewportRequestForTesting?.let { request ->
+                publishViewportRequest(request, FogViewportRequestTrigger.TESTING_REQUEST)
+            }
         }
     }
 
@@ -814,6 +882,7 @@ internal fun TrailVeilMapSurface(
                 fogSyncFailed = true
                 fogPlaceholderReadyGeneration = -1L
                 fogViewportGeneration += 1L
+                traceViewportGeneration(FogViewportRequestTrigger.RENDER_FAILURE)
                 currentOnFogFailure(failure)
                 delay(1_000L)
             }
@@ -837,7 +906,9 @@ internal fun TrailVeilMapSurface(
             // anchored to the map, so it stays truthful wherever a gesture takes the camera, and
             // the backdrop bands keep everything around it fogged in the same rendered frame.
             val idleListener = MapLibreMap.OnCameraIdleListener {
-                if (!suppressFogCameraReactionsForTesting) requestViewport()
+                if (!suppressFogCameraReactionsForTesting) {
+                    requestViewport(FogViewportRequestTrigger.CAMERA_IDLE)
+                }
             }
             // A programmed move differs from a gesture in one way that matters here: it can cross
             // any distance in one step, and the exterior guard's GeoJSON tiles for far ground are
@@ -847,7 +918,7 @@ internal fun TrailVeilMapSurface(
             // second writer of `fogCoverageInstalled = false` beside
             // `retainCommittedGenerationOrRaiseCover`. In-window programmed moves keep the
             // committed generation and no cover flash.
-            var lastMoveWasGesture = false
+            lastMoveWasGesture.set(false)
             fun raiseCoverForProgrammedMoveBeyondSurround() {
                 if (installedSurround != null && !surroundHoldsForCamera()) {
                     fogCoverageInstalled = false
@@ -855,7 +926,7 @@ internal fun TrailVeilMapSurface(
             }
             val moveStartedListener = MapLibreMap.OnCameraMoveStartedListener { reason ->
                 val gesture = reason == MapLibreMap.OnCameraMoveStartedListener.REASON_API_GESTURE
-                lastMoveWasGesture = gesture
+                lastMoveWasGesture.set(gesture)
                 // A complete generation remains renderer-safe across every in-window programmed
                 // move: its exterior guard fogs everything beyond the canonical reveal window.
                 // Invalidate the canonical claim and rebuild at idle; raise the separately
@@ -872,6 +943,7 @@ internal fun TrailVeilMapSurface(
                     fogPlaceholderReadyGeneration = -1L
                     fogViewportRequest = null
                     fogViewportGeneration += 1L
+                    traceViewportGeneration(FogViewportRequestTrigger.PROGRAMMED_MOVE_STARTED)
                     raiseCoverForProgrammedMoveBeyondSurround()
                 }
             }
@@ -882,20 +954,22 @@ internal fun TrailVeilMapSurface(
             val moveListener = MapLibreMap.OnCameraMoveListener {
                 if (
                     !suppressFogCameraReactionsForTesting &&
-                    !lastMoveWasGesture &&
+                    !lastMoveWasGesture.get() &&
                     !followingCameraMove.get()
                 ) {
                     raiseCoverForProgrammedMoveBeyondSurround()
                 }
             }
             val moveCanceledListener = MapLibreMap.OnCameraMoveCanceledListener {
-                if (!suppressFogCameraReactionsForTesting) requestViewport()
+                if (!suppressFogCameraReactionsForTesting) {
+                    requestViewport(FogViewportRequestTrigger.CAMERA_MOVE_CANCELLED)
+                }
             }
             map.addOnCameraIdleListener(idleListener)
             map.addOnCameraMoveStartedListener(moveStartedListener)
             map.addOnCameraMoveListener(moveListener)
             map.addOnCameraMoveCancelListener(moveCanceledListener)
-            requestViewport()
+            requestViewport(FogViewportRequestTrigger.ATTACH)
             onDispose {
                 map.removeOnCameraIdleListener(idleListener)
                 map.removeOnCameraMoveStartedListener(moveStartedListener)
@@ -979,7 +1053,7 @@ internal fun TrailVeilMapSurface(
                 // Keep it visible while a request centred on the newer camera replaces the stale
                 // canonical reveal window.
                 fogCoverageInstalled = true
-                requestViewport()
+                requestViewport(FogViewportRequestTrigger.INSTALLED_BEHIND_CAMERA)
                 return@LaunchedEffect
             }
             canonicalFogLoaded = false
@@ -1050,7 +1124,7 @@ internal fun TrailVeilMapSurface(
                                     coverageInstalledAtDecision = fogCoverageInstalled,
                                 ),
                             )
-                            requestViewport()
+                            requestViewport(FogViewportRequestTrigger.STALE_BEFORE_STYLE_MUTATION)
                             throw StaleCanonicalFogInstallException
                         }
                         currentCanonicalFogInstallCheckpointForTesting?.invoke(
@@ -1143,7 +1217,7 @@ internal fun TrailVeilMapSurface(
                             retiredSlot = retired,
                         )
                     }
-                    requestViewport()
+                    requestViewport(FogViewportRequestTrigger.INSTALLED_NOT_HOLDING)
                     return@canonicalPass CanonicalFogPassOutcome.STOP
                 }
                 fogCoverageInstalled = true

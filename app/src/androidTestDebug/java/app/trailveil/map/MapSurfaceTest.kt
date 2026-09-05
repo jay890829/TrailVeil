@@ -3652,6 +3652,11 @@ class MapSurfaceTest {
         try {
             val fogRendered = AtomicBoolean(false)
             val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
+            // `V02-011`: the surface's own account of every canonical request, so a geometry
+            // assertion can say which path re-installed the fog instead of leaving the reader
+            // to infer it from a dispatcher dump. Recorded from the main thread, read on failure.
+            val viewportRequests =
+                java.util.concurrent.CopyOnWriteArrayList<FogViewportRequestTrace>()
             val fogCameraReactionsSuppressed = mutableStateOf(false)
             revealTrack(database, REVEALED_CENTER)
 
@@ -3673,13 +3678,24 @@ class MapSurfaceTest {
                         zoom = startZoom,
                     ),
                     onFogRendered = { fogRendered.set(true) },
-                    onFogCoverageInstalledForTesting = installedCoverage::set,
+                    onFogCoverageInstalledForTesting = { installed ->
+                        installedCoverage.set(installed)
+                        auditLog(
+                            "fog-installed generation=${installed.generation} " +
+                                "slot=${installed.slot} halfWorlds=${installed.extent.halfWorlds} " +
+                                "wrapsWorld=${installed.extent.wrapsWorld}",
+                        )
+                    },
                     onFogCoverageStateComposedForTesting =
                         onFogCoverageStateComposedForTesting,
                     canonicalFogInstallCheckpointForTesting =
                         canonicalFogInstallCheckpointForTesting,
                     suppressFogCameraReactionsForTesting =
                         fogCameraReactionsSuppressed.value,
+                    onFogViewportRequestedForTesting = { request ->
+                        viewportRequests += request
+                        auditLog(describeFogRequest(request))
+                    },
                 )
             }
 
@@ -3844,6 +3860,11 @@ class MapSurfaceTest {
             var outsideExtentHolds = 0
             var legitimateRebuilds = 0
             val trace = StringBuilder()
+            val gestureStartedAtUptime = SystemClock.uptimeMillis()
+            auditLog(
+                "gesture-start installed-generation=${installedCoverage.get()?.generation} " +
+                    "slot=${installedCoverage.get()?.slot} requests-so-far=${viewportRequests.size}",
+            )
 
             var transitionAudit: SurfaceTransitionAudit? = null
             try {
@@ -3854,6 +3875,10 @@ class MapSurfaceTest {
                     val installed = checkNotNull(installedCoverage.get()) {
                         "No canonical installed-coverage snapshot was published for the gesture"
                     }
+                    auditLog(
+                        "hold=$holds installed-generation=${installed.generation} " +
+                            "slot=${installed.slot} requests=${viewportRequests.size}",
+                    )
                     var frozen = measuredCoverage ?: installed.also { measuredCoverage = it }
                     if (!allowRebuildDuringGesture && installed.extent != frozen.extent) {
                         // Only a change of GEOMETRY is examined, because geometry is all this
@@ -3873,7 +3898,8 @@ class MapSurfaceTest {
                         // that moved the geometry while the camera never left it.
                         assertFalse(
                             "The installed fog geometry changed while the camera stayed inside " +
-                                "it: $frozen -> $installed",
+                                "it: $frozen -> $installed" +
+                                describeFogRequestsSince(viewportRequests, gestureStartedAtUptime),
                             frozen.extent.covers(map.visibleRegionCorners()),
                         )
                         legitimateRebuilds += 1
@@ -5398,6 +5424,46 @@ class MapSurfaceTest {
             if (!streamEnded) {
                 bestEffortClearStuckInjectedPointers()
             }
+        }
+    }
+
+    /**
+     * `V02-011`: the per-test logcat is the only fog narrative a hosted failure leaves behind, and
+     * Timber is not wired in instrumentation. Same suppression as `auditFogCoverage`'s own line.
+     */
+    @Suppress("LogNotTimber")
+    private fun auditLog(message: String) {
+        android.util.Log.i(AUDIT_LOG_TAG, message)
+    }
+
+    /** `V02-011`: one request as the surface reported it - trigger, generation, zoom; no position. */
+    private fun describeFogRequest(request: FogViewportRequestTrace): String =
+        "fog-request ${request.trigger} generation=${request.generation} " +
+            "zoom=${request.mapZoom?.let { "%.2f".format(java.util.Locale.US, it) }} " +
+            "lastMoveWasGesture=${request.lastMoveWasGesture} uptime=${request.uptimeMillis}"
+
+    /**
+     * The requests the surface made since a gesture began, for a failure message. The three
+     * hosted failures `V02-011` was opened for showed a re-install between two holds and nothing
+     * that said why; this is the why, or the proof that no request was made at all.
+     */
+    private fun describeFogRequestsSince(
+        requests: List<FogViewportRequestTrace>,
+        sinceUptimeMillis: Long,
+    ): String {
+        val since = requests.filter { request -> request.uptimeMillis >= sinceUptimeMillis }
+        if (since.isEmpty()) {
+            return "; the surface made no viewport request since the gesture began " +
+                "(${requests.size} before it)"
+        }
+        return since.joinToString(
+            prefix = "; viewport requests since the gesture began: [",
+            postfix = "]",
+        ) { request ->
+            "+${request.uptimeMillis - sinceUptimeMillis}ms ${request.trigger} " +
+                "generation=${request.generation} " +
+                "zoom=${request.mapZoom?.let { "%.2f".format(java.util.Locale.US, it) }} " +
+                "lastMoveWasGesture=${request.lastMoveWasGesture}"
         }
     }
 

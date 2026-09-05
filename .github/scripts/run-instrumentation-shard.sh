@@ -113,7 +113,30 @@ note() {
   fi
 }
 
+# `V02-011`: the hosted job installs whatever revision of the system image is current when it runs
+# and recorded nothing about it, so when three hosted shards failed a pinch case that every local
+# run passed, the one difference that could be read - the guest build - was the one nothing had
+# written down. Both halves of the identity go to the job log and to the diagnostics artifact on
+# EVERY run, green or red: a green run is the comparison a red one needs. Best effort, like every
+# capture here; a missing line must never fail a shard.
+record_environment() {
+  local sdk="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+  local report="$diagnostics/environment-${shard_name}.txt"
+  {
+    echo "shard=${shard_name}"
+    for properties in "$sdk"/system-images/*/*/*/source.properties; do
+      [ -f "$properties" ] || continue
+      echo "system-image=${properties#"$sdk"/system-images/}"
+      grep -E '^Pkg\.(Revision|Path)=' "$properties" || true
+    done
+    echo "ro.build.fingerprint=$(timeout 30 adb shell getprop ro.build.fingerprint 2>/dev/null | tr -d '\r')"
+    echo "ro.build.version.incremental=$(timeout 30 adb shell getprop ro.build.version.incremental 2>/dev/null | tr -d '\r')"
+  } > "$report" 2>&1 || true
+  cat "$report" || true
+}
+
 echo "Shard ${shard_name}: ${shard_args[*]}"
+record_environment
 timeout "$shard_timeout" ./gradlew connectedDebugAndroidTest "${shard_args[@]}"
 code=$?
 if [ "$code" = "0" ]; then
