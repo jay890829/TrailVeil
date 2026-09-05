@@ -3910,8 +3910,8 @@ class MapSurfaceTest {
                         // request behind it is the case this claim was written for, and it
                         // still fails - now with the request list, so it explains itself.
                         //
-                        // The window opens when the gesture lambda begins and closes at this
-                        // hold, so it also contains any lift inside the lambda - an abandoned
+                        // The window opens just before the gesture lambda is invoked and closes
+                        // at this hold, so it also contains any lift inside the lambda - an abandoned
                         // pinch attempt lifts and retries, a sequence may shove, lift and
                         // pinch - and the idle a lift dispatches. A rebuild from one of those
                         // is legitimate too, which is why the log line says "after the
@@ -3920,8 +3920,8 @@ class MapSurfaceTest {
                         // bump, so the request either IS the one this install answered or
                         // the rule does not apply. The uptime bound only refuses an idle from
                         // before the gesture whose render landed late; that fails on purpose,
-                        // with an empty request list, because it is a different story and a
-                        // human should read it.
+                        // with a request list that does not carry the idle that explains it,
+                        // because it is a different story and a human should read it.
                         val cameraStayedInside = frozen.extent.covers(map.visibleRegionCorners())
                         val idleSinceGestureBegan = viewportRequests.firstOrNull { request ->
                             request.uptimeMillis >= gestureStartedAtUptime &&

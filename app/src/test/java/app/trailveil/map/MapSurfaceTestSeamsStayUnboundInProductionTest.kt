@@ -15,15 +15,29 @@ import org.junit.Test
  * a null, plus the null check where it is used; the trace lambda's arguments are never evaluated,
  * because the use is a safe call on that null.
  *
- * `src/googlePoc` is the engineering harness and binds seams on purpose; it is not a shipped
- * source set (`V02-008`) and is not scanned here. The device-test sources are scanned for the
- * opposite fact, so the absence asserted in production is paired with a presence the same scan
- * can see - a scan that could not find a binding anywhere would otherwise pass vacuously.
+ * `src/googlePoc` is the engineering harness and binds seams on purpose; it is compiled into the
+ * `googlePoc` build type alone, which is not shipped (`V02-008`), so it is the one non-test source
+ * root this scan excludes - and it is scanned for the opposite fact, like the device-test sources,
+ * so every absence asserted here is paired with a presence the same scan can see; a scan that
+ * could not find a binding anywhere would otherwise pass vacuously.
+ *
+ * Two routes a binding could take past a text scan, both closed by construction: a seam bound
+ * positionally or as a trailing lambda carries no `ForTesting` text at the call site, so every
+ * shipped call site must name every argument and end at its parenthesis; and a source root the
+ * scan does not know about would never be read, so the roots are found by listing `src/` and
+ * excluding the test trees and the harness, never by naming what to include. A source scan still
+ * cannot see Gradle scoping (`V02-008`'s lesson); what it proves is that no source a shipped build
+ * could compile binds a seam, which for this repository is the same thing.
  */
 class MapSurfaceTestSeamsStayUnboundInProductionTest {
 
-    private val shippedSourceSets = listOf("main", "mapLibre", "google")
     private val actualDirectories = listOf("mapLibre", "google")
+
+    /** The roots the amended acceptance criterion names; a rename must fail loudly, not shrink the scan. */
+    private val rootsThatMustExist = listOf("main", "mapLibre", "google")
+
+    /** The one non-test root a shipped build never compiles. */
+    private val engineeringHarness = "googlePoc"
 
     @Test
     fun everyTestSeamOfEveryActualHasADefault() {
@@ -41,12 +55,18 @@ class MapSurfaceTestSeamsStayUnboundInProductionTest {
     }
 
     @Test
-    fun noShippedCallSiteBindsATestSeam() {
-        val calls = shippedSourceSets.flatMap { sourceSet ->
-            surfaceCallSites(moduleRoot().resolve("src/$sourceSet"))
+    fun theShippedRootsTheCriterionNamesAllExist() {
+        val roots = shippedSourceRoots().map(File::getName)
+        rootsThatMustExist.forEach { name ->
+            assertTrue("src/$name is gone or renamed; the scan would silently shrink: $roots", name in roots)
         }
+    }
+
+    @Test
+    fun noShippedCallSiteBindsATestSeam() {
+        val calls = shippedSourceRoots().flatMap(::surfaceCallSites)
         assertTrue(
-            "no TrailVeilMapSurface( call site was found in the shipped source sets; the scan is broken",
+            "no TrailVeilMapSurface( call site was found in any shipped source root; the scan is broken",
             calls.isNotEmpty(),
         )
         calls.forEach { call ->
@@ -55,6 +75,36 @@ class MapSurfaceTestSeamsStayUnboundInProductionTest {
                 !call.arguments.contains("ForTesting"),
             )
         }
+    }
+
+    @Test
+    fun everyShippedCallSiteNamesEveryArgumentAndTakesNoTrailingLambda() {
+        val calls = shippedSourceRoots().flatMap(::surfaceCallSites)
+        assertTrue("no shipped call site found; the scan is broken", calls.isNotEmpty())
+        calls.forEach { call ->
+            assertTrue(
+                "a shipped call site passes a trailing lambda, which binds the last seam without " +
+                    "naming it: ${call.location}",
+                !call.trailingLambda,
+            )
+            topLevelArguments(call.arguments).forEach { argument ->
+                assertTrue(
+                    "a shipped call site passes an argument positionally, which could bind a seam " +
+                        "without naming it: ${call.location}: $argument",
+                    NAMED_ARGUMENT.containsMatchIn(argument),
+                )
+            }
+        }
+    }
+
+    @Test
+    fun theEngineeringHarnessIsWhereSeamsAreBoundOutsideTheTestTrees() {
+        val calls = surfaceCallSites(moduleRoot().resolve("src/$engineeringHarness"))
+        assertTrue(
+            "src/$engineeringHarness binds no *ForTesting seam at any TrailVeilMapSurface( call site; " +
+                "if the harness moved, move the exclusion with it",
+            calls.any { call -> call.arguments.contains("ForTesting") },
+        )
     }
 
     @Test
@@ -68,7 +118,21 @@ class MapSurfaceTestSeamsStayUnboundInProductionTest {
         )
     }
 
-    private class SurfaceCall(val location: String, val arguments: String)
+    private class SurfaceCall(val location: String, val arguments: String, val trailingLambda: Boolean)
+
+    /**
+     * Every directory under `src/` a shipped build could compile: everything but the JVM and device
+     * test trees and the engineering harness. An exclusion list, so a root added later is scanned
+     * by default.
+     */
+    private fun shippedSourceRoots(): List<File> = moduleRoot().resolve("src")
+        .listFiles { file -> file.isDirectory }
+        .orEmpty()
+        .filter { directory ->
+            val name = directory.name
+            name != engineeringHarness && !name.startsWith("test") && !name.startsWith("androidTest")
+        }
+        .sortedBy(File::getName)
 
     /**
      * Every `TrailVeilMapSurface(` call under [root] with its balanced argument text. Declarations
@@ -98,14 +162,60 @@ class MapSurfaceTestSeamsStayUnboundInProductionTest {
                 val open = from + marker.length - 1
                 val close = matchingParenthesis(text, open)
                 val line = text.substring(0, from).count { it == '\n' } + 1
+                val afterCall = text.substring(close + 1).trimStart()
                 calls += SurfaceCall(
                     location = "${file.relativeTo(root).path}:$line",
                     arguments = text.substring(open + 1, close),
+                    trailingLambda = afterCall.startsWith("{"),
                 )
             }
             from = text.indexOf(marker, from + marker.length)
         }
         return calls
+    }
+
+    /**
+     * The call's arguments split at the commas that belong to the call itself, not to a nested
+     * call, lambda, index or string literal; comments inside the argument list are dropped, so a
+     * commented argument is neither an argument nor a positional one.
+     */
+    private fun topLevelArguments(arguments: String): List<String> {
+        val pieces = mutableListOf<String>()
+        val current = StringBuilder()
+        var depth = 0
+        var inString = false
+        var index = 0
+        while (index < arguments.length) {
+            val c = arguments[index]
+            val next = if (index + 1 < arguments.length) arguments[index + 1] else ' '
+            when {
+                !inString && c == '/' && next == '/' -> {
+                    val end = arguments.indexOf('\n', index)
+                    index = if (end < 0) arguments.length else end
+                }
+                !inString && c == '/' && next == '*' -> {
+                    val end = arguments.indexOf("*/", index + 2)
+                    index = if (end < 0) arguments.length else end + 1
+                }
+                inString -> {
+                    current.append(c)
+                    if (c == '\\') {
+                        index += 1
+                        if (index < arguments.length) current.append(arguments[index])
+                    } else if (c == '"') {
+                        inString = false
+                    }
+                }
+                c == '"' -> { inString = true; current.append(c) }
+                c == '(' || c == '{' || c == '[' -> { depth += 1; current.append(c) }
+                c == ')' || c == '}' || c == ']' -> { depth -= 1; current.append(c) }
+                c == ',' && depth == 0 -> { pieces += current.toString(); current.setLength(0) }
+                else -> current.append(c)
+            }
+            index += 1
+        }
+        pieces += current.toString()
+        return pieces.map(String::trim).filter(String::isNotEmpty)
     }
 
     private fun matchingParenthesis(text: String, open: Int): Int {
@@ -147,6 +257,11 @@ class MapSurfaceTestSeamsStayUnboundInProductionTest {
         }
         if (pending.isNotEmpty()) parameters += pending
         return parameters
+    }
+
+    private companion object {
+        /** `name = ` at the start of an argument; `==` is not a binding. */
+        val NAMED_ARGUMENT = Regex("^[A-Za-z_][A-Za-z0-9_]*\\s*=(?!=)")
     }
 
     private fun moduleRoot(): File {
