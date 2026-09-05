@@ -33,14 +33,29 @@ class GooglePocBoundaryTest {
         assertFalse(manifest.contains("android:name=\"app.trailveil.MainActivity\""))
     }
 
+    /**
+     * The one string element of `src/googlePoc` copy allowed to name the other provider.
+     *
+     * `V02-008` acceptance: every terminal reason belonging to this provider points the user at
+     * the build that does not have it, and a pointer that will not say where to go is not a
+     * pointer. The exception is exactly this: localized user copy, in a resource whose own NAME
+     * carries no marker, so nothing in `src/googlePoc` code can reach for the other provider and
+     * claim this clause.
+     */
+    private val keylessBuildPointer = "map_provider_unavailable_keyless_build"
+
     @Test
     fun googlePoCSourcesContainNoOtherProviderMarkers() {
         // The inverse boundary: near Google content no other basemap may render, so no MapLibre
-        // or OpenFreeMap marker may appear anywhere in the googlePoc source tree. The overlay
-        // manifest is exempt because it legitimately NAMES the MapLibre notices meta-data in a
-        // `tools:node="remove"` directive — the one place the string means "keep this out".
+        // or OpenFreeMap marker may appear anywhere in the googlePoc source tree, save the one
+        // documented copy element above. The overlay manifest is exempt as a file: `V02-008` moved
+        // the notices meta-data into the MapLibre source set, so this manifest names neither
+        // provider today, but the exemption predates that and is cheaper to keep than to re-earn.
         val googlePocRoot = File(moduleRoot(), "src/googlePoc")
         val forbiddenMarkers = listOf("maplibre", "openfreemap")
+        val pointerElement = Regex(
+            """<string [^>]*name="$keylessBuildPointer"[^>]*>[^<]*</string>""",
+        )
         val offenders = googlePocRoot.walkTopDown()
             .filter { file ->
                 file.isFile &&
@@ -48,7 +63,14 @@ class GooglePocBoundaryTest {
                     file.name != "AndroidManifest.xml"
             }
             .flatMap { file ->
-                val text = file.readText()
+                // Only that element's own text is exempt, and only where strings live. Everything
+                // else in the same file is still scanned, so a second marker cannot hide behind
+                // the first one's licence.
+                val text = if (file.name == "strings.xml") {
+                    pointerElement.replace(file.readText(), "")
+                } else {
+                    file.readText()
+                }
                 forbiddenMarkers
                     .filter { marker -> text.contains(marker, ignoreCase = true) }
                     .map { marker -> "${file.relativeTo(googlePocRoot)}: $marker" }
@@ -56,6 +78,29 @@ class GooglePocBoundaryTest {
             .toList()
 
         assertTrue("non-Google provider markers leaked into src/googlePoc: $offenders", offenders.isEmpty())
+    }
+
+    /**
+     * The positive control for the exemption above: a blind reader that stripped the wrong thing,
+     * or copy that quietly stopped naming a destination, would otherwise pass the marker test by
+     * having nothing to find. Every locale must carry the pointer, and it must name the build.
+     */
+    @Test
+    fun everyLocaleOfTheGoogleVariantNamesTheBuildItPointsAt() {
+        val stringFiles = File(moduleRoot(), "src/googlePoc/res").walkTopDown()
+            .filter { it.isFile && it.name == "strings.xml" }
+            .toList()
+        assertTrue("no googlePoc string resources found", stringFiles.size >= 2)
+        stringFiles.forEach { file ->
+            val pointer = Regex(
+                """<string [^>]*name="$keylessBuildPointer"[^>]*>([^<]*)</string>""",
+            ).find(file.readText())
+            assertTrue("${file.parentFile.name} has no $keylessBuildPointer", pointer != null)
+            assertTrue(
+                "${file.parentFile.name} pointer does not name the OpenFreeMap build",
+                pointer!!.groupValues[1].contains("OpenFreeMap"),
+            )
+        }
     }
 
     /**

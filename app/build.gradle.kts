@@ -743,6 +743,14 @@ fun registerProviderBoundaryCheck(variant: String, google: Boolean) {
                     check(!resourceContentNamesMapLibre) {
                         "$variant APK packages a resource whose content names MapLibre"
                     }
+                    // `V02-008` acceptance: every terminal reason on this variant points the user
+                    // at the keyless build, so its NAME is required to be here - in the string
+                    // table, which is where the localized copy lands. This is why the absence
+                    // probes above are the engine's markers and not the word: a variant that
+                    // named no alternative at all would satisfy a blanket ban and fail the user.
+                    check(arscNames("OpenFreeMap")) {
+                        "$variant APK never names the build its failure surfaces point at"
+                    }
                 } else {
                     check(mapLibreClasses > 0) {
                         "$variant APK contains no MapLibre classes, so this reader is blind"

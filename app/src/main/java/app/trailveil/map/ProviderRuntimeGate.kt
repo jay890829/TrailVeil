@@ -92,6 +92,32 @@ internal object ProviderRuntimeGate {
     }
 }
 
+/**
+ * Whether this reason is the PROVIDER's, so that a build rendering with a different one could
+ * plausibly draw a map on the same device.
+ *
+ * `V02-008` acceptance: every terminal reason on the Google variant must point the user at the
+ * OpenFreeMap build. Every reason here is provider-specific except one - no validated internet
+ * connection is the device's, and both providers fetch their tiles over it, so pointing a user
+ * with no network at another build would be advice that cannot work. The `when` is exhaustive with
+ * no `else` on purpose: a reason added later has to be classified deliberately rather than
+ * inheriting a default that quietly promises a fix.
+ *
+ * Neutral by construction - no provider is named here, only the shape of the failure. The variant
+ * that has somewhere to point supplies the copy.
+ */
+internal fun ProviderFallbackReason.isProviderSpecific(): Boolean = when (this) {
+    ProviderFallbackReason.MISSING_KEY,
+    ProviderFallbackReason.STRUCTURALLY_INVALID_KEY,
+    ProviderFallbackReason.PROVIDER_SERVICES_UNAVAILABLE,
+    ProviderFallbackReason.INITIALIZATION_FAILURE,
+    ProviderFallbackReason.MAP_LOAD_TIMEOUT,
+    ProviderFallbackReason.LEGACY_RENDERER,
+    -> true
+
+    ProviderFallbackReason.NO_VALIDATED_NETWORK -> false
+}
+
 internal fun ProviderFallbackReason.message(): String = when (this) {
     ProviderFallbackReason.MISSING_KEY -> "No external API key is configured."
     ProviderFallbackReason.STRUCTURALLY_INVALID_KEY -> "The external API key is invalid."

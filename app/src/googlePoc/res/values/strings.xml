@@ -24,7 +24,16 @@
     <string name="map_provider_unavailable_no_network">The online map is unavailable: no validated internet connection.</string>
     <string name="map_provider_unavailable_no_play_services">The online map is unavailable: compatible Google Play services are missing or disabled on this device.</string>
     <string name="map_provider_unavailable_initialization_failure">The online map could not start.</string>
+    <string name="map_provider_unavailable_load_timeout">The online map did not finish loading in time.</string>
     <string name="map_provider_unavailable_legacy_renderer">The online map is unavailable: this device only offers Google’s legacy map renderer, which cannot draw the map reliably.</string>
+    <!-- `V02-008`: every terminal reason that belongs to this provider names the keyless build,
+         which is the only place in this source set allowed to name it - the boundary test exempts
+         this one string element and nothing else, so the note stays marker-free too. The copy
+         deliberately promises nothing about keeping existing data across the switch: the keyless
+         build carries the project's signature and a build of THIS variant carries whichever key
+         its builder supplied, so whether one installs over the other depends on who built this
+         APK, which the copy cannot know. -->
+    <string name="map_provider_unavailable_keyless_build">The TrailVeil OpenFreeMap build draws a map without a Google map key and without Google Play services: github.com/jay890829/TrailVeil/releases</string>
     <string name="map_provider_unavailable_reassurance">Recording and exploration history stay on this device and keep working.</string>
     <!-- `V02-006`: the disclosure the shared privacy sheet composes for the active basemap. The
          two URLs are the ones Google Maps Platform Terms 3.2.2(a) require the application to

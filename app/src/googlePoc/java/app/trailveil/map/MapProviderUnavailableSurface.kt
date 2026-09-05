@@ -60,6 +60,23 @@ internal fun MapProviderUnavailableSurface(
             style = MaterialTheme.typography.bodyLarge,
             textAlign = TextAlign.Center,
         )
+        // `V02-008`: a terminal reason that belongs to THIS provider has somewhere to send the
+        // user, and the acceptance criteria require it to. A reason that is the device's - no
+        // validated internet connection - does not, and saying otherwise would be advice that
+        // cannot work, so the pointer is absent there rather than softened.
+        //
+        // Only the localized copy names the build it points at. This file does not, and neither
+        // does the resource name, so the source-marker boundary over `src/googlePoc` stays exact
+        // and the exception it grants is exactly one string element.
+        if (reason.isProviderSpecific()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = stringResource(R.string.map_provider_unavailable_keyless_build),
+                color = Color.White,
+                style = MaterialTheme.typography.bodyMedium,
+                textAlign = TextAlign.Center,
+            )
+        }
         Spacer(modifier = Modifier.height(12.dp))
         Text(
             text = stringResource(R.string.map_provider_unavailable_reassurance),
@@ -84,7 +101,7 @@ internal fun ProviderFallbackReason.unavailableMessageResource(): Int = when (th
     ProviderFallbackReason.INITIALIZATION_FAILURE ->
         R.string.map_provider_unavailable_initialization_failure
     ProviderFallbackReason.MAP_LOAD_TIMEOUT ->
-        R.string.map_provider_unavailable_initialization_failure
+        R.string.map_provider_unavailable_load_timeout
     ProviderFallbackReason.LEGACY_RENDERER ->
         R.string.map_provider_unavailable_legacy_renderer
 }

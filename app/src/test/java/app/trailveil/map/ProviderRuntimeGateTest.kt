@@ -166,4 +166,38 @@ class ProviderRuntimeGateTest {
             assertTrue("$reason has no message", reason.message().isNotBlank())
         }
     }
+
+    /**
+     * `V02-008` acceptance: every terminal reason the Google variant can reach points the user at
+     * the OpenFreeMap build. The surface renders that pointer for exactly the provider-specific
+     * reasons, so the criterion is this list - stated by name rather than by iterating the enum,
+     * which would agree with whatever the code said.
+     */
+    @Test
+    fun everyReasonTheGoogleVariantCanReachIsTheProvidersOwn() {
+        listOf(
+            ProviderFallbackReason.MISSING_KEY,
+            ProviderFallbackReason.STRUCTURALLY_INVALID_KEY,
+            ProviderFallbackReason.PROVIDER_SERVICES_UNAVAILABLE,
+            ProviderFallbackReason.INITIALIZATION_FAILURE,
+            ProviderFallbackReason.MAP_LOAD_TIMEOUT,
+            ProviderFallbackReason.LEGACY_RENDERER,
+        ).forEach { reason ->
+            assertTrue(
+                "$reason must point at the other provider's build",
+                reason.isProviderSpecific(),
+            )
+        }
+    }
+
+    /**
+     * The one reason that must NOT point elsewhere: both providers fetch tiles over the same
+     * connection, so telling a user with no network to install the other build is advice that
+     * cannot work. It is unreachable on the Google variant today - that variant initializes
+     * without a validated network - and this pins the classification, not the reachability.
+     */
+    @Test
+    fun aMissingNetworkIsTheDevicesProblemAndNotTheProvidersOwn() {
+        assertFalse(ProviderFallbackReason.NO_VALIDATED_NETWORK.isProviderSpecific())
+    }
 }
