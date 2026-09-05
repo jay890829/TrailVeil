@@ -789,8 +789,11 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             abs(Color.green(pixel) - COVER_GREEN) <= COVER_TOLERANCE &&
             abs(Color.blue(pixel) - COVER_BLUE) <= COVER_TOLERANCE
 
+    // ROOT, not the default locale: this string goes into an instrumentation status stream
+    // that later runs are compared against, so a decimal separator that follows the device
+    // would make the same measurement read differently on different images.
     private fun percent(fraction: Double): String =
-        String.format("%.1f%%", fraction * 100.0)
+        String.format(java.util.Locale.ROOT, "%.1f%%", fraction * 100.0)
 
     private fun report(stream: String) {
         InstrumentationRegistry.getInstrumentation().sendStatus(

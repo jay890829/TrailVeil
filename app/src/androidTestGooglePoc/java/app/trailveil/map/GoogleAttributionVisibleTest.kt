@@ -469,7 +469,7 @@ class GoogleAttributionVisibleTest {
             "Google attribution ImageView was not found"
         }
         val mapBounds = mapView.boundsOnScreen()
-        val reference = Bitmap.createBitmap(
+        val reference = androidx.core.graphics.createBitmap(
             candidate.width.coerceAtLeast(1),
             candidate.height.coerceAtLeast(1),
             Bitmap.Config.ARGB_8888,

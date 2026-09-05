@@ -20,6 +20,7 @@ import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTouchInput
 import androidx.compose.ui.test.swipeUp
 import androidx.core.graphics.get
+import androidx.core.view.isVisible
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.BuildConfig
@@ -934,7 +935,7 @@ class GoogleHistoryDetailPopTest {
             }
         }
         walk(mapView)
-        val visible = candidates.any { it.isShown && it.visibility == View.VISIBLE }
+        val visible = candidates.any { it.isShown && it.isVisible }
         val attributionBounds = candidates.firstOrNull()?.boundsOnScreen()
         val inside = candidates.any { candidate ->
             val bounds = candidate.boundsOnScreen()
@@ -963,7 +964,7 @@ class GoogleHistoryDetailPopTest {
             "Google attribution ImageView was not found"
         }
         val mapBounds = mapView.boundsOnScreen()
-        val reference = Bitmap.createBitmap(
+        val reference = androidx.core.graphics.createBitmap(
             candidate.width.coerceAtLeast(1),
             candidate.height.coerceAtLeast(1),
             Bitmap.Config.ARGB_8888,
