@@ -1,23 +1,25 @@
 package app.trailveil.map
 
 import java.net.URI
-import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Test
 
+/**
+ * The neutral half of the style boundary: what any provider's configuration must satisfy.
+ *
+ * `V02-008`: the assertions about WHICH provider this build uses moved to
+ * `src/testMapLibre`, which is compiled only into the variants that render with it. This file is
+ * shared, so anything asserted here has to be true of every provider.
+ */
 class MapProviderConfigurationTest {
     @Test
-    fun productionProviderIsNoKeyHttpsOpenFreeMapStyle() {
-        val uri = URI(ProductionMapProvider.styleUri)
+    fun acceptsAProviderThatSuppliesNoStyleDocument() {
+        val configuration = MapProviderConfiguration(providerName = "test", styleUri = null)
 
-        assertEquals("OpenFreeMap", ProductionMapProvider.providerName)
-        assertEquals("https", uri.scheme)
-        assertEquals("tiles.openfreemap.org", uri.host)
-        assertEquals("/styles/liberty", uri.path)
-        assertNull(uri.userInfo)
-        assertNull(uri.query)
-        assertNull(uri.fragment)
+        assertThrows(IllegalArgumentException::class.java) {
+            MapProviderConfiguration(providerName = " ", styleUri = null)
+        }
+        assert(configuration.styleUri == null)
     }
 
     @Test

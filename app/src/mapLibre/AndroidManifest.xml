@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- `V02-008`: the MapLibre notices are a MapLibre artifact, so both the resource and the
+     declaration that points at it live in this provider's source set. While they were in
+     `src/main` the Google release APK packaged the 76 KB notice file under a shortened resource
+     path, which is a non-Google map's material inside an APK that must contain none. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <meta-data
+            android:name="app.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES"
+            android:resource="@raw/maplibre_third_party_notices" />
+    </application>
+</manifest>

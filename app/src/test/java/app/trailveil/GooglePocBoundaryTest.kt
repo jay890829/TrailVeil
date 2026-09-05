@@ -58,19 +58,46 @@ class GooglePocBoundaryTest {
         assertTrue("non-Google provider markers leaked into src/googlePoc: $offenders", offenders.isEmpty())
     }
 
+    /**
+     * Neither map engine may be linked by a configuration that reaches the other provider.
+     *
+     * `V02-008` rewrote this from naming one literal dependency line to asserting the property that
+     * line was standing in for, because the property was not actually held: `play-services-maps`
+     * was correctly scoped while `implementation(libs.maplibre.opengl)` was not, so the Google
+     * build packaged four `libmaplibre.so` and 1657 `Lorg/maplibre/` class descriptors. A source
+     * scan cannot see a Gradle configuration, which is why the packaged-APK gate exists too; this
+     * test is the fast one that says which line is wrong.
+     */
     @Test
-    fun mapsDependencyIsScopedToGooglePoCConfiguration() {
-        val buildScript = File(repositoryRoot(), "build.gradle.kts")
-            .readText()
-        val moduleScript = File(moduleRoot(), "build.gradle.kts")
-            .readText()
+    fun neitherMapEngineIsLinkedByASharedConfiguration() {
+        val buildScript = File(repositoryRoot(), "build.gradle.kts").readText()
+        val moduleScript = File(moduleRoot(), "build.gradle.kts").readText()
 
         assertFalse(buildScript.contains("play-services-maps"))
-        assertTrue(moduleScript.contains("add(\"googlePocImplementation\", \"com.google.android.gms:play-services-maps:20.0.0\")"))
+        assertFalse(buildScript.contains("maplibre"))
         assertTrue(moduleScript.contains("debugApiKeySha256"))
-        assertFalse(moduleScript.lines().any { line ->
-            line.trimStart().startsWith("implementation(\"com.google.android.gms:play-services-maps")
-        })
+
+        // Each engine is added by iterating its own build-type list, and by nothing else.
+        assertTrue(
+            "the Maps SDK must be added from googleBuildTypes",
+            moduleScript.contains("googleBuildTypes.forEach { variant ->"),
+        )
+        assertTrue(
+            "MapLibre must be added from openFreeMapBuildTypes",
+            moduleScript.contains(
+                "openFreeMapBuildTypes.forEach { variant -> add(\"\${variant}Implementation\", libs.maplibre.opengl) }",
+            ),
+        )
+        val sharedConfigurations = listOf("implementation", "api", "compileOnly", "runtimeOnly")
+        val offenders = moduleScript.lines()
+            .map(String::trim)
+            .filter { line ->
+                sharedConfigurations.any { configuration ->
+                    line.startsWith("$configuration(") &&
+                        (line.contains("maplibre") || line.contains("play-services-maps"))
+                }
+            }
+        assertTrue("a map engine is on a shared configuration: $offenders", offenders.isEmpty())
     }
 
     @Test

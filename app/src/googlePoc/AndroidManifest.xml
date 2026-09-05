@@ -31,8 +31,5 @@
                 android:name="app.trailveil.map.GoogleMapWarmup"
                 android:value="androidx.startup" />
         </provider>
-        <meta-data
-            android:name="app.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES"
-            tools:node="remove" />
     </application>
 </manifest>

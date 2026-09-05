@@ -310,7 +310,7 @@ try {
     }
 
     $expectedNoticeDigest = 'db3cc41e2c79f394a1dddd890c55c263426175029a898d5167820498ddebf152'
-    $noticeSource = Join-Path $repositoryRoot 'app/src/main/res/raw/maplibre_third_party_notices.txt'
+    $noticeSource = Join-Path $repositoryRoot 'app/src/mapLibre/res/raw/maplibre_third_party_notices.txt'
     $sourceNoticeDigest = Get-NormalizedTextSha256 -Text ([IO.File]::ReadAllText($noticeSource))
     if ($sourceNoticeDigest -ne $expectedNoticeDigest) {
         throw "MapLibre notice source digest $sourceNoticeDigest is not the pinned android-v13.4.1 notice."

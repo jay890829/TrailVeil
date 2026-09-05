@@ -523,7 +523,13 @@ internal fun TrailVeilMapSurface(
             if (!compositionActive.get() || !styleGenerationActive.get()) return@getMapAsync
             readyMap = map
             map.setStyle(
-                Style.Builder().fromUri(provider.styleUri).withInitialFogGuard(fogRequired),
+                Style.Builder()
+                    .fromUri(
+                        requireNotNull(provider.styleUri) {
+                            "This surface renders a style document, so its provider must supply one"
+                        },
+                    )
+                    .withInitialFogGuard(fogRequired),
             ) { style ->
                 if (
                     compositionActive.get() &&

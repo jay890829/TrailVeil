@@ -51,6 +51,31 @@ private val androidTestBuildType = providers
         }
     }
 
+/**
+ * Every build type that renders with MapLibre, and therefore the ONLY ones that may link it.
+ *
+ * `V02-008`: this single list decides both the source wiring and the dependency, so the two cannot
+ * disagree. A build type left out of it does not silently link two map engines - it compiles with
+ * no `TrailVeilMapSurface` actual at all, and says so. Google Maps Platform Terms 3.2.3(e) forbid
+ * using the Maps SDK with a non-Google map, so this is a compliance boundary, not a size
+ * optimisation: before this list scoped it, `implementation(libs.maplibre.opengl)` was unscoped and
+ * the Google build packaged 4 `libmaplibre.so` and 1657 `Lorg/maplibre/` class descriptors.
+ */
+private val openFreeMapBuildTypes = listOf("debug", "internal", "release")
+
+/**
+ * Every build type that renders with the Maps SDK: the PoC harness the Google instrumentation
+ * suites drive, and the release-configured variant a key holder builds and never publishes.
+ */
+private val googleBuildTypes = listOf("googlePoc", "googleRelease")
+
+// The two lists are the boundary. A build type in both would link both map engines, which is
+// the one arrangement Google Maps Platform Terms 3.2.3(e) forbids.
+require(openFreeMapBuildTypes.intersect(googleBuildTypes.toSet()).isEmpty()) {
+    "a build type cannot render with both map providers: " +
+        openFreeMapBuildTypes.intersect(googleBuildTypes.toSet())
+}
+
 private val googlePocMissingKeySentinel = "TRAILVEIL_GOOGLE_MAPS_POC_MISSING_KEY"
 private val googlePocKeyPattern = Regex("^AIza[A-Za-z0-9_-]{35}$")
 private val googlePocKeyFingerprintPattern = Regex("^[a-f0-9]{64}$")
@@ -155,6 +180,30 @@ private fun String.sha256Hex(): String = MessageDigest
     .getInstance("SHA-256")
     .digest(toByteArray(Charsets.UTF_8))
     .joinToString(separator = "") { byte -> "%02x".format(byte) }
+
+/** The Google key inputs, identical on every Google build type. */
+private fun com.android.build.api.dsl.VariantDimension.applyGoogleMapsKey() {
+    buildConfigField(
+        "boolean",
+        "GOOGLE_MAPS_POC_KEY_CONFIGURED",
+        (googlePocKeyConfiguration.reason == GooglePocKeyBuildReason.VALID).toString(),
+    )
+    buildConfigField(
+        "String",
+        "GOOGLE_MAPS_POC_KEY_REASON",
+        googlePocKeyConfiguration.reason.name.toBuildConfigString(),
+    )
+    buildConfigField(
+        "String",
+        "GOOGLE_MAPS_POC_KEY_GUIDANCE",
+        googlePocKeyGuidance(googlePocKeyConfiguration).toBuildConfigString(),
+    )
+    resValue(
+        "string",
+        "trailveil_google_maps_poc_api_key",
+        googlePocKeyConfiguration.key ?: googlePocMissingKeySentinel,
+    )
+}
 
 private fun String.toBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")}\""
@@ -350,26 +399,19 @@ android {
             initWith(getByName("debug"))
             versionNameSuffix = "-googlePoc"
             matchingFallbacks += listOf("debug")
-            buildConfigField(
-                "boolean",
-                "GOOGLE_MAPS_POC_KEY_CONFIGURED",
-                (googlePocKeyConfiguration.reason == GooglePocKeyBuildReason.VALID).toString(),
-            )
-            buildConfigField(
-                "String",
-                "GOOGLE_MAPS_POC_KEY_REASON",
-                googlePocKeyConfiguration.reason.name.toBuildConfigString(),
-            )
-            buildConfigField(
-                "String",
-                "GOOGLE_MAPS_POC_KEY_GUIDANCE",
-                googlePocKeyGuidance(googlePocKeyConfiguration).toBuildConfigString(),
-            )
-            resValue(
-                "string",
-                "trailveil_google_maps_poc_api_key",
-                googlePocKeyConfiguration.key ?: googlePocMissingKeySentinel,
-            )
+            applyGoogleMapsKey()
+        }
+        // `V02-008`: the Google variant a key holder builds. Release-configured - not debuggable,
+        // signed by whatever key its builder configured - and never published as a prebuilt APK,
+        // because the key it compiles in is uncompressed in `resources.arsc`. It reads the key by
+        // exactly the same path as the PoC build type, including the missing-key sentinel, so a
+        // key-less build of it fails closed onto the provider-unavailable surface rather than
+        // failing to build.
+        create("googleRelease") {
+            initWith(getByName("release"))
+            versionNameSuffix = "-google"
+            matchingFallbacks += listOf("release")
+            applyGoogleMapsKey()
         }
     }
 
@@ -384,9 +426,24 @@ android {
         // `V02-005` stage 1: the MapLibre map surface lives in its own source tree so the
         // googlePoc variant can bind a Google implementation of the same neutral contract.
         // debug/internal/release compile exactly the sources they always did.
-        listOf("debug", "internal", "release").forEach { variant ->
+        openFreeMapBuildTypes.forEach { variant ->
             getByName(variant).kotlin.srcDir("src/mapLibre/java")
             getByName(variant).res.srcDir("src/mapLibre/res")
+            // `V02-008`: the notices resource and the meta-data that points at it are MapLibre's,
+            // so they merge in from this provider's own manifest rather than from `src/main`.
+            // These build types declare no manifest of their own, so this is purely additive.
+            getByName(variant).manifest.srcFile("src/mapLibre/AndroidManifest.xml")
+            // Unit tests that name this provider, for the same reason.
+            getByName("test${variant.replaceFirstChar(Char::uppercase)}")
+                .kotlin.srcDir("src/testMapLibre/java")
+        }
+        // `V02-008`: the Google variants share one source tree and one manifest overlay. The
+        // release-configured one is a second build type rather than a copy of the sources, so the
+        // build that ships and the build the instrumentation suites drive cannot drift apart.
+        googleBuildTypes.forEach { variant ->
+            getByName(variant).kotlin.srcDir("src/googlePoc/java")
+            getByName(variant).res.srcDir("src/googlePoc/res")
+            getByName(variant).manifest.srcFile("src/googlePoc/AndroidManifest.xml")
         }
     }
 
@@ -429,103 +486,113 @@ val mergedManifestFiles = mapOf(
     "googlePoc" to layout.buildDirectory.file(
         "intermediates/merged_manifests/googlePoc/processGooglePocManifest/AndroidManifest.xml",
     ),
+    "googleRelease" to layout.buildDirectory.file(
+        "intermediates/merged_manifests/googleRelease/processGoogleReleaseManifest/AndroidManifest.xml",
+    ),
 )
 // The key's one sink. The manifest keeps the `@string` reference; this generated resource holds
 // the value aapt links into resources.arsc, so it is the file that proves what a build resolved.
-val googlePocKeyResValues = layout.buildDirectory.file(
-    "generated/res/resValues/googlePoc/values/gradleResValues.xml",
+/**
+ * The key's one sink, per Google build type. The manifest keeps the `@string` reference; this
+ * generated resource holds the value aapt links into `resources.arsc`, so it is the file that
+ * proves what a build resolved.
+ */
+fun googleKeyResValues(variant: String) = layout.buildDirectory.file(
+    "generated/res/resValues/$variant/values/gradleResValues.xml",
 )
 val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifest") {
     group = "verification"
-    description = "Proves Google Maps markers exist only in the isolated googlePoc manifest"
+    description = "Proves Google Maps markers exist only in the Google variants' manifests"
     dependsOn(
-        "processDebugManifest",
-        "processInternalManifest",
-        "processReleaseManifest",
-        "processGooglePocManifest",
-        "generateGooglePocResValues",
+        openFreeMapBuildTypes.map { "process${it.replaceFirstChar(Char::uppercase)}Manifest" } +
+            googleBuildTypes.flatMap {
+                val capitalised = it.replaceFirstChar(Char::uppercase)
+                listOf("process${capitalised}Manifest", "generate${capitalised}ResValues")
+            },
     )
     inputs.files(mergedManifestFiles.values)
-    inputs.file(googlePocKeyResValues)
+    inputs.files(googleBuildTypes.map(::googleKeyResValues))
     outputs.upToDateWhen { false }
     val keyReason = googlePocKeyConfiguration.reason
     doLast {
-        val googleManifest = mergedManifestFiles.getValue("googlePoc").get().asFile.readText()
-        check("com.google.android.geo.API_KEY" in googleManifest) {
-            "googlePoc merged manifest is missing the Google Maps API-key marker"
-        }
-        check("android:value=\"@string/trailveil_google_maps_poc_api_key\"" in googleManifest) {
-            "googlePoc merged manifest does not bind the key marker to the generated key resource"
-        }
-        // `V02-008` (c): assert the VALUE the build resolved, so a keyless build is proven keyless
-        // rather than assumed keyless because the runner happened to hold no key. The sentinel
-        // must be there when no valid key was configured, and a key-shaped, non-sentinel value
-        // when one was. The value itself is never printed, on either branch.
-        val resValues = googlePocKeyResValues.get().asFile.readText()
-        val keyResource = Regex(
-            """<string\b[^>]*\bname="trailveil_google_maps_poc_api_key"[^>]*>([^<]*)</string>""",
-        ).find(resValues)
-        checkNotNull(keyResource) {
-            "googlePoc resValues do not define trailveil_google_maps_poc_api_key"
-        }
-        val resolvedValue = keyResource.groupValues[1]
-        // The reason is safe to print and worth printing: a CI log then shows that the keyless
-        // job really resolved MISSING_KEY. The value never is, on any branch.
-        logger.lifecycle(
-            "googlePoc key resolved as ${keyReason.name} " +
-                (if (resolvedValue == googlePocMissingKeySentinel) "(sentinel)" else "(key-shaped)"),
-        )
-        if (keyReason == GooglePocKeyBuildReason.VALID) {
-            check(
-                resolvedValue != googlePocMissingKeySentinel &&
-                    googlePocKeyPattern.matches(resolvedValue),
-            ) {
-                "googlePoc key resource does not hold a key although the key reason is VALID"
+        googleBuildTypes.forEach { googleVariant ->
+            val googleManifest = mergedManifestFiles.getValue(googleVariant).get().asFile.readText()
+            check("com.google.android.geo.API_KEY" in googleManifest) {
+                "$googleVariant merged manifest is missing the Google Maps API-key marker"
             }
-        } else {
-            check(resolvedValue == googlePocMissingKeySentinel) {
-                "googlePoc key resource is not the missing-key sentinel although the key reason " +
-                    "is ${keyReason.name}"
+            check("android:value=\"@string/trailveil_google_maps_poc_api_key\"" in googleManifest) {
+                "$googleVariant merged manifest does not bind the key marker to the key resource"
             }
-        }
-        // `V02-005` stage 2 inverted this block: the production MainActivity IS the googlePoc
-        // launcher now, and the PoC Activity must remain present but never launchable.
-        check("org.apache.http.legacy" in googleManifest) {
-            "googlePoc merged manifest is missing the Maps SDK 20 legacy-renderer compatibility shim"
-        }
-        // An <activity> either self-closes its opening tag or runs to </activity>; matching the
-        // first "/>" unconditionally would truncate a block at its first self-closing CHILD
-        // (<action .../>) and lose the intent-filter this verifier exists to check.
-        val activityBlocks = Regex("""<activity\b[^>]*?(?:/>|>[\s\S]*?</activity>)""")
-            .findAll(googleManifest).map(MatchResult::value).toList()
-        val mainActivity = activityBlocks.singleOrNull { "app.trailveil.MainActivity" in it }
-        checkNotNull(mainActivity) {
-            "googlePoc merged manifest is missing the production MainActivity"
-        }
-        check("android.intent.category.LAUNCHER" in mainActivity) {
-            "googlePoc merged manifest does not make MainActivity the launcher"
-        }
-        val pocActivity = activityBlocks.singleOrNull {
-            "app.trailveil.googlepoc.GoogleMapsPocActivity" in it
-        }
-        checkNotNull(pocActivity) {
-            "googlePoc merged manifest lost the retained PoC engineering harness Activity"
-        }
-        check("android.intent.category.LAUNCHER" !in pocActivity) {
-            "the de-launchered PoC Activity regained a launcher intent-filter"
-        }
-        check("android:exported=\"false\"" in pocActivity) {
-            "the retained PoC Activity must stay unexported"
-        }
-        check("app.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES" !in googleManifest) {
-            "googlePoc merged manifest unexpectedly exposes production MapLibre notices"
-        }
-        check("app.trailveil.map.GoogleMapWarmup" in googleManifest) {
-            "googlePoc merged manifest is missing the map warmup initializer"
+            // `V02-008` (c): assert the VALUE the build resolved, so a keyless build is proven
+            // keyless rather than assumed keyless because the runner happened to hold no key. The
+            // sentinel must be there when no valid key was configured, and a key-shaped,
+            // non-sentinel value when one was. The value itself is never printed, on either branch.
+            val resValues = googleKeyResValues(googleVariant).get().asFile.readText()
+            val keyResource = Regex(
+                """<string\b[^>]*\bname="trailveil_google_maps_poc_api_key"[^>]*>([^<]*)</string>""",
+            ).find(resValues)
+            checkNotNull(keyResource) {
+                "$googleVariant resValues do not define trailveil_google_maps_poc_api_key"
+            }
+            val resolvedValue = keyResource.groupValues[1]
+            // The reason is safe to print and worth printing: a CI log then shows that the keyless
+            // job really resolved MISSING_KEY. The value never is, on any branch.
+            logger.lifecycle(
+                "$googleVariant key resolved as ${keyReason.name} " +
+                    (if (resolvedValue == googlePocMissingKeySentinel) "(sentinel)" else "(key-shaped)"),
+            )
+            if (keyReason == GooglePocKeyBuildReason.VALID) {
+                check(
+                    resolvedValue != googlePocMissingKeySentinel &&
+                        googlePocKeyPattern.matches(resolvedValue),
+                ) {
+                    "$googleVariant key resource does not hold a key although the reason is VALID"
+                }
+            } else {
+                check(resolvedValue == googlePocMissingKeySentinel) {
+                    "$googleVariant key resource is not the missing-key sentinel although the key " +
+                        "reason is ${keyReason.name}"
+                }
+            }
+            check("org.apache.http.legacy" in googleManifest) {
+                "$googleVariant merged manifest is missing the Maps SDK 20 legacy-renderer shim"
+            }
+            // An <activity> either self-closes its opening tag or runs to </activity>; matching the
+            // first "/>" unconditionally would truncate a block at its first self-closing CHILD
+            // (<action .../>) and lose the intent-filter this verifier exists to check.
+            val activityBlocks = Regex("""<activity\b[^>]*?(?:/>|>[\s\S]*?</activity>)""")
+                .findAll(googleManifest).map(MatchResult::value).toList()
+            // `V02-005` stage 2 inverted this block: the production MainActivity IS the Google
+            // launcher now, and the PoC Activity must remain present but never launchable.
+            val mainActivity = activityBlocks.singleOrNull { "app.trailveil.MainActivity" in it }
+            checkNotNull(mainActivity) {
+                "$googleVariant merged manifest is missing the production MainActivity"
+            }
+            check("android.intent.category.LAUNCHER" in mainActivity) {
+                "$googleVariant merged manifest does not make MainActivity the launcher"
+            }
+            val pocActivity = activityBlocks.singleOrNull {
+                "app.trailveil.googlepoc.GoogleMapsPocActivity" in it
+            }
+            checkNotNull(pocActivity) {
+                "$googleVariant merged manifest lost the retained PoC engineering harness Activity"
+            }
+            check("android.intent.category.LAUNCHER" !in pocActivity) {
+                "the de-launchered PoC Activity regained a launcher intent-filter in $googleVariant"
+            }
+            check("android:exported=\"false\"" in pocActivity) {
+                "the retained PoC Activity must stay unexported in $googleVariant"
+            }
+            check("app.trailveil.MAPLIBRE_THIRD_PARTY_NOTICES" !in googleManifest) {
+                "$googleVariant merged manifest unexpectedly exposes the other provider's notices"
+            }
+            check("app.trailveil.map.GoogleMapWarmup" in googleManifest) {
+                "$googleVariant merged manifest is missing the map warmup initializer"
+            }
         }
 
         mergedManifestFiles
-            .filterKeys { variant -> variant != "googlePoc" }
+            .filterKeys { variant -> variant !in googleBuildTypes }
             .forEach { (variant, manifestProvider) ->
                 val manifest = manifestProvider.get().asFile.readText()
                 check("com.google.android.geo.API_KEY" !in manifest) {
@@ -535,7 +602,7 @@ val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifes
                     "$variant merged manifest leaked the Google PoC launcher"
                 }
                 check("org.apache.http.legacy" !in manifest) {
-                    "$variant merged manifest leaked the Google PoC legacy-renderer compatibility shim"
+                    "$variant merged manifest leaked the Google PoC legacy-renderer shim"
                 }
                 check("app.trailveil.MainActivity" in manifest) {
                     "$variant merged manifest lost the production launcher"
@@ -548,7 +615,9 @@ val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifes
 }
 
 tasks.configureEach {
-    if (name == "assembleGooglePoc") {
+    // Every Google variant is gated, not just the PoC one: the release-configured build is
+    // the one that would carry a real key to a stranger.
+    if (name in googleBuildTypes.map { "assemble${it.replaceFirstChar(Char::uppercase)}" }) {
         dependsOn(verifyGooglePocMergedManifest)
     }
 }
@@ -727,7 +796,10 @@ dependencies {
     implementation(libs.room.runtime)
     implementation(libs.datastore.preferences)
     implementation(libs.coroutines.android)
-    implementation(libs.maplibre.opengl)
+    // `V02-008`: scoped, not shared. See [openFreeMapBuildTypes] for why this is a compliance
+    // boundary rather than a size optimisation, and section 6 of the task evidence for the
+    // measurement that found it unscoped.
+    openFreeMapBuildTypes.forEach { variant -> add("${variant}Implementation", libs.maplibre.opengl) }
     // Room 2.8.4 migration bundles require serialization 1.8.1 at runtime.
     // Pin the tested app so its parent class loader cannot supply the older 1.7.3 API.
     implementation(libs.kotlinx.serialization.json)
@@ -747,6 +819,8 @@ dependencies {
     debugImplementation(libs.compose.ui.tooling)
     debugImplementation(libs.compose.ui.test.manifest)
 
-    add("googlePocImplementation", "com.google.android.gms:play-services-maps:20.0.0")
-    add("googlePocImplementation", "androidx.startup:startup-runtime:1.2.0")
+    googleBuildTypes.forEach { variant ->
+        add("${variant}Implementation", "com.google.android.gms:play-services-maps:20.0.0")
+        add("${variant}Implementation", "androidx.startup:startup-runtime:1.2.0")
+    }
 }
