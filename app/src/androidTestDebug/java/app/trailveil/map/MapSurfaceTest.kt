@@ -2192,8 +2192,12 @@ class MapSurfaceTest {
                     // More than one engagement attempt: the hosted emulator's input timing can
                     // reject a detector-perfect stream that the local AVD always accepts (the first
                     // hosted run of these gates lost the zoom control to exactly that, "never engaged
-                    // in 1 attempts"). An unengaged stream moves no camera, so a retry re-runs from
-                    // the same frozen pose; the residual risk is red-only.
+                    // in 1 attempts"). An abandoned attempt leaves the camera near where it started
+                    // rather than exactly there - it lifts at the engage span, which is under 0.03
+                    // levels when the engagement floor rejects it and about 0.17 when the begin-slip
+                    // check does - so a retry re-runs from a pose still well inside the installed
+                    // surround, and the case's style mutation is re-applied between attempts. The
+                    // residual risk is red-only.
                     FiniteExtentPath.TILT -> shoveInSteps(
                         map = map,
                         onHold = onHold,
@@ -3762,6 +3766,7 @@ class MapSurfaceTest {
             }
             Thread.sleep(ZOOM_SETTLE_MILLIS)
             configureFogLayers?.invoke(map)
+            fogLayerMutationForRetries.set(configureFogLayers)
 
             // Same calibration the settled sweep runs, for the same reason: a detector that cannot
             // see a leak here would report every audit of the gesture as covered.
@@ -4210,6 +4215,25 @@ class MapSurfaceTest {
             auditEveryMove = true,
         )
 
+    /**
+     * The style mutation this case applied before its gesture, so a retry can re-apply it.
+     *
+     * An abandoned gesture attempt lifts the fingers, and the camera idle that follows rebuilds the
+     * fog into the OTHER slot with freshly built, unmutated layers - `FogGenerationSlot.next` always
+     * switches, and a new seam guard installs VISIBLE. A control case that hid a guard in order to
+     * have a leak to reproduce therefore loses its mutation to its own retry and then fails for not
+     * reproducing what it no longer removed, blaming the product for the harness. Re-applying
+     * between attempts makes a retry equivalent to a first try. The mutation lambdas re-read the
+     * published slot, so they land on whichever slot the rebuild installed.
+     */
+    private val fogLayerMutationForRetries =
+        AtomicReference<((MapLibreMap) -> Unit)?>(null)
+
+    /** Re-applies [fogLayerMutationForRetries] after an abandoned gesture attempt. */
+    private fun reapplyFogLayerMutation(map: MapLibreMap) {
+        fogLayerMutationForRetries.get()?.invoke(map)
+    }
+
     private enum class PinchSpanEdge { SHORTEST, TALLEST }
 
     private fun pinchInSteps(
@@ -4222,7 +4246,7 @@ class MapSurfaceTest {
         onEngaged: (() -> Unit)? = null,
     ) {
         require(attemptLimit > 0) { "attemptLimit must be positive" }
-        repeat(attemptLimit) {
+        repeat(attemptLimit) { attempt ->
             if (
                 pinchOnce(
                     map,
@@ -4231,8 +4255,16 @@ class MapSurfaceTest {
                     spanEdge,
                     auditEveryMove,
                     onEngaged,
+                    // Abandoning a stream costs an attempt, so only an attempt with a successor may
+                    // abandon one. The last attempt measures whatever it engaged: a stream whose
+                    // begin slipped by one move still delivers 4.14 levels on the tall geometry,
+                    // above every floor that asks for one, whereas abandoning it here would throw
+                    // "never engaged" at a caller that has no attempt left - which is exactly what
+                    // the single-attempt composite case would have done.
+                    retrySlippedBegin = attempt < attemptLimit - 1,
                 )
             ) return
+            reapplyFogLayerMutation(map)
         }
         // Every assertion downstream would still be sound, but reporting nothing measured is more
         // useful than reporting a clean gesture that never happened.
@@ -4247,6 +4279,7 @@ class MapSurfaceTest {
         spanEdge: PinchSpanEdge = PinchSpanEdge.SHORTEST,
         auditEveryMove: Boolean = false,
         onEngaged: (() -> Unit)? = null,
+        retrySlippedBegin: Boolean = false,
     ): Boolean {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         // A stuck injected-pointer state from any earlier crashed stream would reject this
@@ -4374,8 +4407,8 @@ class MapSurfaceTest {
         // inward probe remained below its effective touch slop. The >=4.0 zoom assertion remains
         // the authority on whether the tall stream leaves enough measured travel afterwards.
         // The tall path engages in gentler steps: the closer the begin move sits to the opened
-        // span, the more of the sweep is delivered. The ordinary pinch keeps its travel - its
-        // engage speed is 1.75 px/ms against MapLibre's 1.575 px/ms begin gate and cannot shrink.
+        // span, the more of the sweep is delivered. The ordinary pinch keeps its travel: it has
+        // less span to spend, so gentler steps there would buy little and cost begin-gate margin.
         val engageTravel = when (spanEdge) {
             PinchSpanEdge.SHORTEST -> PINCH_ENGAGE_TRAVEL
             PinchSpanEdge.TALLEST -> LONG_PINCH_ENGAGE_TRAVEL
@@ -4405,14 +4438,16 @@ class MapSurfaceTest {
             Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
             return false
         }
-        if (spanEdge == PinchSpanEdge.TALLEST) {
+        if (retrySlippedBegin && spanEdge == PinchSpanEdge.TALLEST) {
             // MapLibre never begins on the first move - the gestures library latches its start
             // span there - and begins on the second unless that move arrived slower than
             // 0.6 dp/ms, which one delayed injection under a loaded runner is enough to cause.
-            // Then it begins on the third, the base drops by one step, and every level this
-            // stream delivers is short by the same ratio: 4.046 became 3.988 against a 4.0 floor,
-            // five times on the hosted `map-0` shard. A slipped begin is a stream that cannot
-            // deliver what its geometry promises, so it is retried, not measured.
+            // Then it begins on the third and the base drops by one step. Under the old geometry
+            // that alone decided the case: 4.046 became 3.988 against a 4.0 floor, five times on
+            // the hosted `map-0` shard. The opened span fixed that - a begin on the third move
+            // now still delivers 4.14 - so this check is margin, not the fix, and it costs an
+            // attempt. Start a fresh stream while attempts remain; measure what the last one
+            // engaged.
             val earliestBeginSpan = startSpan + (engageSpan - startSpan) * 2 / PINCH_ENGAGE_MOVES
             val began = beginSpan.get()?.div(DETECTOR_SPAN_PER_POINTER_DISTANCE)
             if (began == null || began < earliestBeginSpan - BEGIN_SPAN_TOLERANCE_PX) {
@@ -4545,6 +4580,7 @@ class MapSurfaceTest {
             ) {
                 return
             }
+            reapplyFogLayerMutation(map)
         }
         throw AssertionError(
             "The shove never engaged MapLibre's shove detector in $attemptLimit attempts",
@@ -4632,6 +4668,7 @@ class MapSurfaceTest {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         repeat(attemptLimit) {
             if (rotateOnce(map, view, onHold, onEngaged)) return
+            reapplyFogLayerMutation(map)
         }
         throw AssertionError(
             "The rotate never engaged MapLibre's rotate detector in $attemptLimit attempts",
@@ -7701,18 +7738,48 @@ class MapSurfaceTest {
 
     private fun MapLibreMap.setFiniteExtentGuardsVisible(visible: Boolean) {
         val value = if (visible) Property.VISIBLE else Property.NONE
-        val activeSlotName = composeRule.runOnIdle {
-            attachedMapView()?.getTag(R.id.map_fog_active_slot) as? String
+        // "Only the active slot's guards are installed" describes a SETTLED overlay, not an
+        // invariant: both generations are installed while an A/B rebuild is in flight, and the
+        // superseded one is retired a moment later. Asserted during that window it reported all
+        // four guard layers and took the hosted `map-0` shard red on two commits that cannot have
+        // caused it - runs 33822582434 (2026-09-04) and 33944289438 (2026-09-05), the second on a
+        // commit touching only the pinch geometry. So wait for the retirement first.
+        // `waitUntil` THROWS on timeout, so a bare wait would replace the assertion's own report
+        // with "Condition still not satisfied after 90000 ms" - and since this predicate is
+        // strictly stronger than the assertion below, that would be the report for every state the
+        // assertion used to name. `P4-047` already built the split this needs, one screen down.
+        runCatching {
+            composeRule.waitUntil(timeoutMillis = BETWEEN_TRANSITIONS_TIMEOUT_MILLIS) {
+                val slot = activeFogSlotOrNull()
+                slot != null && hasOnlyPublishedFogGeneration(slot)
+            }
+        }.getOrElse { failure ->
+            val slot = activeFogSlotOrNull()
+            val style = slot?.let { active ->
+                runCatching { fogGenerationStyleReport(active) }
+                    .getOrElse { unreadable -> "unreadable: $unreadable" }
+            }
+            throw AssertionError(
+                "The fog never settled on one generation before the finite-extent A/B mutation, " +
+                    "within ${BETWEEN_TRANSITIONS_TIMEOUT_MILLIS}ms: slot=$slot " +
+                    "activeComplete=${slot?.let { hasCompletePublishedGeneration(it) }} " +
+                    "inactiveRetired=${slot?.let { hasRetiredGeneration(it.other()) }} " +
+                    "style=[$style]",
+                failure,
+            )
         }
-        val activeSlot = requireNotNull(activeSlotName?.let(FogGenerationSlot::valueOf)) {
-            "No active fog slot was published before the finite-extent A/B mutation"
-        }
-        val activeLayers = listOf(
-            FogSeamGuardIds.extentFillLayer(activeSlot),
-            FogSeamGuardIds.extentBoundaryLayer(activeSlot),
-        )
         InstrumentationRegistry.getInstrumentation().runOnMainSync {
             val style = requireNotNull(style) { "The style is not ready" }
+            // Read the slot on the same main-thread pass that asserts and mutates. A slot read
+            // beforehand can be superseded before the assertion runs, which is the same race in a
+            // narrower window rather than a fixed one.
+            val activeSlot = requireNotNull(mainThreadActiveFogSlot()) {
+                "No active fog slot was published before the finite-extent A/B mutation"
+            }
+            val activeLayers = listOf(
+                FogSeamGuardIds.extentFillLayer(activeSlot),
+                FogSeamGuardIds.extentBoundaryLayer(activeSlot),
+            )
             val installedGuardLayers = FogSeamGuardIds.ExtentGuardLayers.filter { id ->
                 style.getLayer(id) != null
             }
@@ -7727,6 +7794,20 @@ class MapSurfaceTest {
             }
         }
         Thread.sleep(FOG_VISIBILITY_SETTLE_MILLIS)
+    }
+
+    /** The published slot, read on the caller's thread. Must already be on the main thread. */
+    private fun mainThreadActiveFogSlot(): FogGenerationSlot? =
+        (attachedMapView()?.getTag(R.id.map_fog_active_slot) as? String)
+            ?.let(FogGenerationSlot::valueOf)
+
+    /** The published slot, or `null` if none is published yet. Never throws; for wait predicates. */
+    private fun activeFogSlotOrNull(): FogGenerationSlot? {
+        val slot = AtomicReference<FogGenerationSlot?>(null)
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            slot.set(runCatching { mainThreadActiveFogSlot() }.getOrNull())
+        }
+        return slot.get()
     }
 
     private fun publishedFogSlot(): FogGenerationSlot {
@@ -9273,8 +9354,9 @@ class MapSurfaceTest {
          * begin span was 1733 px on the CI geometry and the last analysed span 104 px, a ceiling
          * of 4.046 levels - 0.046 above the 4.0 the long-pinch cases require - and one
          * load-dependent step inside that gap took the `map-0` shard red five times. At 0.90 the
-         * begin span is ~1979 px and the sweep ends just above the floor, for ~4.17. The pointers
-         * open at 0.0725 and 0.9275 of the view height, clear of the edge slop.
+         * begin span is ~1979 px and the sweep ends just above the floor, for ~4.17; a begin one
+         * move late still delivers 4.14, so the floor no longer sits inside the load-dependent
+         * step. The pointers open at 0.0725 and 0.9275 of the view height, clear of the edge slop.
          */
         const val LONG_PINCH_START_SPAN_FRACTION = 0.90f
 
@@ -9422,8 +9504,14 @@ class MapSurfaceTest {
 
         /**
          * The tall path's engage travel. Smaller steps put the begin move nearer the opened span,
-         * which is where the delivered travel comes from; 0.15 over eight moves is ~36 px per
-         * 16 ms step on the CI geometry, 2.3 px/ms against the 1.575 px/ms begin gate.
+         * which is where the delivered travel comes from.
+         *
+         * The floor under it is MapLibre's begin gate, and that gate is stated in the detector's
+         * own span - twice the finger distance, see [DETECTOR_SPAN_PER_POINTER_DISTANCE] - so the
+         * comparison must be made there. On the CI geometry 0.15 over eight moves is ~36 finger px
+         * per 16 ms step, which the detector reads as ~73 px, or 4.55 px/ms against the gate's
+         * 1.575: begin slips only when one step's events arrive more than ~46 ms apart. The
+         * ordinary pinch's 0.30 is ~28 finger px per step, 3.49 px/ms in the same units.
          */
         const val LONG_PINCH_ENGAGE_TRAVEL = 0.15f
         const val MINIMUM_PINCH_ENGAGEMENT = 0.03
