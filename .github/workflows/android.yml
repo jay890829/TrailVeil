@@ -86,8 +86,73 @@ jobs:
 
       - name: Assemble googlePoc keyless, verify its merged manifest, and build its test APK
         run: >-
-          ./gradlew assembleGooglePoc verifyGooglePocMergedManifest
+          ./gradlew assembleGooglePoc lintGooglePoc verifyGooglePocMergedManifest
           assembleGooglePocAndroidTest -PtrailveilAndroidTestBuildType=googlePoc
+
+  # `V02-008` acceptance: the provider boundary is proven on the RELEASE-configured variants, not
+  # only on debug. Those build types are signed by the lifetime distribution key, which is not on a
+  # hosted runner and must never be, so this job makes a throwaway key inside the runner and points
+  # the build at it.
+  #
+  # That is not a hole in the keystore guard. The guard exists so a DISTRIBUTED artifact is never
+  # signed by something unexpected; this job publishes nothing, and the key, the properties file
+  # and the APKs die with the runner. The half of the guard that catches a build type slipping out
+  # of the signed list is a configuration-time `require` and still runs here, exactly as it does
+  # everywhere else. The key is a fresh random secret per run, so nothing that could be mistaken
+  # for a credential is written down anywhere.
+  release-boundary:
+    name: Provider boundary on the release variants
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5.6.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: >-
+            platform-tools
+            platforms;android-37.0
+            build-tools;36.0.0
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        with:
+          cache-provider: basic
+
+      # Outside the checkout on purpose: the build refuses a keystore or a properties file that
+      # lives inside the repository, and that refusal is one of the things worth exercising here.
+      - name: Make a throwaway signing key for this runner only
+        run: |
+          set -euo pipefail
+          signing_dir="${HOME}/trailveil-ci-signing"
+          mkdir -p "${signing_dir}"
+          password="$(openssl rand -hex 24)"
+          keytool -genkeypair -noprompt -keystore "${signing_dir}/throwaway.jks" -storetype JKS -keyalg RSA -keysize 4096 -validity 1 -alias ci-throwaway -dname "CN=TrailVeil CI throwaway, O=not for distribution" -storepass "${password}" -keypass "${password}" > /dev/null 2>&1
+          umask 077
+          cat > "${signing_dir}/signing.properties" <<PROPERTIES
+          storeFile=${signing_dir}/throwaway.jks
+          storePassword=${password}
+          keyAlias=ci-throwaway
+          keyPassword=${password}
+          PROPERTIES
+          echo "TRAILVEIL_INTERNAL_SIGNING_PROPERTIES=${signing_dir}/signing.properties" >> "${GITHUB_ENV}"
+
+      # Each assemble is finalized by its own packaged-APK boundary check, so this proves the
+      # property on the artifacts rather than on the sources. Nothing is uploaded.
+      - name: Assemble both release variants and verify their provider boundaries
+        run: >-
+          ./gradlew assembleRelease assembleGoogleRelease verifyGooglePocMergedManifest
 
   instrumentation:
     name: Compose instrumentation test (${{ matrix.shard.name }})
