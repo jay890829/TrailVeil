@@ -3909,24 +3909,38 @@ class MapSurfaceTest {
                         // rule below still judges the frames. A geometry change with NO such
                         // request behind it is the case this claim was written for, and it
                         // still fails - now with the request list, so it explains itself.
+                        //
+                        // The window opens when the gesture lambda begins and closes at this
+                        // hold, so it also contains any lift inside the lambda - an abandoned
+                        // pinch attempt lifts and retries, a sequence may shove, lift and
+                        // pinch - and the idle a lift dispatches. A rebuild from one of those
+                        // is legitimate too, which is why the log line says "after the
+                        // gesture began" and not "with the fingers down". What attributes
+                        // the install is the generation match: the counter is unique per
+                        // bump, so the request either IS the one this install answered or
+                        // the rule does not apply. The uptime bound only refuses an idle from
+                        // before the gesture whose render landed late; that fails on purpose,
+                        // with an empty request list, because it is a different story and a
+                        // human should read it.
                         val cameraStayedInside = frozen.extent.covers(map.visibleRegionCorners())
-                        val idleDuringGesture = viewportRequests.firstOrNull { request ->
+                        val idleSinceGestureBegan = viewportRequests.firstOrNull { request ->
                             request.uptimeMillis >= gestureStartedAtUptime &&
                                 request.trigger == FogViewportRequestTrigger.CAMERA_IDLE &&
                                 request.generation == installed.generation
                         }
-                        if (cameraStayedInside && idleDuringGesture != null) {
+                        if (cameraStayedInside && idleSinceGestureBegan != null) {
                             sdkIdleRebuilds += 1
                             auditLog(
-                                "hold=$holds rebuild explained by an SDK idle during the gesture: " +
-                                    describeFogRequest(idleDuringGesture),
+                                "hold=$holds rebuild explained by a camera idle the SDK " +
+                                    "dispatched after the gesture began: " +
+                                    describeFogRequest(idleSinceGestureBegan),
                             )
                             trace.append("idleRebuild@${installed.generation} ")
                         } else {
                             assertFalse(
                                 "The installed fog geometry changed while the camera stayed " +
-                                    "inside it, and no camera idle the SDK dispatched during the " +
-                                    "gesture accounts for it: $frozen -> $installed" +
+                                    "inside it, and no camera idle the SDK dispatched since the " +
+                                    "gesture began accounts for it: $frozen -> $installed" +
                                     describeFogRequestsSince(viewportRequests, gestureStartedAtUptime),
                                 cameraStayedInside,
                             )
