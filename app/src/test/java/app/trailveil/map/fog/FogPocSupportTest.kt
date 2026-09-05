@@ -74,7 +74,7 @@ class FogPocSupportTest {
         ).asStructuredLog()
 
         assertEquals(
-            "event=trailveil_maplibre_poc_timing stage=update_render " +
+            "event=trailveil_fog_poc_timing stage=update_render " +
                 "duration_ms=42 point_count=100000 tile_count=9",
             log,
         )

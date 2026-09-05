@@ -77,7 +77,9 @@ data class FogPocTiming(
      * trail coordinates.
      */
     fun asStructuredLog(): String =
-        "event=trailveil_maplibre_poc_timing " +
+        // `V02-008`: a provider-neutral label. This is shared code compiled into every variant,
+        // and the old spelling was the last provider name left in a Google build's dex.
+        "event=trailveil_fog_poc_timing " +
             "stage=${stage.logValue} " +
             "duration_ms=$durationMillis " +
             "point_count=$pointCount " +

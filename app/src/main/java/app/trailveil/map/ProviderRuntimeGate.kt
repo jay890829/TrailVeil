@@ -41,8 +41,15 @@ internal data class ProviderStartupDecision(
 /**
  * What the provider's renderer selection reported, as the gate needs to read it.
  *
- * `UNREPORTED` is not a failure: the callback may not have run yet on the first composition, and a
- * provider that never reports is not thereby broken. Only an explicit legacy grant is terminal.
+ * `UNREPORTED` is not a failure. On the pinned Maps SDK the grant callback runs inline at process
+ * start, so no composition ever observes this value in practice; the contract does not promise
+ * that, and a provider that never reports is not thereby broken. Only an explicit legacy grant is
+ * terminal.
+ *
+ * Known latent gap, recorded in the V02-008 evidence rather than closed: the Google surface
+ * remembers its startup decision per composition, so an SDK that ever POSTED the callback could let
+ * a first composition read `UNREPORTED`, build a legacy map, and keep it. Closing it means deriving
+ * the decision from the grant as observable state instead of reading a value once.
  */
 internal enum class ProviderRenderer {
     LEGACY,

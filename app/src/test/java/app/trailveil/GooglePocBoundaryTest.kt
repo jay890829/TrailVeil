@@ -129,7 +129,7 @@ class GooglePocBoundaryTest {
         val stringFiles = File(moduleRoot(), "src/google/res").walkTopDown()
             .filter { it.isFile && it.name == "strings.xml" }
             .toList()
-        assertTrue("no googlePoc string resources found", stringFiles.size >= 2)
+        assertTrue("no Google string resources found under src/google/res", stringFiles.size >= 2)
         stringFiles.forEach { file ->
             val pointer = Regex(
                 """<string [^>]*name="$keylessBuildPointer"[^>]*>([^<]*)</string>""",
@@ -172,15 +172,23 @@ class GooglePocBoundaryTest {
                 "openFreeMapBuildTypes.forEach { variant -> add(\"\${variant}Implementation\", libs.maplibre.opengl) }",
             ),
         )
-        val sharedConfigurations = listOf("implementation", "api", "compileOnly", "runtimeOnly")
+        // Every dependency line that names an engine must be one whose configuration is spelled
+        // from a build-type variable - `add("{variant}Implementation", ...)` inside one of the two
+        // forEach loops asserted above. That is the whole allowed shape. `implementation(`,
+        // `add("implementation", ...)`, `debugImplementation(` and `api(` all fail it, which the
+        // previous prefix match let through (V02-008 verifier note). Comment lines are skipped so
+        // the build script may explain the rule in prose without tripping it.
+        val engineMarkers = listOf("libs.maplibre", "org.maplibre", "play-services-maps")
+        val dependencyShapes = listOf("add(", "implementation(", "api(", "compileOnly(", "runtimeOnly(")
         val offenders = moduleScript.lines()
             .map(String::trim)
-            .filter { line ->
-                sharedConfigurations.any { configuration ->
-                    line.startsWith("$configuration(") &&
-                        (line.contains("maplibre") || line.contains("play-services-maps"))
-                }
-            }
+            .filter { line -> !line.startsWith("//") && !line.startsWith("*") && !line.startsWith("/*") }
+            .filter { line -> engineMarkers.any(line::contains) }
+            // Case-insensitive, because the configuration prefix capitalises the shape:
+            // `debugImplementation(` and `debugApi(` are the evasions this exists to catch, and a
+            // case-sensitive match let the first of them straight through (proven by mutation).
+            .filter { line -> dependencyShapes.any { shape -> line.contains(shape, ignoreCase = true) } }
+            .filter { line -> !line.contains("{variant}Implementation") }
         assertTrue("a map engine is on a shared configuration: $offenders", offenders.isEmpty())
     }
 

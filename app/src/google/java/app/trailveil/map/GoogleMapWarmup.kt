@@ -35,8 +35,12 @@ class GoogleMapWarmup : Initializer<Unit> {
             // `V02-008`: the three-argument call, so the GRANTED renderer is observed rather than
             // assumed. No preference is requested - asking for one is a test-harness affordance,
             // and production takes whatever the device offers and then decides whether it can use
-            // it. The callback arrives on the main looper, possibly after this returns, which is
-            // why the grant is a volatile process-wide value and not a return.
+            // it. On the pinned SDK (play-services-maps 20.0.0) the callback is invoked inline,
+            // inside `initialize` itself - measured from the SDK bytecode by the V02-008 verifier -
+            // so the grant is latched here, inside ContentProvider.onCreate, before
+            // Application.onCreate and before any composition. The SDK's contract does not
+            // promise that, which is why the grant is a volatile process-wide value rather than a
+            // return, and why UNREPORTED exists at all.
             MapsInitializer.initialize(
                 context.applicationContext,
                 MapsInitializer.Renderer.LATEST,

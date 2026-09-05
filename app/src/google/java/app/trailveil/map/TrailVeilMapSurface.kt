@@ -113,8 +113,9 @@ internal fun TrailVeilMapSurface(
             onFogRendered = onFogRendered,
             onFogFailure = onFogFailure,
             // Observed BEFORE the state write, so a case can attribute the terminal surface to
-            // the deadline that produced it. MAP_LOAD_TIMEOUT and INITIALIZATION_FAILURE render
-            // the same copy, so the surface on screen cannot say which one arrived.
+            // the deadline that produced it without reading the copy. The two deadline reasons
+            // rendered one sentence until `V02-008` gave MAP_LOAD_TIMEOUT its own; the seam stays
+            // because attribution by copy would be attribution by translation.
             onTerminalFailure = { failure ->
                 onTerminalFailureForTesting?.invoke(failure)
                 runtimeFailure = failure

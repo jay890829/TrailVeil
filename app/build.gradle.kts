@@ -665,10 +665,18 @@ val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifes
     }
 }
 
+// Every Google variant is gated, not just the PoC one: the release-configured build is the one
+// that would carry a real key to a stranger. Hung off the PACKAGING tasks rather than the
+// `assemble` lifecycle task: `install<Variant>` and `bundle<Variant>` reach an artifact without
+// passing through `assemble`, and the V02-008 verifier measured that `installGoogleRelease`
+// produced an ungated APK (55 tasks, no verifier on the graph). Both APK and bundle packaging
+// depend on it now, so there is no artifact-producing path that skips the manifest check.
+val gatedGooglePackagingTasks = googleBuildTypes.flatMap { variant ->
+    val capitalised = variant.replaceFirstChar(Char::uppercase)
+    listOf("package$capitalised", "package${capitalised}Bundle")
+}
 tasks.configureEach {
-    // Every Google variant is gated, not just the PoC one: the release-configured build is
-    // the one that would carry a real key to a stranger.
-    if (name in googleBuildTypes.map { "assemble${it.replaceFirstChar(Char::uppercase)}" }) {
+    if (name in gatedGooglePackagingTasks) {
         dependsOn(verifyGooglePocMergedManifest)
     }
 }
@@ -693,6 +701,12 @@ tasks.configureEach {
 fun registerProviderBoundaryCheck(variant: String, google: Boolean) {
     val capitalised = variant.replaceFirstChar(Char::uppercase)
     val apkDirectory = layout.buildDirectory.dir("outputs/apk/$variant")
+    // Every dex probe below is a descriptor-substring tally, which only means something while the
+    // dex is unminified: R8 would rename `Lorg/maplibre/` out of a Google build that still carried
+    // MapLibre, and only the native-library probe would keep firing. Read at configuration and
+    // refused at execution, so enabling minification on a variant fails this check by name until
+    // the probes are moved to something that survives renaming.
+    val minified = android.buildTypes.getByName(variant).isMinifyEnabled
     val check = tasks.register("verify${capitalised}ProviderBoundary") {
         group = "verification"
         description = "Proves the $variant APK carries exactly one map provider"
@@ -703,11 +717,12 @@ fun registerProviderBoundaryCheck(variant: String, google: Boolean) {
             checkNotNull(apk) {
                 "expected exactly one APK in ${apkDirectory.get().asFile}"
             }
+            check(!minified) {
+                "$variant is minified; the descriptor-based provider boundary probes cannot see " +
+                    "through R8, so this check must be extended before that variant may pass it"
+            }
             ZipFile(apk).use { zip ->
                 val entries = zip.entries().toList()
-                fun bytesOf(name: String): ByteArray =
-                    entries.single { it.name == name }.let { zip.getInputStream(it).readBytes() }
-
                 val dex = entries.filter { it.name.matches(Regex("""classes\d*\.dex""")) }
                 check(dex.isNotEmpty()) { "$variant APK has no dex; this check would prove nothing" }
                 val dexBytes = dex.map { entry -> zip.getInputStream(entry).readBytes() }
@@ -815,13 +830,22 @@ fun registerProviderBoundaryCheck(variant: String, google: Boolean) {
                     check(mapLibreNative) {
                         "$variant APK packages no MapLibre native library, so this reader is blind"
                     }
+                    // The positive control for the Google branch's resource-content probe: this
+                    // variant packages MapLibre's notices, so a resource reader that finds nothing
+                    // naming MapLibre here has gone blind, and its "absent" on the other side
+                    // would prove nothing. Release resource-path shortening is exactly the kind
+                    // of change that could blind it, which is why it is checked by content.
+                    check(resourceContentNamesMapLibre) {
+                        "$variant APK packages no resource whose content names MapLibre, so the " +
+                            "resource reader is blind"
+                    }
                     check(googleMapsClasses == 0) {
                         "$variant APK contains $googleMapsClasses Google Maps SDK class references"
                     }
-                    check(dexCount("com.google.android.geo.API_KEY") == 0) {
-                        "$variant APK names the Google Maps API-key marker"
-                    }
-                    // The value is never printed, only its presence.
+                    // The API-key manifest marker cannot live in dex, so it is not probed here; its
+                    // absence from these variants is asserted on the merged manifest by
+                    // verifyGooglePocMergedManifest. The key VALUE is what dex and the resource
+                    // table could carry, and that is probed below - presence only, never printed.
                     val keyShaped = Regex("""AIza[A-Za-z0-9_-]{35}""")
                     check(!keyShaped.containsMatchIn(String(arsc, Charsets.ISO_8859_1))) {
                         "$variant APK's resource table contains a Google API key-shaped string"
@@ -834,8 +858,13 @@ fun registerProviderBoundaryCheck(variant: String, google: Boolean) {
             }
         }
     }
+    // `package<Variant>` is the task that writes the APK this check reads, and both
+    // `assemble<Variant>` and `install<Variant>` go through it. Finalizing `assemble` alone left
+    // `install` - the natural way a key holder puts a Google build on a phone - ungated; the
+    // V02-008 verifier measured 55 tasks on `installGoogleRelease` with no boundary check among
+    // them. Bundles are not APKs and are not read here; their manifest check is wired above.
     tasks.configureEach {
-        if (name == "assemble$capitalised") {
+        if (name == "package$capitalised") {
             finalizedBy(check)
         }
     }
