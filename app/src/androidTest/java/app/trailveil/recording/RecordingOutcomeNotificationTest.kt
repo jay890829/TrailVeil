@@ -69,6 +69,7 @@ class RecordingOutcomeNotificationTest {
                 operationId("outcome-begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
+                bootId = null,
             ).sessionId
             activity.onActivity {
                 RecordingForegroundService.startFromVisibleActivity(it, sessionId)
@@ -142,6 +143,7 @@ class RecordingOutcomeNotificationTest {
                 operationId("stream-failure-begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
+                bootId = null,
             ).sessionId
             activity.onActivity {
                 RecordingForegroundService.startFromVisibleActivity(it, sessionId)

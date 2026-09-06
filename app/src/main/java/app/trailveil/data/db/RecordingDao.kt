@@ -727,6 +727,7 @@ internal abstract class RecordingDao {
     open suspend fun executePrepareStart(
         startedAt: Long,
         createdAppVersion: String,
+        bootId: Long?,
         operationId: String,
         commandKind: String,
         createdAt: Long,
@@ -739,7 +740,15 @@ internal abstract class RecordingDao {
             return record(RecordingOperationReceiptEntity(operationId, commandKind, RecordingReceiptOutcome.START_ALREADY_PENDING, pending.id, createdAt = createdAt))
         }
         val sessionId = insertSessionRow(
-            RecordingSessionEntity(startedAt = startedAt, status = RecordingStatus.STARTING, createdAppVersion = createdAppVersion),
+            RecordingSessionEntity(
+                startedAt = startedAt,
+                status = RecordingStatus.STARTING,
+                createdAppVersion = createdAppVersion,
+                // Recorded once, when the exploration begins, and never rewritten: a recovery inside
+                // the same boot legitimately reacquires the row, and rewriting the boot then would
+                // erase the only evidence that a reboot had NOT happened.
+                bootId = bootId,
+            ),
         )
         return record(RecordingOperationReceiptEntity(operationId, commandKind, RecordingReceiptOutcome.START_PREPARED, sessionId, createdAt = createdAt))
     }

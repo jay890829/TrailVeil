@@ -351,6 +351,7 @@ class RecordingControllerTest {
             RecordingOperationId("$purpose:test")
         },
         clock: RecordingControllerClock = RecordingControllerClock { 123L },
+        bootIdentity: BootIdentitySource = BootIdentitySource { THIS_BOOT },
     ) = RecordingController(
         preflight = preflight,
         commands = commands,
@@ -358,11 +359,47 @@ class RecordingControllerTest {
         clock = clock,
         operationIds = operationIds,
         createdAppVersion = "test",
+        bootIdentity = bootIdentity,
     )
+
+    @Test
+    fun `the boot a session starts in is recorded with it`() = runBlocking {
+        // `V02-015`. Nothing downstream can tell a missing boot identity from a device that has
+        // none, so a controller that stopped asking - or asked and dropped the answer - would write
+        // a null column that looks exactly like an old row, and the only symptom would be an
+        // exploration silently resumed after a reboot months later. The write is asserted here.
+        val commands = FakeCommands()
+
+        controller(commands = commands, launcher = FakeLauncher()).startFromVisibleActivity(
+            activityVisible = true,
+        )
+
+        assertEquals(listOf<Long?>(THIS_BOOT), commands.beginBootIds)
+    }
+
+    @Test
+    fun `a device that reports no boot identity still starts an exploration`() = runBlocking {
+        // Failing closed here would be the wrong closure: the user asked to record. The null is
+        // carried into the row, and it is the ABANDONED decision - not this one - that refuses to
+        // resume on it later.
+        val commands = FakeCommands()
+
+        val outcome = controller(
+            commands = commands,
+            launcher = FakeLauncher(),
+            bootIdentity = BootIdentitySource { null },
+        ).startFromVisibleActivity(activityVisible = true)
+
+        assertTrue(outcome is RecordingStartOutcome.ServiceRequested)
+        assertEquals(listOf<Long?>(null), commands.beginBootIds)
+    }
 
     private companion object {
         /** A walk that stopped recording in the morning. */
         const val LAST_POINT_AT = 1_700_000_000_000L
+
+        /** Whatever the platform's boot counter happens to say; only its identity matters. */
+        const val THIS_BOOT = 41L
 
         /** Discovered when the user reopened the app that evening, nine hours later. */
         const val FIXED_NOW = LAST_POINT_AT + 9 * 3_600_000L
@@ -379,15 +416,18 @@ private class FakeCommands(
     var beginCalls = 0
     var failCalls = 0
     val beginOperationIds = mutableListOf<RecordingOperationId>()
+    val beginBootIds = mutableListOf<Long?>()
     val interruptCalls = mutableListOf<Triple<Long, Long, String>>()
 
     override suspend fun beginStart(
         operationId: RecordingOperationId,
         startedAtEpochMillis: Long,
         createdAppVersion: String,
+        bootId: Long?,
     ): BeginStartResult {
         beginCalls++
         beginOperationIds += operationId
+        beginBootIds += bootId
         events += "begin"
         beginFailure?.let { throw it }
         return BeginStartResult(

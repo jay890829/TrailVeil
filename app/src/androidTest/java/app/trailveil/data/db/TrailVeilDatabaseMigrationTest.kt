@@ -263,6 +263,61 @@ class TrailVeilDatabaseMigrationTest {
     }
 
     @Test
+    fun migrate8To9AddsTheBootColumnAndLeavesExistingRowsUnknown() {
+        // `V02-015`. The column answers "did the device restart under this exploration". A row
+        // written before it existed cannot answer, and the important half of this test is that the
+        // migration does not invent an answer: backfilling anything - this boot, or a value derived
+        // from the session's start time - would either resume explorations nobody asked to continue
+        // or reintroduce the clock comparison the column exists to remove. NULL is the third answer,
+        // and the decision that reads it has a branch for exactly that.
+        migrationHelper.createDatabase(V02_015_DATABASE, 8).apply {
+            execSQL(
+                """
+                INSERT INTO recording_sessions(
+                    id, started_at, ended_at, status, stop_reason, distance_meters,
+                    accepted_point_count, rejected_point_count, created_app_version,
+                    active_slot, location_owner_token
+                ) VALUES (1, 100, NULL, 'ACTIVE', NULL, 12.5, 1, 2, '0.2.0', 1, 'a-runtime')
+                """.trimIndent(),
+            )
+            close()
+        }
+
+        val migrated = migrationHelper.runMigrationsAndValidate(
+            V02_015_DATABASE,
+            9,
+            true,
+            MIGRATION_8_9,
+        )
+
+        migrated.query(
+            "SELECT boot_id, status, location_owner_token FROM recording_sessions WHERE id = 1",
+        ).use { cursor ->
+            assertTrue("the pre-existing session did not survive the migration", cursor.moveToFirst())
+            assertTrue("an existing row was given a boot identity it never had", cursor.isNull(0))
+            // The rest of the row is untouched: this migration adds a column and does nothing else,
+            // and an ACTIVE row that lost its owner token would be read as abandoned by the screen.
+            assertEquals("ACTIVE", cursor.getString(1))
+            assertEquals("a-runtime", cursor.getString(2))
+        }
+        // A row written after the migration can carry one, which is what the write path relies on.
+        migrated.execSQL(
+            """
+            INSERT INTO recording_sessions(
+                id, started_at, ended_at, status, stop_reason, distance_meters,
+                accepted_point_count, rejected_point_count, created_app_version,
+                active_slot, boot_id, location_owner_token
+            ) VALUES (2, 200, NULL, 'STARTING', NULL, 0, 0, 0, '0.2.0', NULL, 41, NULL)
+            """.trimIndent(),
+        )
+        migrated.query("SELECT boot_id FROM recording_sessions WHERE id = 2").use { cursor ->
+            assertTrue(cursor.moveToFirst())
+            assertEquals(41L, cursor.getLong(0))
+        }
+        migrated.close()
+    }
+
+    @Test
     fun migrate4To5AddsBoundedSummaryOrderingIndexes() {
         migrationHelper.createDatabase("migration-p4-033", 4).close()
 
@@ -490,5 +545,8 @@ class TrailVeilDatabaseMigrationTest {
 
     private companion object {
         const val TEST_DATABASE = "migration-p2-001"
+
+        /** Its own file, so a failing run cannot leave a half-migrated database for another case. */
+        const val V02_015_DATABASE = "migration-v02-015"
     }
 }

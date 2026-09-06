@@ -428,7 +428,7 @@ class RecordingRepositoryTest {
     private suspend fun RecordingRepository.begin(
         operationId: RecordingOperationId,
         startedAtEpochMillis: Long,
-    ) = beginStart(operationId, startedAtEpochMillis, createdAppVersion = "test")
+    ) = beginStart(operationId, startedAtEpochMillis, createdAppVersion = "test", bootId = null)
 
     private suspend fun RecordingRepository.deliver(
         operationId: RecordingOperationId,

@@ -175,6 +175,10 @@ class AbandonedRecordingStateTest {
             sqlite,
             ownerToken = "runtime-from-before-the-restart-$FIXTURE_SUFFIX",
             startedAt = bootedAt - AN_HOUR,
+            // `V02-015`: the fixture states the reboot rather than implying it from a start time.
+            // The start time is kept because the ending is still DATED from the recording, and the
+            // cases below check that; it just no longer decides whether the ending happens.
+            bootId = thisBoot() - 1L,
         )
         // A session that actually recorded something, because the fallback and the real anchor are
         // different values and a fixture with no points asserts only the fallback: with no point
@@ -378,6 +382,75 @@ class AbandonedRecordingStateTest {
     }
 
     @Test
+    fun anExplorationWithNoRecordedBootIsNeitherResumedNorEnded() {
+        // `V02-015`. This is what every row an existing user already has looks like after the
+        // update: the column exists and is NULL, because nothing recorded which boot it began in
+        // and the migration deliberately invents nothing. Neither automatic answer is safe. Resuming
+        // would collect location from someone who did not ask, which `PLAN.md` forbids; ending would
+        // close an exploration a process death should have continued, silently. So the app does
+        // neither and leaves both controls on screen, which is what asking looks like here.
+        grant(Manifest.permission.ACCESS_COARSE_LOCATION)
+        grant(Manifest.permission.ACCESS_FINE_LOCATION)
+        shell("cmd location set-location-enabled true")
+
+        val sqlite = container.databaseForTesting().openHelper.writableDatabase
+        val sessionId = seedAbandonedSession(
+            sqlite,
+            ownerToken = "runtime-from-before-the-boot-column-$FIXTURE_SUFFIX",
+            startedAt = System.currentTimeMillis(),
+            bootId = null,
+        )
+
+        try {
+            composeRule.activityRule.scenario.recreate()
+
+            var shown: String? = null
+            var waited = 0L
+            while (waited < STATE_SETTLE_MILLIS) {
+                composeRule.waitForIdle()
+                shown = publishedState()
+                if (shown == "ABANDONED") break
+                SystemClock.sleep(POLL_MILLIS)
+                waited += POLL_MILLIS
+            }
+            assertEquals("the screen never settled on the abandoned row", "ABANDONED", shown)
+
+            // Give the decision the same window the sibling cases get to act, and require that it
+            // did not: the row is untouched in both directions.
+            SystemClock.sleep(STATE_SETTLE_MILLIS)
+            composeRule.waitForIdle()
+            assertEquals(
+                "an exploration with no recorded boot was closed without being asked about",
+                "ACTIVE",
+                sessionColumn(sqlite, sessionId, "status"),
+            )
+            assertTrue(
+                "an exploration with no recorded boot was resumed",
+                !hasRecoverySegment(sqlite, sessionId),
+            )
+
+            // Both controls, because the user is the one who decides now.
+            composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
+            composeRule.onNodeWithTag(RecordingEntryTestTags.Start).assertIsDisplayed()
+            composeRule.onNodeWithTag(RecordingEntryTestTags.Stop).assertIsDisplayed()
+        } finally {
+            sqlite.execSQL("DELETE FROM recording_sessions WHERE id = $sessionId")
+        }
+    }
+
+    /**
+     * This device's boot identity, required rather than assumed.
+     *
+     * `Settings.Global.BOOT_COUNT` has existed since API 24 and this app's minimum is 34, so a null
+     * here is a broken emulator image rather than a supported configuration - and a test that
+     * quietly seeded null instead would be asserting the unknown-boot path while claiming to assert
+     * the same-boot one.
+     */
+    private fun thisBoot(): Long = requireNotNull(container.currentBootId()) {
+        "this device reports no boot identity, so none of these fixtures can mean what they say"
+    }
+
+    @Test
     fun anAnnouncementMadeWhileTheScreenIsOpenChangesItWithNothingElseHappening() {
         // `V02-014`, the ordering the sibling case deliberately avoids. There, the announcement is
         // made before the row exists, so the row's own arrival is what recomposes the screen.
@@ -478,15 +551,17 @@ class AbandonedRecordingStateTest {
         ownerToken: String,
         startedAt: Long = System.currentTimeMillis(),
         explicitId: Long? = null,
+        bootId: Long? = thisBoot(),
     ): Long {
         val idColumn = if (explicitId == null) "" else "id, "
         val idValue = if (explicitId == null) "" else "$explicitId, "
         sqlite.execSQL(
             "INSERT INTO recording_sessions($idColumn" +
                 "started_at, ended_at, status, stop_reason, distance_meters, accepted_point_count, " +
-                "rejected_point_count, created_app_version, active_slot, location_owner_token" +
+                "rejected_point_count, created_app_version, active_slot, location_owner_token, " +
+                "boot_id" +
                 ") VALUES($idValue$startedAt, NULL, 'ACTIVE', NULL, 0, 0, 0, 'abandoned-state-test', " +
-                "1, '$ownerToken')",
+                "1, '$ownerToken', ${bootId ?: "NULL"})",
         )
         val sessionId = explicitId ?: sqlite.query("SELECT MAX(id) FROM recording_sessions")
             .use { cursor ->

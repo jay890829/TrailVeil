@@ -23,6 +23,7 @@ internal class RecordingController(
     private val clock: RecordingControllerClock = SystemRecordingControllerClock,
     private val operationIds: RecordingControllerOperationIds = UuidRecordingControllerOperationIds,
     private val createdAppVersion: String,
+    private val bootIdentity: BootIdentitySource,
 ) {
     /**
      * Re-arm an exploration this process found abandoned — an `ACTIVE` row whose owning runtime is
@@ -106,6 +107,7 @@ internal class RecordingController(
                 beginOperationId ?: operationIds.next("begin-start"),
                 clock.epochMillis(),
                 createdAppVersion,
+                bootIdentity.current(),
             )
         } catch (cancelled: CancellationException) {
             throw cancelled
@@ -239,6 +241,7 @@ internal interface RecordingStartCommands {
         operationId: RecordingOperationId,
         startedAtEpochMillis: Long,
         createdAppVersion: String,
+        bootId: Long?,
     ): BeginStartResult
 
     suspend fun failStart(
@@ -263,10 +266,12 @@ internal class RepositoryRecordingStartCommands(
         operationId: RecordingOperationId,
         startedAtEpochMillis: Long,
         createdAppVersion: String,
+        bootId: Long?,
     ): BeginStartResult = repository.beginStart(
         operationId,
         startedAtEpochMillis,
         createdAppVersion,
+        bootId,
     )
 
     override suspend fun failStart(

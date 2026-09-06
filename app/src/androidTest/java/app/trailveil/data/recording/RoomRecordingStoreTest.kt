@@ -840,7 +840,7 @@ class RoomRecordingStoreTest {
     private suspend fun RecordingRepository.begin(
         operationId: String,
         startedAt: Long,
-    ) = beginStart(id(operationId), startedAt, TEST_APP_VERSION)
+    ) = beginStart(id(operationId), startedAt, TEST_APP_VERSION, bootId = null)
 
     private suspend fun RecordingRepository.deliver(
         operationId: String,

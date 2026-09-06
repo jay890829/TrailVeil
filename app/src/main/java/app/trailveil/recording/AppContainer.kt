@@ -15,7 +15,6 @@ import app.trailveil.data.recording.ReconcileStartingResult
 import app.trailveil.data.recording.RecordingRepository
 import app.trailveil.data.recording.LocationOperationSequence
 import app.trailveil.data.recording.RoomRecordingStore
-import app.trailveil.feature.recording.bootInstantEpochMillis
 import app.trailveil.map.fog.FogDiskTileCache
 import app.trailveil.map.fog.FogMemoryTileCache
 import app.trailveil.map.fog.FogRenderStyle
@@ -67,9 +66,17 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     val announcedInterruptionState: StateFlow<Map<Long, String>>
         get() = announcedInterruptions.interruptions
 
-    /** Wall-clock instant this boot began, so a session older than the boot can be told apart. */
-    fun bootedAtEpochMillis(): Long =
-        bootInstantEpochMillis(clock.epochMillis(), clock.elapsedRealtimeNanos())
+    /**
+     * Which boot this is, recorded on every session that starts and compared when one is found open.
+     *
+     * `V02-015` replaced wall-clock arithmetic here. The old value was `epochMillis -
+     * elapsedRealtime`, which moves whenever the clock is corrected, so a pre-reboot session could
+     * look like a post-boot one and be silently resumed.
+     */
+    private val bootIdentity: BootIdentitySource = androidBootIdentitySource(applicationContext)
+
+    /** The current boot's identity, or null when this device will not report one. */
+    fun currentBootId(): Long? = bootIdentity.current()
 
     private val platformLocationEngine: LocationEngine = PlatformLocationEngine(
         requireNotNull(context.applicationContext.getSystemService(LocationManager::class.java)),
@@ -101,6 +108,7 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
         commands = RepositoryRecordingStartCommands(recordingRepository),
         launcher = AndroidRecordingServiceLauncher(activityContext),
         createdAppVersion = createdAppVersion,
+        bootIdentity = bootIdentity,
     )
 
     /** Must resolve before an app-visible Start can be issued in this process. */

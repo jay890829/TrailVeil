@@ -390,8 +390,8 @@ class RecordingPresentationTest {
         // Both clauses live here. Nothing else in the tree can enforce either: the durable row
         // survives a reboot untouched, startup reconciliation reaches only a still-STARTING row, and
         // the runtime token is regenerated per process — so a reboot is indistinguishable from a
-        // process death by the time this decision is made, and without the start-time comparison the
-        // first open after a restart re-arms location collection on a session of any age.
+        // process death by the time this decision is made, unless the row itself says which boot it
+        // began in. `V02-015` made it say so; before that this was inferred from the wall clock.
         assertEquals(
             AbandonedExplorationAction.Interrupt(
                 7L,
@@ -400,35 +400,90 @@ class RecordingPresentationTest {
                 // the one the repair's own `device_restarted` default is correct for.
                 reason = null,
             ),
-            abandonedAction(startedAt = BOOTED_AT - AN_HOUR),
+            abandonedAction(startedAt = BOOTED_AT - AN_HOUR, sessionBootId = PREVIOUS_BOOT),
         )
     }
 
     @Test
-    fun theBootBoundaryIsSpentOnNotRecordingSomeoneWhoDidNotAsk() {
-        // Wall clock minus uptime moves when the clock is corrected, so the boundary is approximate.
-        // Which way it errs is not: inside the tolerance the exploration is ended, because the cost
-        // is that the user starts a new one, while the cost of erring the other way is collecting
-        // location without being asked.
+    fun aClockCorrectionCannotTurnAProcessDeathIntoAReboot() {
+        // `V02-015`, and the defect this task exists for. The old test was
+        // `startedAt < epochMillis - elapsedRealtime + 5s`, so a wall-clock correction larger than
+        // five seconds - a time sync right after a reboot does exactly this, and so does a user -
+        // moved the computed boot instant under the session and changed the answer. Here the clock
+        // is not consulted at all, so a start time anywhere at all cannot change the outcome: the
+        // boots match, so the runtime died and continuing is honest.
+        listOf(
+            BOOTED_AT + AN_HOUR,
+            BOOTED_AT - A_LONG_WAY,
+            0L,
+            Long.MAX_VALUE / 2,
+        ).forEach { startedAt ->
+            assertEquals(
+                "a session started at $startedAt was not resumed although the boot is the same",
+                AbandonedExplorationAction.Resume(7L),
+                abandonedAction(startedAt = startedAt, sessionBootId = THIS_BOOT),
+            )
+        }
+    }
+
+    @Test
+    fun aClockCorrectionCannotTurnARebootIntoAProcessDeath() {
+        // The direction that matters more: this is the one that silently records someone who did
+        // not ask. A session whose start time is comfortably after the computed boot instant - which
+        // the old rule read as "started in this boot, resume it" - is still ended, because the boot
+        // counter says the device restarted under it and no correction can move a counter.
         assertEquals(
             AbandonedExplorationAction.Interrupt(
                 7L,
-                stoppedRecordingAt = BOOTED_AT + BOOT_BOUNDARY_TOLERANCE_MILLIS - 1L,
+                stoppedRecordingAt = BOOTED_AT + A_LONG_WAY,
                 reason = null,
             ),
-            abandonedAction(startedAt = BOOTED_AT + BOOT_BOUNDARY_TOLERANCE_MILLIS - 1L),
-        )
-        assertEquals(
-            AbandonedExplorationAction.Resume(7L),
-            abandonedAction(startedAt = BOOTED_AT + BOOT_BOUNDARY_TOLERANCE_MILLIS),
+            abandonedAction(startedAt = BOOTED_AT + A_LONG_WAY, sessionBootId = PREVIOUS_BOOT),
         )
     }
 
     @Test
-    fun anExplorationWithNoKnownStartTimeIsNeverSilentlyResumed() {
+    fun anExplorationWhoseBootIsUnknownIsNeitherResumedNorEndedBehindTheUsersBack() {
+        // Three answers, not two. A row written before the boot column existed has no identity, and
+        // a device may refuse to report one; either way nothing is established. Resuming would
+        // collect location from someone who did not ask, and ending would silently close
+        // explorations that a process death should have continued - for everyone on such a device,
+        // forever. So the app does neither and leaves the row for the user, who is offered both
+        // controls for exactly this state.
+        assertNull(
+            "a session with no recorded boot was acted on",
+            abandonedAction(startedAt = BOOTED_AT + AN_HOUR, sessionBootId = null),
+        )
+        assertNull(
+            "a device that reports no boot identity was acted on",
+            abandonedAction(startedAt = BOOTED_AT + AN_HOUR, currentBootId = null),
+        )
+        assertNull(abandonedAction(startedAt = null, sessionBootId = null, currentBootId = null))
+    }
+
+    @Test
+    fun theBootQuestionHasExactlyThreeAnswersAndUnknownIsOneOfThem() {
         assertEquals(
-            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = null, reason = null),
-            abandonedAction(startedAt = null),
+            BootContinuity.SAME_BOOT,
+            bootContinuity(sessionBootId = THIS_BOOT, currentBootId = THIS_BOOT),
+        )
+        assertEquals(
+            BootContinuity.RESTARTED,
+            bootContinuity(sessionBootId = PREVIOUS_BOOT, currentBootId = THIS_BOOT),
+        )
+        // A counter that went backwards is still not this boot. Nothing should produce it, and the
+        // rule does not have to explain it to refuse to resume on it.
+        assertEquals(
+            BootContinuity.RESTARTED,
+            bootContinuity(sessionBootId = THIS_BOOT, currentBootId = PREVIOUS_BOOT),
+        )
+        assertEquals(
+            BootContinuity.UNKNOWN,
+            bootContinuity(sessionBootId = null, currentBootId = THIS_BOOT),
+        )
+        assertEquals(
+            BootContinuity.UNKNOWN,
+            bootContinuity(sessionBootId = THIS_BOOT, currentBootId = null),
         )
     }
 
@@ -447,6 +502,7 @@ class RecordingPresentationTest {
             abandonedAction(
                 startedAt = BOOTED_AT - AN_HOUR,
                 lastPointAt = BOOTED_AT - AN_HOUR + 900_000L,
+                sessionBootId = PREVIOUS_BOOT,
             ),
         )
     }
@@ -463,7 +519,11 @@ class RecordingPresentationTest {
                 // the one the repair's own `device_restarted` default is correct for.
                 reason = null,
             ),
-            abandonedAction(startedAt = BOOTED_AT - AN_HOUR, lastPointAt = null),
+            abandonedAction(
+                startedAt = BOOTED_AT - AN_HOUR,
+                lastPointAt = null,
+                sessionBootId = PREVIOUS_BOOT,
+            ),
         )
     }
 
@@ -528,14 +588,12 @@ class RecordingPresentationTest {
     fun aRefusedClaimStopsTheEndingTooAndNotOnlyTheResuming() {
         // Otherwise a failing interrupt retries on every recomposition for as long as the screen is
         // open, which is the loop the claim exists to prevent, just on the other branch.
-        assertNull(abandonedAction(startedAt = BOOTED_AT - AN_HOUR, claim = { false }))
-    }
-
-    @Test
-    fun theBootInstantIsWallClockMinusUptime() {
-        assertEquals(
-            1_000L,
-            bootInstantEpochMillis(epochMillis = 61_000L, elapsedRealtimeNanos = 60_000_000_000L),
+        assertNull(
+            abandonedAction(
+                startedAt = BOOTED_AT - AN_HOUR,
+                sessionBootId = PREVIOUS_BOOT,
+                claim = { false },
+            ),
         )
     }
 
@@ -622,6 +680,8 @@ class RecordingPresentationTest {
         lastPointAt: Long? = null,
         startupReconciled: Boolean = true,
         activityResumed: Boolean = true,
+        sessionBootId: Long? = THIS_BOOT,
+        currentBootId: Long? = THIS_BOOT,
         claim: (Long) -> Boolean = { true },
         announcedInterruptionReason: (Long) -> String? = { null },
     ): AbandonedExplorationAction? = abandonedExplorationAction(
@@ -629,7 +689,8 @@ class RecordingPresentationTest {
         activeSessionId = activeSessionId,
         activeSessionStartedAt = startedAt,
         activeSessionLastPointAt = lastPointAt,
-        bootedAtEpochMillis = BOOTED_AT,
+        activeSessionBootId = sessionBootId,
+        currentBootId = currentBootId,
         startupReconciled = startupReconciled,
         activityResumed = activityResumed,
         claim = claim,
@@ -870,7 +931,10 @@ class RecordingPresentationTest {
             activeSessionId = 7L,
             activeSessionStartedAt = BOOTED_AT + AN_HOUR,
             activeSessionLastPointAt = BOOTED_AT + AN_HOUR + 1_000L,
-            bootedAtEpochMillis = BOOTED_AT,
+            // The announcement decides this one, so the boots deliberately AGREE: without the
+            // announcement this row would be resumed, which is what makes the case load-bearing.
+            activeSessionBootId = THIS_BOOT,
+            currentBootId = THIS_BOOT,
             startupReconciled = true,
             activityResumed = true,
             claim = claims::claim,
@@ -905,7 +969,8 @@ class RecordingPresentationTest {
                 activeSessionId = 7L,
                 activeSessionStartedAt = BOOTED_AT + AN_HOUR,
                 activeSessionLastPointAt = null,
-                bootedAtEpochMillis = BOOTED_AT,
+                activeSessionBootId = THIS_BOOT,
+                currentBootId = THIS_BOOT,
                 startupReconciled = true,
                 activityResumed = true,
                 claim = claims::claim,
@@ -930,6 +995,7 @@ class RecordingPresentationTest {
         outcome: String = "START_ACTIVATED",
         ownerToken: String? = THIS_RUNTIME,
         sessionLastPointAt: Long? = SESSION_LAST_POINT_AT,
+        sessionBootId: Long? = THIS_BOOT,
     ) = RecordingLatestSessionSummary(
         session = RecordingHistorySession(
             id = 7L,
@@ -957,6 +1023,7 @@ class RecordingPresentationTest {
         ),
         locationOwnerToken = ownerToken,
         sessionLastAcceptedPointAt = sessionLastPointAt,
+        sessionBootId = sessionBootId,
     )
 
     private companion object {
@@ -971,6 +1038,17 @@ class RecordingPresentationTest {
         const val STOPPED_BECAUSE = "storage_failure"
 
         /**
+         * Two boots, told apart by being different rather than by being ordered.
+         *
+         * `V02-015`: the rule asks only whether the two identities are equal, so the fixtures do not
+         * need to model a counter that increases - and deliberately do not, because a test that
+         * relied on the ordering would pass a rule that compared them with `<`, which is the clock
+         * comparison again in another costume.
+         */
+        const val THIS_BOOT = 41L
+        const val PREVIOUS_BOOT = 40L
+
+        /**
          * A runtime that has announced nothing, which is every case but `V02-014`'s.
          *
          * Named rather than written as `{ false }` at each site so that a case which DOES care
@@ -981,6 +1059,12 @@ class RecordingPresentationTest {
         /** An arbitrary but plausible boot instant; only its distance from a start time matters. */
         const val BOOTED_AT = 1_700_000_000_000L
         const val AN_HOUR = 3_600_000L
+
+        /**
+         * Comfortably more than the five-second tolerance the retired clock comparison used, so a
+         * case that still depended on it would produce the opposite answer rather than the same one.
+         */
+        const val A_LONG_WAY = 3 * AN_HOUR
 
         /**
          * Distinct from every other timestamp in the fixture, so a presentation that carried the

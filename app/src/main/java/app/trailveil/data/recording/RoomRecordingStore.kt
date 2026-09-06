@@ -45,6 +45,7 @@ internal class RoomRecordingStore(
             dao.executePrepareStart(
                 startedAt = transaction.startedAtEpochMillis,
                 createdAppVersion = transaction.createdAppVersion,
+                bootId = transaction.bootId,
                 operationId = transaction.operationId.value,
                 commandKind = RecordingOperationKind.BEGIN_START.name,
                 createdAt = transaction.startedAtEpochMillis,

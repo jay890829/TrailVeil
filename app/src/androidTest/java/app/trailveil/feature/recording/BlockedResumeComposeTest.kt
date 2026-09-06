@@ -292,9 +292,13 @@ class BlockedResumeComposeTest {
         sqlite.execSQL(
             "INSERT INTO recording_sessions(" +
                 "started_at, ended_at, status, stop_reason, distance_meters, accepted_point_count, " +
-                "rejected_point_count, created_app_version, active_slot, location_owner_token" +
+                "rejected_point_count, created_app_version, active_slot, location_owner_token, " +
+                "boot_id" +
                 ") VALUES($startedAt, NULL, 'ACTIVE', NULL, 0, 0, 0, 'abandoned-state-test', " +
-                "1, '$deadRuntime')",
+                // `V02-015`: this boot, because this test is about a resume that gets BLOCKED, and a
+                // row with no recorded boot is never offered a resume at all - the decision declines
+                // and asks the user instead, so the blocker under test would never be reached.
+                "1, '$deadRuntime', ${requireNotNull(container.currentBootId())})",
         )
         val sessionId = sqlite.query("SELECT MAX(id) FROM recording_sessions").use { cursor ->
             cursor.moveToFirst()

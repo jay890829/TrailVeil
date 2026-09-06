@@ -70,6 +70,8 @@ internal data class PrepareStartTransaction(
     val operationId: RecordingOperationId,
     val startedAtEpochMillis: Long,
     val createdAppVersion: String,
+    /** `V02-015`: which boot this is, or null when the platform would not say. */
+    val bootId: Long?,
 ) { init { require(startedAtEpochMillis >= 0L && createdAppVersion.isNotBlank()) } }
 internal data class ActivateStartTransaction(
     val operationId: RecordingOperationId,
@@ -280,11 +282,17 @@ internal class RecordingRepository(
         operationId: RecordingOperationId,
         startedAtEpochMillis: Long,
         createdAppVersion: String,
+        bootId: Long?,
     ): BeginStartResult = mutex.withLock {
         val receipt = receiptOrNull(operationId, RecordingOperationKind.BEGIN_START)
             ?: commit(
                 store.prepareStart(
-                    PrepareStartTransaction(operationId, startedAtEpochMillis, createdAppVersion),
+                    PrepareStartTransaction(
+                        operationId,
+                        startedAtEpochMillis,
+                        createdAppVersion,
+                        bootId,
+                    ),
                 ),
             )
         val result = beginResult(receipt)

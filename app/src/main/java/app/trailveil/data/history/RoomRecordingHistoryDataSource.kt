@@ -94,6 +94,7 @@ internal class RoomRecordingHistoryDataSource(
             latestAcceptedPoint = latestPoint,
             locationOwnerToken = session.locationOwnerToken,
             sessionLastAcceptedPointAt = ownLastPointTimestamp,
+            sessionBootId = session.bootId,
         )
     }
 

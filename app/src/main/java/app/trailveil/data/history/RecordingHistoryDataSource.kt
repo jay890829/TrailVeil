@@ -127,6 +127,16 @@ data class RecordingLatestSessionSummary(
      * was ever forced to say what it should be.
      */
     val sessionLastAcceptedPointAt: Long?,
+    /**
+     * Which boot the session was started in, or null when it was never recorded.
+     *
+     * `V02-015`. Carried through as data for the same reason as [locationOwnerToken]: this layer
+     * reports what the database says and makes no comparison, so it keeps its promise of having no
+     * runtime dependency. Null has two causes that cannot be told apart here and must not be - a
+     * platform that refused the value, and a row written before the column existed - and both mean
+     * the same thing to the decision above: not known.
+     */
+    val sessionBootId: Long?,
 )
 
 /** Read-only persisted history contract; it intentionally has no service/runtime dependency. */

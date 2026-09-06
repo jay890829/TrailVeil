@@ -19,6 +19,11 @@ internal data class RecordingPresentation(
      * [latestAcceptedPoint], which is the newest point across every session.
      */
     val activeSessionLastPointAt: Long?,
+    /**
+     * Which boot the open exploration was started in, so a reboot can be told from a process death
+     * without asking what time it is. Null when unknown, which is not the same as "this boot".
+     */
+    val activeSessionBootId: Long?,
     val latestSessionId: Long?,
     val latestEndedAt: Long?,
     val latestAcceptedPoint: RecordingHistoryAcceptedPoint?,
@@ -89,6 +94,7 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
             activeSessionId = null,
             activeSessionStartedAt = null,
             activeSessionLastPointAt = null,
+            activeSessionBootId = null,
             latestSessionId = null,
             latestEndedAt = null,
             latestAcceptedPoint = null,
@@ -137,6 +143,7 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
         activeSessionId = activeSessionId,
         activeSessionStartedAt = activeSessionId?.let { session.startedAt },
         activeSessionLastPointAt = activeSessionId?.let { sessionLastAcceptedPointAt },
+        activeSessionBootId = activeSessionId?.let { sessionBootId },
         // Unlike `activeSessionId`, this identifies the newest session whatever its status, which
         // is what lets an acknowledgement be bound to the one outcome it was made for.
         latestSessionId = session.id,
@@ -219,28 +226,47 @@ internal fun stoppedRecordingInstant(
     activeSessionStartedAt: Long?,
 ): Long? = activeSessionLastPointAt ?: activeSessionStartedAt
 
-/**
- * When the running boot began, in wall-clock millis.
- *
- * Wall clock minus uptime. Both reads come from the same clock source a moment apart, so the result
- * is stable to within the cost of the two calls; it moves when the wall clock is corrected, which is
- * why callers compare against it with [BOOT_BOUNDARY_TOLERANCE_MILLIS] rather than exactly.
- */
-internal fun bootInstantEpochMillis(
-    epochMillis: Long,
-    elapsedRealtimeNanos: Long,
-): Long = epochMillis - elapsedRealtimeNanos / 1_000_000L
+/** Whether the device restarted under an exploration, when that can be established at all. */
+internal enum class BootContinuity {
+    /** Same boot: the runtime died and the row outlived it, so continuing it is honest. */
+    SAME_BOOT,
+
+    /** Different boot: the device restarted under it, and `PLAN.md` forbids resuming across that. */
+    RESTARTED,
+
+    /** Neither is established. The app must ask rather than pick one. */
+    UNKNOWN,
+}
 
 /**
- * How far either side of the computed boot instant a session's start time is treated as ambiguous.
+ * Did the device restart under this exploration?
  *
- * The comparison decides whether to collect location without being asked, so the tolerance is spent
- * on the side that does not: a session inside this window of the boot instant is interrupted rather
- * than resumed. The cost of being wrong that way is that the user starts a new exploration instead
- * of continuing one that is at most this old; the cost of being wrong the other way is silently
- * recording someone who did not ask, which is what `PLAN.md` forbids.
+ * `V02-015` replaced a clock comparison with this. The old test computed the boot instant as wall
+ * clock minus uptime and asked whether the session started before it, within a five-second
+ * tolerance. Both halves were wrong in the same way: the computed instant moves whenever the wall
+ * clock is corrected - a time sync after a reboot does exactly that, and so does the user - and a
+ * correction larger than the tolerance makes a pre-reboot session look like a post-boot one. The
+ * consequence was not cosmetic: the app then re-armed location collection on an exploration nobody
+ * asked to continue, which `PLAN.md` forbids in as many words.
+ *
+ * A boot counter is not a clock. It increases by one per boot, it cannot be set, and equality
+ * answers the question directly rather than approximately, so no tolerance is needed and no
+ * correction can move it.
+ *
+ * **[UNKNOWN] is a real answer and is not folded into either other one.** A row from before the
+ * column existed has no identity, and a platform may refuse to report one. Treating that as
+ * [SAME_BOOT] resumes someone who did not ask; treating it as [RESTARTED] ends explorations that a
+ * process death should have continued, silently, for everyone on such a device. So it is returned
+ * as itself, and the caller declines to act rather than guessing.
  */
-internal const val BOOT_BOUNDARY_TOLERANCE_MILLIS = 5_000L
+internal fun bootContinuity(
+    sessionBootId: Long?,
+    currentBootId: Long?,
+): BootContinuity = when {
+    sessionBootId == null || currentBootId == null -> BootContinuity.UNKNOWN
+    sessionBootId == currentBootId -> BootContinuity.SAME_BOOT
+    else -> BootContinuity.RESTARTED
+}
 
 /**
  * What to do about an abandoned exploration, or null for "leave it alone".
@@ -283,7 +309,8 @@ internal fun abandonedExplorationAction(
     activeSessionId: Long?,
     activeSessionStartedAt: Long?,
     activeSessionLastPointAt: Long?,
-    bootedAtEpochMillis: Long,
+    activeSessionBootId: Long?,
+    currentBootId: Long?,
     startupReconciled: Boolean,
     activityResumed: Boolean,
     claim: (Long) -> Boolean,
@@ -297,26 +324,30 @@ internal fun abandonedExplorationAction(
     // attempt on a refusal that says nothing about whether recovery was possible.
     if (!activityResumed) return null
     if (!claim(sessionId)) return null
-    // An unknown start time cannot be shown to postdate the boot, so it takes the safe branch.
-    val predatesThisBoot = activeSessionStartedAt == null ||
-        activeSessionStartedAt < bootedAtEpochMillis + BOOT_BOUNDARY_TOLERANCE_MILLIS
-    // P4-048. Ordered before the boot comparison rather than folded into it, because the two say
-    // different things: the boot comparison asks whether resuming COULD be right, and this asks
-    // whether the user has already been told it will not happen. An announcement wins.
+    // P4-048. Asked before the boot question rather than folded into it, because the two say
+    // different things: the boot question asks whether resuming COULD be right, and this asks
+    // whether the user has already been told it will not happen. An announcement wins either way.
     // One lookup answers both halves: a reason exists exactly when this runtime announced, so the
     // fact and the reason cannot drift apart the way two parameters could.
     val announcedReason = announcedInterruptionReason(sessionId)
-    return if (predatesThisBoot || announcedReason != null) {
-        AbandonedExplorationAction.Interrupt(
-            sessionId = sessionId,
-            stoppedRecordingAt = stoppedRecordingInstant(
-                activeSessionLastPointAt = activeSessionLastPointAt,
-                activeSessionStartedAt = activeSessionStartedAt,
-            ),
-            reason = announcedReason,
-        )
-    } else {
-        AbandonedExplorationAction.Resume(sessionId)
+    val interrupt = AbandonedExplorationAction.Interrupt(
+        sessionId = sessionId,
+        stoppedRecordingAt = stoppedRecordingInstant(
+            activeSessionLastPointAt = activeSessionLastPointAt,
+            activeSessionStartedAt = activeSessionStartedAt,
+        ),
+        reason = announcedReason,
+    )
+    if (announcedReason != null) return interrupt
+    return when (bootContinuity(sessionBootId = activeSessionBootId, currentBootId = currentBootId)) {
+        BootContinuity.RESTARTED -> interrupt
+        BootContinuity.SAME_BOOT -> AbandonedExplorationAction.Resume(sessionId)
+        // `V02-015`: neither established, so neither is done. Nothing is resumed and nothing is
+        // ended behind the user's back; the row stays as it is and the screen goes on offering both
+        // controls, which is what asking looks like here. The claim taken above is deliberately NOT
+        // returned: asking once per process is the point, and a released claim would put this back
+        // on every recomposition.
+        BootContinuity.UNKNOWN -> null
     }
 }
 

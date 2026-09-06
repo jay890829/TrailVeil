@@ -65,6 +65,7 @@ class RecordingForegroundServiceTest {
                 operationId("begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
+                bootId = null,
             ).sessionId
 
             val activity = ActivityScenario.launch(MainActivity::class.java)
@@ -115,6 +116,7 @@ class RecordingForegroundServiceTest {
             operationId("recovery-begin"),
             System.currentTimeMillis(),
             "instrumentation",
+            bootId = null,
         ).sessionId
 
         val activity = ActivityScenario.launch(MainActivity::class.java)
@@ -184,6 +186,7 @@ class RecordingForegroundServiceTest {
             operationId("pending-stop-begin"),
             System.currentTimeMillis(),
             "instrumentation",
+            bootId = null,
         ).sessionId
         val activity = ActivityScenario.launch(MainActivity::class.java)
         try {
@@ -251,6 +254,7 @@ class RecordingForegroundServiceTest {
             operationId("provider-disable-begin"),
             System.currentTimeMillis(),
             "instrumentation",
+            bootId = null,
         ).sessionId
         val activity = ActivityScenario.launch(MainActivity::class.java)
         try {
@@ -300,6 +304,7 @@ class RecordingForegroundServiceTest {
             operationId("backpressure-begin"),
             System.currentTimeMillis(),
             "instrumentation",
+            bootId = null,
         ).sessionId
         val activity = ActivityScenario.launch(MainActivity::class.java)
         val releaseRoomWriter = CompletableDeferred<Unit>()
@@ -411,6 +416,7 @@ class RecordingForegroundServiceTest {
                 operationId("stale-first-begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
+                bootId = null,
             ).sessionId
             activity.onActivity {
                 RecordingForegroundService.startFromVisibleActivity(it, firstSessionId)
@@ -432,6 +438,7 @@ class RecordingForegroundServiceTest {
                 operationId("stale-replacement-begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
+                bootId = null,
             ).sessionId
             activity.onActivity {
                 RecordingForegroundService.startFromVisibleActivity(it, replacementSessionId)
@@ -509,6 +516,7 @@ class RecordingForegroundServiceTest {
                     operationId("rapid-$cycle"),
                     System.currentTimeMillis(),
                     "instrumentation",
+                    bootId = null,
                 ).sessionId
                 sessionIds += sessionId
                 activity.onActivity {
