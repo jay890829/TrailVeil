@@ -1,5 +1,8 @@
 param(
-    [string]$AsciiStagingRoot = $env:TEMP
+    [string]$AsciiStagingRoot = $env:TEMP,
+    # V02-013: 0.2.0 publishes two APKs, so both are built and audited by default. A builder who
+    # holds no Google release key opts out explicitly rather than silently shipping one asset.
+    [switch]$OpenFreeMapOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,7 +105,13 @@ $published = $false
 
 try {
     $gradle = Join-Path $repositoryRoot 'gradlew.bat'
-    & $gradle -p $repositoryRoot clean assembleRelease assembleInternal lintRelease testDebugUnitTest
+    $gradleTasks = @('clean', 'assembleRelease', 'assembleInternal', 'lintRelease', 'testDebugUnitTest')
+    if (-not $OpenFreeMapOnly) {
+        # V02-013: the same clean commit, the same invocation. Two published APKs assembled from
+        # two invocations could differ by an edit between them, and nothing downstream would say so.
+        $gradleTasks += @('assembleGoogleRelease', 'lintGoogleRelease')
+    }
+    & $gradle -p $repositoryRoot @gradleTasks
     if ($LASTEXITCODE -ne 0) {
         throw "Release Gradle gate failed with exit code $LASTEXITCODE."
     }
@@ -416,30 +425,298 @@ try {
         $utf8WithoutBom
     )
     Remove-Item -LiteralPath $candidateInternalApk -Force
+    $publicNames = @($artifactName, $checksumName, $certificateName, $auditName)
+    $publishedDigests = [ordered]@{ $artifactName = $hash }
+
+    # V02-013: the Google artifact. Every assertion below is the mirror image of the refusals above,
+    # because this APK is the one that must contain what the other must not. The key it carries is
+    # public by construction - uncompressed in resources.arsc - so what protects it is its Android
+    # restriction to this package and to the certificate pinned above, which is why the signer check
+    # is not a formality here: a Google APK signed by anything else would ship a key that cannot
+    # authorize, exactly the failure this task exists to fix.
+    if (-not $OpenFreeMapOnly) {
+        $googleSourceApk = Join-Path $repositoryRoot 'app/build/outputs/apk/googleRelease/app-googleRelease.apk'
+        if (-not (Test-Path -LiteralPath $googleSourceApk -PathType Leaf)) {
+            throw "Google APK was not produced at $googleSourceApk"
+        }
+        $candidateGoogleApk = Join-Path $stagingDirectory 'candidate-google.apk'
+        Copy-Item -LiteralPath $googleSourceApk -Destination $candidateGoogleApk
+
+        $googleCertificateReport = @(Invoke-CheckedNative -FilePath $apksigner `
+            -ArgumentList @('verify', '--verbose', '--print-certs', $candidateGoogleApk) `
+            -Description 'Google APK signature verification')
+        foreach ($requiredSignatureFact in @(
+            'Verifies',
+            'Verified using v2 scheme (APK Signature Scheme v2): true',
+            'Number of signers: 1'
+        )) {
+            if ($requiredSignatureFact -notin $googleCertificateReport) {
+                throw "Google signature report is missing: $requiredSignatureFact"
+            }
+        }
+        $googleDigestMatches = @($googleCertificateReport | Select-String -Pattern $digestPattern)
+        if ($googleDigestMatches.Count -ne 1) {
+            throw 'The Google APK must report exactly one signer certificate digest.'
+        }
+        $googleCertificateDigest = $googleDigestMatches[0].Matches[0].Groups[1].Value
+        if ($googleCertificateDigest -ne $expectedCertificateDigest) {
+            throw "Google certificate $googleCertificateDigest is not the pinned TrailVeil certificate."
+        }
+
+        $googleManifestCommands = [ordered]@{
+            applicationId = @('manifest', 'application-id', $candidateGoogleApk)
+            versionName = @('manifest', 'version-name', $candidateGoogleApk)
+            versionCode = @('manifest', 'version-code', $candidateGoogleApk)
+            minSdk = @('manifest', 'min-sdk', $candidateGoogleApk)
+            targetSdk = @('manifest', 'target-sdk', $candidateGoogleApk)
+            debuggable = @('manifest', 'debuggable', $candidateGoogleApk)
+        }
+        $googleManifestFacts = [ordered]@{}
+        foreach ($key in $googleManifestCommands.Keys) {
+            $lines = @(Invoke-CheckedNative -FilePath $apkanalyzer `
+                -ArgumentList $googleManifestCommands[$key] -Description "Google manifest $key audit")
+            if ($lines.Count -ne 1 -or [string]::IsNullOrWhiteSpace($lines[0])) {
+                throw "Google manifest $key audit returned no single value."
+            }
+            $googleManifestFacts[$key] = $lines[0].Trim()
+        }
+        # Derived from the OpenFreeMap expectations rather than repeated, so the two published APKs
+        # cannot drift apart on identity: same application, same version code, same SDK range, both
+        # not debuggable, and a version name that is the release name plus this variant's suffix.
+        $expectedGoogleFacts = [ordered]@{}
+        foreach ($key in $expectedFacts.Keys) {
+            $expectedGoogleFacts[$key] = $expectedFacts[$key]
+        }
+        $expectedGoogleFacts.versionName = "$($expectedFacts.versionName)-google"
+        foreach ($key in $expectedGoogleFacts.Keys) {
+            if ($googleManifestFacts[$key] -ne $expectedGoogleFacts[$key]) {
+                throw "Unexpected Google manifest $key=$($googleManifestFacts[$key]); expected $($expectedGoogleFacts[$key])."
+            }
+        }
+
+        $googleBuildConfig = @(Invoke-CheckedNative -FilePath $apkanalyzer `
+            -ArgumentList @('dex', 'code', '--class', 'app.trailveil.BuildConfig', $candidateGoogleApk) `
+            -Description 'Google BuildConfig audit')
+        # GOOGLE_MAPS_POC_KEY_REASON is the build's own account of which key it resolved. A keyless
+        # Google build still builds, on purpose, and fails closed onto the provider-unavailable
+        # surface; it must never be the thing that gets published, and this is where that is caught.
+        $expectedGoogleBuildConfigFields = @(
+            ".field public static final APPLICATION_ID:Ljava/lang/String; = `"$($expectedGoogleFacts.applicationId)`"",
+            '.field public static final BUILD_TYPE:Ljava/lang/String; = "googleRelease"',
+            '.field public static final DEBUG:Z = false',
+            ".field public static final GIT_COMMIT:Ljava/lang/String; = `"$head`"",
+            '.field public static final GOOGLE_MAPS_POC_KEY_CONFIGURED:Z = true',
+            '.field public static final GOOGLE_MAPS_POC_KEY_GUIDANCE:Ljava/lang/String; = ""',
+            '.field public static final GOOGLE_MAPS_POC_KEY_REASON:Ljava/lang/String; = "VALID"',
+            (".field public static final VERSION_CODE:I = " +
+                ('0x{0:x}' -f [int]$expectedGoogleFacts.versionCode)),
+            ".field public static final VERSION_NAME:Ljava/lang/String; = `"$($expectedGoogleFacts.versionName)`""
+        )
+        foreach ($field in $expectedGoogleBuildConfigFields) {
+            if ($field -notin $googleBuildConfig) {
+                throw "Google APK BuildConfig is missing exact field: $field"
+            }
+        }
+
+        # The key resource, and the marker that has to point at it. `apkanalyzer manifest print`
+        # renders a resource reference as its numeric id, so the binding is proven by resolving the
+        # resource's id from the resource table and matching the id the marker actually holds. The
+        # value itself is never read into a variable that anything prints.
+        $googleResources = @(Invoke-CheckedNative -FilePath $aapt2 `
+            -ArgumentList @('dump', 'resources', $candidateGoogleApk) -Description 'Google resource audit')
+        $googleResourceText = $googleResources -join "`n"
+        $keyResourceMatches = @([regex]::Matches(
+            $googleResourceText,
+            '(?m)^\s*resource\s+(0x[0-9a-f]{8})\s+\S*string/trailveil_google_maps_poc_api_key\b'
+        ))
+        if ($keyResourceMatches.Count -ne 1) {
+            throw "The Google APK must define trailveil_google_maps_poc_api_key exactly once; found $($keyResourceMatches.Count)."
+        }
+        $keyResourceId = $keyResourceMatches[0].Groups[1].Value
+        $googleManifestXml = @(Invoke-CheckedNative -FilePath $apkanalyzer `
+            -ArgumentList @('manifest', 'print', $candidateGoogleApk) `
+            -Description 'Google manifest provider audit') -join "`n"
+        if ($googleManifestXml -notmatch 'com\.google\.android\.geo\.API_KEY') {
+            throw 'Refusing to release the Google APK: it does not declare the Google Maps API-key marker.'
+        }
+        $keyMarkerMatch = [regex]::Match(
+            $googleManifestXml,
+            'android:name="com\.google\.android\.geo\.API_KEY"\s*android:value="@ref/(0x[0-9a-f]{8})"'
+        )
+        if (-not $keyMarkerMatch.Success -or $keyMarkerMatch.Groups[1].Value -ne $keyResourceId) {
+            throw 'Refusing to release the Google APK: its API-key marker does not reference the key resource.'
+        }
+        if ($googleResourceText.Contains('TRAILVEIL_GOOGLE_MAPS_POC_MISSING_KEY')) {
+            throw 'Refusing to release the Google APK: it carries the missing-key sentinel, so it was built without a key.'
+        }
+        $googleKeyShaped = @([regex]::Matches($googleResourceText, 'AIza[A-Za-z0-9_-]{35}'))
+        if ($googleKeyShaped.Count -ne 1) {
+            throw "The Google APK must compile exactly one key-shaped string; found $($googleKeyShaped.Count)."
+        }
+        # Which key, not just a key. Shape checks cannot tell the release key from any other valid
+        # one, and publishing the wrong key means publishing a build that cannot authorize - or
+        # someone else's key. The fingerprint is optional for a local build and mandatory here.
+        $googleKeyPropertiesPath = if ($env:TRAILVEIL_GOOGLE_MAPS_PROPERTIES) {
+            $env:TRAILVEIL_GOOGLE_MAPS_PROPERTIES
+        } else {
+            Join-Path $HOME '.trailveil/maps/google-maps.properties'
+        }
+        if (-not (Test-Path -LiteralPath $googleKeyPropertiesPath -PathType Leaf)) {
+            throw "The Google Maps properties file was not found at $googleKeyPropertiesPath."
+        }
+        $expectedKeyFingerprint = $null
+        foreach ($propertyLine in [IO.File]::ReadAllLines($googleKeyPropertiesPath)) {
+            if ($propertyLine -match '^\s*releaseApiKeySha256\s*=\s*([0-9a-fA-F]{64})\s*$') {
+                $expectedKeyFingerprint = $Matches[1].ToLowerInvariant()
+            }
+        }
+        if (-not $expectedKeyFingerprint) {
+            throw ("Publishing a Google APK requires releaseApiKeySha256 in $googleKeyPropertiesPath " +
+                '(the lowercase hex SHA-256 of the release key text), so the packaged key can be ' +
+                'proven to be the intended one without ever being printed.')
+        }
+        # Scoped so the value leaves no variable behind, and compared only as a digest.
+        $packagedKeyFingerprint = & {
+            $packagedKeyBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($googleKeyShaped[0].Value)
+            $sha256 = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                return ($sha256.ComputeHash($packagedKeyBytes) | ForEach-Object { $_.ToString('x2') }) -join ''
+            } finally {
+                $sha256.Dispose()
+            }
+        }
+        if ($packagedKeyFingerprint -ne $expectedKeyFingerprint) {
+            throw 'The key packaged in the Google APK does not match the configured releaseApiKeySha256.'
+        }
+        # A MapLibre artifact inside the Google APK is the V02-008 defect this pair of source sets
+        # was split to prevent, so it is asserted on the artifact rather than assumed from the split.
+        if ($googleResourceText.Contains('maplibre_third_party_notices')) {
+            throw 'Refusing to release the Google APK: it packages the MapLibre third-party notices.'
+        }
+
+        $googleDexPackages = @(Invoke-CheckedNative -FilePath $apkanalyzer `
+            -ArgumentList @('dex', 'packages', $candidateGoogleApk) `
+            -Description 'Google dex package audit')
+        if (@($googleDexPackages | Where-Object { $_ -match '\bcom\.google\.android\.gms\.maps\b' }).Count -eq 0) {
+            throw 'Refusing to release the Google APK: it does not package the Google Maps SDK.'
+        }
+        if (@($googleDexPackages | Where-Object { $_ -match '\borg\.maplibre\.android\b' }).Count -ne 0) {
+            throw 'Refusing to release the Google APK: it packages MapLibre, so the two providers are not exclusive.'
+        }
+        # The engineering harness, by class and by component. Naming the two Activities is what this
+        # can assert: the production Google surface legitimately lives in the `googlepoc` PACKAGE,
+        # so a package-name scan here would refuse every correct build.
+        foreach ($harnessClass in @(
+            'app.trailveil.googlepoc.GoogleMapsPocActivity',
+            'app.trailveil.map.GoogleMapSurfaceTestActivity'
+        )) {
+            if (@($googleDexPackages | Where-Object { $_ -match [regex]::Escape($harnessClass) }).Count -ne 0) {
+                throw "Refusing to release the Google APK: it carries the engineering class $harnessClass."
+            }
+            if ($googleManifestXml -match [regex]::Escape($harnessClass)) {
+                throw "Refusing to release the Google APK: it declares the engineering component $harnessClass."
+            }
+        }
+
+        $googlePermissions = @(Invoke-CheckedNative -FilePath $apkanalyzer `
+            -ArgumentList @('manifest', 'permissions', $candidateGoogleApk) `
+            -Description 'Google permission audit') | Sort-Object -Unique
+        if (@(Compare-Object $expectedPermissions $googlePermissions).Count -ne 0) {
+            throw "Unexpected Google permissions: $($googlePermissions -join ', ')."
+        }
+        $googleFiles = @(Invoke-CheckedNative -FilePath $apkanalyzer `
+            -ArgumentList @('files', 'list', $candidateGoogleApk) -Description 'Google file inventory')
+        $googleAbis = $googleFiles | ForEach-Object {
+            if ($_ -match '^/?lib/([^/]+)/') { $Matches[1] }
+        } | Sort-Object -Unique
+        if (@(Compare-Object $expectedAbis $googleAbis).Count -ne 0) {
+            throw "Unexpected Google packaged ABIs: $($googleAbis -join ', ')."
+        }
+        if (@($googleFiles | Where-Object { $_ -match 'libmaplibre\.so$' }).Count -ne 0) {
+            throw 'Refusing to release the Google APK: it packages the MapLibre native library.'
+        }
+
+        $googleVersion = "v$($googleManifestFacts.versionName)"
+        $googleArtifactName = "TrailVeil-$googleVersion.apk"
+        $googleArtifact = Join-Path $stagingDirectory $googleArtifactName
+        Move-Item -LiteralPath $candidateGoogleApk -Destination $googleArtifact
+        $googleHash = (Get-FileHash -LiteralPath $googleArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
+        $googleChecksumName = "$googleArtifactName.sha256"
+        $googleCertificateName = "TrailVeil-$googleVersion-certificate.txt"
+        $googleAuditName = "TrailVeil-$googleVersion-audit.txt"
+        [IO.File]::WriteAllText(
+            (Join-Path $stagingDirectory $googleChecksumName),
+            "$googleHash  $googleArtifactName`n",
+            $utf8WithoutBom
+        )
+        [IO.File]::WriteAllLines(
+            (Join-Path $stagingDirectory $googleCertificateName),
+            $googleCertificateReport,
+            $utf8WithoutBom
+        )
+        # This file is published. It records that a key is present and how it is bound, never the
+        # key, and never anything from which the key could be reconstructed.
+        $googleAuditLines = @(
+            "artifact=$googleArtifactName",
+            "sha256=$googleHash",
+            "certificateSha256=$googleCertificateDigest"
+        ) + ($googleManifestFacts.Keys | ForEach-Object { "$_=$($googleManifestFacts[$_])" }) + @(
+            "gitCommit=$head",
+            'buildType=googleRelease',
+            'signatureSchemeV2=true',
+            'signerCount=1',
+            "abis=$($googleAbis -join ',')",
+            'provider=google',
+            'mapLibrePackages=absent',
+            'mapLibreNativeLibrary=absent',
+            'googleMapsSdk=present',
+            'engineeringComponents=absent',
+            "apiKeyResource=present:$keyResourceId",
+            'apiKeyMarkerReferencesKeyResource=true',
+            'apiKeySentinel=absent',
+            'apiKeyFingerprintVerified=true',
+            'apiKeyRestriction=android-package-and-release-certificate',
+            'permissions:'
+        ) + ($googlePermissions | ForEach-Object { "  $_" })
+        [IO.File]::WriteAllLines(
+            (Join-Path $stagingDirectory $googleAuditName),
+            $googleAuditLines,
+            $utf8WithoutBom
+        )
+        $publicNames += @($googleArtifactName, $googleChecksumName, $googleCertificateName, $googleAuditName)
+        $publishedDigests[$googleArtifactName] = $googleHash
+    }
 
     # TEMP and the repository may appear as different drives (for example C: and a subst T:).
     # Copy validated public files across that boundary, then write the ready marker LAST. Consumers
     # must treat a directory without the marker as incomplete; finally removes it on any failure.
     New-Item -ItemType Directory -Path $distributionDirectory | Out-Null
-    foreach ($publicName in $artifactName, $checksumName, $certificateName, $auditName) {
+    foreach ($publicName in $publicNames) {
         Copy-Item -LiteralPath (Join-Path $stagingDirectory $publicName) `
             -Destination (Join-Path $distributionDirectory $publicName)
     }
-    $publishedArtifact = Join-Path $distributionDirectory $artifactName
-    $publishedHash = (Get-FileHash -LiteralPath $publishedArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($publishedHash -ne $hash) {
-        throw "Published APK digest $publishedHash does not match the validated staging digest $hash."
+    # Every APK is re-hashed where it will be uploaded from, not only the first one.
+    foreach ($publishedName in $publishedDigests.Keys) {
+        $publishedArtifact = Join-Path $distributionDirectory $publishedName
+        $publishedHash = (Get-FileHash -LiteralPath $publishedArtifact -Algorithm SHA256).Hash.ToLowerInvariant()
+        if ($publishedHash -ne $publishedDigests[$publishedName]) {
+            throw "Published digest $publishedHash for $publishedName does not match the validated staging digest $($publishedDigests[$publishedName])."
+        }
     }
-    $expectedPublicNames = @($artifactName, $checksumName, $certificateName, $auditName) | Sort-Object
+    $expectedPublicNames = @($publicNames) | Sort-Object
     $actualPublicNames = @(Get-ChildItem -LiteralPath $distributionDirectory -Force | ForEach-Object {
         if (-not $_.PSIsContainer) { $_.Name } else { "<directory>:$($_.Name)" }
     }) | Sort-Object
     if (@(Compare-Object $expectedPublicNames $actualPublicNames).Count -ne 0) {
-        throw "Release directory does not contain exactly the four audited public files: $($actualPublicNames -join ', ')."
+        throw "Release directory does not contain exactly the $($expectedPublicNames.Count) audited public files: $($actualPublicNames -join ', ')."
+    }
+    $readyLines = @("commit=$head", "artifact=$artifactName", "sha256=$hash")
+    if (-not $OpenFreeMapOnly) {
+        $readyLines += @("googleArtifact=$googleArtifactName", "googleSha256=$googleHash")
     }
     [IO.File]::WriteAllText(
         (Join-Path $distributionDirectory 'RELEASE-READY.txt'),
-        "commit=$head`nartifact=$artifactName`nsha256=$hash`n",
+        (($readyLines -join "`n") + "`n"),
         $utf8WithoutBom
     )
     $published = $true
@@ -448,6 +725,12 @@ try {
     Write-Output "SHA-256: $hash"
     Write-Output "Certificate report: $(Join-Path $distributionDirectory $certificateName)"
     Write-Output "Audit report: $(Join-Path $distributionDirectory $auditName)"
+    if (-not $OpenFreeMapOnly) {
+        Write-Output "Google artifact: $(Join-Path $distributionDirectory $googleArtifactName)"
+        Write-Output "Google SHA-256: $googleHash"
+        Write-Output "Google certificate report: $(Join-Path $distributionDirectory $googleCertificateName)"
+        Write-Output "Google audit report: $(Join-Path $distributionDirectory $googleAuditName)"
+    }
 } finally {
     if ($javaOptionsCleared) {
         $env:_JAVA_OPTIONS = $inheritedJavaOptions

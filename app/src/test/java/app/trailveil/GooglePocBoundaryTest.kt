@@ -159,7 +159,6 @@ class GooglePocBoundaryTest {
 
         assertFalse(buildScript.contains("play-services-maps"))
         assertFalse(buildScript.contains("maplibre"))
-        assertTrue(moduleScript.contains("debugApiKeySha256"))
 
         // Each engine is added by iterating its own build-type list, and by nothing else.
         assertTrue(
@@ -194,6 +193,62 @@ class GooglePocBoundaryTest {
             .filter { line -> dependencyShapes.any { shape -> line.contains(shape, ignoreCase = true) } }
             .filter { line -> !line.contains("{variant}Implementation") }
         assertTrue("a map engine is on a shared configuration: $offenders", offenders.isEmpty())
+    }
+
+    /**
+     * The two Google build types read two different key properties, and neither falls back.
+     *
+     * `V02-013` publishes the release-configured Google APK, so the key it compiles in is public
+     * by construction and its only protection is being restricted to the release certificate and
+     * this package. Both build types used to read `debugApiKey`, which is how the owner's first
+     * Google release build shipped a key restricted to the debug certificate and could not
+     * authorize. A fallback would restore that failure quietly, so the mapping is asserted to be
+     * exhaustive rather than defaulted.
+     *
+     * This is a source assertion, and it says which line is wrong; what proves the shipped APK is
+     * `verifyGooglePocMergedManifest`, which reads the value each variant actually resolved.
+     */
+    @Test
+    fun eachGoogleBuildTypeReadsItsOwnKeyProperty() {
+        val moduleScript = File(moduleRoot(), "build.gradle.kts").readText()
+
+        assertTrue(
+            "the PoC build type must name the debug-certificate key property",
+            moduleScript.contains("\"googlePoc\" -> \"debugApiKey\""),
+        )
+        assertTrue(
+            "the release build type must name the release-certificate key property",
+            moduleScript.contains("\"googleRelease\" -> \"releaseApiKey\""),
+        )
+        // An `else ->` that returns a property name is the fallback this test exists to forbid; an
+        // unmapped build type must fail the build instead of borrowing the other one's key.
+        val mapping = Regex(
+            """fun googleKeyPropertyFor\(buildType: String\): String = when \(buildType\) \{([\s\S]*?)\n\}""",
+        ).find(moduleScript)
+        assertTrue("googleKeyPropertyFor is missing", mapping != null)
+        assertTrue(
+            "an unmapped build type must not resolve to a key property",
+            mapping!!.groupValues[1].contains("else -> error("),
+        )
+
+        // Each build type passes its own name, so the mapping above is the only place the two
+        // properties are chosen.
+        assertTrue(
+            moduleScript.contains("applyGoogleMapsKey(buildType = \"googlePoc\")"),
+        )
+        assertTrue(
+            moduleScript.contains("applyGoogleMapsKey(buildType = \"googleRelease\")"),
+        )
+        assertFalse(
+            "applyGoogleMapsKey() without a build type would share one key again",
+            moduleScript.contains("applyGoogleMapsKey()"),
+        )
+
+        // The reader takes the property, and the fingerprint check follows it, so a release key's
+        // typo self-check cannot be satisfied by the debug key's fingerprint.
+        assertTrue(moduleScript.contains("properties.getProperty(keyProperty)?.trim()"))
+        assertTrue(moduleScript.contains(".getProperty(keyProperty + \"Sha256\")"))
+        assertFalse(moduleScript.contains("getProperty(\"debugApiKey\")"))
     }
 
     @Test

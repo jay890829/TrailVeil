@@ -104,7 +104,20 @@ private data class GooglePocKeyBuildConfiguration(
     val reason: GooglePocKeyBuildReason,
 )
 
-private fun readGooglePocKeyConfiguration(): GooglePocKeyBuildConfiguration {
+/**
+ * `V02-013`: the key property each Google build type reads, and the only place that mapping is
+ * written. Both build types used to read `debugApiKey`, so a release-signed APK was built with a
+ * key restricted to the debug certificate and could not authorize on the phone. There is
+ * deliberately no fallback between the two: a key is restricted to one certificate, so borrowing
+ * the other build type's key would only move the failure from configuration time to runtime.
+ */
+private fun googleKeyPropertyFor(buildType: String): String = when (buildType) {
+    "googlePoc" -> "debugApiKey"
+    "googleRelease" -> "releaseApiKey"
+    else -> error("no Google Maps key property is defined for build type " + buildType)
+}
+
+private fun readGooglePocKeyConfiguration(keyProperty: String): GooglePocKeyBuildConfiguration {
     val configuredPath = googlePocPropertiesOverride
     if (configuredPath != null && !File(configuredPath).isAbsolute) {
         return GooglePocKeyBuildConfiguration(
@@ -131,12 +144,12 @@ private fun readGooglePocKeyConfiguration(): GooglePocKeyBuildConfiguration {
         val properties = Properties().apply {
             propertiesFile.inputStream().use(::load)
         }
-        val key = properties.getProperty("debugApiKey")?.trim()
+        val key = properties.getProperty(keyProperty)?.trim()
         // An empty value is not a configured fingerprint. `Properties.load` returns "" for a
         // `debugApiKeySha256=` line, which the README's own template shows, so without this the
         // documented file would resolve INVALID_KEY and compile the sentinel over a good key.
         val expectedFingerprint = properties
-            .getProperty("debugApiKeySha256")
+            .getProperty(keyProperty + "Sha256")
             ?.trim()
             ?.lowercase()
             ?.takeIf(String::isNotEmpty)
@@ -175,51 +188,65 @@ private fun readGooglePocKeyConfiguration(): GooglePocKeyBuildConfiguration {
     }
 }
 
-private val googlePocKeyConfiguration = readGooglePocKeyConfiguration()
+private val googlePocKeyConfigurations = mutableMapOf<String, GooglePocKeyBuildConfiguration>()
+
+/** Read once per build type: Gradle configures both Google build types in one invocation. */
+private fun googlePocKeyConfiguration(buildType: String): GooglePocKeyBuildConfiguration =
+    googlePocKeyConfigurations.getOrPut(buildType) {
+        readGooglePocKeyConfiguration(googleKeyPropertyFor(buildType))
+    }
 
 private fun String.sha256Hex(): String = MessageDigest
     .getInstance("SHA-256")
     .digest(toByteArray(Charsets.UTF_8))
     .joinToString(separator = "") { byte -> "%02x".format(byte) }
 
-/** The Google key inputs, identical on every Google build type. */
-private fun com.android.build.api.dsl.VariantDimension.applyGoogleMapsKey() {
+/**
+ * The Google key inputs. The same shape on every Google build type, but each resolves its key from
+ * its own property, because the certificate a build is signed with is what its key is restricted
+ * to.
+ */
+private fun com.android.build.api.dsl.VariantDimension.applyGoogleMapsKey(buildType: String) {
+    val configuration = googlePocKeyConfiguration(buildType)
     buildConfigField(
         "boolean",
         "GOOGLE_MAPS_POC_KEY_CONFIGURED",
-        (googlePocKeyConfiguration.reason == GooglePocKeyBuildReason.VALID).toString(),
+        (configuration.reason == GooglePocKeyBuildReason.VALID).toString(),
     )
     buildConfigField(
         "String",
         "GOOGLE_MAPS_POC_KEY_REASON",
-        googlePocKeyConfiguration.reason.name.toBuildConfigString(),
+        configuration.reason.name.toBuildConfigString(),
     )
     buildConfigField(
         "String",
         "GOOGLE_MAPS_POC_KEY_GUIDANCE",
-        googlePocKeyGuidance(googlePocKeyConfiguration).toBuildConfigString(),
+        googlePocKeyGuidance(configuration, googleKeyPropertyFor(buildType)).toBuildConfigString(),
     )
     resValue(
         "string",
         "trailveil_google_maps_poc_api_key",
-        googlePocKeyConfiguration.key ?: googlePocMissingKeySentinel,
+        configuration.key ?: googlePocMissingKeySentinel,
     )
 }
 
 private fun String.toBuildConfigString(): String =
     "\"${replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")}\""
 
-private fun googlePocKeyGuidance(configuration: GooglePocKeyBuildConfiguration): String = when (
+private fun googlePocKeyGuidance(
+    configuration: GooglePocKeyBuildConfiguration,
+    keyProperty: String,
+): String = when (
     configuration.reason
 ) {
     GooglePocKeyBuildReason.VALID -> ""
     GooglePocKeyBuildReason.MISSING_KEY ->
-        "Add debugApiKey to ~/.trailveil/maps/google-maps.properties (debugApiKeySha256 is " +
+        "Add $keyProperty to ~/.trailveil/maps/google-maps.properties (${keyProperty}Sha256 is " +
             "optional), or set TRAILVEIL_GOOGLE_MAPS_PROPERTIES to an absolute external properties file."
 
     GooglePocKeyBuildReason.INVALID_KEY ->
-        "debugApiKey is not a Google API key, or it does not match the debugApiKeySha256 you " +
-            "configured. Fix the external file and rebuild the googlePoc variant."
+        "$keyProperty is not a Google API key, or it does not match the ${keyProperty}Sha256 you " +
+            "configured. Fix the external file and rebuild this Google variant."
 
     GooglePocKeyBuildReason.CONFIG_PATH_NOT_ABSOLUTE ->
         "TRAILVEIL_GOOGLE_MAPS_PROPERTIES must be an absolute path outside this repository."
@@ -414,19 +441,22 @@ android {
             initWith(getByName("debug"))
             versionNameSuffix = "-googlePoc"
             matchingFallbacks += listOf("debug")
-            applyGoogleMapsKey()
+            // Debug-signed, so its key is the one restricted to the debug certificate.
+            applyGoogleMapsKey(buildType = "googlePoc")
         }
         // `V02-008`: the Google variant a key holder builds. Release-configured - not debuggable,
-        // signed by whatever key its builder configured - and never published as a prebuilt APK,
-        // because the key it compiles in is uncompressed in `resources.arsc`. It reads the key by
-        // exactly the same path as the PoC build type, including the missing-key sentinel, so a
-        // key-less build of it fails closed onto the provider-unavailable surface rather than
-        // failing to build.
+        // signed by whatever key its builder configured. It reads its key by exactly the same path
+        // as the PoC build type, including the missing-key sentinel, so a key-less build of it
+        // fails closed onto the provider-unavailable surface rather than failing to build.
+        // `V02-013` publishes it, and gave it its own key property: the key compiled into it sits
+        // uncompressed in `resources.arsc` and is therefore public, so what protects it is its
+        // restriction to the release certificate and this package, which a debug-certificate key
+        // does not have.
         create("googleRelease") {
             initWith(getByName("release"))
             versionNameSuffix = "-google"
             matchingFallbacks += listOf("release")
-            applyGoogleMapsKey()
+            applyGoogleMapsKey(buildType = "googleRelease")
         }
     }
 
@@ -549,9 +579,13 @@ val verifyGooglePocMergedManifest = tasks.register("verifyGooglePocMergedManifes
     inputs.files(mergedManifestFiles.values)
     inputs.files(googleBuildTypes.map(::googleKeyResValues))
     outputs.upToDateWhen { false }
-    val keyReason = googlePocKeyConfiguration.reason
+    // `V02-013`: one reason per variant. The two Google build types read different properties, so
+    // a builder holding only the debug key gets VALID for the PoC build and MISSING_KEY for the
+    // release build in the same invocation, and each variant's resource is checked against its own.
+    val keyReasons = googleBuildTypes.associateWith { googlePocKeyConfiguration(it).reason }
     doLast {
         googleBuildTypes.forEach { googleVariant ->
+            val keyReason = keyReasons.getValue(googleVariant)
             val googleManifest = mergedManifestFiles.getValue(googleVariant).get().asFile.readText()
             check("com.google.android.geo.API_KEY" in googleManifest) {
                 "$googleVariant merged manifest is missing the Google Maps API-key marker"
