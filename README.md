@@ -169,8 +169,27 @@ debugApiKey=replace-with-your-own-key
 debugApiKeySha256=
 # Read by googleRelease, which is signed like release. Restrict it to that certificate, not the debug one.
 releaseApiKey=replace-with-your-own-key
+# Optional to build, REQUIRED to publish. See below for what it is and how to fill it in.
 releaseApiKeySha256=
 ```
+
+Neither fingerprint is a value Google shows you. Both are digests you compute from your own key: the lowercase hex SHA-256 of the key text exactly as the build reads it, which is the property value with surrounding whitespace trimmed and no trailing newline. `debugApiKeySha256` is a typo self-check and stays optional. `releaseApiKeySha256` is optional for building too, but **publishing requires it**, because it is the only check that can tell your release key from any other valid key: `scripts/build-github-release.ps1` extracts the key actually compiled into the candidate APK, hashes it, and refuses to publish unless the two digests agree. That is what makes "the published APK carries the release key" a checked fact rather than a hope - and it is exactly the mistake it catches, since a debug-restricted key in a release-signed build produces an APK that looks fine and cannot authorize.
+
+Derive it from the file rather than retyping it, so the two cannot disagree and neither the key nor its digest reaches your screen:
+
+```powershell
+$path = if ($env:TRAILVEIL_GOOGLE_MAPS_PROPERTIES) { $env:TRAILVEIL_GOOGLE_MAPS_PROPERTIES } else { Join-Path $HOME '.trailveil\maps\google-maps.properties' }
+$lines = [IO.File]::ReadAllLines($path)
+$key = $null
+foreach ($line in $lines) { if ($line -match '^\s*releaseApiKey\s*=\s*(.+?)\s*$') { $key = $Matches[1] } }
+if (-not $key) { throw "releaseApiKey is not set in $path." }
+$sha = [System.Security.Cryptography.SHA256]::Create()
+try { $digest = ($sha.ComputeHash([System.Text.UTF8Encoding]::new($false).GetBytes($key)) | ForEach-Object { $_.ToString('x2') }) -join '' } finally { $sha.Dispose() }
+[IO.File]::WriteAllLines($path, @($lines | Where-Object { $_ -notmatch '^\s*releaseApiKeySha256\s*=' }) + "releaseApiKeySha256=$digest")
+Write-Output 'releaseApiKeySha256 written; neither the key nor the digest was printed.'
+```
+
+Both fingerprints belong in the same external file as the key, and neither goes in the repository, in CI, or in a release note - the published audit deliberately carries neither the key nor its digest.
 
 Each Google build type reads its own property and neither falls back to the other. That is deliberate: a Maps key is restricted to one signing certificate, so a shared property can only produce a build whose key cannot authorize - which is exactly what happened to this project's first Google release build. A build type whose property is absent gets the sentinel below, not the other build type's key.
 
