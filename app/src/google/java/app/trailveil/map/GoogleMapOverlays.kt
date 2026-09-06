@@ -51,15 +51,6 @@ internal data class GoogleMapOverlayObservation(
 )
 
 /**
- * Optional real-SDK observation seam used by googlePoc instrumentation. It is null by default and
- * never participates in map rendering; the permanent history tests set it only while they inspect
- * a real MainActivity detail composition.
- */
-internal object GoogleMapOverlayTestHooks {
-    @Volatile var onObservation: ((GoogleMapOverlayObservation) -> Unit)? = null
-}
-
-/**
  * Google map overlays owned by one hosted composition.
  *
  * The renderer keeps the marker and track objects installed but invisible until the matching
@@ -323,7 +314,11 @@ internal class GoogleMapOverlays(
 
     private fun publishObservation() {
         val callback = onObservationChanged
-        if (callback == null && GoogleMapOverlayTestHooks.onObservation == null) return
+        // `V02-013` verifier: read once, so the guard below and the invoke further down cannot see
+        // two different values - and declared per build type, so the published variant's version is
+        // a constant null rather than a mutable static.
+        val seam = googleMapOverlayObservationSeam()
+        if (callback == null && seam == null) return
         val observation = try {
             GoogleMapOverlayObservation(
                 currentMarker = currentMarker?.let(::observeMarker),
@@ -343,7 +338,7 @@ internal class GoogleMapOverlays(
             // Same isolation for provider/test linkage failures.
         }
         try {
-            GoogleMapOverlayTestHooks.onObservation?.invoke(observation)
+            seam?.invoke(observation)
         } catch (_: Exception) {
             // The real-SDK test seam is best effort and cannot affect production rendering.
         } catch (_: LinkageError) {

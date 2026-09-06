@@ -298,6 +298,22 @@ try {
     if ($mapLibrePackages.Count -eq 0) {
         throw 'Refusing to release: the candidate APK does not package MapLibre, so it is not the OpenFreeMap variant.'
     }
+    # `V02-013` verifier, 2026-09-07: these two were asserted absent from the Google artifact and
+    # nowhere else. The manifest regex above matches only the `googlepoc` PACKAGE, so it could never
+    # have caught `app.trailveil.map.GoogleMapSurfaceTestActivity`, nor a dex-only class with no
+    # manifest component. "The harness is not in the published build" is a claim about EVERY
+    # published build, so both artifacts get the same two-surface check.
+    foreach ($harnessClass in @(
+        'app.trailveil.googlepoc.GoogleMapsPocActivity',
+        'app.trailveil.map.GoogleMapSurfaceTestActivity'
+    )) {
+        if (@($dexPackages | Where-Object { $_ -match [regex]::Escape($harnessClass) }).Count -ne 0) {
+            throw "Refusing to release: the candidate APK carries the engineering class $harnessClass."
+        }
+        if ($manifestXml -match [regex]::Escape($harnessClass)) {
+            throw "Refusing to release: the candidate APK declares the engineering component $harnessClass."
+        }
+    }
 
     $permissions = @(Invoke-CheckedNative -FilePath $apkanalyzer `
         -ArgumentList @('manifest', 'permissions', $candidateApk) `
@@ -326,6 +342,13 @@ try {
     $expectedAbis = @('arm64-v8a', 'armeabi-v7a', 'x86', 'x86_64')
     if (@(Compare-Object $expectedAbis $abis).Count -ne 0) {
         throw "Unexpected packaged ABIs: $($abis -join ', ')."
+    }
+    # `V02-013` verifier, 2026-09-07: the Google path asserts this library is ABSENT, and nothing
+    # asserted it is PRESENT here - so a MapLibre build that packaged no native library at all would
+    # have satisfied both sides. An absence is only evidence next to the matching presence.
+    $mapLibreNative = @($files | Where-Object { $_ -match 'libmaplibre\.so$' })
+    if ($mapLibreNative.Count -eq 0) {
+        throw 'Refusing to release: the candidate APK packages no MapLibre native library, so its renderer is not there.'
     }
 
     $expectedNoticeDigest = 'db3cc41e2c79f394a1dddd890c55c263426175029a898d5167820498ddebf152'
@@ -410,11 +433,14 @@ try {
         'buildType=release',
         'signatureSchemeV2=true',
         'signerCount=1',
-        "internalApplicationId=$($internalApplicationId[0].Trim())",
-        "internalVersionName=$($internalVersionName[0].Trim())",
-        "internalVersionCode=$($internalVersionCode[0].Trim())",
         "abis=$($abis -join ',')",
-        "maplibreAndroidNoticeSha256=$packagedNoticeDigest",
+        # `V02-013` verifier, 2026-09-07: named for what it actually is. This digest is taken after
+        # CRLF->LF, TrimEnd and a single trailing newline, so a reader who hashes the packaged file
+        # gets a different value and would reasonably conclude the notice had been tampered with.
+        # The internal-lineage comparison still runs and still gates the release; its three facts
+        # were dropped from here because they describe an APK that is never published, so nobody
+        # reading this file beside the artifact can check them.
+        "maplibreAndroidNoticeNormalizedSha256=$packagedNoticeDigest",
         'provider=openfreemap',
         'googleMapsMarkers=absent',
         'permissions:'
@@ -675,7 +701,13 @@ try {
             'apiKeyMarkerReferencesKeyResource=true',
             'apiKeySentinel=absent',
             'apiKeyFingerprintVerified=true',
-            'apiKeyRestriction=android-package-and-release-certificate',
+            # `V02-013` verifier, 2026-09-07: this used to read
+            # `apiKeyRestriction=android-package-and-release-certificate`, published as a derived
+            # fact beside facts that really are derived. Nothing here can see Google Cloud Console,
+            # and the restriction is the key's ONLY protection once the APK is public - so stating
+            # it as though it had been checked is the most misleading line the file could carry.
+            # It is the operator's attestation, and it is labelled as one.
+            'apiKeyRestrictionAttestedByOperator=android-package-and-release-certificate',
             'permissions:'
         ) + ($googlePermissions | ForEach-Object { "  $_" })
         [IO.File]::WriteAllLines(

@@ -2,6 +2,7 @@ package app.trailveil
 
 import java.io.File
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -191,6 +192,82 @@ class ReleaseScriptSourceTest {
         // The publishable directory holds exactly what was audited and nothing else, so a stray
         // file cannot ride along with the upload.
         assertTrue(script.contains("audited public files"))
+    }
+
+    @Test
+    fun `both published artifacts are checked for the engineering harness`() {
+        val script = releaseScript()
+
+        // `V02-013` verifier, 2026-09-07: the two-class check ran on the Google artifact only. The
+        // OpenFreeMap path had a manifest regex for the `googlepoc` package, which cannot match
+        // `app.trailveil.map.GoogleMapSurfaceTestActivity` and cannot see a dex-only class. Both
+        // published artifacts are published, so both are checked.
+        assertTrue(
+            "the OpenFreeMap artifact is no longer checked for the harness classes",
+            script.contains("Refusing to release: the candidate APK carries the engineering class"),
+        )
+        assertTrue(
+            "the Google artifact is no longer checked for the harness classes",
+            script.contains("Refusing to release the Google APK: it carries the engineering class"),
+        )
+        listOf(
+            "app.trailveil.googlepoc.GoogleMapsPocActivity",
+            "app.trailveil.map.GoogleMapSurfaceTestActivity",
+        ).forEach { harness ->
+            val occurrences = Regex(Regex.escape(harness)).findAll(script).count()
+            assertTrue(
+                "$harness is named $occurrences time(s); both artifact paths must name it",
+                occurrences >= 2,
+            )
+        }
+    }
+
+    @Test
+    fun `the MapLibre renderer is asserted present, not only absent from the other artifact`() {
+        // An absence is only evidence beside the matching presence: without this, a build that
+        // packaged no native renderer at all satisfied both the Google APK's "no libmaplibre" and
+        // the OpenFreeMap APK's silence.
+        assertTrue(
+            "the MapLibre native library presence assertion is gone",
+            releaseScript().contains("packages no MapLibre native library"),
+        )
+    }
+
+    @Test
+    fun `the published audit states nothing it has not checked`() {
+        val script = releaseScript()
+
+        // The key restriction is the only thing protecting a key that ships inside a public APK,
+        // and nothing in this script can see Google Cloud Console. Publishing it as a derived fact
+        // beside facts that really are derived was the most misleading line the file carried.
+        assertFalse(
+            "the key restriction is published as a derived fact again",
+            script.contains("'apiKeyRestriction=android-package-and-release-certificate'"),
+        )
+        assertTrue(
+            "the key restriction is no longer labelled as the operator's attestation",
+            script.contains("apiKeyRestrictionAttestedByOperator="),
+        )
+        // A digest a reader cannot reproduce from the packaged file reads as tampering. It is taken
+        // after newline and trailing-whitespace normalization, so it says so.
+        assertFalse(
+            "the notice digest is published under a name that implies raw bytes",
+            script.contains("\"maplibreAndroidNoticeSha256="),
+        )
+        assertTrue(
+            "the notice digest no longer says it is normalized",
+            script.contains("\"maplibreAndroidNoticeNormalizedSha256="),
+        )
+        // The internal lineage still gates the release; it is just not described in a file that a
+        // reader holds beside an artifact it does not describe.
+        assertFalse(
+            "the published audit describes the internal APK, which is never published",
+            script.contains("\"internalVersionName="),
+        )
+        assertTrue(
+            "the internal lineage comparison itself was removed, which was not the point",
+            script.contains("Release versionCode is lower than the internal lineage"),
+        )
     }
 
     private fun releaseScript(): String {
