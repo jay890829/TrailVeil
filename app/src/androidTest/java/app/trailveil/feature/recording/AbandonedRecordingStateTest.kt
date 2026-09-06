@@ -361,6 +361,87 @@ class AbandonedRecordingStateTest {
                 "the announced exploration was resumed instead of ended",
                 !hasRecoverySegment(sqlite, sessionId),
             )
+            // The reason the runtime actually stopped for, all the way to the column the history
+            // screen renders. Its sibling three tests up asserts the same column for the reboot
+            // case; without this one, hard-coding `device_restarted` in the repair would record a
+            // full disk as a reboot and every test in the tree would still pass.
+            assertEquals(
+                "the repaired row was labelled with the wrong reason",
+                "INTERRUPT:$STORAGE_FAILURE",
+                sessionColumn(sqlite, sessionId, "stop_reason"),
+            )
+        } finally {
+            RecordingForegroundService.stopFromVisibleActivity(context, sessionId)
+            SystemClock.sleep(STOP_SETTLE_MILLIS)
+            sqlite.execSQL("DELETE FROM recording_sessions WHERE id = $sessionId")
+        }
+    }
+
+    @Test
+    fun anAnnouncementMadeWhileTheScreenIsOpenChangesItWithNothingElseHappening() {
+        // `V02-014`, the ordering the sibling case deliberately avoids. There, the announcement is
+        // made before the row exists, so the row's own arrival is what recomposes the screen.
+        // Production is the other way round: the exploration has been on screen for the whole walk
+        // and the announcement is the LAST thing that happens. If the screen reads the announcement
+        // as plain memory rather than as state it subscribes to, nothing tells it to look again -
+        // and the two `MutableStateFlow` writes that follow in `stopRuntime` are null-to-null in
+        // exactly this case, because no location was ever accepted, so they conflate and emit
+        // nothing. The card would keep saying "recording" until the user left and came back.
+        //
+        // So: seed, let the screen settle on a live state, announce the way the service does, and
+        // then touch nothing at all. The row closing is what proves the screen looked again.
+        grant(Manifest.permission.ACCESS_COARSE_LOCATION)
+        grant(Manifest.permission.ACCESS_FINE_LOCATION)
+
+        val sqlite = container.databaseForTesting().openHelper.writableDatabase
+        val sessionId = seedAbandonedSession(
+            sqlite,
+            ownerToken = container.recordingRuntimeToken,
+            startedAt = System.currentTimeMillis(),
+        )
+
+        try {
+            composeRule.activityRule.scenario.recreate()
+
+            var settled: String? = null
+            var waited = 0L
+            while (waited < STATE_SETTLE_MILLIS) {
+                composeRule.waitForIdle()
+                settled = publishedState()
+                if (settled in LIVE_STATES) break
+                SystemClock.sleep(POLL_MILLIS)
+                waited += POLL_MILLIS
+            }
+            assertTrue(
+                "the fixture never reached a live state, so this test would prove nothing " +
+                    "about noticing the announcement; saw '$settled'",
+                settled in LIVE_STATES,
+            )
+
+            // The one event. Nothing after this line recreates the activity, clicks anything,
+            // starts a service or writes to the database.
+            container.announcedInterruptions.announce(sessionId, STORAGE_FAILURE)
+
+            var status: String? = null
+            waited = 0L
+            while (waited < RECOVERY_TIMEOUT_MILLIS) {
+                composeRule.waitForIdle()
+                status = sessionColumn(sqlite, sessionId, "status")
+                if (status == "INTERRUPTED") break
+                SystemClock.sleep(POLL_MILLIS)
+                waited += POLL_MILLIS
+            }
+
+            assertEquals(
+                "the announcement changed nothing on screen, so the exploration the user was told " +
+                    "had ended was still presented as live; shown state ${publishedState()}",
+                "INTERRUPTED",
+                status,
+            )
+            assertEquals(
+                "INTERRUPT:$STORAGE_FAILURE",
+                sessionColumn(sqlite, sessionId, "stop_reason"),
+            )
         } finally {
             RecordingForegroundService.stopFromVisibleActivity(context, sessionId)
             SystemClock.sleep(STOP_SETTLE_MILLIS)

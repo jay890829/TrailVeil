@@ -15,6 +15,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableLongStateOf
@@ -431,10 +432,14 @@ internal fun RecordingEntryRoute(
         }
     }
 
+    // `V02-014`: collected, not looked up. An announcement has to be able to change what is on
+    // screen by itself; read as plain memory it could only be noticed the next time something else
+    // caused a recomposition, and in the case this exists for nothing else does.
+    val announcedInterruptions by appContainer.announcedInterruptionState.collectAsState()
     val recordingPresentation = latestSessionSummary.toRecordingPresentation(
         stoppingSessionId = stoppingSessionId,
         runtimeToken = appContainer.recordingRuntimeToken,
-        announcedInterruption = appContainer::announcedInterruptionInThisRuntime,
+        announcedInterruption = { sessionId -> announcedInterruptions.containsKey(sessionId) },
     )
 
     LaunchedEffect(
@@ -456,7 +461,7 @@ internal fun RecordingEntryRoute(
             startupReconciled = startupReconciled,
             activityResumed = activityResumed,
             claim = appContainer::claimAbandonedResumeAttempt,
-            announcedInterruptionReason = appContainer::announcedInterruptionReason,
+            announcedInterruptionReason = { sessionId -> announcedInterruptions[sessionId] },
         )
         runClaimedAbandonedAction(
             action = action,
@@ -591,14 +596,40 @@ internal fun RecordingEntryRoute(
         onStop = {
             val sessionId = recordingPresentation.activeSessionId
             if (!starting && sessionId != null) {
-                starting = true
-                try {
-                    RecordingForegroundService.stopFromVisibleActivity(activity, sessionId)
-                    raiseStartNotice(RecordingStartNotice.STOP_REQUESTED)
-                } catch (_: RuntimeException) {
-                    raiseStartNotice(RecordingStartNotice.LAUNCH_FAILURE)
-                } finally {
-                    starting = false
+                if (recordingPresentation.state == RecordingDisplayState.INTERRUPTED_UNSAVED) {
+                    // `V02-014`. This row's ending is already decided and already announced; what is
+                    // missing is only the write. Routing it through the service would take the
+                    // user-stop path and record COMPLETED with `user_notification_stop` - a
+                    // completion for an exploration the user was told was interrupted - and it would
+                    // race the automatic repair for which of the two outcomes lands. So Stop here is
+                    // that same repair, asked for by hand, with the reason this runtime remembered.
+                    starting = true
+                    scope.launch {
+                        try {
+                            interruptAbandonedRecording(
+                                sessionId = sessionId,
+                                stoppedRecordingAt = stoppedRecordingInstant(
+                                    activeSessionLastPointAt =
+                                        recordingPresentation.activeSessionLastPointAt,
+                                    activeSessionStartedAt =
+                                        recordingPresentation.activeSessionStartedAt,
+                                ),
+                                reason = announcedInterruptions[sessionId],
+                            )
+                        } finally {
+                            starting = false
+                        }
+                    }
+                } else {
+                    starting = true
+                    try {
+                        RecordingForegroundService.stopFromVisibleActivity(activity, sessionId)
+                        raiseStartNotice(RecordingStartNotice.STOP_REQUESTED)
+                    } catch (_: RuntimeException) {
+                        raiseStartNotice(RecordingStartNotice.LAUNCH_FAILURE)
+                    } finally {
+                        starting = false
+                    }
                 }
             }
         },

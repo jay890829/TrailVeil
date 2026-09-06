@@ -100,16 +100,28 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
             session.status == RecordingHistoryStatus.ACTIVE
     }
     val state = when (session.status) {
-        RecordingHistoryStatus.STARTING -> RecordingDisplayState.STARTING
+        // `V02-014`. The same contradiction reaches this arm: `handleStart`'s catch-all interrupts a
+        // session whose start could not be completed, and if that write fails too the row is left
+        // `STARTING` while the user has been told the exploration ended. Startup reconciliation runs
+        // once per process and will not come back for it, so without this the screen says
+        // "Preparing a durable exploration record…" for the life of the process. The terminal
+        // transaction closes a `STARTING` row perfectly well - it writes `INTERRUPT_DURING_START:` -
+        // so the repair below needs nothing new.
+        RecordingHistoryStatus.STARTING -> when {
+            announcedInterruption(session.id) -> RecordingDisplayState.INTERRUPTED_UNSAVED
+            else -> RecordingDisplayState.STARTING
+        }
         RecordingHistoryStatus.ACTIVE -> when {
             // Ownership is asked first because it decides whether anything is recording at all. A
             // row this process does not own is not stopping and has no signal quality to report —
             // both of those would describe a runtime that no longer exists.
             locationOwnerToken != runtimeToken -> RecordingDisplayState.ABANDONED
-            // `V02-014`. Asked before stopping and before signal quality, because those describe a
-            // runtime that is still collecting and this one has already stopped and said so. The
-            // announcement outranks every durable signal here: the row and the token both still
-            // claim a live recording, and they are the ones that are wrong.
+            // `V02-014`. Asked before both of the branches below, and the reason is not that they
+            // describe a live collector - `stoppingSessionId` is set after a stop request commits,
+            // so it describes one that is on its way out. It is that this runtime has already told
+            // the user the exploration ENDED. Nothing after that may describe it as still going,
+            // and every durable signal here says it is: the row is `ACTIVE` and the token is ours,
+            // and they are the ones that are wrong.
             announcedInterruption(session.id) -> RecordingDisplayState.INTERRUPTED_UNSAVED
             stoppingSessionId == session.id -> RecordingDisplayState.STOPPING
             latestOperationOutcome?.value?.startsWith(LOCATION_REJECTED_PREFIX) == true ->
@@ -185,11 +197,27 @@ internal sealed interface AbandonedExplorationAction {
          *
          * `V02-014`. Null is the reboot case and keeps the reason the repair already wrote; a value
          * is what the runtime remembered when it announced the interruption, and it reaches the
-         * history screen, so a wrong one here is a wrong one there.
+         * history screen, so a wrong one here is a wrong one there. Not defaulted, for the reason
+         * the parameter above is not: a construction that omitted it would compile and quietly
+         * relabel a storage failure as a reboot, which is the defect rather than a shortcut.
          */
-        val reason: String? = null,
+        val reason: String?,
     ) : AbandonedExplorationAction
 }
+
+/**
+ * When an unfinished exploration stopped recording, for a terminal row dated after the fact.
+ *
+ * Its own last accepted point, or its start when it accepted none, and null only when even the start
+ * is unknown. Written once and shared, because it is used from two places now - the automatic repair
+ * and the Stop control - and `V02-007`'s ninth check found this exact rule unbound when it lived
+ * inline at a single call site: deleting the fallback compiled and left every test green while a
+ * zero-point exploration went back to being dated from its discovery.
+ */
+internal fun stoppedRecordingInstant(
+    activeSessionLastPointAt: Long?,
+    activeSessionStartedAt: Long?,
+): Long? = activeSessionLastPointAt ?: activeSessionStartedAt
 
 /**
  * When the running boot began, in wall-clock millis.
@@ -281,7 +309,10 @@ internal fun abandonedExplorationAction(
     return if (predatesThisBoot || announcedReason != null) {
         AbandonedExplorationAction.Interrupt(
             sessionId = sessionId,
-            stoppedRecordingAt = activeSessionLastPointAt ?: activeSessionStartedAt,
+            stoppedRecordingAt = stoppedRecordingInstant(
+                activeSessionLastPointAt = activeSessionLastPointAt,
+                activeSessionStartedAt = activeSessionStartedAt,
+            ),
             reason = announcedReason,
         )
     } else {

@@ -61,6 +61,7 @@ class RecordingControllerTest {
             .interruptAbandoned(
                 sessionId = 12L,
                 stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+                reason = null,
             )
 
         assertTrue(ended)
@@ -85,8 +86,43 @@ class RecordingControllerTest {
             controller.interruptAbandoned(
                 sessionId = 12L,
                 stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+                reason = null,
             ),
         )
+        assertEquals(listOf(Triple(12L, LAST_POINT_AT, "device_restarted")), commands.interruptCalls)
+    }
+
+    @Test
+    fun `the supplied reason is what gets written, not the restart default`() = runBlocking {
+        // `V02-014`. Every other case here is a reboot and expects `device_restarted`, so hard-coding
+        // that constant left the whole suite green while a storage failure was recorded as a
+        // reboot - on the history screen, where the user reads it. This is the case that fails.
+        val commands = FakeCommands()
+
+        assertTrue(
+            controller(commands = commands, launcher = FakeLauncher()).interruptAbandoned(
+                sessionId = 12L,
+                stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+                reason = "storage_failure",
+            ),
+        )
+
+        assertEquals(listOf(Triple(12L, LAST_POINT_AT, "storage_failure")), commands.interruptCalls)
+    }
+
+    @Test
+    fun `a blank reason cannot become a repair that never succeeds`() = runBlocking {
+        // A blank is not null, so it would pass every check on the way here and then fail the
+        // terminal transaction's own `require`, leaving the row open and the repair retrying for the
+        // life of the process. No caller produces one today; the boundary is asserted, not assumed.
+        val commands = FakeCommands()
+
+        controller(commands = commands, launcher = FakeLauncher()).interruptAbandoned(
+            sessionId = 12L,
+            stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+            reason = "   ",
+        )
+
         assertEquals(listOf(Triple(12L, LAST_POINT_AT, "device_restarted")), commands.interruptCalls)
     }
 
@@ -99,6 +135,7 @@ class RecordingControllerTest {
                 .interruptAbandoned(
                     sessionId = 12L,
                     stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+                reason = null,
                 ),
         )
     }
@@ -112,7 +149,7 @@ class RecordingControllerTest {
         val commands = FakeCommands()
 
         controller(commands = commands, launcher = FakeLauncher(), clock = { FIXED_NOW })
-            .interruptAbandoned(sessionId = 12L, stoppedRecordingAtEpochMillis = null)
+            .interruptAbandoned(sessionId = 12L, stoppedRecordingAtEpochMillis = null, reason = null)
 
         assertEquals(listOf(Triple(12L, FIXED_NOW, "device_restarted")), commands.interruptCalls)
     }
@@ -127,6 +164,7 @@ class RecordingControllerTest {
             .interruptAbandoned(
                 sessionId = 12L,
                 stoppedRecordingAtEpochMillis = LAST_POINT_AT,
+                reason = null,
             )
 
         assertEquals(listOf(Triple(12L, LAST_POINT_AT, "device_restarted")), commands.interruptCalls)

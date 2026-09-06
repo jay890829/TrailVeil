@@ -20,7 +20,7 @@ class AbandonedActionRunnerTest {
 
         val job = launch {
             runClaimedAbandonedAction(
-                action = AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = 1_000L),
+                action = AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = 1_000L, reason = null),
                 resume = { error("resume was not selected") },
                 interrupt = {
                     entered.complete(Unit)
@@ -45,7 +45,7 @@ class AbandonedActionRunnerTest {
         val released = mutableListOf<Long>()
 
         runClaimedAbandonedAction(
-            action = AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = 1_000L),
+            action = AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = 1_000L, reason = null),
             resume = { error("resume was not selected") },
             interrupt = { false },
             release = { released += it; true },

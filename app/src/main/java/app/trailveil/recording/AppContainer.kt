@@ -27,6 +27,7 @@ import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.StateFlow
 
 /** Process-scoped production wiring. Constructing it performs no recording action. */
 internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
@@ -55,18 +56,16 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     /** `P4-048`: what this runtime has told the user about, shared with the service in-process. */
     override val announcedInterruptions = AnnouncedInterruptions()
 
-    fun announcedInterruptionInThisRuntime(sessionId: Long): Boolean =
-        announcedInterruptions.wasAnnounced(sessionId)
-
     /**
-     * Why this runtime stopped recording [sessionId], or null if it never told the user it had.
+     * The announcements this runtime has made, as state the screen can subscribe to.
      *
-     * `V02-014`: null is the answer to two different questions at once - was it announced, and what
-     * for - and they are answered together on purpose, because a caller that could get "announced"
-     * without a reason would have to invent one.
+     * `V02-014`: handed out as a flow rather than as two lookup functions, because the screen reads
+     * it during composition and a lookup gives it no reason to compose again when the answer
+     * changes. One source also answers both questions at once - whether an exploration was
+     * announced, and what for - so they cannot drift apart.
      */
-    fun announcedInterruptionReason(sessionId: Long): String? =
-        announcedInterruptions.reasonFor(sessionId)
+    val announcedInterruptionState: StateFlow<Map<Long, String>>
+        get() = announcedInterruptions.interruptions
 
     /** Wall-clock instant this boot began, so a session older than the boot can be told apart. */
     fun bootedAtEpochMillis(): Long =

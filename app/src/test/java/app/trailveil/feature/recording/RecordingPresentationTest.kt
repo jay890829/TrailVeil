@@ -393,7 +393,13 @@ class RecordingPresentationTest {
         // process death by the time this decision is made, and without the start-time comparison the
         // first open after a restart re-arms location collection on a session of any age.
         assertEquals(
-            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = BOOTED_AT - AN_HOUR),
+            AbandonedExplorationAction.Interrupt(
+                7L,
+                stoppedRecordingAt = BOOTED_AT - AN_HOUR,
+                // No announcement, so nothing in this process knows why: the reboot case, and
+                // the one the repair's own `device_restarted` default is correct for.
+                reason = null,
+            ),
             abandonedAction(startedAt = BOOTED_AT - AN_HOUR),
         )
     }
@@ -408,6 +414,7 @@ class RecordingPresentationTest {
             AbandonedExplorationAction.Interrupt(
                 7L,
                 stoppedRecordingAt = BOOTED_AT + BOOT_BOUNDARY_TOLERANCE_MILLIS - 1L,
+                reason = null,
             ),
             abandonedAction(startedAt = BOOTED_AT + BOOT_BOUNDARY_TOLERANCE_MILLIS - 1L),
         )
@@ -420,7 +427,7 @@ class RecordingPresentationTest {
     @Test
     fun anExplorationWithNoKnownStartTimeIsNeverSilentlyResumed() {
         assertEquals(
-            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = null),
+            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = null, reason = null),
             abandonedAction(startedAt = null),
         )
     }
@@ -435,6 +442,7 @@ class RecordingPresentationTest {
             AbandonedExplorationAction.Interrupt(
                 7L,
                 stoppedRecordingAt = BOOTED_AT - AN_HOUR + 900_000L,
+                reason = null,
             ),
             abandonedAction(
                 startedAt = BOOTED_AT - AN_HOUR,
@@ -448,7 +456,13 @@ class RecordingPresentationTest {
         // Start pressed, no fix ever accepted, reboot: dating from anything later than the start
         // publishes time the exploration never covered.
         assertEquals(
-            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = BOOTED_AT - AN_HOUR),
+            AbandonedExplorationAction.Interrupt(
+                7L,
+                stoppedRecordingAt = BOOTED_AT - AN_HOUR,
+                // No announcement, so nothing in this process knows why: the reboot case, and
+                // the one the repair's own `device_restarted` default is correct for.
+                reason = null,
+            ),
             abandonedAction(startedAt = BOOTED_AT - AN_HOUR, lastPointAt = null),
         )
     }
@@ -545,7 +559,11 @@ class RecordingPresentationTest {
         // about the device.
         assertFalse(
             backgroundStartNoticeEarned(
-                action = AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = 1_000L),
+                action = AbandonedExplorationAction.Interrupt(
+                    7L,
+                    stoppedRecordingAt = 1_000L,
+                    reason = null,
+                ),
                 resumeOutcome = RecordingResumeOutcome.ServiceRequested(7L),
             ),
         )
@@ -706,6 +724,55 @@ class RecordingPresentationTest {
         // The row is still open, so it is still the active session: that is what the repair below
         // needs in order to close it, and what keeps Stop reachable.
         assertEquals(7L, announced.activeSessionId)
+    }
+
+    @Test
+    fun anAnnouncedStartThatCouldNotBeFinishedIsNotShownAsStillPreparing() {
+        // `V02-014`, the same contradiction one status over. `handleStart`'s catch-all interrupts a
+        // session whose start could not be completed; if that write fails too the row is left
+        // STARTING, startup reconciliation has already run for this process, and the screen said
+        // "Preparing a durable exploration record…" for the life of the process while the user held
+        // a notification saying the exploration had ended.
+        val neverFinishedStarting = detail(RecordingHistoryStatus.STARTING)
+
+        assertEquals(
+            RecordingDisplayState.INTERRUPTED_UNSAVED,
+            neverFinishedStarting.toRecordingPresentation(
+                stoppingSessionId = null,
+                runtimeToken = THIS_RUNTIME,
+                announcedInterruption = { true },
+            ).state,
+        )
+        // And an ordinary start, which is the overwhelmingly common case, is untouched.
+        assertEquals(
+            RecordingDisplayState.STARTING,
+            neverFinishedStarting.toRecordingPresentation(
+                stoppingSessionId = null,
+                runtimeToken = THIS_RUNTIME,
+                announcedInterruption = NOTHING_ANNOUNCED,
+            ).state,
+        )
+    }
+
+    @Test
+    fun theTerminalInstantIsOneRuleSharedByTheRepairAndTheStopControl() {
+        // Written once because two callers use it now. Its fallback has been unbound before: a
+        // ninth check found that deleting it compiled and left every test green while a zero-point
+        // exploration went back to being dated from its discovery.
+        assertEquals(
+            BOOTED_AT + 900_000L,
+            stoppedRecordingInstant(
+                activeSessionLastPointAt = BOOTED_AT + 900_000L,
+                activeSessionStartedAt = BOOTED_AT,
+            ),
+        )
+        assertEquals(
+            BOOTED_AT,
+            stoppedRecordingInstant(activeSessionLastPointAt = null, activeSessionStartedAt = BOOTED_AT),
+        )
+        assertNull(
+            stoppedRecordingInstant(activeSessionLastPointAt = null, activeSessionStartedAt = null),
+        )
     }
 
     @Test

@@ -106,8 +106,11 @@ internal enum class RecordingDisplayState {
      * record of the announcement it made, which is why the presentation is given that record
      * directly.
      *
-     * The condition is repairable and repairs itself: the same path that terminalizes an abandoned
-     * row retries the write, so this state lasts exactly as long as the storage failure does.
+     * The condition is repairable and the app keeps trying: the same path that terminalizes an
+     * abandoned row writes the row here too, and a failed attempt returns its claim. It is not
+     * instant - the decision is reached when the activity resumes or the screen is rebuilt - so the
+     * card promises a retry rather than a deadline, and names no cause: this state is reached from a
+     * catch-all, and a locked database or an I/O error land here exactly as a full disk does.
      */
     INTERRUPTED_UNSAVED,
 }

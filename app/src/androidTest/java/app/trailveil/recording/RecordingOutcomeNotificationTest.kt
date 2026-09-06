@@ -197,12 +197,24 @@ class RecordingOutcomeNotificationTest {
                 "The service announced an interruption for session $sessionId without recording " +
                     "it, so reopening would resume the exploration the user was just told had " +
                     "ended (P4-048)",
-                container.announcedInterruptionInThisRuntime(sessionId),
+                container.announcedInterruptions.wasAnnounced(sessionId),
             )
             assertFalse(
                 "The runtime claims an announcement for a session it never announced, so the " +
                     "record is a latch rather than a per-session fact (P4-048)",
-                container.announcedInterruptionInThisRuntime(sessionId + 1_000L),
+                container.announcedInterruptions.wasAnnounced(sessionId + 1_000L),
+            )
+            // `V02-014`, and the same argument one step further along. The runtime records not only
+            // THAT it announced but WHY, because the repair writes that reason onto the history
+            // screen when the terminal write failed. This is the only place the real service
+            // supplies it, so without this assertion `announceInterruption` could pass any constant
+            // and every test in the tree would still pass. The reason asserted here is the one the
+            // durable row above already carries, so the two cannot disagree silently.
+            assertEquals(
+                "The service announced an interruption without recording the reason it stopped " +
+                    "for, so a failed terminal write would later be labelled a reboot (V02-014)",
+                "location_stream_failure",
+                container.announcedInterruptions.reasonFor(sessionId),
             )
         } finally {
             container.setLocationEngineOverrideForTesting(null)
