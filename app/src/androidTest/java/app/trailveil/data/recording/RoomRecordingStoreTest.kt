@@ -833,6 +833,32 @@ class RoomRecordingStoreTest {
         assertEquals(RecordingStatus.FAILED_TO_START, dao.sessionById(sessionId)?.status)
     }
 
+    @Test
+    fun theBootASessionStartsInIsPersistedThroughEveryHopToTheRow() = runBlocking {
+        // `V02-015`. Every other assertion about `boot_id` in this project reads a row seeded by
+        // raw SQL, so dropping the value anywhere between the repository and the column would leave
+        // all of them green. The failure would be silent and late: a fresh session would be
+        // indistinguishable from one written before the column existed, every abandoned row would
+        // answer "unknown", no exploration would ever be ended after a restart, and the Start the
+        // screen goes on offering would reacquire the pre-restart row and re-arm collection across
+        // the very event that should have closed it.
+        val bootItStartedIn = 41L
+        val repository = repository()
+
+        val sessionId = repository.beginStart(
+            id("begin-with-boot"),
+            5_000,
+            TEST_APP_VERSION,
+            bootId = bootItStartedIn,
+        ).sessionId
+
+        assertEquals(
+            "the boot the session started in did not reach the row",
+            bootItStartedIn,
+            dao.sessionById(sessionId)?.bootId,
+        )
+    }
+
     private fun repository(
         runtimeId: RecordingRuntimeId = RecordingRuntimeId("room-instrumentation-runtime"),
     ) = RecordingRepository(RoomRecordingStore(dao), runtimeId = runtimeId)

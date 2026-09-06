@@ -301,13 +301,18 @@ class TrailVeilDatabaseMigrationTest {
             assertEquals("a-runtime", cursor.getString(2))
         }
         // A row written after the migration can carry one, which is what the write path relies on.
+        // Shaped like a row the app would really write - terminal, so it holds no active slot and
+        // no owner token, because row 1 above still holds the only slot there is. The session
+        // invariant triggers are installed by the open callback and so are absent under
+        // `MigrationTestHelper`; a fixture that leant on that absence would be depicting a row the
+        // running app cannot produce.
         migrated.execSQL(
             """
             INSERT INTO recording_sessions(
                 id, started_at, ended_at, status, stop_reason, distance_meters,
                 accepted_point_count, rejected_point_count, created_app_version,
                 active_slot, boot_id, location_owner_token
-            ) VALUES (2, 200, NULL, 'STARTING', NULL, 0, 0, 0, '0.2.0', NULL, 41, NULL)
+            ) VALUES (2, 200, 300, 'COMPLETED', 'user_stopped', 0, 0, 0, '0.2.0', NULL, 41, NULL)
             """.trimIndent(),
         )
         migrated.query("SELECT boot_id FROM recording_sessions WHERE id = 2").use { cursor ->

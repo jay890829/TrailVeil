@@ -65,7 +65,7 @@ class RecordingForegroundServiceTest {
                 operationId("begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
-                bootId = null,
+                bootId = thisBoot(),
             ).sessionId
 
             val activity = ActivityScenario.launch(MainActivity::class.java)
@@ -116,7 +116,7 @@ class RecordingForegroundServiceTest {
             operationId("recovery-begin"),
             System.currentTimeMillis(),
             "instrumentation",
-            bootId = null,
+            bootId = thisBoot(),
         ).sessionId
 
         val activity = ActivityScenario.launch(MainActivity::class.java)
@@ -186,7 +186,7 @@ class RecordingForegroundServiceTest {
             operationId("pending-stop-begin"),
             System.currentTimeMillis(),
             "instrumentation",
-            bootId = null,
+            bootId = thisBoot(),
         ).sessionId
         val activity = ActivityScenario.launch(MainActivity::class.java)
         try {
@@ -254,7 +254,7 @@ class RecordingForegroundServiceTest {
             operationId("provider-disable-begin"),
             System.currentTimeMillis(),
             "instrumentation",
-            bootId = null,
+            bootId = thisBoot(),
         ).sessionId
         val activity = ActivityScenario.launch(MainActivity::class.java)
         try {
@@ -304,7 +304,7 @@ class RecordingForegroundServiceTest {
             operationId("backpressure-begin"),
             System.currentTimeMillis(),
             "instrumentation",
-            bootId = null,
+            bootId = thisBoot(),
         ).sessionId
         val activity = ActivityScenario.launch(MainActivity::class.java)
         val releaseRoomWriter = CompletableDeferred<Unit>()
@@ -416,7 +416,7 @@ class RecordingForegroundServiceTest {
                 operationId("stale-first-begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
-                bootId = null,
+                bootId = thisBoot(),
             ).sessionId
             activity.onActivity {
                 RecordingForegroundService.startFromVisibleActivity(it, firstSessionId)
@@ -438,7 +438,7 @@ class RecordingForegroundServiceTest {
                 operationId("stale-replacement-begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
-                bootId = null,
+                bootId = thisBoot(),
             ).sessionId
             activity.onActivity {
                 RecordingForegroundService.startFromVisibleActivity(it, replacementSessionId)
@@ -516,7 +516,7 @@ class RecordingForegroundServiceTest {
                     operationId("rapid-$cycle"),
                     System.currentTimeMillis(),
                     "instrumentation",
-                    bootId = null,
+                    bootId = thisBoot(),
                 ).sessionId
                 sessionIds += sessionId
                 activity.onActivity {
@@ -641,4 +641,15 @@ class RecordingForegroundServiceTest {
             awaitClose()
         }.withLocationFixBuffer()
     }
+
+    /**
+     * The boot this device is in, as the app itself records it.
+     *
+     * `V02-015`: seeding null here would depict a row written before the boot column existed, and
+     * every session in this file is one this runtime just started. None of them reaches the
+     * abandoned decision today, so the value is inert - but an inert untruth is one refactor away
+     * from a test that asserts the same-boot path while describing the unknown one.
+     */
+    private fun thisBoot(): Long? =
+        (context.applicationContext as TrailVeilApplication).appContainer.currentBootId()
 }

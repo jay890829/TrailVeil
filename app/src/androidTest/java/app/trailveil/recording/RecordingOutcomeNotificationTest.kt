@@ -69,7 +69,7 @@ class RecordingOutcomeNotificationTest {
                 operationId("outcome-begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
-                bootId = null,
+                bootId = thisBoot(),
             ).sessionId
             activity.onActivity {
                 RecordingForegroundService.startFromVisibleActivity(it, sessionId)
@@ -143,7 +143,7 @@ class RecordingOutcomeNotificationTest {
                 operationId("stream-failure-begin"),
                 System.currentTimeMillis(),
                 "instrumentation",
-                bootId = null,
+                bootId = thisBoot(),
             ).sessionId
             activity.onActivity {
                 RecordingForegroundService.startFromVisibleActivity(it, sessionId)
@@ -264,4 +264,15 @@ class RecordingOutcomeNotificationTest {
 
     private fun operationId(prefix: String) =
         RecordingOperationId(prefix + ":" + UUID.randomUUID())
+
+    /**
+     * The boot this device is in, as the app itself records it.
+     *
+     * `V02-015`: seeding null here would depict a row written before the boot column existed, and
+     * every session in this file is one this runtime just started. None of them reaches the
+     * abandoned decision today, so the value is inert - but an inert untruth is one refactor away
+     * from a test that asserts the same-boot path while describing the unknown one.
+     */
+    private fun thisBoot(): Long? =
+        (context.applicationContext as TrailVeilApplication).appContainer.currentBootId()
 }

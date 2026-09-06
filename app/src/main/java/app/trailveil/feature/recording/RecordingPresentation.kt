@@ -9,8 +9,10 @@ internal data class RecordingPresentation(
     val state: RecordingDisplayState,
     val activeSessionId: Long?,
     /**
-     * When the open exploration began, in wall-clock millis, so a caller can tell whether it
-     * predates the running boot. Null exactly when [activeSessionId] is null.
+     * When the open exploration began, in wall-clock millis, so a terminal row can be dated from
+     * it when the exploration recorded no point at all. Null exactly when [activeSessionId] is
+     * null. `V02-015` removed its other use: it no longer decides anything, because a start time
+     * compared against a clock-derived boot instant is a clock test, not a reboot test.
      */
     val activeSessionStartedAt: Long?,
     /**
@@ -323,12 +325,13 @@ internal fun abandonedExplorationAction(
     // A start is only permitted from a visible activity, so asking earlier would spend the one
     // attempt on a refusal that says nothing about whether recovery was possible.
     if (!activityResumed) return null
-    if (!claim(sessionId)) return null
-    // P4-048. Asked before the boot question rather than folded into it, because the two say
+    // P4-048. Answered before the boot question rather than folded into it, because the two say
     // different things: the boot question asks whether resuming COULD be right, and this asks
     // whether the user has already been told it will not happen. An announcement wins either way.
     // One lookup answers both halves: a reason exists exactly when this runtime announced, so the
-    // fact and the reason cannot drift apart the way two parameters could.
+    // fact and the reason cannot drift apart the way two parameters could. What matters is which
+    // answer WINS - [bootContinuity] is a pure comparison, so evaluating it below asks the platform
+    // nothing and observes nothing.
     val announcedReason = announcedInterruptionReason(sessionId)
     val interrupt = AbandonedExplorationAction.Interrupt(
         sessionId = sessionId,
@@ -338,17 +341,29 @@ internal fun abandonedExplorationAction(
         ),
         reason = announcedReason,
     )
-    if (announcedReason != null) return interrupt
-    return when (bootContinuity(sessionBootId = activeSessionBootId, currentBootId = currentBootId)) {
-        BootContinuity.RESTARTED -> interrupt
-        BootContinuity.SAME_BOOT -> AbandonedExplorationAction.Resume(sessionId)
-        // `V02-015`: neither established, so neither is done. Nothing is resumed and nothing is
-        // ended behind the user's back; the row stays as it is and the screen goes on offering both
-        // controls, which is what asking looks like here. The claim taken above is deliberately NOT
-        // returned: asking once per process is the point, and a released claim would put this back
-        // on every recomposition.
-        BootContinuity.UNKNOWN -> null
+    val continuity = bootContinuity(
+        sessionBootId = activeSessionBootId,
+        currentBootId = currentBootId,
+    )
+    val action: AbandonedExplorationAction? = if (announcedReason != null) {
+        interrupt
+    } else {
+        when (continuity) {
+            BootContinuity.RESTARTED -> interrupt
+            BootContinuity.SAME_BOOT -> AbandonedExplorationAction.Resume(sessionId)
+            // `V02-015`: neither established, so neither is done. Nothing is resumed and nothing
+            // is ended behind the user's back; the row stays as it is and the screen goes on
+            // offering both controls, which is what asking looks like here.
+            BootContinuity.UNKNOWN -> null
+        }
     }
+    // The claim is spent only once there is an action to spend it on, and deliberately not before.
+    // It bounds ATTEMPTS - one per process - and the unknown branch makes none, so burning it there
+    // would leave nothing to retry with when this runtime later announces an interruption for the
+    // same row and the branch above becomes reachable. That is the `V02-014` repair, and an
+    // exploration with no recorded boot is exactly the row most likely to need it.
+    if (action == null || !claim(sessionId)) return null
+    return action
 }
 
 /**

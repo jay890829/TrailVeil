@@ -462,6 +462,74 @@ class RecordingPresentationTest {
     }
 
     @Test
+    fun anUnknownBootDoesNotSpendTheAttemptTheAnnouncedRepairStillNeeds() {
+        // The claim is one attempt per process per session, and the unknown answer makes no
+        // attempt - so it must not consume one. `V02-014`'s repair is the case that proves it: a
+        // row with no recorded boot is answered UNKNOWN and nothing is done, and only later, when
+        // this runtime stops the exploration and cannot save the ending, does an announcement
+        // appear that MUST be acted on. Had the unknown answer spent the claim, that repair would
+        // never run in this process, and the user would hold a notification saying the exploration
+        // ended while the row went on saying it was recording - which is the exact defect
+        // `V02-014` exists to close, reopened from the other end.
+        val claims = AbandonedResumeClaims()
+
+        assertNull(
+            "an unknown boot acted on a session",
+            abandonedAction(sessionBootId = null, claim = claims::claim),
+        )
+
+        assertEquals(
+            "the announced repair could not claim an attempt the unknown answer never used",
+            AbandonedExplorationAction.Interrupt(
+                sessionId = 7L,
+                stoppedRecordingAt = BOOTED_AT + AN_HOUR,
+                reason = STOPPED_BECAUSE,
+            ),
+            abandonedAction(
+                state = RecordingDisplayState.INTERRUPTED_UNSAVED,
+                sessionBootId = null,
+                claim = claims::claim,
+                announcedInterruptionReason = { STOPPED_BECAUSE },
+            ),
+        )
+    }
+
+    @Test
+    fun theBootTheOpenExplorationBeganInReachesTheDecisionThatReadsIt() {
+        // The decision is tested directly everywhere else, so nothing else would notice if the
+        // mapping that feeds it dropped the column: every abandoned row would answer UNKNOWN, no
+        // exploration would ever be ended after a restart, and the only symptom would be the
+        // absence of a behaviour.
+        assertEquals(
+            "the boot the open exploration began in did not reach the presentation",
+            PREVIOUS_BOOT,
+            detail(
+                status = RecordingHistoryStatus.ACTIVE,
+                ownerToken = null,
+                sessionBootId = PREVIOUS_BOOT,
+            ).toRecordingPresentation(
+                stoppingSessionId = null,
+                runtimeToken = THIS_RUNTIME,
+                announcedInterruption = NOTHING_ANNOUNCED,
+            ).activeSessionBootId,
+        )
+        // A terminal row has no open exploration, so it carries no boot either - the same rule the
+        // other active-only fields follow, and the reason the decision can never be handed a boot
+        // belonging to a session it is not about.
+        assertNull(
+            "a finished exploration was described as having an open boot",
+            detail(
+                status = RecordingHistoryStatus.COMPLETED,
+                sessionBootId = PREVIOUS_BOOT,
+            ).toRecordingPresentation(
+                stoppingSessionId = null,
+                runtimeToken = THIS_RUNTIME,
+                announcedInterruption = NOTHING_ANNOUNCED,
+            ).activeSessionBootId,
+        )
+    }
+
+    @Test
     fun theBootQuestionHasExactlyThreeAnswersAndUnknownIsOneOfThem() {
         assertEquals(
             BootContinuity.SAME_BOOT,

@@ -452,13 +452,18 @@ internal fun RecordingEntryRoute(
         // container rather than this composition because a `remember` here handed out a fresh
         // attempt on each history round trip — is made inside the function, so that the route holds
         // no rule of its own that a test could not reach.
+        // `V02-015`: reading `Settings.Global` is a binder round trip the first time a process
+        // makes it, and this effect body runs on the composition's dispatcher. The value is
+        // process-cached afterwards, so this costs one hop off the main thread per launch and
+        // keeps StrictMode quiet about the one that matters.
+        val currentBootId = withContext(Dispatchers.IO) { appContainer.currentBootId() }
         val action = abandonedExplorationAction(
             state = recordingPresentation.state,
             activeSessionId = recordingPresentation.activeSessionId,
             activeSessionStartedAt = recordingPresentation.activeSessionStartedAt,
             activeSessionLastPointAt = recordingPresentation.activeSessionLastPointAt,
             activeSessionBootId = recordingPresentation.activeSessionBootId,
-            currentBootId = appContainer.currentBootId(),
+            currentBootId = currentBootId,
             startupReconciled = startupReconciled,
             activityResumed = activityResumed,
             claim = appContainer::claimAbandonedResumeAttempt,

@@ -60,7 +60,7 @@
     <string name="recording_state_completed">The latest exploration was completed and saved.</string>
     <string name="recording_state_interrupted">The latest exploration was interrupted. Its saved points remain in history.</string>
     <string name="recording_state_failed">The latest exploration could not start; no active recording remains.</string>
-    <string name="recording_state_abandoned">This exploration stopped being recorded when the app was closed by the system. Points saved before that remain in history.</string>
+    <string name="recording_state_abandoned">This exploration stopped being recorded and is still open. Points saved before it stopped remain in history. Start exploration continues this one; Stop exploration ends it.</string>
     <string name="recording_state_interrupted_unsaved">Recording stopped, but this exploration could not be marked as ended because storage is unavailable. Points saved before it stopped remain in history; free some space and the app will finish closing it.</string>
     <string name="recording_state_dismiss">Dismiss this status</string>
     <string name="map_center_latest_location">Center on latest recorded location and keep following it</string>

@@ -290,21 +290,6 @@ internal val MIGRATION_6_7 = object : Migration(6, 7) {
  * fills it from rows it does not touch, so a failure part-way leaves every recorded track intact and
  * costs at most a rebuild of state that is derivable by definition.
  */
-/**
- * `V02-015`: which boot a session started in, so a reboot is not inferred from the wall clock.
- *
- * Additive and nullable, with no backfill, because there is nothing truthful to backfill with: a row
- * written before this column existed was started in a boot nobody recorded, and guessing one from
- * its start time would reintroduce the clock comparison this column exists to remove. Those rows
- * read as "unknown", and the decision that reads them refuses to resume on an unknown rather than
- * assuming either answer.
- */
-internal val MIGRATION_8_9 = object : Migration(8, 9) {
-    override fun migrate(db: SupportSQLiteDatabase) {
-        db.execSQL("ALTER TABLE recording_sessions ADD COLUMN boot_id INTEGER")
-    }
-}
-
 internal val MIGRATION_7_8 = object : Migration(7, 8) {
     override fun migrate(db: SupportSQLiteDatabase) {
         db.execSQL(
@@ -322,6 +307,21 @@ internal val MIGRATION_7_8 = object : Migration(7, 8) {
         // Installed here as well as from the open callback so a database is never left for even one
         // write with the table present and nothing maintaining it.
         createTrackPointCellTriggers(db)
+    }
+}
+
+/**
+ * `V02-015`: which boot a session started in, so a reboot is not inferred from the wall clock.
+ *
+ * Additive and nullable, with no backfill, because there is nothing truthful to backfill with: a row
+ * written before this column existed was started in a boot nobody recorded, and guessing one from
+ * its start time would reintroduce the clock comparison this column exists to remove. Those rows
+ * read as "unknown", and the decision that reads them refuses to resume on an unknown rather than
+ * assuming either answer.
+ */
+internal val MIGRATION_8_9 = object : Migration(8, 9) {
+    override fun migrate(db: SupportSQLiteDatabase) {
+        db.execSQL("ALTER TABLE recording_sessions ADD COLUMN boot_id INTEGER")
     }
 }
 
