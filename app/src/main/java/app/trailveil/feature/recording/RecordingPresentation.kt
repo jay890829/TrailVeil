@@ -29,8 +29,23 @@ internal val TerminalRecordingStates = setOf(
     RecordingDisplayState.INTERRUPTED,
     RecordingDisplayState.FAILED_TO_START,
     // Not durably terminal — the row is still ACTIVE — but terminal to the user, who is no longer
-    // being recorded and needs to be told so rather than have it expire unread.
+    // being recorded and needs to be told so rather than have it expire unread. `V02-014` adds the
+    // second row of that kind: the user has been told, and the terminal write is what is missing.
     RecordingDisplayState.ABANDONED,
+    RecordingDisplayState.INTERRUPTED_UNSAVED,
+)
+
+/**
+ * The two states whose durable row is still `ACTIVE` while nothing is recording it.
+ *
+ * Both are contradictions between the database and reality, and both are ended by writing the
+ * terminal row, so [abandonedExplorationAction] treats them alike. They differ only in which half
+ * is missing: [RecordingDisplayState.ABANDONED] lost the runtime, and
+ * [RecordingDisplayState.INTERRUPTED_UNSAVED] lost the write.
+ */
+private val RepairableActiveStates = setOf(
+    RecordingDisplayState.ABANDONED,
+    RecordingDisplayState.INTERRUPTED_UNSAVED,
 )
 
 /**
@@ -57,10 +72,16 @@ internal val ExpiringStartNotices = setOf(
  * @param runtimeToken this process's durable ownership token. It is required rather than defaulted
  *   because a caller that omitted it would be claiming a recording is live without checking, which
  *   is the exact defect this parameter exists to prevent.
+ * @param announcedInterruption whether this runtime has already told the user that the given
+ *   exploration was interrupted. Required for the same reason, and it is the only thing that can
+ *   answer the question: after a failed terminal write the row still says `ACTIVE` and the token is
+ *   still this process's, so every durable signal agrees that recording is live while the user has
+ *   a notification in hand saying it ended (`V02-014`).
  */
 internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
     stoppingSessionId: Long?,
     runtimeToken: String,
+    announcedInterruption: (Long) -> Boolean,
 ): RecordingPresentation {
     if (this == null) {
         return RecordingPresentation(
@@ -85,6 +106,11 @@ internal fun RecordingLatestSessionSummary?.toRecordingPresentation(
             // row this process does not own is not stopping and has no signal quality to report —
             // both of those would describe a runtime that no longer exists.
             locationOwnerToken != runtimeToken -> RecordingDisplayState.ABANDONED
+            // `V02-014`. Asked before stopping and before signal quality, because those describe a
+            // runtime that is still collecting and this one has already stopped and said so. The
+            // announcement outranks every durable signal here: the row and the token both still
+            // claim a live recording, and they are the ones that are wrong.
+            announcedInterruption(session.id) -> RecordingDisplayState.INTERRUPTED_UNSAVED
             stoppingSessionId == session.id -> RecordingDisplayState.STOPPING
             latestOperationOutcome?.value?.startsWith(LOCATION_REJECTED_PREFIX) == true ->
                 RecordingDisplayState.POOR_SIGNAL
@@ -154,6 +180,14 @@ internal sealed interface AbandonedExplorationAction {
     data class Interrupt(
         override val sessionId: Long,
         val stoppedRecordingAt: Long?,
+        /**
+         * Why recording stopped, or null when nothing in this process knows.
+         *
+         * `V02-014`. Null is the reboot case and keeps the reason the repair already wrote; a value
+         * is what the runtime remembered when it announced the interruption, and it reaches the
+         * history screen, so a wrong one here is a wrong one there.
+         */
+        val reason: String? = null,
     ) : AbandonedExplorationAction
 }
 
@@ -201,6 +235,13 @@ internal const val BOOT_BOUNDARY_TOLERANCE_MILLIS = 5_000L
  * of this decision instead of a line beside it — the guard has twice been correct in isolation while
  * the wiring that reaches it was bound by nothing.
  *
+ * **`V02-014`: an announced interruption whose write failed is repaired here too.** That row is
+ * still `ACTIVE` and still owned by this process, so it never presents as abandoned; what it needs
+ * is exactly what an abandoned row needs, the terminal write, and the retry contract is already
+ * right - [runClaimedAbandonedAction] releases the claim when the write returns false, so the next
+ * time this decision is reached the attempt is available again. It is reached again when the
+ * activity resumes or the screen is rebuilt, which is when a storage failure has plausibly cleared.
+ *
  * **`P4-048`: an announcement outranks the boot comparison.** If this runtime has already told the
  * user that this exploration was interrupted, it ends - resuming it would make the notification a
  * lie, which is what the product owner decided on 2026-08-21 after `P5-001` row 6. This is NOT
@@ -218,9 +259,9 @@ internal fun abandonedExplorationAction(
     startupReconciled: Boolean,
     activityResumed: Boolean,
     claim: (Long) -> Boolean,
-    announcedInThisRuntime: (Long) -> Boolean,
+    announcedInterruptionReason: (Long) -> String?,
 ): AbandonedExplorationAction? {
-    if (state != RecordingDisplayState.ABANDONED) return null
+    if (state !in RepairableActiveStates) return null
     val sessionId = activeSessionId ?: return null
     // Startup repair owns any still-STARTING row; acting across it would race that decision.
     if (!startupReconciled) return null
@@ -234,10 +275,14 @@ internal fun abandonedExplorationAction(
     // P4-048. Ordered before the boot comparison rather than folded into it, because the two say
     // different things: the boot comparison asks whether resuming COULD be right, and this asks
     // whether the user has already been told it will not happen. An announcement wins.
-    return if (predatesThisBoot || announcedInThisRuntime(sessionId)) {
+    // One lookup answers both halves: a reason exists exactly when this runtime announced, so the
+    // fact and the reason cannot drift apart the way two parameters could.
+    val announcedReason = announcedInterruptionReason(sessionId)
+    return if (predatesThisBoot || announcedReason != null) {
         AbandonedExplorationAction.Interrupt(
             sessionId = sessionId,
             stoppedRecordingAt = activeSessionLastPointAt ?: activeSessionStartedAt,
+            reason = announcedReason,
         )
     } else {
         AbandonedExplorationAction.Resume(sessionId)

@@ -66,9 +66,20 @@ internal class RecordingController(
      * the phone spent switched off. The store clamps it up to the session and segment starts, so a
      * past instant cannot produce a row that ends before it began.
      */
-    suspend fun interruptAbandonedAcrossRestart(
+    /**
+     * Close a row that is still `ACTIVE` while nothing is recording it.
+     *
+     * @param reason why recording stopped, or null when nothing knows. `V02-014` made this a
+     *   parameter: the only caller used to be the reboot branch, so the reason was hard-coded, and
+     *   the history screen shows it to the user. A row closed after a failed terminal write has a
+     *   true reason - the runtime that stopped remembers it - and writing `device_restarted` over
+     *   it would put a false statement on that screen. Null still means a restart, because that is
+     *   the case in which no runtime survived to remember anything.
+     */
+    suspend fun interruptAbandoned(
         sessionId: Long,
         stoppedRecordingAtEpochMillis: Long?,
+        reason: String? = null,
     ): Boolean {
         require(sessionId > 0L) { "sessionId must be positive" }
         return try {
@@ -76,7 +87,7 @@ internal class RecordingController(
                 operationIds.next("restart-interrupt"),
                 sessionId,
                 stoppedRecordingAtEpochMillis ?: clock.epochMillis(),
-                DEVICE_RESTARTED,
+                reason ?: DEVICE_RESTARTED,
             )
             true
         } catch (cancelled: CancellationException) {

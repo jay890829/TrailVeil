@@ -227,13 +227,18 @@ internal fun RecordingEntryRoute(
         }
     }
 
-    suspend fun interruptAbandonedRecording(sessionId: Long, stoppedRecordingAt: Long?): Boolean {
+    suspend fun interruptAbandonedRecording(
+        sessionId: Long,
+        stoppedRecordingAt: Long?,
+        reason: String?,
+    ): Boolean {
         // Also quiet, and for a different reason than the resume: the row is being closed, so what
         // the user needs to see is the interrupted exploration itself, which the card already
         // becomes the moment the terminal row lands.
-        return controller.interruptAbandonedAcrossRestart(
+        return controller.interruptAbandoned(
             sessionId = sessionId,
             stoppedRecordingAtEpochMillis = stoppedRecordingAt,
+            reason = reason,
         )
     }
 
@@ -429,6 +434,7 @@ internal fun RecordingEntryRoute(
     val recordingPresentation = latestSessionSummary.toRecordingPresentation(
         stoppingSessionId = stoppingSessionId,
         runtimeToken = appContainer.recordingRuntimeToken,
+        announcedInterruption = appContainer::announcedInterruptionInThisRuntime,
     )
 
     LaunchedEffect(
@@ -450,7 +456,7 @@ internal fun RecordingEntryRoute(
             startupReconciled = startupReconciled,
             activityResumed = activityResumed,
             claim = appContainer::claimAbandonedResumeAttempt,
-            announcedInThisRuntime = appContainer::announcedInterruptionInThisRuntime,
+            announcedInterruptionReason = appContainer::announcedInterruptionReason,
         )
         runClaimedAbandonedAction(
             action = action,
@@ -459,6 +465,7 @@ internal fun RecordingEntryRoute(
                 interruptAbandonedRecording(
                     sessionId = interrupt.sessionId,
                     stoppedRecordingAt = interrupt.stoppedRecordingAt,
+                    reason = interrupt.reason,
                 )
             },
             release = appContainer::releaseAbandonedResumeAttempt,

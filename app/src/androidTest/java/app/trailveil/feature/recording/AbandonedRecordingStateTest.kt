@@ -173,7 +173,7 @@ class AbandonedRecordingStateTest {
         val strangerSessionId = seedCompletedSession(sqlite, startedAt = bootedAt - THREE_HOURS)
         val sessionId = seedAbandonedSession(
             sqlite,
-            deadRuntime = "runtime-from-before-the-restart-$FIXTURE_SUFFIX",
+            ownerToken = "runtime-from-before-the-restart-$FIXTURE_SUFFIX",
             startedAt = bootedAt - AN_HOUR,
         )
         // A session that actually recorded something, because the fallback and the real anchor are
@@ -263,7 +263,7 @@ class AbandonedRecordingStateTest {
         )
         val sessionId = seedAbandonedSession(
             sqlite,
-            deadRuntime = "runtime-of-a-blocked-retry-$FIXTURE_SUFFIX",
+            ownerToken = "runtime-of-a-blocked-retry-$FIXTURE_SUFFIX",
             startedAt = System.currentTimeMillis(),
             explicitId = reservedId,
         )
@@ -295,6 +295,79 @@ class AbandonedRecordingStateTest {
         }
     }
 
+    @Test
+    fun anAnnouncedInterruptionWhoseWriteFailedIsClosedAndNeverShownAsRecording() {
+        // `V02-014`. The service stops the collector, tells the user the exploration was
+        // interrupted, and then fails to write the terminal row - which is what a full disk does.
+        // The state that leaves behind is seeded rather than produced, because the mechanism is a
+        // failing write and the durable result is what the screen can read: an `ACTIVE` row whose
+        // owner token is this LIVE process's, plus this runtime's memory of the announcement. There
+        // is no seam in the repository to fail a single transaction, and inventing one would test
+        // the seam; this tests the state.
+        //
+        // Before the fix, both halves of this failed: every durable signal said a live recording, so
+        // the screen said RECORDING while the notification said the opposite, and the repair path
+        // never ran because it opened only for a row whose owner was gone.
+        grant(Manifest.permission.ACCESS_COARSE_LOCATION)
+        grant(Manifest.permission.ACCESS_FINE_LOCATION)
+
+        val sqlite = container.databaseForTesting().openHelper.writableDatabase
+        // Announced before the row exists, for the reason `nextSessionId` documents: the route
+        // reacts to the insert on its own, so announcing afterwards would race it and the first
+        // presentation could legitimately be RECORDING.
+        val reservedId = nextSessionId(sqlite)
+        container.announcedInterruptions.announce(reservedId, STORAGE_FAILURE)
+        val sessionId = seedAbandonedSession(
+            sqlite,
+            // Alive, and this process: that is the point. Passing a dead token here would make this
+            // the sibling test above and it would pass without the fix.
+            ownerToken = container.recordingRuntimeToken,
+            startedAt = System.currentTimeMillis(),
+            explicitId = reservedId,
+        )
+        assertEquals(reservedId, sessionId)
+
+        try {
+            composeRule.activityRule.scenario.recreate()
+
+            val everShown = mutableSetOf<String>()
+            var status: String? = null
+            var waited = 0L
+            while (waited < RECOVERY_TIMEOUT_MILLIS) {
+                composeRule.waitForIdle()
+                publishedState()?.let(everShown::add)
+                status = sessionColumn(sqlite, sessionId, "status")
+                if (status == "INTERRUPTED") break
+                SystemClock.sleep(POLL_MILLIS)
+                waited += POLL_MILLIS
+            }
+
+            // Closed correctly, which is what "once storage recovers" means here: the retry that
+            // the repair path already performs succeeds against a database that can be written.
+            assertEquals(
+                "the announced exploration was never closed; states seen: $everShown",
+                "INTERRUPTED",
+                status,
+            )
+            // And never described as live on the way there. Sampled every poll rather than once at
+            // the end, because the end state is honest even in the broken build - the row is closed
+            // by then - and the defect is what the user is shown while it is not.
+            assertTrue(
+                "the screen showed a live recording for an exploration the user was told had " +
+                    "ended; states seen: $everShown",
+                everShown.none { shown -> shown in LIVE_STATES },
+            )
+            assertTrue(
+                "the announced exploration was resumed instead of ended",
+                !hasRecoverySegment(sqlite, sessionId),
+            )
+        } finally {
+            RecordingForegroundService.stopFromVisibleActivity(context, sessionId)
+            SystemClock.sleep(STOP_SETTLE_MILLIS)
+            sqlite.execSQL("DELETE FROM recording_sessions WHERE id = $sessionId")
+        }
+    }
+
     private fun grant(permission: String) {
         if (context.checkSelfPermission(permission) != PackageManager.PERMISSION_GRANTED) {
             InstrumentationRegistry.getInstrumentation().uiAutomation
@@ -310,10 +383,18 @@ class AbandonedRecordingStateTest {
         descriptor.close()
     }
 
-    /** The durable remains of a process death: an ACTIVE row with an owner that no longer exists. */
+    /**
+     * An `ACTIVE` row with an owner token, which is what an exploration nothing is recording looks
+     * like from the database.
+     *
+     * The owner is a parameter rather than a dead runtime because `V02-014` needs the same row with
+     * this process's token in that column: a terminal write that failed leaves the row open under
+     * the owner that is still alive, and that one field is the entire difference between the two
+     * defects this class covers.
+     */
     private fun seedAbandonedSession(
         sqlite: SupportSQLiteDatabase,
-        deadRuntime: String,
+        ownerToken: String,
         startedAt: Long = System.currentTimeMillis(),
         explicitId: Long? = null,
     ): Long {
@@ -324,7 +405,7 @@ class AbandonedRecordingStateTest {
                 "started_at, ended_at, status, stop_reason, distance_meters, accepted_point_count, " +
                 "rejected_point_count, created_app_version, active_slot, location_owner_token" +
                 ") VALUES($idValue$startedAt, NULL, 'ACTIVE', NULL, 0, 0, 0, 'abandoned-state-test', " +
-                "1, '$deadRuntime')",
+                "1, '$ownerToken')",
         )
         val sessionId = explicitId ?: sqlite.query("SELECT MAX(id) FROM recording_sessions")
             .use { cursor ->
@@ -435,6 +516,13 @@ class AbandonedRecordingStateTest {
         const val POLL_MILLIS = 250L
         const val STOP_SETTLE_MILLIS = 1_500L
         const val FIXTURE_SUFFIX = "p4-038"
+
+        /**
+         * The terminal reason a storage failure announces, and therefore the reason the repair must
+         * write. `V02-014`: the repair path's own default is `device_restarted`, which would be a
+         * false statement on the history screen for this row.
+         */
+        const val STORAGE_FAILURE = "storage_failure"
         const val AN_HOUR = 3_600_000L
         const val A_QUARTER_HOUR = 900_000L
         const val THREE_HOURS = 3 * AN_HOUR

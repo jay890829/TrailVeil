@@ -12,13 +12,14 @@ import app.trailveil.recording.RecordingStartFailureKind
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class RecordingPresentationTest {
     @Test
     fun missingHistoryIsIdleWithoutAnActiveSession() {
-        val presentation = null.toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+        val presentation = null.toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
 
         assertEquals(RecordingDisplayState.IDLE, presentation.state)
         assertNull(presentation.activeSessionId)
@@ -30,7 +31,7 @@ class RecordingPresentationTest {
     @Test
     fun terminalOutcomesStillCarryTheirSessionIdentity() {
         val presentation = detail(RecordingHistoryStatus.COMPLETED)
-            .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+            .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
 
         // `activeSessionId` is deliberately null once a session ends, so identity for an
         // acknowledgement has to come from somewhere that survives the ending.
@@ -44,11 +45,11 @@ class RecordingPresentationTest {
         val rejected = detail(
             status = RecordingHistoryStatus.ACTIVE,
             outcome = "LOCATION_REJECTED_ACCURACY",
-        ).toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+        ).toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
         val accepted = detail(
             status = RecordingHistoryStatus.ACTIVE,
             outcome = "LOCATION_ACCEPTED_CONTINUOUS_NONE",
-        ).toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+        ).toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
 
         assertEquals(RecordingDisplayState.POOR_SIGNAL, rejected.state)
         assertEquals(RecordingDisplayState.RECORDING, accepted.state)
@@ -62,11 +63,11 @@ class RecordingPresentationTest {
 
         assertEquals(
             RecordingDisplayState.STOPPING,
-            detail.toRecordingPresentation(stoppingSessionId = 7L, runtimeToken = THIS_RUNTIME).state,
+            detail.toRecordingPresentation(stoppingSessionId = 7L, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED).state,
         )
         assertEquals(
             RecordingDisplayState.RECORDING,
-            detail.toRecordingPresentation(stoppingSessionId = 8L, runtimeToken = THIS_RUNTIME).state,
+            detail.toRecordingPresentation(stoppingSessionId = 8L, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED).state,
         )
     }
 
@@ -75,19 +76,19 @@ class RecordingPresentationTest {
         assertEquals(
             RecordingDisplayState.COMPLETED,
             detail(RecordingHistoryStatus.COMPLETED)
-                .toRecordingPresentation(stoppingSessionId = 7L, runtimeToken = THIS_RUNTIME)
+                .toRecordingPresentation(stoppingSessionId = 7L, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
                 .state,
         )
         assertEquals(
             RecordingDisplayState.INTERRUPTED,
             detail(RecordingHistoryStatus.INTERRUPTED)
-                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
                 .state,
         )
         assertEquals(
             RecordingDisplayState.FAILED_TO_START,
             detail(RecordingHistoryStatus.FAILED_TO_START)
-                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
                 .state,
         )
     }
@@ -277,14 +278,14 @@ class RecordingPresentationTest {
         val orphaned = detail(
             status = RecordingHistoryStatus.ACTIVE,
             ownerToken = "runtime-of-a-process-that-died",
-        ).toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+        ).toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
 
         assertEquals(RecordingDisplayState.ABANDONED, orphaned.state)
         // The same row owned by this process is the ordinary live case and must be unaffected.
         assertEquals(
             RecordingDisplayState.RECORDING,
             detail(status = RecordingHistoryStatus.ACTIVE)
-                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
                 .state,
         )
     }
@@ -301,11 +302,11 @@ class RecordingPresentationTest {
         // the fact that no runtime owns this row.
         assertEquals(
             RecordingDisplayState.ABANDONED,
-            orphaned.toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME).state,
+            orphaned.toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED).state,
         )
         assertEquals(
             RecordingDisplayState.ABANDONED,
-            orphaned.toRecordingPresentation(stoppingSessionId = 7L, runtimeToken = THIS_RUNTIME).state,
+            orphaned.toRecordingPresentation(stoppingSessionId = 7L, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED).state,
         )
     }
 
@@ -317,7 +318,7 @@ class RecordingPresentationTest {
         assertEquals(
             RecordingDisplayState.ABANDONED,
             detail(status = RecordingHistoryStatus.ACTIVE, ownerToken = null)
-                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+                .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
                 .state,
         )
     }
@@ -357,10 +358,14 @@ class RecordingPresentationTest {
         // session still starts inside this boot, so the boot comparison would resume it. Only the
         // announcement differs, which is the whole claim of P4-048.
         assertEquals(
-            AbandonedExplorationAction.Interrupt(7L, stoppedRecordingAt = BOOTED_AT + AN_HOUR),
+            AbandonedExplorationAction.Interrupt(
+                7L,
+                stoppedRecordingAt = BOOTED_AT + AN_HOUR,
+                reason = STOPPED_BECAUSE,
+            ),
             abandonedAction(
                 startedAt = BOOTED_AT + AN_HOUR,
-                announcedInThisRuntime = { true },
+                announcedInterruptionReason = { STOPPED_BECAUSE },
             ),
         )
     }
@@ -374,7 +379,7 @@ class RecordingPresentationTest {
             AbandonedExplorationAction.Resume(7L),
             abandonedAction(
                 startedAt = BOOTED_AT + AN_HOUR,
-                announcedInThisRuntime = { sessionId -> sessionId == 4L },
+                announcedInterruptionReason = { sessionId -> STOPPED_BECAUSE.takeIf { sessionId == 4L } },
             ),
         )
     }
@@ -458,15 +463,35 @@ class RecordingPresentationTest {
     }
 
     @Test
-    fun onlyAnAbandonedExplorationIsEverActedOn() {
+    fun onlyAnOpenRowWithNoRuntimeIsEverActedOn() {
+        // Exactly two states mean "the database still says ACTIVE and nothing is recording it":
+        // the runtime is gone, or its terminal write failed. Every other state describes either a
+        // live runtime or a row that is already closed, and acting on those would be recovery
+        // inventing work. Enumerating the enum is what keeps a state added later from defaulting
+        // into this decision unnoticed.
+        val repairable = setOf(
+            RecordingDisplayState.ABANDONED,
+            RecordingDisplayState.INTERRUPTED_UNSAVED,
+        )
         RecordingDisplayState.entries
-            .filter { it != RecordingDisplayState.ABANDONED }
+            .filter { it !in repairable }
             .forEach { state ->
                 assertNull(
                     "$state must not trigger a recovery attempt",
                     abandonedAction(state = state),
                 )
             }
+        repairable.forEach { state ->
+            assertEquals(
+                "$state must be repaired by writing the terminal row",
+                AbandonedExplorationAction.Interrupt(
+                    sessionId = 7L,
+                    stoppedRecordingAt = BOOTED_AT + AN_HOUR,
+                    reason = STOPPED_BECAUSE,
+                ),
+                abandonedAction(state = state, announcedInterruptionReason = { STOPPED_BECAUSE }),
+            )
+        }
     }
 
     @Test
@@ -580,7 +605,7 @@ class RecordingPresentationTest {
         startupReconciled: Boolean = true,
         activityResumed: Boolean = true,
         claim: (Long) -> Boolean = { true },
-        announcedInThisRuntime: (Long) -> Boolean = { false },
+        announcedInterruptionReason: (Long) -> String? = { null },
     ): AbandonedExplorationAction? = abandonedExplorationAction(
         state = state,
         activeSessionId = activeSessionId,
@@ -590,7 +615,7 @@ class RecordingPresentationTest {
         startupReconciled = startupReconciled,
         activityResumed = activityResumed,
         claim = claim,
-        announcedInThisRuntime = announcedInThisRuntime,
+        announcedInterruptionReason = announcedInterruptionReason,
     )
 
     @Test
@@ -612,11 +637,11 @@ class RecordingPresentationTest {
         // latestAcceptedPoint, whose fixture timestamp here is deliberately different - and it must
         // vanish with the active session, because dating anything else with it would be a lie.
         val active = detail(RecordingHistoryStatus.ACTIVE)
-            .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+            .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
         assertEquals(SESSION_LAST_POINT_AT, active.activeSessionLastPointAt)
 
         val completed = detail(RecordingHistoryStatus.COMPLETED)
-            .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME)
+            .toRecordingPresentation(stoppingSessionId = null, runtimeToken = THIS_RUNTIME, announcedInterruption = NOTHING_ANNOUNCED)
         assertNull(completed.activeSessionLastPointAt)
     }
 
@@ -658,6 +683,181 @@ class RecordingPresentationTest {
         )
     }
 
+    /**
+     * An announced interruption whose terminal row was never written keeps the screen honest.
+     *
+     * `V02-014`. The service stops the collector, announces, and then fails to write the terminal
+     * row - a full disk does exactly this. Every durable signal then says the exploration is live:
+     * the row is `ACTIVE` and its owner token is this process's, because this process really does
+     * still exist. Before this, the screen read those signals and said `RECORDING` while the
+     * notification in the user's hand said the exploration had ended.
+     */
+    @Test
+    fun anAnnouncedInterruptionOutranksARowThatStillSaysActive() {
+        val stillOwnedAndStillActive = detail(RecordingHistoryStatus.ACTIVE)
+
+        val announced = stillOwnedAndStillActive.toRecordingPresentation(
+            stoppingSessionId = null,
+            runtimeToken = THIS_RUNTIME,
+            announcedInterruption = { sessionId -> sessionId == 7L },
+        )
+
+        assertEquals(RecordingDisplayState.INTERRUPTED_UNSAVED, announced.state)
+        // The row is still open, so it is still the active session: that is what the repair below
+        // needs in order to close it, and what keeps Stop reachable.
+        assertEquals(7L, announced.activeSessionId)
+    }
+
+    @Test
+    fun anAnnouncementOutranksStoppingAndSignalQuality() {
+        // Both of the states this displaces describe a runtime that is still collecting. This one
+        // has stopped, so neither can be true of it, and reporting either would be the same lie in
+        // a quieter voice.
+        val poorSignal = detail(RecordingHistoryStatus.ACTIVE, outcome = "LOCATION_REJECTED_ACCURACY")
+
+        assertEquals(
+            RecordingDisplayState.INTERRUPTED_UNSAVED,
+            poorSignal.toRecordingPresentation(
+                stoppingSessionId = 7L,
+                runtimeToken = THIS_RUNTIME,
+                announcedInterruption = { true },
+            ).state,
+        )
+        // Without the announcement the same row is exactly what it was before this task.
+        assertEquals(
+            RecordingDisplayState.STOPPING,
+            poorSignal.toRecordingPresentation(
+                stoppingSessionId = 7L,
+                runtimeToken = THIS_RUNTIME,
+                announcedInterruption = NOTHING_ANNOUNCED,
+            ).state,
+        )
+    }
+
+    @Test
+    fun anAnnouncementAboutAnotherSessionChangesNothing() {
+        // The announcement is per session; a runtime that announced an earlier exploration is not
+        // thereby lying about the one it is recording now.
+        val recording = detail(RecordingHistoryStatus.ACTIVE)
+
+        assertEquals(
+            RecordingDisplayState.RECORDING,
+            recording.toRecordingPresentation(
+                stoppingSessionId = null,
+                runtimeToken = THIS_RUNTIME,
+                announcedInterruption = { sessionId -> sessionId == 6L },
+            ).state,
+        )
+    }
+
+    @Test
+    fun aWrittenTerminalRowIsNotDisplacedByItsOwnAnnouncement() {
+        // The announcement is made whether or not the write succeeds, so the happy path also has
+        // one. It must not turn a correctly closed exploration into the unsaved state - the row is
+        // no longer `ACTIVE`, and the branch this state lives in is only reached for rows that are.
+        assertEquals(
+            RecordingDisplayState.INTERRUPTED,
+            detail(RecordingHistoryStatus.INTERRUPTED).toRecordingPresentation(
+                stoppingSessionId = null,
+                runtimeToken = THIS_RUNTIME,
+                announcedInterruption = { true },
+            ).state,
+        )
+    }
+
+    @Test
+    fun theUnsavedStateIsTerminalToTheUserAndWaitsToBeRead() {
+        assertTrue(RecordingDisplayState.INTERRUPTED_UNSAVED in TerminalRecordingStates)
+        // `endedAt` is null - nothing wrote one - so a state that expired on a timestamp would
+        // never appear at all. This one waits, like every other outcome the user may need to act on.
+        assertTrue(
+            terminalNoticeVisible(
+                state = RecordingDisplayState.INTERRUPTED_UNSAVED,
+                sessionId = 7L,
+                endedAt = null,
+                nowMillis = BOOTED_AT,
+                acknowledgedSessionId = null,
+            ),
+        )
+    }
+
+    @Test
+    fun theUnsavedStateOffersStopAndNotStart() {
+        // Stop is the manual form of the same repair: it terminalizes the row. Start is not offered,
+        // because against a row that is still `ACTIVE` it would reacquire ownership and resume the
+        // exploration the user has already been told ended - the `P4-048` defect, from the other end.
+        assertTrue(
+            stopControlOffered(state = RecordingDisplayState.INTERRUPTED_UNSAVED, activeSessionId = 7L),
+        )
+        assertFalse(
+            startControlOffered(state = RecordingDisplayState.INTERRUPTED_UNSAVED, activeSessionId = 7L),
+        )
+    }
+
+    @Test
+    fun theUnsavedStateIsRepairedByWritingTheTerminalRow() {
+        val claims = AbandonedResumeClaims()
+
+        val action = abandonedExplorationAction(
+            state = RecordingDisplayState.INTERRUPTED_UNSAVED,
+            activeSessionId = 7L,
+            activeSessionStartedAt = BOOTED_AT + AN_HOUR,
+            activeSessionLastPointAt = BOOTED_AT + AN_HOUR + 1_000L,
+            bootedAtEpochMillis = BOOTED_AT,
+            startupReconciled = true,
+            activityResumed = true,
+            claim = claims::claim,
+            announcedInterruptionReason = { STOPPED_BECAUSE },
+        )
+
+        // Interrupt, not Resume, although the session starts well after this boot: the announcement
+        // is what decides it, and that is the point of asking it before the boot comparison.
+        assertEquals(
+            AbandonedExplorationAction.Interrupt(
+                sessionId = 7L,
+                stoppedRecordingAt = BOOTED_AT + AN_HOUR + 1_000L,
+                // The reason the runtime remembered when it announced, not the reboot default. It
+                // is shown to the user on the history screen, so it is asserted, not defaulted.
+                reason = STOPPED_BECAUSE,
+            ),
+            action,
+        )
+    }
+
+    @Test
+    fun aFailedRepairIsRetriedWhenTheDecisionIsReachedAgain() = runBlocking {
+        // Storage is still full: the write returns false. The claim must come back, or the one
+        // attempt this process gets is spent on the failure and the row stays open until the app is
+        // killed - which is exactly the state the user was told they were out of.
+        val claims = AbandonedResumeClaims()
+        val attempts = mutableListOf<Long>()
+
+        repeat(2) {
+            val action = abandonedExplorationAction(
+                state = RecordingDisplayState.INTERRUPTED_UNSAVED,
+                activeSessionId = 7L,
+                activeSessionStartedAt = BOOTED_AT + AN_HOUR,
+                activeSessionLastPointAt = null,
+                bootedAtEpochMillis = BOOTED_AT,
+                startupReconciled = true,
+                activityResumed = true,
+                claim = claims::claim,
+                announcedInterruptionReason = { STOPPED_BECAUSE },
+            )
+            runClaimedAbandonedAction(
+                action = action,
+                resume = { throw AssertionError("an announced interruption must never resume") },
+                interrupt = { interrupt ->
+                    attempts += interrupt.sessionId
+                    false
+                },
+                release = claims::release,
+            )
+        }
+
+        assertEquals(listOf(7L, 7L), attempts)
+    }
+
     private fun detail(
         status: RecordingHistoryStatus,
         outcome: String = "START_ACTIVATED",
@@ -694,6 +894,22 @@ class RecordingPresentationTest {
 
     private companion object {
         const val THIS_RUNTIME = "runtime-of-the-process-under-test"
+
+        /**
+         * A terminal reason a runtime would really have announced.
+         *
+         * `V02-014`: the announcement carries WHY recording stopped, because the repair writes that
+         * reason onto the history screen and the only path that existed wrote `device_restarted`.
+         */
+        const val STOPPED_BECAUSE = "storage_failure"
+
+        /**
+         * A runtime that has announced nothing, which is every case but `V02-014`'s.
+         *
+         * Named rather than written as `{ false }` at each site so that a case which DOES care
+         * about the announcement is visible as an exception to it.
+         */
+        val NOTHING_ANNOUNCED: (Long) -> Boolean = { false }
 
         /** An arbitrary but plausible boot instant; only its distance from a start time matters. */
         const val BOOTED_AT = 1_700_000_000_000L

@@ -58,7 +58,7 @@ class RecordingControllerTest {
         val launcher = FakeLauncher()
 
         val ended = controller(commands = commands, launcher = launcher)
-            .interruptAbandonedAcrossRestart(
+            .interruptAbandoned(
                 sessionId = 12L,
                 stoppedRecordingAtEpochMillis = LAST_POINT_AT,
             )
@@ -82,7 +82,7 @@ class RecordingControllerTest {
         )
 
         assertTrue(
-            controller.interruptAbandonedAcrossRestart(
+            controller.interruptAbandoned(
                 sessionId = 12L,
                 stoppedRecordingAtEpochMillis = LAST_POINT_AT,
             ),
@@ -96,7 +96,7 @@ class RecordingControllerTest {
 
         assertFalse(
             controller(commands = commands, launcher = FakeLauncher())
-                .interruptAbandonedAcrossRestart(
+                .interruptAbandoned(
                     sessionId = 12L,
                     stoppedRecordingAtEpochMillis = LAST_POINT_AT,
                 ),
@@ -112,7 +112,7 @@ class RecordingControllerTest {
         val commands = FakeCommands()
 
         controller(commands = commands, launcher = FakeLauncher(), clock = { FIXED_NOW })
-            .interruptAbandonedAcrossRestart(sessionId = 12L, stoppedRecordingAtEpochMillis = null)
+            .interruptAbandoned(sessionId = 12L, stoppedRecordingAtEpochMillis = null)
 
         assertEquals(listOf(Triple(12L, FIXED_NOW, "device_restarted")), commands.interruptCalls)
     }
@@ -124,7 +124,7 @@ class RecordingControllerTest {
         val commands = FakeCommands()
 
         controller(commands = commands, launcher = FakeLauncher(), clock = { FIXED_NOW })
-            .interruptAbandonedAcrossRestart(
+            .interruptAbandoned(
                 sessionId = 12L,
                 stoppedRecordingAtEpochMillis = LAST_POINT_AT,
             )

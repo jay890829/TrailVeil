@@ -328,6 +328,7 @@ class RecordingSummaryScaleBenchmarkTest {
                     val presentation = updated.toRecordingPresentation(
                         stoppingSessionId = null,
                         runtimeToken = SESSION_OWNER_TOKEN,
+                        announcedInterruption = { false },
                     )
                     UpdateMeasurement(
                         summary = updated,

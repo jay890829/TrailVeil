@@ -334,7 +334,7 @@ class RecordingForegroundService : Service() {
                     // startForeground was refused because the permission grade cannot re-arm
                     // location from the background (measured on the POCO: sessions 39 and 43
                     // refused at 使用時允許; session 44 recovered at 一律允許, P4-041).
-                    announceInterruption(state.sessionId)
+                    announceInterruption(state.sessionId, TerminalReason.FOREGROUND_RESTART_FAILURE)
                 }
                 command.action == ACTION_START && command.sessionId != null ->
                     dependencies.recordingRepository.failStart(
@@ -425,7 +425,7 @@ class RecordingForegroundService : Service() {
         // This is the site P4-048 exists for. When the interrupt above fails - which is what a full
         // disk does - the durable row stays ACTIVE while the user is told the exploration ended,
         // and without the record below, reopening would resume it.
-        announceInterruption(sessionId)
+        announceInterruption(sessionId, reason)
         stopRuntime(startId)
     }
 
@@ -438,8 +438,8 @@ class RecordingForegroundService : Service() {
      * `abandonedExplorationAction`, which refuses to resume an exploration the user has been told
      * about.
      */
-    private fun announceInterruption(sessionId: Long) {
-        dependencies.announcedInterruptions.announce(sessionId)
+    private fun announceInterruption(sessionId: Long, reason: String) {
+        dependencies.announcedInterruptions.announce(sessionId, reason)
         notifier.showInterrupted()
     }
 

@@ -26,17 +26,32 @@ import java.util.concurrent.ConcurrentHashMap
  * announcement resumes an exploration the user was told had ended, which is the whole defect. So
  * this one may not overwrite, and the bound on its size is the number of explorations one runtime
  * announces — one per user-initiated exploration that failed, which in practice is one.
+ *
+ * **`V02-014`: it remembers the REASON, not only the fact.** The terminal row may still be
+ * unwritten when this is read - that is the case `V02-014` repairs - and the repair has to write
+ * the reason recording actually stopped for. The history screen shows that reason to the user, and
+ * the only path that existed wrote `device_restarted`, which for a full disk is simply false. The
+ * runtime knows the true reason at the moment it announces, and nothing else does afterwards.
  */
 internal class AnnouncedInterruptions {
-    private val announced = ConcurrentHashMap.newKeySet<Long>()
+    private val announced = ConcurrentHashMap<Long, String>()
 
-    /** Records that the user has been told [sessionId] was interrupted. */
-    fun announce(sessionId: Long) {
-        if (sessionId > NO_SESSION) announced += sessionId
+    /**
+     * Records that the user has been told [sessionId] was interrupted, and why.
+     *
+     * First announcement wins, for the same reason this is a map and not a slot: a later
+     * announcement about the same exploration cannot make the first one un-said, so overwriting its
+     * reason would only replace the truth with a guess.
+     */
+    fun announce(sessionId: Long, reason: String) {
+        if (sessionId > NO_SESSION) announced.putIfAbsent(sessionId, reason)
     }
 
     /** True when this runtime already told the user [sessionId] was interrupted. */
-    fun wasAnnounced(sessionId: Long): Boolean = sessionId in announced
+    fun wasAnnounced(sessionId: Long): Boolean = announced.containsKey(sessionId)
+
+    /** Why this runtime stopped recording [sessionId], or null if it never announced one. */
+    fun reasonFor(sessionId: Long): String? = announced[sessionId]
 
     private companion object {
         const val NO_SESSION = 0L

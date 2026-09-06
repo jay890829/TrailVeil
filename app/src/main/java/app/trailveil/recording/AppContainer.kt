@@ -58,6 +58,16 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
     fun announcedInterruptionInThisRuntime(sessionId: Long): Boolean =
         announcedInterruptions.wasAnnounced(sessionId)
 
+    /**
+     * Why this runtime stopped recording [sessionId], or null if it never told the user it had.
+     *
+     * `V02-014`: null is the answer to two different questions at once - was it announced, and what
+     * for - and they are answered together on purpose, because a caller that could get "announced"
+     * without a reason would have to invent one.
+     */
+    fun announcedInterruptionReason(sessionId: Long): String? =
+        announcedInterruptions.reasonFor(sessionId)
+
     /** Wall-clock instant this boot began, so a session older than the boot can be told apart. */
     fun bootedAtEpochMillis(): Long =
         bootInstantEpochMillis(clock.epochMillis(), clock.elapsedRealtimeNanos())

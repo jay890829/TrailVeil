@@ -95,6 +95,21 @@ internal enum class RecordingDisplayState {
      * process death rather than every possible way a runtime can stop delivering.
      */
     ABANDONED,
+
+    /**
+     * Recording stopped and the user was told so, but the terminal row could not be written.
+     *
+     * `V02-014`. The durable row is still `ACTIVE` and still owned by THIS process, so it is not
+     * [ABANDONED] - that state means the owning runtime is gone - and it is emphatically not
+     * [RECORDING], which is what the screen showed before this existed while the notification said
+     * the opposite. What distinguishes it is neither the row nor the token but this runtime's own
+     * record of the announcement it made, which is why the presentation is given that record
+     * directly.
+     *
+     * The condition is repairable and repairs itself: the same path that terminalizes an abandoned
+     * row retries the write, so this state lasts exactly as long as the storage failure does.
+     */
+    INTERRUPTED_UNSAVED,
 }
 
 internal data class RecordingEntryUiState(
@@ -597,6 +612,7 @@ private fun RecordingStateCard(
         RecordingDisplayState.INTERRUPTED -> R.string.recording_state_interrupted
         RecordingDisplayState.FAILED_TO_START -> R.string.recording_state_failed
         RecordingDisplayState.ABANDONED -> R.string.recording_state_abandoned
+        RecordingDisplayState.INTERRUPTED_UNSAVED -> R.string.recording_state_interrupted_unsaved
     }
     Card(
         modifier = Modifier
@@ -607,6 +623,9 @@ private fun RecordingStateCard(
                 RecordingDisplayState.POOR_SIGNAL,
                 RecordingDisplayState.INTERRUPTED,
                 RecordingDisplayState.FAILED_TO_START,
+                // `V02-014`: a write that failed is a failure, and the user may have to free space
+                // before it can succeed.
+                RecordingDisplayState.INTERRUPTED_UNSAVED,
                 -> MaterialTheme.colorScheme.errorContainer
                 else -> MaterialTheme.colorScheme.secondaryContainer
             },
