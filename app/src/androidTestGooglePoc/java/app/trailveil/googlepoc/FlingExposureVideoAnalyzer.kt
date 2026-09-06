@@ -1,5 +1,7 @@
 package app.trailveil.googlepoc
 
+import app.trailveil.map.fog.FogTilePngCodec
+import app.trailveil.map.fog.FogTileColor
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.media.MediaExtractor
@@ -206,9 +208,13 @@ object FlingExposureVideoAnalyzer {
         val red = android.graphics.Color.red(pixel)
         val green = android.graphics.Color.green(pixel)
         val blue = android.graphics.Color.blue(pixel)
-        return red in (31 - VIDEO_TOLERANCE)..(31 + 12 + VIDEO_TOLERANCE) &&
+        val opaquePalette = red in (31 - VIDEO_TOLERANCE)..(31 + 12 + VIDEO_TOLERANCE) &&
             green in (38 - VIDEO_TOLERANCE)..(38 + 12 + VIDEO_TOLERANCE) &&
             blue in (43 - VIDEO_TOLERANCE)..(43 + 12 + VIDEO_TOLERANCE)
+        // V02-012 design 2: on screen, fog and the safety cover are the fog colour blended over
+        // the basemap at the shared fog opacity.
+        return opaquePalette ||
+            FogTilePngCodec.matchesRevealedFogAnyGeneration(FogTileColor(red, green, blue), VIDEO_TOLERANCE)
     }
 
     private fun isMarker(pixel: Int): Boolean {

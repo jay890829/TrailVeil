@@ -27,6 +27,10 @@ class FogOverlaySurfaceCoordinatorTest {
             log += "attach($generationId)"
         }
 
+        override fun revealOverlay(generationId: Long, previousGenerationId: Long?) {
+            log += "reveal($generationId,previous=$previousGenerationId)"
+        }
+
         var removeSucceeds = true
 
         override fun removeOverlay(generationId: Long): Boolean {
@@ -60,6 +64,98 @@ class FogOverlaySurfaceCoordinatorTest {
         override fun insidePublishedSurround(): Boolean = inside
         var pendingInsideOverride: Boolean? = null
         override fun insidePendingSurround(): Boolean = pendingInsideOverride ?: inside
+    }
+
+    // ---- V02-012 design 2i: the three findings of the independent verifier --------------------
+
+    @Test
+    fun `a generation delivered outside its own surround raises the cover before the predecessor leaves`() {
+        val harness = Harness()
+        val first = harness.firstInstall()
+        assertFalse("the first install lowered its cover", harness.coordinator.coverUp)
+        harness.overlay.log.clear()
+
+        // The camera is still inside the INSTALLED generation's coverage, so nothing on the
+        // movement path raised a cover; the generation being delivered does not cover it. Before
+        // this fix the predecessor was removed here with nothing visible in its place, and the
+        // screen showed bare basemap for the whole of the follow-up render.
+        harness.coordinator.onCanonicalRefreshRequired()
+        harness.coordinator.onCameraIdle()
+        val second = requireNotNull(harness.coordinator.pendingGenerationId)
+        harness.camera.pendingInsideOverride = false
+        harness.coordinator.onGenerationPublished(second)
+        harness.coordinator.onDeliveryBarrierDrained(second)
+
+        assertTrue("the cover must be up before anything is removed", harness.coordinator.coverUp)
+        assertTrue(
+            "nothing is revealed for a generation delivered outside its surround",
+            harness.overlay.log.none { entry -> entry.startsWith("reveal(") },
+        )
+        val raised = harness.coordinator.recentTransitions.indexOfFirst { it.startsWith("raise:") }
+        val removed = harness.overlay.log.indexOfFirst { it == "remove($first)" }
+        assertTrue("the predecessor is removed", removed >= 0)
+        assertTrue("the cover was raised, and before the removal", raised >= 0)
+    }
+
+    @Test
+    fun `a superseded verification does not strand the predecessor it would have removed`() {
+        val harness = Harness()
+        harness.snapshot.deliverImmediately = false
+        harness.coordinator.onFirstComposition()
+        val first = harness.install()
+
+        // Two more generations complete while the first verdict is still outstanding. The
+        // snapshot port runs one proof at a time, so the replaced callbacks never return and the
+        // removal that lives in them never runs; the next reveal has to do it instead.
+        harness.coordinator.onCanonicalRefreshRequired()
+        val second = harness.install()
+        assertTrue(
+            "the first generation is still held by the outstanding verdict",
+            harness.overlay.log.none { entry -> entry == "remove($first)" },
+        )
+
+        harness.coordinator.onCanonicalRefreshRequired()
+        val third = harness.install()
+
+        assertTrue(
+            "the stranded predecessor is removed by the next reveal",
+            harness.overlay.log.any { entry -> entry == "remove($first)" },
+        )
+        assertTrue("three distinct generations", first < second && second < third)
+        assertEquals(third, harness.coordinator.installedGenerationId)
+    }
+
+    @Test
+    fun `a reveal the overlay port could not show fails closed instead of leaving nothing visible`() {
+        val harness = Harness()
+        val installed = harness.firstInstall()
+        assertFalse(harness.coordinator.coverUp)
+        harness.overlay.log.clear()
+
+        harness.coordinator.onRevealFailed(installed)
+
+        assertTrue("the cover goes up", harness.coordinator.coverUp)
+        assertEquals(FogCoverReason.RUNTIME_FAILURE, harness.coordinator.coverReason)
+        assertTrue(
+            "a rebuild follows",
+            harness.overlay.log.any { entry -> entry.startsWith("begin(") },
+        )
+        assertTrue(
+            "the predecessor stays: it is the only proven thing on screen",
+            harness.overlay.log.none { entry -> entry.startsWith("remove(") },
+        )
+    }
+
+    @Test
+    fun `a reveal failure for a generation that is no longer installed changes nothing`() {
+        val harness = Harness()
+        harness.firstInstall()
+        harness.overlay.log.clear()
+
+        harness.coordinator.onRevealFailed(9_999L)
+
+        assertFalse(harness.coordinator.coverUp)
+        assertTrue(harness.overlay.log.isEmpty())
     }
 
     private class Harness {
@@ -253,7 +349,7 @@ class FogOverlaySurfaceCoordinatorTest {
     // ---- §11 row 5: REFRESH handover with add-before-remove ordering -------------------------
 
     @Test
-    fun `refresh runs a handover and removes the old overlay only after the new proof`() {
+    fun `refresh reveals the new overlay at delivery and removes the old one only after the verdict`() {
         val harness = Harness()
         val first = harness.firstInstall()
         harness.coordinator.onCanonicalRefreshRequired()
@@ -264,21 +360,121 @@ class FogOverlaySurfaceCoordinatorTest {
         harness.coordinator.onGenerationPublished(second)
         harness.coordinator.onDeliveryBarrierDrained(second)
         assertTrue("new overlay attached", harness.overlay.log.contains("attach($second)"))
+        assertTrue(
+            "design 2: the delivered generation is revealed in the same turn the old one is hidden",
+            harness.overlay.log.contains("reveal($second,previous=$first)"),
+        )
+        assertEquals("design 2: installed at delivery", second, harness.coordinator.installedGenerationId)
+        assertFalse("design 2: the cover is down from the reveal on", harness.coordinator.coverUp)
         assertFalse(
-            "old overlay must NOT be removed before the proof verdict",
+            "old overlay must NOT be removed before the verification verdict",
             harness.overlay.log.contains("remove($first)"),
         )
         assertFalse("no in-place clearTileCache on the refresh path (SP9)", harness.overlay.log.contains("clearTileCache"))
         val (provenId, callback) = harness.snapshot.heldCallbacks.single()
         assertEquals(second, provenId)
         callback(true)
-        assertTrue("old overlay removed after proof", harness.overlay.log.contains("remove($first)"))
+        assertTrue("old overlay removed after the verdict", harness.overlay.log.contains("remove($first)"))
         assertTrue(
-            harness.overlay.log.indexOf("attach($second)") <
+            harness.overlay.log.indexOf("reveal($second,previous=$first)") <
                 harness.overlay.log.indexOf("remove($first)"),
         )
         assertEquals(second, harness.coordinator.installedGenerationId)
         assertFalse(harness.coordinator.coverUp)
+    }
+
+    @Test
+    fun `a reveal beneath a raised cover keeps the cover up until the verdict passes`() {
+        val harness = Harness()
+        harness.snapshot.deliverImmediately = false
+        harness.coordinator.onFirstComposition()
+        harness.coordinator.onCameraIdle()
+        val first = requireNotNull(harness.coordinator.pendingGenerationId)
+        harness.coordinator.onGenerationPublished(first)
+        harness.coordinator.onDeliveryBarrierDrained(first)
+        assertTrue("revealed beneath the cover", harness.overlay.log.contains("reveal($first,previous=null)"))
+        assertEquals(first, harness.coordinator.installedGenerationId)
+        assertTrue(
+            "the View cover and the renderer's overlay are not presented in the same frame: the cover " +
+                "stays up until the renderer's own snapshot shows the revealed overlay",
+            harness.coordinator.coverUp,
+        )
+        assertEquals(FogCoverReason.FIRST_COMPOSITION, harness.coordinator.coverReason)
+        val (provenId, callback) = harness.snapshot.heldCallbacks.single()
+        assertEquals(first, provenId)
+        callback(true)
+        assertFalse("the passed verdict lowers the held cover", harness.coordinator.coverUp)
+        assertNull(harness.coordinator.coverReason)
+    }
+
+    @Test
+    fun `a host start during an in-flight verification does not replace it`() {
+        val harness = Harness()
+        harness.snapshot.deliverImmediately = false
+        harness.coordinator.onFirstComposition()
+        harness.coordinator.onCameraIdle()
+        val first = requireNotNull(harness.coordinator.pendingGenerationId)
+        harness.coordinator.onGenerationPublished(first)
+        harness.coordinator.onDeliveryBarrierDrained(first)
+        assertEquals(listOf(first), harness.snapshot.proveRequests)
+        harness.coordinator.onStart()
+        assertEquals(
+            "the single-run prover would replace the reveal's verification and its verdict would never come",
+            listOf(first),
+            harness.snapshot.proveRequests,
+        )
+        harness.snapshot.heldCallbacks.single().second(true)
+        assertFalse(harness.coordinator.coverUp)
+        // With no verification in flight, a later start re-proves as before.
+        harness.coordinator.onStart()
+        assertEquals(listOf(first, first), harness.snapshot.proveRequests)
+        harness.snapshot.heldCallbacks.last().second(true)
+        assertFalse(harness.coordinator.coverUp)
+        assertTrue(harness.coordinator.recentTransitions.contains("start:prove:$first"))
+    }
+
+    @Test
+    fun `a cover the camera raises during a held verification is not lowered by the verdict`() {
+        val harness = Harness()
+        harness.snapshot.deliverImmediately = false
+        harness.coordinator.onFirstComposition()
+        harness.coordinator.onCameraIdle()
+        val first = requireNotNull(harness.coordinator.pendingGenerationId)
+        harness.coordinator.onGenerationPublished(first)
+        harness.coordinator.onDeliveryBarrierDrained(first)
+        assertTrue(harness.coordinator.coverUp)
+        harness.camera.inside = false
+        harness.coordinator.beginProgrammedFlight()
+        harness.coordinator.onCameraMoveStarted(FogCameraMoveReason.DEVELOPER)
+        assertEquals(FogCoverReason.PROGRAMMED_EXIT, harness.coordinator.coverReason)
+        harness.snapshot.heldCallbacks.single().second(true)
+        assertTrue("the camera's cover outlives the verdict", harness.coordinator.coverUp)
+        assertEquals(FogCoverReason.PROGRAMMED_EXIT, harness.coordinator.coverReason)
+    }
+
+    @Test
+    fun `a failed verdict beneath a cover the camera raised after the reveal is moot`() {
+        val harness = Harness()
+        harness.firstInstall()
+        harness.coordinator.onCanonicalRefreshRequired()
+        harness.snapshot.deliverImmediately = false
+        harness.coordinator.onCameraIdle()
+        val second = requireNotNull(harness.coordinator.pendingGenerationId)
+        harness.coordinator.onGenerationPublished(second)
+        harness.coordinator.onDeliveryBarrierDrained(second)
+        assertFalse("revealed at rest: no cover", harness.coordinator.coverUp)
+        // A gesture leaves the surround before the verdict: the cover is up for the camera, every
+        // overlay is hidden beneath it, and the snapshot that follows cannot pass.
+        harness.coordinator.onCameraMoveStarted(FogCameraMoveReason.GESTURE)
+        harness.camera.inside = false
+        harness.coordinator.onCameraMoveFrame()
+        assertTrue(harness.coordinator.coverUp)
+        assertEquals(FogCoverReason.VIEWPORT_EXIT, harness.coordinator.coverReason)
+        val begins = harness.overlay.log.count { it.startsWith("begin(") }
+        harness.snapshot.heldCallbacks.single().second(false)
+        assertEquals("the camera's reason stands, not RUNTIME_FAILURE", FogCoverReason.VIEWPORT_EXIT, harness.coordinator.coverReason)
+        assertEquals("no rebuild began on the moot verdict: the idle rebuild re-verifies", begins, harness.overlay.log.count { it.startsWith("begin(") })
+        assertEquals(second, harness.coordinator.installedGenerationId)
     }
 
     @Test
@@ -310,15 +506,17 @@ class FogOverlaySurfaceCoordinatorTest {
     }
 
     @Test
-    fun `handover failure keeps the old published set serving without a cover`() {
+    fun `handover failure before the reveal keeps the old published set serving without a cover`() {
         val harness = Harness()
         val first = harness.firstInstall()
         harness.coordinator.onCanonicalRefreshRequired()
-        harness.snapshot.result = false
         harness.coordinator.onCameraIdle()
         val second = requireNotNull(harness.coordinator.pendingGenerationId)
         harness.coordinator.onGenerationPublished(second)
-        harness.coordinator.onDeliveryBarrierDrained(second)
+        // Design 2: a failure BEFORE delivery (here the install timeout) is the handover failure
+        // that keeps the old set serving; a failed verification after the reveal fails closed
+        // instead (its own case above).
+        harness.coordinator.onInstallTimeout(second)
         assertEquals(first, harness.coordinator.installedGenerationId)
         assertTrue(harness.overlay.log.contains("cancel($second)"))
         assertTrue("the failed new overlay leaves", harness.overlay.log.contains("remove($second)"))
@@ -334,20 +532,26 @@ class FogOverlaySurfaceCoordinatorTest {
     }
 
     @Test
-    fun `successful retry clears the unavailable state before overlays are revealed`() {
+    fun `a failed verification fails closed and the handover rebuild that follows clears it`() {
         val harness = Harness()
-        harness.firstInstall()
+        val first = harness.firstInstall()
         harness.coordinator.onCanonicalRefreshRequired()
         harness.snapshot.result = false
         harness.coordinator.onCameraIdle()
         val failed = requireNotNull(harness.coordinator.pendingGenerationId)
         harness.coordinator.onGenerationPublished(failed)
         harness.coordinator.onDeliveryBarrierDrained(failed)
-        assertTrue(harness.coordinator.retryScheduled)
+        // Design 2: the generation was revealed, its verification failed, so the cover is up
+        // again (every overlay hidden beneath it in the binding) and a handover rebuild is
+        // already pending; the hidden previous overlay left on the verdict.
+        assertTrue("a failed verification raises the cover", harness.coordinator.coverUp)
+        assertEquals(FogCoverReason.RUNTIME_FAILURE, harness.coordinator.coverReason)
+        assertTrue(harness.overlay.log.contains("remove($first)"))
+        assertFalse("no scheduled retry: the rebuild begins at once", harness.coordinator.retryScheduled)
 
         harness.snapshot.result = true
-        harness.coordinator.onRetryFogOperation()
         val retried = requireNotNull(harness.coordinator.pendingGenerationId)
+        assertTrue(retried != failed)
         harness.coordinator.onGenerationPublished(retried)
         harness.coordinator.onDeliveryBarrierDrained(retried)
 
@@ -374,15 +578,19 @@ class FogOverlaySurfaceCoordinatorTest {
         harness.coordinator.onGenerationPublished(second)
         assertFalse("old stays until target delivery", harness.overlay.log.contains("remove($first)"))
         harness.coordinator.onDeliveryBarrierDrained(second)
-        assertTrue(harness.coordinator.coverUp)
         assertTrue("old leaves before same-colour proof", harness.overlay.log.contains("remove($first)"))
-        assertNull("old generation is no longer a valid fallback", harness.coordinator.installedGenerationId)
-        harness.snapshot.heldCallbacks.single().second(true)
         assertTrue(
             harness.overlay.log.indexOf("attach($second)") <
                 harness.overlay.log.indexOf("remove($first)"),
         )
-        assertFalse("re-proof lowers the rotation cover", harness.coordinator.coverUp)
+        assertTrue(
+            "design 2: revealed with no previous overlay left to hide",
+            harness.overlay.log.contains("reveal($second,previous=null)"),
+        )
+        assertTrue("design 2b: the rotation cover is held until the verdict", harness.coordinator.coverUp)
+        assertEquals(second, harness.coordinator.installedGenerationId)
+        harness.snapshot.heldCallbacks.single().second(true)
+        assertFalse("the passed verdict lowers it", harness.coordinator.coverUp)
         assertEquals(second, harness.coordinator.installedGenerationId)
         // The rotation debt is consumed: the next idle is a no-op.
         val settled = harness.overlay.log.toList()
@@ -534,7 +742,8 @@ class FogOverlaySurfaceCoordinatorTest {
         val pending = requireNotNull(harness.coordinator.pendingGenerationId)
         harness.coordinator.onGenerationPublished(pending)
         harness.coordinator.onDeliveryBarrierDrained(pending)
-        // A programmed jump exits the published surround while the proof is in flight.
+        assertEquals("design 2: revealed and installed at delivery", pending, harness.coordinator.installedGenerationId)
+        // A programmed jump exits the published surround while the verification is in flight.
         harness.camera.inside = false
         harness.coordinator.beginProgrammedFlight()
         harness.coordinator.onCameraMoveStarted(FogCameraMoveReason.DEVELOPER)
@@ -544,14 +753,17 @@ class FogOverlaySurfaceCoordinatorTest {
 
         assertEquals(pending, harness.coordinator.installedGenerationId)
         assertTrue(
-            "the cover must survive an install proven for coverage the camera has left",
+            "a passed verification never lowers a cover the camera raised meanwhile",
             harness.coordinator.coverUp,
         )
         assertEquals(FogCoverReason.PROGRAMMED_EXIT, harness.coordinator.coverReason)
+        // The flight ends in an idle, which begins the handover for the new viewport.
+        harness.coordinator.onCameraIdle()
         assertTrue(
             "a follow-up handover began for the new viewport",
             harness.overlay.log.last().startsWith("begin(3,handover=true"),
         )
+        assertTrue("the cover stays up through that rebuild", harness.coordinator.coverUp)
     }
 
     @Test
@@ -576,11 +788,12 @@ class FogOverlaySurfaceCoordinatorTest {
         )
         harness.coordinator.onGenerationPublished(pending)
         harness.coordinator.onDeliveryBarrierDrained(pending)
-        harness.snapshot.heldCallbacks.single().second(true)
         assertTrue(
-            "the swallowed viewport idle triggers the follow-up rebuild",
-            harness.overlay.log.last().startsWith("begin(3,handover=true"),
+            "the swallowed viewport idle triggers the follow-up rebuild at delivery",
+            harness.overlay.log.any { it.startsWith("begin(3,handover=true") },
         )
+        harness.snapshot.heldCallbacks.single().second(true)
+        assertEquals("the follow-up is the pending one", 3L, harness.coordinator.pendingGenerationId)
     }
 
     // ---- §11 row 9: per-composition terminal classification ----------------------------------
@@ -609,7 +822,7 @@ class FogOverlaySurfaceCoordinatorTest {
     // ---- oracle-integrity control (design §11, coordinator level) ----------------------------
 
     @Test
-    fun `a proof that keeps failing can never lower the first-install cover`() {
+    fun `a verification that keeps failing raises the cover again and rebuilds until the deadline`() {
         val harness = Harness()
         harness.snapshot.result = false
         harness.coordinator.onFirstComposition()
@@ -617,9 +830,17 @@ class FogOverlaySurfaceCoordinatorTest {
         val id = requireNotNull(harness.coordinator.pendingGenerationId)
         harness.coordinator.onGenerationPublished(id)
         harness.coordinator.onDeliveryBarrierDrained(id)
-        assertTrue("bare-basemap verdicts keep the cover up", harness.coordinator.coverUp)
-        assertNull(harness.coordinator.installedGenerationId)
-        assertTrue("nothing proven: terminal for the composition", harness.coordinator.terminal)
+        assertTrue("a bare-basemap verdict raises the cover again", harness.coordinator.coverUp)
+        assertEquals(FogCoverReason.RUNTIME_FAILURE, harness.coordinator.coverReason)
+        assertEquals("design 2: the revealed generation is the installed one", id, harness.coordinator.installedGenerationId)
+        val rebuild = requireNotNull(harness.coordinator.pendingGenerationId) { "a handover rebuild must be pending" }
+        assertTrue(rebuild != id)
+        // Every further attempt fails the same way; the binding's cover deadline ends it.
+        harness.coordinator.onGenerationPublished(rebuild)
+        harness.coordinator.onDeliveryBarrierDrained(rebuild)
+        assertTrue(harness.coordinator.coverUp)
+        harness.coordinator.onCoverDeadlineExceeded()
+        assertTrue("bounded: the cover deadline makes the composition terminal", harness.coordinator.terminal)
     }
 
     // ---- interleavings -----------------------------------------------------------------------
@@ -633,16 +854,17 @@ class FogOverlaySurfaceCoordinatorTest {
         harness.coordinator.onCameraIdle()
         val second = requireNotNull(harness.coordinator.pendingGenerationId)
         harness.coordinator.onGenerationPublished(second)
-        harness.coordinator.onDeliveryBarrierDrained(second)
-        // Canonical content changes again while the proof is in flight; the camera is
+        // Canonical content changes again while the render is in flight; the camera is
         // stationary, so no further idle will arrive.
         harness.coordinator.onCanonicalRefreshRequired()
-        harness.snapshot.heldCallbacks.single().second(true)
+        harness.coordinator.onDeliveryBarrierDrained(second)
         assertEquals(second, harness.coordinator.installedGenerationId)
         assertTrue(
-            "a follow-up handover began without waiting for an idle",
-            harness.overlay.log.last().startsWith("begin(3,handover=true"),
+            "a follow-up handover began at delivery without waiting for an idle",
+            harness.overlay.log.any { it.startsWith("begin(3,handover=true") },
         )
+        harness.snapshot.heldCallbacks.single().second(true)
+        assertEquals(3L, harness.coordinator.pendingGenerationId)
     }
 
     @Test
@@ -692,7 +914,7 @@ class FogOverlaySurfaceCoordinatorTest {
     }
 
     @Test
-    fun `old overlay removal failure terminates instead of lowering the cover`() {
+    fun `old overlay removal failure on the verdict terminates the composition`() {
         val harness = Harness()
         harness.firstInstall()
         harness.coordinator.onCanonicalRefreshRequired()

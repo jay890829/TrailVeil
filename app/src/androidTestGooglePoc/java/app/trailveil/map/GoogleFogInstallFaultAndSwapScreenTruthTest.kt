@@ -1,5 +1,7 @@
 package app.trailveil.map
 
+import app.trailveil.map.fog.FogTilePngCodec
+import app.trailveil.map.fog.FogTileColor
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
@@ -783,11 +785,12 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
     private fun isFogOrCover(pixel: Int): Boolean =
         SpikeCaptureSupport.isFogFamily(pixel) || isSafetyCover(pixel)
 
-    /** The exact drawable colour asserted by `GoogleProductionLauncherMapHostTest`, same tolerance. */
+    /** V02-012 design 2: the cover is fog over basemap (the codec's revealed-fog window). */
     private fun isSafetyCover(pixel: Int): Boolean =
-        abs(Color.red(pixel) - COVER_RED) <= COVER_TOLERANCE &&
-            abs(Color.green(pixel) - COVER_GREEN) <= COVER_TOLERANCE &&
-            abs(Color.blue(pixel) - COVER_BLUE) <= COVER_TOLERANCE
+        FogTilePngCodec.matchesRevealedFogAnyGeneration(
+            FogTileColor(Color.red(pixel), Color.green(pixel), Color.blue(pixel)),
+            COVER_TOLERANCE,
+        )
 
     // ROOT, not the default locale: this string goes into an instrumentation status stream
     // that later runs are compared against, so a decimal separator that follows the device
@@ -1099,9 +1102,6 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         const val TILE_HOLE_CELLS = 88
         const val GRID_COLUMNS = 48
         const val GRID_ROWS = 80
-        const val COVER_RED = 0x3C
-        const val COVER_GREEN = 0x3D
-        const val COVER_BLUE = 0x3A
         const val COVER_TOLERANCE = 2
 
         /** Nobody moves this camera, so two reads of it must agree to well inside a rendered pixel. */

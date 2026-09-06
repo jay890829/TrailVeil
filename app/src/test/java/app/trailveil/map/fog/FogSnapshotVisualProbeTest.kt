@@ -344,6 +344,153 @@ class FogSnapshotVisualProbeTest {
         assertFalse(zone.contains(20.0, 175.0))
     }
 
+    // ---- V02-012 design 2g: tiles outside the visible polygon are culled before the scan ------
+
+    @Test
+    fun aTiltedTrapezoidCullsExactlyTheTilesWithoutAVisiblePixelCentre() {
+        // Tile coordinates at zoom 4: a narrow near edge at the bottom, a wide far edge at the
+        // top, the shape a tilted camera's visible region takes. Its bounding box holds 140 tiles;
+        // the trapezoid about half of them. The corners sit off the pixel-centre lattice: with
+        // round corners one pixel centre lay exactly on an edge, and the planner's polygon, which
+        // takes a lat/lon round trip, broke that tie the other way from this test's reference.
+        val trapezoid = listOf(7.03 to 12.01, 1.47 to 3.52, 14.53 to 3.49, 9.01 to 12.02)
+        assertCullMatchesPixelRule(zoom = 4, cornersInTileSpace = trapezoid, xRange = 1..14, yRange = 3..12)
+    }
+
+    @Test
+    fun aBowTiePolygonTakesThePerPixelPathAndStillMatchesThePixelRule() {
+        // The same four corners with the far pair swapped: the edges cross, the polygon is not
+        // convex, and the planner must fall back to scanning every tile rather than trust a
+        // separating axis. The result is defined by the same point-in-polygon rule.
+        val bowTie = listOf(7.03 to 12.01, 14.53 to 3.49, 1.47 to 3.52, 9.01 to 12.02)
+        assertCullMatchesPixelRule(zoom = 4, cornersInTileSpace = bowTie, xRange = 1..14, yRange = 3..12)
+    }
+
+    @Test
+    fun aFullWorldRequestCullsTheRowsOutsideItsLatitudeBand() {
+        val zoom = 3
+        val tileCount = 1 shl zoom
+        val north = WebMercator.latitudeAtNormalizedY(2.0 / tileCount)
+        val south = WebMercator.latitudeAtNormalizedY(6.0 / tileCount)
+        val request = FogViewportCoverageRequest(
+            center = GeoPoint(WebMercator.latitudeAtNormalizedY(4.0 / tileCount), 0.0),
+            floorZoom = zoom,
+            nearLeft = GeoPoint(south, -180.0),
+            farLeft = GeoPoint(north, -180.0),
+            farRight = GeoPoint(north, 180.0),
+            nearRight = GeoPoint(south, 180.0),
+        )
+        val masks = (0 until tileCount).associate { row ->
+            FogTileKey(zoom, 3, row, FogRenderVersions.CURRENT) to smallOpaqueMask()
+        }
+
+        val plan = FogSnapshotVisualProbePlanner().plan(request, masks)
+
+        assertEquals(masks.keys, plan.coverageKeys)
+        assertEquals(
+            "rows whose pixel centres fall in the band 2..6 keep probes; the others are culled",
+            setOf(2, 3, 4, 5),
+            plan.probesByKey.keys.map { key -> key.y }.toSet(),
+        )
+    }
+
+    /**
+     * Every tile of the grid keeps probes exactly when one of its pixel centres lies inside the
+     * polygon by the planner's own rule, computed here pixel by pixel, and within a kept tile the
+     * blocks that carry probes are exactly the blocks with such a pixel centre (design 2h culls
+     * at block grain). Opaque masks make the weak pass accept any visible pixel, so "has probes"
+     * and "has a visible pixel centre" coincide at both grains.
+     */
+    private fun assertCullMatchesPixelRule(
+        zoom: Int,
+        cornersInTileSpace: List<Pair<Double, Double>>,
+        xRange: IntRange,
+        yRange: IntRange,
+    ) {
+        val tileCount = 1 shl zoom
+        fun geo(point: Pair<Double, Double>) = GeoPoint(
+            WebMercator.latitudeAtNormalizedY(point.second / tileCount),
+            point.first / tileCount * 360.0 - 180.0,
+        )
+        val request = FogViewportCoverageRequest(
+            center = geo(8.0 to 8.0),
+            floorZoom = zoom,
+            nearLeft = geo(cornersInTileSpace[0]),
+            farLeft = geo(cornersInTileSpace[1]),
+            farRight = geo(cornersInTileSpace[2]),
+            nearRight = geo(cornersInTileSpace[3]),
+        )
+        val masks = xRange.flatMap { x ->
+            yRange.map { y -> FogTileKey(zoom, x, y, FogRenderVersions.CURRENT) to smallOpaqueMask() }
+        }.toMap()
+
+        val plan = FogSnapshotVisualProbePlanner().plan(request, masks)
+
+        assertEquals(masks.keys, plan.coverageKeys)
+        var kept = 0
+        var culled = 0
+        masks.keys.forEach { key ->
+            val expectedBlocks = blocksWithAVisiblePixelCentre(key, SMALL_MASK_SIZE, cornersInTileSpace)
+            val expected = expectedBlocks.isNotEmpty()
+            assertEquals("tile x=${key.x} y=${key.y}", expected, plan.probesByKey.containsKey(key))
+            if (expected) {
+                kept += 1
+                assertEquals(
+                    "blocks of tile x=${key.x} y=${key.y}",
+                    expectedBlocks,
+                    plan.probesByKey.getValue(key).map { probe -> probe.blockIndex }.toSet(),
+                )
+            } else {
+                culled += 1
+            }
+        }
+        assertTrue("the polygon must keep some tiles ($kept)", kept > 0)
+        assertTrue("the polygon must cull some tiles ($culled)", culled > 0)
+    }
+
+    /** The planner's block indices (row-major, [FogSnapshotVisualProbePlanner.DEFAULT_BLOCKS_PER_AXIS] per axis) holding a visible pixel centre. */
+    private fun blocksWithAVisiblePixelCentre(
+        key: FogTileKey,
+        maskSize: Int,
+        polygon: List<Pair<Double, Double>>,
+    ): Set<Int> {
+        val blocks = FogSnapshotVisualProbePlanner.DEFAULT_BLOCKS_PER_AXIS
+        val result = HashSet<Int>()
+        for (y in 0 until maskSize) {
+            for (x in 0 until maskSize) {
+                val pointX = key.x + (x + 0.5) / maskSize
+                val pointY = key.y + (y + 0.5) / maskSize
+                if (pointInside(pointX, pointY, polygon)) {
+                    result += (y * blocks / maskSize) * blocks + (x * blocks / maskSize)
+                }
+            }
+        }
+        return result
+    }
+
+    /** The planner's even-odd rule, restated independently. */
+    private fun pointInside(x: Double, y: Double, polygon: List<Pair<Double, Double>>): Boolean {
+        var inside = false
+        var previous = polygon.last()
+        polygon.forEach { current ->
+            val (currentX, currentY) = current
+            val (previousX, previousY) = previous
+            if ((currentY > y) != (previousY > y) &&
+                x < (previousX - currentX) * (y - currentY) / (previousY - currentY) + currentX
+            ) {
+                inside = !inside
+            }
+            previous = current
+        }
+        return inside
+    }
+
+    private fun smallOpaqueMask() = FogPixelMask(
+        SMALL_MASK_SIZE,
+        SMALL_MASK_SIZE,
+        ByteArray(SMALL_MASK_SIZE * SMALL_MASK_SIZE) { 0xff.toByte() },
+    )
+
     private fun opaqueMask() = FogPixelMask(
         256,
         256,
@@ -365,5 +512,8 @@ class FogSnapshotVisualProbeTest {
     private companion object {
         /** Probe centres are whole pixels; this only absorbs the projection round trip. */
         const val TOLERANCE_PIXELS = 1e-3
+
+        /** Masks for the cull cases: 126 tiles at 256 px would make the pixel reference slow. */
+        const val SMALL_MASK_SIZE = 32
     }
 }

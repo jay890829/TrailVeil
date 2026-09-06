@@ -139,9 +139,13 @@ class GoogleFogStage6SourceTest {
                 "by moving the SDK view, never by punching a hole",
             Regex("""clipOut|clipRect|clipPath""").containsMatchIn(coverDraw),
         )
-        assertFalse(
-            "the cover must not advertise translucency; it is the fail-closed guard",
-            synchronousCover.contains("PixelFormat.TRANSLUCENT"),
+        // V02-012 design 2 (owner decision 2026-09-06): the cover is the fog colour at the shared
+        // fog opacity - unproven ground is never shown clearer than fog - so it advertises
+        // translucency and takes its colour from the codec, never from a literal of its own.
+        assertTrue(
+            "the cover is drawn at the fog opacity",
+            synchronousCover.contains("PixelFormat.TRANSLUCENT") &&
+                synchronousCover.contains("FogTilePngCodec.REVEALED_FOG_ALPHA"),
         )
         assertFalse(
             "moving the SDK attribution must not become a camera or padding change",
@@ -428,6 +432,11 @@ class GoogleFogStage6SourceTest {
             .filter { file -> file.isFile && file.extension == "kt" }
             .joinToString("\n") { file -> file.readText() }
 
+        // V02-012 (owner, 2026-09-06): the SDK draws the basemap's labels and POI icons above
+        // every overlay an app can add, so the fog cannot conceal them. Two styles were built and
+        // judged on the phone - the halo removed (prototype 3, text became hard to read) and the
+        // halo darkened with the POI icons muted (prototype 4, "這樣看起來也很怪") - and the owner
+        // reverted both. The map is styled by nothing, and this ban stands.
         assertFalse(surfaceBinding.contains("setMapStyle"))
         assertFalse(surfaceBinding.contains("setOnPoiClickListener"))
         assertFalse(source.contains("com.google.android.libraries.places"))
@@ -454,6 +463,10 @@ class GoogleFogStage6SourceTest {
                     )
                 }
             }
+        assertFalse(
+            "no map style resource ships either",
+            moduleRoot().resolve("src/google/res/raw").exists(),
+        )
     }
 
     /**

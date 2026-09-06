@@ -290,7 +290,7 @@ class GoogleFogRevealLatencyTest {
      * loop, with no safety cover.
      *
      * `map_fog_canonical_generation` is written from `installedGeneration`, which the coordinator
-     * sets only in `completeInstall` - after the overlay attached, the delivery barrier drained
+     * sets only in `revealAndComplete` - after the overlay attached, the delivery barrier drained
      * and the snapshot proof passed. Reading it at one instant is not enough on its own: the
      * generation the FIRST render installed, long before any sample was persisted, would satisfy
      * "installed and presented" while proving nothing about the twenty renders that were timed.

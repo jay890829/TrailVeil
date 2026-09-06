@@ -27,6 +27,8 @@ internal class GoogleFogSnapshotProver(
     private val hostStopped: () -> Boolean = { false },
     /** Hides visible map overlays when their exclusion zones make the plan undecidable. */
     private val onUnprovablePlan: () -> Boolean = { false },
+    /** Milliseconds for the event trace, on the binding's clock so both traces align. */
+    private val nowMillis: () -> Long = { android.os.SystemClock.elapsedRealtime() },
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private var epoch = 0L
@@ -41,8 +43,18 @@ internal class GoogleFogSnapshotProver(
     private var activeRun: ProofRun? = null
     private var resumeAfterStop = false
 
+    /** Bounded event history (names, numbers, booleans) for device failure messages. */
+    private val events = ArrayDeque<String>()
+    val recentEvents: List<String> get() = events.toList()
+
+    private fun note(event: String) {
+        if (events.size >= EVENT_TRACE_LIMIT) events.removeFirst()
+        events.addLast("$event@${nowMillis()}")
+    }
+
     fun prove(generation: Long, onResult: (Boolean) -> Unit) {
         val proofEpoch = ++epoch
+        note("prove:$generation")
         val run = ProofRun(
             generation = generation,
             proofEpoch = proofEpoch,
@@ -106,13 +118,19 @@ internal class GoogleFogSnapshotProver(
         // classifies as a hard proof failure — terminal when nothing is installed yet. Wait
         // without consuming the budget; the cover stays up throughout, so this is fail-closed.
         if (hostStopped()) {
+            note("stopped")
             handler.postDelayed(
                 { attempt(run) },
                 STOPPED_POLL_MILLIS,
             )
             return
         }
-        val attemptToken = run.budget.begin(lifecycleEpoch, cameraEpoch()) ?: return
+        val attemptToken = run.budget.begin(lifecycleEpoch, cameraEpoch())
+        if (attemptToken == null) {
+            note("begin:null")
+            return
+        }
+        note("attempt:${attemptToken.number}")
         // Re-plan on every pass. A plan captured before a tilt/pan can demand probes that are no
         // longer on screen and can never become true (F0/F2).
         val plan = try {
@@ -121,6 +139,7 @@ internal class GoogleFogSnapshotProver(
             null
         }
         if (plan == null) {
+            note("plan:null")
             retryOrFinish(run, attemptToken)
             return
         }
@@ -132,10 +151,12 @@ internal class GoogleFogSnapshotProver(
             null
         }
         if (preparation == null) {
+            note("prep:null")
             retryOrFinish(run, attemptToken)
             return
         }
         if (!preparation.canProve) {
+            note("unprovable:hidden=${preparation.overlaysHidden}")
             if (preparation.overlaysHidden && run.budget.abandon(attemptToken)) {
                 // Hiding is a state transition, not a proof failure. Re-plan after the map has
                 // applied the visibility change; consuming an attempt here would make the proof
@@ -151,14 +172,17 @@ internal class GoogleFogSnapshotProver(
         try {
             map.snapshot { snapshot ->
                 if (activeRun !== run || run.proofEpoch != epoch) {
+                    note("snapshot:stale")
                     snapshot?.recycle()
                     return@snapshot
                 }
                 if (!isLive(run, attemptToken)) {
+                    note("snapshot:notLive")
                     snapshot?.recycle()
                     retrySameAttempt(run, attemptToken)
                     return@snapshot
                 }
+                note(if (snapshot == null) "snapshot:null" else "snapshot:${snapshot.width}x${snapshot.height}")
                 val observation = snapshot?.let { bitmap ->
                     try {
                         evaluate(bitmap, plan, run.generation, attemptToken.number)
@@ -171,6 +195,11 @@ internal class GoogleFogSnapshotProver(
                     }
                 }
                 if (observation != null) {
+                    note(
+                        "eval:${observation.passed}:" +
+                            "${observation.verifiedTileCount}/${observation.requiredTileCount}" +
+                            "/off${observation.offScreenTileCount}",
+                    )
                     try {
                         onProofObserved(observation)
                     } catch (_: Exception) {
@@ -189,6 +218,7 @@ internal class GoogleFogSnapshotProver(
                 }
             }
         } catch (_: Exception) {
+            note("snapshot:exception")
             if (!isLive(run, attemptToken)) {
                 retrySameAttempt(run, attemptToken)
             } else {
@@ -207,7 +237,11 @@ internal class GoogleFogSnapshotProver(
         run: ProofRun,
         attempt: FogSnapshotProofBudget.Attempt,
     ) {
-        if (activeRun !== run || run.proofEpoch != epoch || !run.budget.abandon(attempt)) return
+        if (activeRun !== run || run.proofEpoch != epoch || !run.budget.abandon(attempt)) {
+            note("retrySame:dropped")
+            return
+        }
+        note("retrySame")
         handler.postDelayed(
             { attempt(run) },
             if (hostStopped()) STOPPED_POLL_MILLIS else RETRY_MILLIS,
@@ -218,14 +252,21 @@ internal class GoogleFogSnapshotProver(
         run: ProofRun,
         attempt: FogSnapshotProofBudget.Attempt,
     ) {
-        if (activeRun !== run || run.proofEpoch != epoch) return
+        if (activeRun !== run || run.proofEpoch != epoch) {
+            note("retryOrFinish:stale")
+            return
+        }
         when (run.budget.recordFailure(attempt)) {
-            null -> Unit
+            null -> note("retryOrFinish:null")
             false -> {
+                note("result:false")
                 activeRun = null
                 run.onResult(false)
             }
-            true -> handler.postDelayed({ attempt(run) }, RETRY_MILLIS)
+            true -> {
+                note("retry")
+                handler.postDelayed({ attempt(run) }, RETRY_MILLIS)
+            }
         }
     }
 
@@ -252,7 +293,9 @@ internal class GoogleFogSnapshotProver(
             )
         }
         val projection = map.projection
-        val samples = plan.probesByKey.keys.map { key ->
+        val tileNotes = StringBuilder()
+        val samples = plan.probesByKey.keys.mapIndexed { index, key ->
+            var firstMismatch: String? = null
             // Carry-forward F: the unit the per-tile threshold counts is the BLOCK, and a block's
             // candidates are interchangeable. Stopping at the first match keeps the unoccluded case
             // at exactly one projection per block, the cost before the fallbacks existed; only a
@@ -266,19 +309,36 @@ internal class GoogleFogSnapshotProver(
                             anyOnScreen = true
                             anyMatched = true
                         }
-                        ProbeObservation.MISMATCH -> anyOnScreen = true
+                        ProbeObservation.MISMATCH -> {
+                            anyOnScreen = true
+                            if (firstMismatch == null) firstMismatch = describeMismatch(snapshot, projection, candidate)
+                        }
                         ProbeObservation.OFF_SCREEN -> Unit
                     }
                     if (anyMatched) break
                 }
                 FogProofBlockSample(anyOnScreen = anyOnScreen, anyMatched = anyMatched)
             }
-            reduceFogProofBlocks(blocks)
+            val sample = reduceFogProofBlocks(blocks)
+            val required = minOf(MINIMUM_MATCHING_BLOCKS_PER_TILE, sample.onScreenBlocks)
+            if (sample.onScreenBlocks > 0 && sample.matchingBlocks < required && tileNotes.length < 400) {
+                tileNotes.append("t$index:on${sample.onScreenBlocks}/m${sample.matchingBlocks}:${firstMismatch ?: "?"} ")
+            }
+            sample
         }
         // The verdict rule is provider-neutral and lives in src/main so it can be unit tested; this
         // file cannot be reached from any JVM test source set. See tallyFogProof for why an
         // off-screen-only tile is exempt yet a plan can never pass on zero verified tiles.
         val tally = tallyFogProof(samples, MINIMUM_MATCHING_BLOCKS_PER_TILE)
+        if (!tally.passed) {
+            val expected = FogTilePngCodec.colorForGeneration(generation)
+            note(
+                "tiles:[${tileNotes.toString().trim()}] window=" +
+                    "r${FogTilePngCodec.revealedFogChannelRange(expected.red)}" +
+                    "g${FogTilePngCodec.revealedFogChannelRange(expected.green)}" +
+                    "b${FogTilePngCodec.revealedFogChannelRange(expected.blue)}",
+            )
+        }
         return GoogleFogProofObservation(
             generation = generation,
             attempt = attempt,
@@ -287,6 +347,27 @@ internal class GoogleFogSnapshotProver(
             offScreenTileCount = tally.offScreenTiles,
             passed = tally.passed,
         )
+    }
+
+    /** The probe's centre pixel and its 3x3 neighbourhood's channel ranges, as hex (colours only). */
+    private fun describeMismatch(snapshot: Bitmap, projection: Projection, probe: FogSnapshotVisualProbe): String {
+        val point = try {
+            projection.toScreenLocation(LatLng(probe.latitude, probe.longitude))
+        } catch (_: Exception) {
+            return "noPoint"
+        }
+        if (point.x !in 1 until snapshot.width - 1 || point.y !in 1 until snapshot.height - 1) return "edge"
+        val centre = snapshot[point.x, point.y]
+        var minRed = 255; var maxRed = 0; var minGreen = 255; var maxGreen = 0; var minBlue = 255; var maxBlue = 0
+        for (dy in -1..1) for (dx in -1..1) {
+            val pixel = snapshot[point.x + dx, point.y + dy]
+            minRed = minOf(minRed, Color.red(pixel)); maxRed = maxOf(maxRed, Color.red(pixel))
+            minGreen = minOf(minGreen, Color.green(pixel)); maxGreen = maxOf(maxGreen, Color.green(pixel))
+            minBlue = minOf(minBlue, Color.blue(pixel)); maxBlue = maxOf(maxBlue, Color.blue(pixel))
+        }
+        return String.format("%06X", centre and 0xFFFFFF) +
+            "(r$minRed-$maxRed,g$minGreen-$maxGreen,b$minBlue-$maxBlue,a${Color.alpha(centre)})" +
+            if (probe.strongNeighbourhood) "s" else "e"
     }
 
     private fun observe(
@@ -325,8 +406,15 @@ internal class GoogleFogSnapshotProver(
         return if (passed) ProbeObservation.MATCH else ProbeObservation.MISMATCH
     }
 
+    /**
+     * V02-012 design 2: the overlay under verification is revealed at the fog display opacity, so
+     * a fog pixel is the generation's colour blended over the basemap. The window assumes the
+     * basemap is at least [FogTilePngCodec.BASEMAP_MINIMUM_CHANNEL] per channel where probed -
+     * the light default style everywhere except labels and icons, which the SDK draws above
+     * the overlay and which the probe plan's exclusion zones and the 5-of-9 rule tolerate.
+     */
     private fun matchesGeneration(pixel: Int, generation: Long): Boolean =
-        Color.alpha(pixel) == 255 && FogTilePngCodec.matchesGenerationColor(
+        FogTilePngCodec.matchesRevealedFog(
             actual = FogTileColor(
                 red = Color.red(pixel),
                 green = Color.green(pixel),
@@ -339,6 +427,7 @@ internal class GoogleFogSnapshotProver(
 
     private companion object {
         const val MAX_ATTEMPTS = 10
+        const val EVENT_TRACE_LIMIT = 40
         const val RETRY_MILLIS = 250L
 
         /** Slower than [RETRY_MILLIS]: while stopped there is nothing to observe, only to wait for. */

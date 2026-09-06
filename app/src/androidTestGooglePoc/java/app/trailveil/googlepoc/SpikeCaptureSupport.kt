@@ -1,5 +1,6 @@
 package app.trailveil.googlepoc
 
+import app.trailveil.map.fog.FogTileColor
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.graphics.RectF
@@ -23,17 +24,24 @@ object SpikeCaptureSupport {
     /** The strategy name a locator reports when it found nothing and returned a guessed rect. */
     const val FALLBACK_STRATEGY = "fallbackRect"
 
-    /** Any pixel inside the whole palette family (all 63 signatures + placeholder) +- video/GL
-     *  tolerance. Labels/roads/POIs differ from this window by >= 40 per channel. */
+    /**
+     * Any pixel that is fog on screen. `V02-012` design 2: a revealed overlay and the safety cover
+     * are the fog colour blended over the basemap at the shared fog opacity (the codec's
+     * revealed-fog window); the opaque palette family (all 63 signatures + placeholder) is kept
+     * for tile bitmaps and for the frame in which two layers may still stack. Labels, roads and
+     * POIs lie outside both windows.
+     */
     fun isFogFamily(pixel: Int, tolerance: Int = 6): Boolean {
         val base = FogTilePngCodec.DEFAULT_FOG_COLOR
         val maxOffset = 3 * FogTilePngCodec.SIGNATURE_CHANNEL_STEP
         val red = android.graphics.Color.red(pixel)
         val green = android.graphics.Color.green(pixel)
         val blue = android.graphics.Color.blue(pixel)
-        return red in (base.red - tolerance)..(base.red + maxOffset + tolerance) &&
+        val opaquePalette = red in (base.red - tolerance)..(base.red + maxOffset + tolerance) &&
             green in (base.green - tolerance)..(base.green + maxOffset + tolerance) &&
             blue in (base.blue - tolerance)..(base.blue + maxOffset + tolerance)
+        return opaquePalette ||
+            FogTilePngCodec.matchesRevealedFogAnyGeneration(FogTileColor(red, green, blue), tolerance)
     }
 
     data class PixelTally(val analyzedPx: Int, val excludedPx: Int, val nonFogPx: Int)
@@ -64,12 +72,17 @@ object SpikeCaptureSupport {
     }
 
     /**
-     * Median per-channel delta of five 32x32 patches (center + four quarter intersections)
-     * against the installed generation colour. A single label-bearing patch cannot abort the
-     * capture — it is counted by [countNonFog] as a LEAK instead.
+     * Median per-channel distance of five 32x32 patches (center + four quarter intersections)
+     * outside the installed generation's revealed-fog window (V02-012: the fog is displayed at
+     * the shared opacity over the basemap, so the exact opaque colour no longer appears; a patch
+     * inside the window scores 0). A single label-bearing patch cannot abort the capture — it is
+     * counted by [countNonFog] as a LEAK instead.
      */
     fun calibrationDelta(bitmap: Bitmap, generation: Long): Int {
         val expected = FogTilePngCodec.colorForGeneration(generation)
+        val redWindow = FogTilePngCodec.revealedFogChannelRange(expected.red)
+        val greenWindow = FogTilePngCodec.revealedFogChannelRange(expected.green)
+        val blueWindow = FogTilePngCodec.revealedFogChannelRange(expected.blue)
         val anchors = listOf(
             bitmap.width / 2 to bitmap.height / 2,
             bitmap.width / 4 to bitmap.height / 4,
@@ -94,32 +107,42 @@ object SpikeCaptureSupport {
             }
             if (samples == 0) return@map Int.MAX_VALUE
             maxDelta = maxOf(
-                abs((redSum / samples).toInt() - expected.red),
-                abs((greenSum / samples).toInt() - expected.green),
-                abs((blueSum / samples).toInt() - expected.blue),
+                redWindow.distanceOutside((redSum / samples).toInt()),
+                greenWindow.distanceOutside((greenSum / samples).toInt()),
+                blueWindow.distanceOutside((blueSum / samples).toInt()),
             )
             maxDelta
         }.sorted()
         return deltas[deltas.size / 2]
     }
 
-    /** Count of pixels in [rect] whose max channel delta from the generation colour exceeds 25 —
-     *  the logo-variant-agnostic "something visibly not fog renders here" corroboration. */
+    /** Count of pixels in [rect] whose max channel distance outside the generation's revealed-fog
+     *  window exceeds 25 — the logo-variant-agnostic "something visibly not fog renders here"
+     *  corroboration (V02-012: measured against the displayed, blended fog). */
     fun fogDeltaCount(bitmap: Bitmap, rect: Rect, generation: Long): Int {
         val expected = FogTilePngCodec.colorForGeneration(generation)
+        val redWindow = FogTilePngCodec.revealedFogChannelRange(expected.red)
+        val greenWindow = FogTilePngCodec.revealedFogChannelRange(expected.green)
+        val blueWindow = FogTilePngCodec.revealedFogChannelRange(expected.blue)
         var count = 0
         for (y in rect.top.coerceAtLeast(0) until rect.bottom.coerceAtMost(bitmap.height)) {
             for (x in rect.left.coerceAtLeast(0) until rect.right.coerceAtMost(bitmap.width)) {
                 val pixel = bitmap[x, y]
                 val delta = maxOf(
-                    abs(android.graphics.Color.red(pixel) - expected.red),
-                    abs(android.graphics.Color.green(pixel) - expected.green),
-                    abs(android.graphics.Color.blue(pixel) - expected.blue),
+                    redWindow.distanceOutside(android.graphics.Color.red(pixel)),
+                    greenWindow.distanceOutside(android.graphics.Color.green(pixel)),
+                    blueWindow.distanceOutside(android.graphics.Color.blue(pixel)),
                 )
                 if (delta > 25) count += 1
             }
         }
         return count
+    }
+
+    private fun IntRange.distanceOutside(value: Int): Int = when {
+        value < first -> first - value
+        value > last -> value - last
+        else -> 0
     }
 
     data class LocatorObservation(

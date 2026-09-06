@@ -1,5 +1,7 @@
 package app.trailveil.map
 
+import app.trailveil.map.fog.FogTilePngCodec
+import app.trailveil.map.fog.FogTileColor
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.os.Bundle
@@ -321,7 +323,10 @@ class GoogleProductionLauncherMapHostTest {
      * sample can only mean something if it actually landed inside the captured map.
      */
     private fun assertFogCoverPixels(bitmap: Bitmap, origin: IntArray, size: IntArray) {
-        val expected = Color.rgb(0x3C, 0x3D, 0x3A)
+        // V02-012 design 2: the cover is the default fog colour at the shared fog opacity, so a
+        // covered pixel is fog blended over the basemap - the codec's revealed-fog window. Labels
+        // and icons draw beneath the cover (dimmed, never bare), so the rule is the prover's
+        // 5-of-9, not all nine.
         val centerX = origin[0] + size[0] / 2
         val centerY = origin[1] + size[1] / 2
         val offsetsX = listOf(-size[0] / 6, 0, size[0] / 6)
@@ -335,22 +340,25 @@ class GoogleProductionLauncherMapHostTest {
         }
         val mismatched = readings.filter { (_, inBitmap, actual) ->
             !inBitmap ||
-                kotlin.math.abs(Color.red(actual) - Color.red(expected)) > 2 ||
-                kotlin.math.abs(Color.green(actual) - Color.green(expected)) > 2 ||
-                kotlin.math.abs(Color.blue(actual) - Color.blue(expected)) > 2 ||
-                Color.alpha(actual) != 255
+                !FogTilePngCodec.matchesBeneathCover(
+                    FogTileColor(Color.red(actual), Color.green(actual), Color.blue(actual)),
+                    2,
+                )
         }
         assertTrue(
-            "safety-cover samples were not opaque fog. expected=#${hex(expected)} " +
+            "safety-cover samples were not fog over basemap. window=" +
+                "r${FogTilePngCodec.revealedFogChannelRange(FogTilePngCodec.DEFAULT_FOG_COLOR.red, 2)} " +
+                "g${FogTilePngCodec.revealedFogChannelRange(FogTilePngCodec.DEFAULT_FOG_COLOR.green, 2)} " +
+                "b${FogTilePngCodec.revealedFogChannelRange(FogTilePngCodec.DEFAULT_FOG_COLOR.blue, 2)} " +
                 "bitmap=${bitmap.width}x${bitmap.height} config=${bitmap.config} " +
                 "mapOrigin=${origin[0]},${origin[1]} mapSize=${size[0]}x${size[1]} " +
-                "mismatched=${mismatched.size}/${readings.size} samples=[" +
+                "mismatched=${mismatched.size}/${readings.size} (at most ${readings.size - COVER_STRONG_MATCHES} allowed) samples=[" +
                 readings.joinToString(" ") { (point, inBitmap, actual) ->
                     "${point.first},${point.second}=" +
                         if (inBitmap) "#${hex(actual)}" else "OUT_OF_BITMAP"
                 } +
                 "]",
-            mismatched.isEmpty(),
+            readings.size - mismatched.size >= COVER_STRONG_MATCHES,
         )
     }
 
@@ -359,6 +367,9 @@ class GoogleProductionLauncherMapHostTest {
     private companion object {
         /** Comfortably past the binding's and the host's 20 s cover deadlines. */
         const val BACKGROUND_DWELL_MILLIS = 25_000L
+
+        /** The prover's strong-neighbourhood rule: 5 of 9 samples read as fog over basemap. */
+        const val COVER_STRONG_MATCHES = 5
     }
 
     private fun awaitGeneration(

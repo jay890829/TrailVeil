@@ -10,6 +10,7 @@ import android.view.ViewGroup
 import android.view.WindowInsets
 import android.widget.ImageView
 import app.trailveil.R
+import app.trailveil.map.fog.FogTilePngCodec
 import com.google.android.gms.maps.MapView
 
 /**
@@ -22,7 +23,17 @@ import com.google.android.gms.maps.MapView
 internal class GoogleFogSafetyOverlay(
     private val mapView: MapView,
 ) {
-    private val drawable = FogCoverDrawable(Color.rgb(0x3C, 0x3D, 0x3A))
+    // V02-012 design 2 (owner decision 2026-09-06): the cover is drawn at the fog's own colour and
+    // opacity, so a gesture that leaves proven coverage shows "everything fogged" rather than an
+    // opaque slab. Unproven ground is never shown clearer than fog; SDK labels dim under it.
+    private val drawable = FogCoverDrawable(
+        Color.argb(
+            FogTilePngCodec.REVEALED_FOG_ALPHA,
+            FogTilePngCodec.DEFAULT_FOG_COLOR.red,
+            FogTilePngCodec.DEFAULT_FOG_COLOR.green,
+            FogTilePngCodec.DEFAULT_FOG_COLOR.blue,
+        ),
+    )
     private var visible = false
     private var released = false
     private val layoutListener = View.OnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
@@ -105,7 +116,7 @@ internal class GoogleFogSafetyOverlay(
     }
 }
 
-/** Opaque full-surface guard; no attribution cutout may expose an unproven basemap frame. */
+/** Full-surface guard at the fog opacity; no attribution cutout may expose an unproven basemap frame. */
 private class FogCoverDrawable(
     private val fogColor: Int,
 ) : Drawable() {
@@ -136,5 +147,5 @@ private class FogCoverDrawable(
     }
 
     @Deprecated("Drawable opacity is only a rendering hint")
-    override fun getOpacity(): Int = PixelFormat.OPAQUE
+    override fun getOpacity(): Int = PixelFormat.TRANSLUCENT
 }

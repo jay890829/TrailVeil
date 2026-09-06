@@ -196,6 +196,25 @@ class FogSnapshotVisualProbePlanner(
         require(polygon.all { point -> point.x.isFinite() && point.y.isFinite() }) {
             "visual probe polygon must be finite"
         }
+        // V02-012 (seventh AVD run): a tile whose square meets the visible polygon in no world
+        // column has no visible pixel centre, so both passes of findVisibleOpaqueProbes would
+        // scan all of it, with a point-in-polygon test per pixel per world column, and find
+        // nothing. A tilted, zoomed-out camera publishes about 240 floor-zoom masks of which the
+        // SDK draws about 31; scanning the other 209 held the main thread for 6.8 s per proof on
+        // the API 36 AVD, and the screen with it. The cull below is a separating-axis test, exact
+        // for a convex polygon (the SDK's visible region is a perspective trapezoid); a polygon
+        // that is not convex takes the per-pixel path for every tile, so the plan is identical
+        // either way. The full-world rule is the y-range test isVisible applies, at tile grain.
+        val convexPolygon = !fullWorld && isConvex(polygon)
+        val fullWorldMinimumY = polygon.minOf(ProjectedProbePoint::y)
+        val fullWorldMaximumY = polygon.maxOf(ProjectedProbePoint::y)
+
+        /** Whether the projected rectangle (tile units, one world column) can hold a visible pixel centre. */
+        fun rectangleMayHoldVisiblePixel(x0: Double, y0: Double, x1: Double, y1: Double): Boolean = when {
+            fullWorld -> y0 < fullWorldMaximumY && y1 > fullWorldMinimumY
+            convexPolygon -> rectangleMeetsConvexPolygon(x0, y0, x1, y1, polygon)
+            else -> true
+        }
 
         val probesByKey = LinkedHashMap<FogTileKey, List<FogSnapshotVisualProbe>>()
         val zoneBlockedKeys = LinkedHashSet<FogTileKey>()
@@ -205,6 +224,10 @@ class FogSnapshotVisualProbePlanner(
             val worldColumns = ((nearestWorld - 1)..(nearestWorld + 1)).map { world ->
                 key.x + world * tileCount
             }
+            val mayHoldVisiblePixel = worldColumns.any { column ->
+                rectangleMayHoldVisiblePixel(column.toDouble(), key.y.toDouble(), column + 1.0, key.y + 1.0)
+            }
+            if (!mayHoldVisiblePixel) return@forEach
             val selection = findVisibleOpaqueProbes(
                 key = key,
                 mask = mask,
@@ -213,6 +236,7 @@ class FogSnapshotVisualProbePlanner(
                 tileCount = tileCount,
                 fullWorld = fullWorld,
                 exclusionZones = exclusionZones,
+                rectangleMayHoldVisiblePixel = ::rectangleMayHoldVisiblePixel,
             )
             if (selection.probes.isNotEmpty()) {
                 probesByKey[key] = selection.probes
@@ -238,6 +262,7 @@ class FogSnapshotVisualProbePlanner(
         tileCount: Int,
         fullWorld: Boolean,
         exclusionZones: List<FogProbeExclusionZone>,
+        rectangleMayHoldVisiblePixel: (Double, Double, Double, Double) -> Boolean,
     ): ProbeSelection {
         val probes = ArrayList<FogSnapshotVisualProbe>(blocksPerAxis * blocksPerAxis)
         var visibleOpaqueSeen = false
@@ -256,6 +281,19 @@ class FogSnapshotVisualProbePlanner(
             for (blockX in 0 until blocksPerAxis) {
                 val xStart = blockX * mask.width / blocksPerAxis
                 val xEnd = (blockX + 1) * mask.width / blocksPerAxis
+                // V02-012 design 2h: the tile cull at block grain. A tile the visible trapezoid
+                // crosses is mostly outside it, and both passes below scan every outside block in
+                // full; a block that cannot hold a visible pixel centre is skipped instead. The
+                // plan is unchanged (the tests compare the kept blocks with a per-pixel reference).
+                val blockMayHoldVisiblePixel = worldColumns.any { column ->
+                    rectangleMayHoldVisiblePixel(
+                        column + xStart.toDouble() / mask.width,
+                        key.y + yStart.toDouble() / mask.height,
+                        column + xEnd.toDouble() / mask.width,
+                        key.y + yEnd.toDouble() / mask.height,
+                    )
+                }
+                if (!blockMayHoldVisiblePixel) continue
                 // Carry-forward F: one probe per block made the whole install hinge on one pixel,
                 // and the owner decision keeps Google's labels and POI icons compositing ABOVE the
                 // fog overlay. A glyph over that pixel is deterministic, so re-planning a
@@ -366,6 +404,67 @@ class FogSnapshotVisualProbePlanner(
                 pointInPolygon(point, polygon)
             }
         }
+    }
+
+    /** Strictly convex, in either winding; a degenerate or reflex polygon answers false. */
+    private fun isConvex(polygon: List<ProjectedProbePoint>): Boolean {
+        if (polygon.size < 3) return false
+        var sign = 0
+        for (index in polygon.indices) {
+            val a = polygon[index]
+            val b = polygon[(index + 1) % polygon.size]
+            val c = polygon[(index + 2) % polygon.size]
+            val cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+            val current = when {
+                cross > 0.0 -> 1
+                cross < 0.0 -> -1
+                else -> return false
+            }
+            if (sign == 0) sign = current else if (sign != current) return false
+        }
+        return true
+    }
+
+    /**
+     * Whether the axis-aligned rectangle [x0, x1] x [y0, y1] meets [polygon], which must be
+     * convex: separating-axis test over the rectangle's two axes and the polygon's edge normals.
+     * Touching counts as meeting, so a tile or block is only ever culled when no pixel centre of
+     * it can be inside.
+     */
+    private fun rectangleMeetsConvexPolygon(
+        x0: Double,
+        y0: Double,
+        x1: Double,
+        y1: Double,
+        polygon: List<ProjectedProbePoint>,
+    ): Boolean {
+        if (polygon.all { point -> point.x < x0 } || polygon.all { point -> point.x > x1 }) return false
+        if (polygon.all { point -> point.y < y0 } || polygon.all { point -> point.y > y1 }) return false
+        var previous = polygon.last()
+        for (current in polygon) {
+            val normalX = -(current.y - previous.y)
+            val normalY = current.x - previous.x
+            previous = current
+            if (normalX == 0.0 && normalY == 0.0) continue
+            var polygonMinimum = Double.POSITIVE_INFINITY
+            var polygonMaximum = Double.NEGATIVE_INFINITY
+            for (vertex in polygon) {
+                val projected = vertex.x * normalX + vertex.y * normalY
+                polygonMinimum = minOf(polygonMinimum, projected)
+                polygonMaximum = maxOf(polygonMaximum, projected)
+            }
+            var squareMinimum = Double.POSITIVE_INFINITY
+            var squareMaximum = Double.NEGATIVE_INFINITY
+            for (cornerX in doubleArrayOf(x0, x1)) {
+                for (cornerY in doubleArrayOf(y0, y1)) {
+                    val projected = cornerX * normalX + cornerY * normalY
+                    squareMinimum = minOf(squareMinimum, projected)
+                    squareMaximum = maxOf(squareMaximum, projected)
+                }
+            }
+            if (squareMaximum < polygonMinimum || polygonMaximum < squareMinimum) return false
+        }
+        return true
     }
 
     private fun pointInPolygon(

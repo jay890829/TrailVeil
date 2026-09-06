@@ -72,13 +72,13 @@ import org.junit.runner.RunWith
  *    `googlePoc/.../GoogleHostedMapSurface.kt` under `fogState?.retryScheduled == true &&
  *    !fogCoverUp`, and `retryScheduled` is cleared on EVERY retry tick
  *    (`FogOverlaySurfaceCoordinator.onRetryFogOperation`) and again at
- *    `FogOverlaySurfaceCoordinator.completeInstall`. Between a tick and the failure that follows
+ *    `FogOverlaySurfaceCoordinator.revealAndComplete`. Between a tick and the failure that follows
  *    it - and, for a feed outage, for the whole of every rebuild that succeeds while the feed stays
  *    broken - the badge is legitimately absent.
  *
  * The two product sites are therefore `GoogleHostedMapSurface`'s status branch and
  * `FogOverlaySurfaceCoordinator`'s two `retryScheduled = false` writes
- * (`onRetryFogOperation`, `completeInstall`). Closing the gap needs a latched fog-unavailable state
+ * (`onRetryFogOperation`, `revealAndComplete`). Closing the gap needs a latched fog-unavailable state
  * on the Google surface; nothing of the sort is added here, because a test must not invent product
  * behaviour. THE COORDINATOR MUST RECORD ROW 85 EITHER AS AN ACCEPTED REPLACEMENT - the property
  * below - OR AS A PRODUCT DECISION to add the latch. It is not closed as a twin by this class.

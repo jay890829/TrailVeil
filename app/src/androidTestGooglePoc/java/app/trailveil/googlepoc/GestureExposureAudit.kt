@@ -1,5 +1,7 @@
 package app.trailveil.googlepoc
 
+import app.trailveil.map.fog.FogTilePngCodec
+import app.trailveil.map.fog.FogTileColor
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
@@ -97,11 +99,6 @@ internal object GestureExposurePixels {
 
     val SURFACE_CHANNELS = setOf(PIXEL_COPY_CHANNEL, TEXTURE_VIEW_CHANNEL)
 
-    /** The exact colour `GoogleFogSafetyOverlay` paints. */
-    const val COVER_RED = 0x3C
-    const val COVER_GREEN = 0x3D
-    const val COVER_BLUE = 0x3A
-
     /** Classification tolerance for a scaled/compressed readback. */
     const val COVER_TOLERANCE = 6
 
@@ -133,18 +130,27 @@ internal object GestureExposurePixels {
                 "clusterPct=${"%.3f".format(largestClusterPct)}"
     }
 
-    /** True for the opaque safety cover, which hides ground exactly as fog does. */
-    fun isSafetyCover(pixel: Int): Boolean =
-        abs(Color.red(pixel) - COVER_RED) <= COVER_TOLERANCE &&
-            abs(Color.green(pixel) - COVER_GREEN) <= COVER_TOLERANCE &&
-            abs(Color.blue(pixel) - COVER_BLUE) <= COVER_TOLERANCE
+    /**
+     * True for the safety cover. `V02-012` design 2: `GoogleFogSafetyOverlay` paints the default
+     * fog colour at the shared fog opacity, so on screen it is fog over basemap - the codec's
+     * revealed-fog window - and hides ground exactly as revealed fog does.
+     */
+    fun isSafetyCover(pixel: Int): Boolean = isCoverPixel(pixel, COVER_TOLERANCE)
 
-    /** The strict proof window: opaque, and within +-2 of the cover colour on every channel. */
-    fun isExactSafetyCover(pixel: Int): Boolean =
-        Color.alpha(pixel) == 255 &&
-            abs(Color.red(pixel) - COVER_RED) <= COVER_PROOF_TOLERANCE &&
-            abs(Color.green(pixel) - COVER_GREEN) <= COVER_PROOF_TOLERANCE &&
-            abs(Color.blue(pixel) - COVER_BLUE) <= COVER_PROOF_TOLERANCE
+    /** The strict proof window: the cover windows with only the +-2 read-back allowance. */
+    fun isExactSafetyCover(pixel: Int): Boolean = isCoverPixel(pixel, COVER_PROOF_TOLERANCE)
+
+    /**
+     * A covered pixel is anything the fog-coloured cover can produce: over the basemap (every
+     * overlay hidden beneath it), over a revealed generation verified beneath it (design 2b), or
+     * over a label. The cover's own contribution is the floor, so a bare label reads below it and
+     * bare basemap of the assumed lightness above it.
+     */
+    private fun isCoverPixel(pixel: Int, tolerance: Int): Boolean =
+        FogTilePngCodec.matchesBeneathCover(
+            FogTileColor(Color.red(pixel), Color.green(pixel), Color.blue(pixel)),
+            tolerance,
+        )
 
     fun regionFor(bitmap: Bitmap, channel: String): Rect {
         val inset = Rect(
@@ -304,6 +310,11 @@ internal data class ExposureFrame(
     val basemapLoadState: String?,
     val channel: String,
     val tally: GestureExposurePixels.Tally,
+    /** How long each step of this sample took, for the sampler's own gap diagnosis. */
+    val tagsBeforeMillis: Long = 0L,
+    val captureMillis: Long = 0L,
+    val tagsAfterMillis: Long = 0L,
+    val tallyMillis: Long = 0L,
 ) {
     val judged: Boolean get() = tally.analyzedPx > 0
 
@@ -486,6 +497,7 @@ internal class GestureExposureSampler(
     private val failure = AtomicReference<Throwable?>(null)
     private var proofAttempts = 0
     private var proofsTaken = 0
+    private val proofTimings = Collections.synchronizedList(ArrayList<Pair<Long, Long>>())
     private var worker: Thread? = null
 
     fun start() {
@@ -523,10 +535,17 @@ internal class GestureExposureSampler(
 
     fun proofAttempts(): Int = proofAttempts
 
+    /** Each cover-proof screenshot's start (elapsedRealtime) and duration, in ms. */
+    fun proofTimings(): List<Pair<Long, Long>> = proofTimings.toList()
+
     private fun sampleOnce() {
+        val tagsBeforeStarted = SystemClock.elapsedRealtime()
         val before = readPublishedTags()
+        val captureStarted = SystemClock.elapsedRealtime()
         val capture = capturer.capture()
+        val tagsAfterStarted = SystemClock.elapsedRealtime()
         val after = readPublishedTags()
+        val tallyStarted = SystemClock.elapsedRealtime()
         // Straddling OR on BOTH cover witnesses, not on one of them.
         //
         // An earlier version read the synchronous flag either side of the capture and the
@@ -548,6 +567,9 @@ internal class GestureExposureSampler(
                 basemapLoadState = published.basemapLoadState,
                 channel = GestureExposurePixels.UNJUDGED_CHANNEL,
                 tally = GestureExposurePixels.Tally(0, 0, 0, 0),
+                tagsBeforeMillis = captureStarted - tagsBeforeStarted,
+                captureMillis = tagsAfterStarted - captureStarted,
+                tagsAfterMillis = tallyStarted - tagsAfterStarted,
             )
             return
         }
@@ -562,8 +584,11 @@ internal class GestureExposureSampler(
             )
         }
         val region = GestureExposurePixels.regionFor(capture, channel)
+        // Stamped before the tally, as before: the stamp is the capture's time, not the sum's.
+        val stampedAt = SystemClock.elapsedRealtime()
+        val tally = GestureExposurePixels.tally(capture, region, scaled)
         frames += ExposureFrame(
-            atMillis = SystemClock.elapsedRealtime(),
+            atMillis = stampedAt,
             coverUp = coverUp,
             composeCoverUp = composeCoverUp,
             publishedIntervalMillis = published.intervalMillis,
@@ -571,11 +596,17 @@ internal class GestureExposureSampler(
             destroyedAtMillis = published.destroyedAt,
             basemapLoadState = published.basemapLoadState,
             channel = channel,
-            tally = GestureExposurePixels.tally(capture, region, scaled),
+            tally = tally,
+            tagsBeforeMillis = captureStarted - tagsBeforeStarted,
+            captureMillis = tagsAfterStarted - captureStarted,
+            tagsAfterMillis = tallyStarted - tagsAfterStarted,
+            tallyMillis = SystemClock.elapsedRealtime() - tallyStarted,
         )
         if (coverUp && proofsTaken < COVER_PROOFS_WANTED && proofAttempts < COVER_PROOF_ATTEMPTS) {
             proofAttempts += 1
+            val proofStarted = SystemClock.elapsedRealtime()
             corroborateCoverInScreenPixels()
+            proofTimings += proofStarted to (SystemClock.elapsedRealtime() - proofStarted)
         }
     }
 
@@ -935,6 +966,8 @@ internal data class GestureTrialReport(
     val maxFrameGapMillis: Long,
     val maxFrameGapStartMillis: Long,
     val teardownShape: String,
+    /** The sampler's own costs; see `samplerShape`. */
+    val samplerShape: String,
     /**
      * Whether a hosted MapView is still in the window when the trial ends.
      *
@@ -1044,6 +1077,7 @@ internal data class GestureTrialReport(
             "coverShape=[$coverShape] composeCoverShape=[$composeCoverShape] " +
             "intervalShape=[$intervalShape] maxFrameGapMs=$maxFrameGapMillis " +
             "maxFrameGapAtMs=$maxFrameGapStartMillis teardown=[$teardownShape] " +
+            "sampler=[$samplerShape] " +
             "mapViewPresentAfter=$mapViewPresentAfter " +
             "hostStops=$hostStopsDuringTrial hostStarts=$hostStartsDuringTrial " +
             "hostLifecycle=$hostLifecycle lastBasemapState=$lastBasemapState " +
@@ -1155,6 +1189,9 @@ internal class GestureExposureHarness private constructor(
 
     /** `pending=..,reason=..,terminal=..,retry=..` - why the cover is up, and whether it gave up. */
     fun fogPhase(): String? = onMain { mapView.getTag(R.id.map_fog_phase)?.toString() }
+
+    /** The binding's gates tag: coordinator transition trace and prover events, ids and names. */
+    fun fogGates(): String? = onMain { mapView.getTag(R.id.map_fog_binding_gates)?.toString() }
 
     fun touchDownCount(): Int = onMain {
         (mapView.getTag(R.id.map_touch_down_count) as? Int) ?: 0
@@ -1420,8 +1457,9 @@ internal class GestureExposureHarness private constructor(
             maxFrameGapMillis = maxFrameGapMillis(frames),
             maxFrameGapStartMillis = maxFrameGapStartMillis(frames),
             teardownShape = teardownShape(frames),
+            samplerShape = samplerShape(frames, sampler.proofTimings()),
             mapViewPresentAfter = hostedMapViewPresent(),
-            phaseAfter = fogPhase(),
+            phaseAfter = "${fogPhase()} gates=${fogGates()}",
             coverIntervalBeforeMillis = coverIntervalBefore,
             coverIntervalAfterMillis = publishedCoverIntervalMillis(),
             coverPixelProof = sampler.coverPixelProof(),
@@ -1566,6 +1604,26 @@ internal class GestureExposureHarness private constructor(
         if (disposed == null && destroyed == null) return "intact"
         return "disposedSeenAtMs=${disposed?.let { it.atMillis - origin }} " +
             "destroyedSeenAtMs=${destroyed?.let { it.atMillis - origin }}"
+    }
+
+    /**
+     * The sampler's own costs, in ms from the first sampled frame: the slowest frame's steps, the
+     * worst tag round trip and capture over the trial, and every cover-proof screenshot (start
+     * offset and duration). A frame gap that coincides with a proof or a slow step is the
+     * harness's own; one that does not is the surface's.
+     */
+    private fun samplerShape(frames: List<ExposureFrame>, proofs: List<Pair<Long, Long>>): String {
+        if (frames.isEmpty()) return "none"
+        val origin = frames.first().atMillis
+        val slowest = frames.maxByOrNull { frame ->
+            frame.tagsBeforeMillis + frame.captureMillis + frame.tagsAfterMillis + frame.tallyMillis
+        } ?: return "none"
+        return "slowestFrameAtMs=${slowest.atMillis - origin} " +
+            "tagsBefore=${slowest.tagsBeforeMillis} capture=${slowest.captureMillis} " +
+            "tagsAfter=${slowest.tagsAfterMillis} tally=${slowest.tallyMillis} " +
+            "maxTagsMs=${frames.maxOf { maxOf(it.tagsBeforeMillis, it.tagsAfterMillis) }} " +
+            "maxCaptureMs=${frames.maxOf { it.captureMillis }} " +
+            "proofs=${proofs.joinToString(";") { (at, took) -> "atMs=${at - origin}:${took}ms" }}"
     }
 
     /** The last basemap load state any frame saw, or null if no frame ever carried one. */

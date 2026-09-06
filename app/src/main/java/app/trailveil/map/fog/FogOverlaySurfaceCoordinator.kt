@@ -86,7 +86,15 @@ interface FogOverlayPort {
      */
     fun beginRebuild(handover: Boolean, paletteRotation: Boolean): Long
 
+    /** Attaches [generationId]'s overlay HIDDEN: it pre-renders while nothing on screen changes. */
     fun attachOverlay(generationId: Long)
+
+    /**
+     * `V02-012` design 2: in ONE main-thread turn, shows [generationId] at the fog display opacity
+     * and hides [previousGenerationId] (if any). The binding never interleaves other renderer
+     * work between the two, so the SDK can apply both in the same frame.
+     */
+    fun revealOverlay(generationId: Long, previousGenerationId: Long?)
 
     /** False means stale/native content may still be visible and the composition must terminate. */
     fun removeOverlay(generationId: Long): Boolean
@@ -101,6 +109,11 @@ interface FogOverlayPort {
 /**
  * Visual-proof side effects. The implementation owns the SP8-measured retry cadence
  * (250 ms x 10); [prove]'s callback delivers the FINAL verdict on the main thread.
+ *
+ * `V02-012` design 2: the proof is a VERIFICATION of an overlay that is already revealed at the
+ * fog display opacity (a translucent layer cannot be proven before it is shown without a visible
+ * darkening pulse, which the owner rejected). A failed verification fails closed: cover up,
+ * overlays hidden beneath it, rebuild.
  */
 interface FogSnapshotPort {
     fun prove(generationId: Long, onResult: (Boolean) -> Unit)
@@ -150,6 +163,8 @@ class FogOverlaySurfaceCoordinator(
     private val overlayPort: FogOverlayPort,
     private val snapshotPort: FogSnapshotPort,
     private val cameraPort: FogCameraPort,
+    /** Milliseconds for the timed transition trace; the binding passes its monotonic clock. */
+    private val nowMillis: () -> Long = { 0L },
 ) {
 
     /** One pending (rendering or proving) generation. */
@@ -163,6 +178,52 @@ class FogOverlaySurfaceCoordinator(
 
     var coverUp: Boolean = false
         private set
+
+    /**
+     * `V02-012` design 2: the generation revealed beneath a raised cover, whose passed verification
+     * is what lowers that cover. The cover is a View and the overlay is drawn by the provider's
+     * renderer; they are not presented in the same frame, so lowering the cover at the reveal
+     * exposes bare ground until the renderer draws the revealed overlay. The verification snapshot
+     * is the renderer's own frame with the overlay drawn. Any later raise cancels the hold: the
+     * camera has moved on and its own rebuild re-verifies.
+     */
+    private var coverHeldForVerification: Long? = null
+
+    /**
+     * The revealed generation whose verification is in flight. The snapshot port runs one proof
+     * at a time: a re-proof started meanwhile would replace this one and its verdict would never
+     * arrive, so [onStart] waits for it instead.
+     */
+    private var verificationInFlight: Long? = null
+
+    /**
+     * A predecessor whose removal is still owed to a verification that may never return.
+     *
+     * The snapshot port runs ONE proof at a time: a proof started while another is in flight
+     * replaces it, and the replaced run's callback never fires. Removal lives in that callback,
+     * so without this the predecessor's overlay, provider, masks and coverage would stay for the
+     * composition's life - an invisible tile overlay the SDK keeps requesting tiles for. At most
+     * one can be owed, and the next reveal flushes it.
+     */
+    private var overlayAwaitingRemoval: Long? = null
+
+    /** Bounded, names-and-ids-only history of state transitions, for device failure messages. */
+    private val transitions = ArrayDeque<String>()
+    private val transitionMillis = ArrayDeque<Long>()
+    val recentTransitions: List<String> get() = transitions.toList()
+
+    /** [recentTransitions] with each event's [nowMillis] reading appended as `@ms`. */
+    val recentTransitionsTimed: List<String>
+        get() = transitions.zip(transitionMillis) { event, at -> "$event@$at" }
+
+    private fun trace(event: String) {
+        if (transitions.size >= TRANSITION_TRACE_LIMIT) {
+            transitions.removeFirst()
+            transitionMillis.removeFirst()
+        }
+        transitions.addLast(event)
+        transitionMillis.addLast(nowMillis())
+    }
     var coverReason: FogCoverReason? = null
         private set
     var terminal: Boolean = false
@@ -203,13 +264,24 @@ class FogOverlaySurfaceCoordinator(
         if (terminal) return
         val installed = installedGenerationId ?: return
         if (pending != null) return
+        // V02-012: the reveal's own verification is still running for this generation; its
+        // verdict lowers the held cover and removes the previous overlay. A second proof would
+        // replace it in the single-run prover and that verdict would never come.
+        if (verificationInFlight == installed) return
+        trace("start:prove:$installed")
         snapshotPort.prove(installed) { passed ->
             // The verdict is asynchronous (SP8: up to 250 ms x 10). A rebuild may legitimately
             // have begun meanwhile, or the installed generation may have moved on; acting on a
             // stale verdict would clobber that pending rebuild — orphaning its attached overlay
             // — or raise a spurious cover over freshly proven coverage.
-            if (passed || terminal) return@prove
+            if (terminal) return@prove
+            trace("start:verdict:$installed:$passed")
+            if (passed) {
+                releaseHeldCover(installed)
+                return@prove
+            }
             if (pending != null || installedGenerationId != installed) return@prove
+            if (coverUp && coverHeldForVerification != installed) return@prove
             raiseCover(FogCoverReason.RUNTIME_FAILURE)
             beginRebuild(handover = true, paletteRotation = paletteRotationDue)
         }
@@ -316,6 +388,7 @@ class FogOverlaySurfaceCoordinator(
         val pendingNow = pending ?: return
         if (pendingNow.generationId != generationId) return
         overlayPort.attachOverlay(generationId)
+        trace("attach:$generationId")
         pending = pendingNow.copy(overlayAttached = true)
     }
 
@@ -323,11 +396,14 @@ class FogOverlaySurfaceCoordinator(
 
     /**
      * Every tile the renderer actually requested for [generationId] has been delivered (see the
-     * class KDoc's F0 contract). The visual proof starts here.
+     * class KDoc's F0 contract). `V02-012` design 2: the delivered generation is revealed here
+     * (atomically with hiding the previous one and lowering the cover), and its screen
+     * verification starts on the revealed overlay.
      */
     fun onDeliveryBarrierDrained(generationId: Long) {
         var pendingNow = pending ?: return
         if (pendingNow.generationId != generationId || !pendingNow.overlayAttached) return
+        trace("delivered:$generationId")
         if (pendingNow.paletteRotation && !pendingNow.oldOverlayRemoved) {
             val previous = installedGenerationId
             if (previous != null && previous != generationId) {
@@ -343,9 +419,7 @@ class FogOverlaySurfaceCoordinator(
                 pending = pendingNow
             }
         }
-        snapshotPort.prove(generationId) { passed ->
-            if (passed) completeInstall(generationId) else failPending(generationId)
-        }
+        revealAndComplete(pendingNow)
     }
 
     fun onInstallTimeout(generationId: Long) = failPending(generationId)
@@ -438,6 +512,7 @@ class FogOverlaySurfaceCoordinator(
             handover = handover,
             paletteRotation = paletteRotation,
         )
+        trace("begin:$generationId:handover=$handover")
         pending = PendingRebuild(
             generationId = generationId,
             handover = handover,
@@ -446,25 +521,23 @@ class FogOverlaySurfaceCoordinator(
         )
     }
 
-    private fun completeInstall(generationId: Long) {
-        val pendingNow = pending ?: return
-        if (pendingNow.generationId != generationId) return
+    /**
+     * `V02-012` design 2. The delivered generation becomes the installed one. If the camera is
+     * over its coverage, it is revealed at the fog opacity in the same turn as the previous
+     * overlay is hidden, and its screen verification begins; the previous overlay is removed once
+     * that verification returns. A cover that is up at the reveal stays up until the verdict
+     * passes ([coverHeldForVerification]); at rest the reveal is visible at once. If the camera
+     * has already left its coverage, nothing is shown (the cover stays up, hiding every overlay
+     * beneath it), the previous overlay is removed at once and the follow-up rebuild reveals its
+     * successor.
+     */
+    private fun revealAndComplete(pendingNow: PendingRebuild) {
+        val generationId = pendingNow.generationId
         val previous = installedGenerationId
-        if (
-            previous != null && previous != generationId &&
-            !pendingNow.oldOverlayRemoved
-        ) {
-            // Add-before-remove completes: the old overlay leaves only after the new proof.
-            if (!overlayPort.removeOverlay(previous)) {
-                installedGenerationId = generationId
-                pending = null
-                enterTerminalFailure()
-                return
-            }
-        }
+            ?.takeIf { it != generationId && !pendingNow.oldOverlayRemoved }
         // Read the pending generation before replacing the installed-generation identity. The
-        // movement path deliberately reads only installed/proven coverage; completion instead
-        // must judge whether the generation it just proved covers the camera at this instant.
+        // movement path deliberately reads only installed coverage; completion instead must
+        // judge whether the generation it just delivered covers the camera at this instant.
         val insidePendingSurround = cameraPort.insidePendingSurround()
         installedGenerationId = generationId
         pending = null
@@ -475,12 +548,107 @@ class FogOverlaySurfaceCoordinator(
         // otherwise be lost until the next camera move.
         val outsideSurround = !insidePendingSurround
         val stale = canonicalDirty || paletteRotationDue || viewportDirty || outsideSurround
-        // The cover may only be lowered once the camera is actually over proven coverage: an
-        // install that completes while the camera sits outside the published surround must keep
-        // the §4(b) programmed-exit cover up through its follow-up rebuild.
         retryScheduled = false
-        if (!outsideSurround) lowerCover()
-        if (stale) beginRebuild(handover = true, paletteRotation = paletteRotationDue)
+        if (!flushOverlayAwaitingRemoval()) return
+        if (outsideSurround) {
+            // Nothing is shown for this generation: it stays hidden and its successor is what
+            // gets verified. So the cover must be up BEFORE the predecessor leaves, and it is not
+            // necessarily up already - the movement path raises it from the INSTALLED
+            // generation's coverage while this branch is chosen from the PENDING one's, and a
+            // camera inside the old coverage and outside the new reaches here with the cover
+            // down. Removing the predecessor then would show bare basemap for the whole of the
+            // follow-up render. (Before `V02-012` the successor was attached opaque and visible,
+            // so the predecessor could always leave; design 2 attaches it hidden.)
+            if (!coverUp) raiseCover(movingOutsideCoverReason)
+            if (previous != null && !overlayPort.removeOverlay(previous)) {
+                enterTerminalFailure()
+                return
+            }
+        } else {
+            overlayPort.revealOverlay(generationId, previous)
+            if (coverUp) coverHeldForVerification = generationId
+            verificationInFlight = generationId
+            overlayAwaitingRemoval = previous
+            trace("reveal:$generationId<$previous:held=$coverUp")
+            snapshotPort.prove(generationId) { passed ->
+                onVerification(generationId, previous, passed)
+            }
+        }
+        if (stale && pending == null && !terminal) {
+            beginRebuild(handover = true, paletteRotation = paletteRotationDue)
+        }
+    }
+
+    /**
+     * Verdict on a revealed generation. The previous overlay leaves on either outcome (it is
+     * hidden, and a failed verification raises the cover anyway). A pass lowers the cover that
+     * was held for this generation's verification, if the camera has not raised it again since.
+     * A failure fails closed for the generation that is still installed: cover up, and a handover
+     * rebuild unless one is already pending. A verdict for a generation that has since been
+     * superseded changes nothing more, because its successor verifies itself; and a failed
+     * verdict taken beneath a cover the camera raised after the reveal is moot, because that
+     * cover's own idle rebuild re-verifies the viewport (the binding hides every overlay beneath
+     * a rising cover, so such a snapshot cannot pass).
+     */
+    private fun onVerification(generationId: Long, previous: Long?, passed: Boolean) {
+        if (verificationInFlight == generationId) verificationInFlight = null
+        if (terminal) return
+        trace("verdict:$generationId:$passed")
+        if (overlayAwaitingRemoval == previous) overlayAwaitingRemoval = null
+        if (previous != null && !overlayPort.removeOverlay(previous)) {
+            enterTerminalFailure()
+            return
+        }
+        if (passed) {
+            releaseHeldCover(generationId)
+            return
+        }
+        if (installedGenerationId != generationId) return
+        if (coverUp && coverHeldForVerification != generationId) {
+            trace("moot:$generationId")
+            return
+        }
+        raiseCover(FogCoverReason.RUNTIME_FAILURE)
+        if (pending == null) beginRebuild(handover = true, paletteRotation = paletteRotationDue)
+    }
+
+    /**
+     * Removes a predecessor left owed by a verification that was superseded. Returns false when
+     * the removal failed, in which case the caller must stop: the surface is already terminal.
+     */
+    private fun flushOverlayAwaitingRemoval(): Boolean {
+        val owed = overlayAwaitingRemoval ?: return true
+        overlayAwaitingRemoval = null
+        if (owed == installedGenerationId) return true
+        if (!overlayPort.removeOverlay(owed)) {
+            enterTerminalFailure()
+            return false
+        }
+        trace("flush:$owed")
+        return true
+    }
+
+    /**
+     * The overlay port could not show a generation it was asked to reveal.
+     *
+     * The predecessor is deliberately still visible (the port only hides it once the show takes),
+     * so nothing bare is on screen yet; this raises the cover and rebuilds before the in-flight
+     * verification could return. That verdict is then moot either way: a pass finds no held cover
+     * to lower, and a failure finds the cover already up for another reason.
+     */
+    fun onRevealFailed(generationId: Long) {
+        if (terminal || installedGenerationId != generationId) return
+        trace("revealFailed:$generationId")
+        raiseCover(FogCoverReason.RUNTIME_FAILURE)
+        if (pending == null) beginRebuild(handover = true, paletteRotation = paletteRotationDue)
+    }
+
+    /** A passed verdict for the installed generation lowers the cover held for its reveal. */
+    private fun releaseHeldCover(generationId: Long) {
+        if (coverHeldForVerification == generationId && installedGenerationId == generationId) {
+            coverHeldForVerification = null
+            lowerCover()
+        }
     }
 
     /**
@@ -512,6 +680,7 @@ class FogOverlaySurfaceCoordinator(
     private fun failPending(generationId: Long) {
         val pendingNow = pending ?: return
         if (pendingNow.generationId != generationId) return
+        trace("fail:$generationId")
         pending = null
         overlayPort.cancelRebuild(generationId)
         if (pendingNow.overlayAttached && !overlayPort.removeOverlay(generationId)) {
@@ -531,17 +700,21 @@ class FogOverlaySurfaceCoordinator(
     }
 
     private fun raiseCover(reason: FogCoverReason) {
+        trace("raise:$reason")
         coverUp = true
         coverReason = reason
+        coverHeldForVerification = null
     }
 
     private fun lowerCover() {
+        trace("lower")
         coverUp = false
         coverReason = null
     }
 
     private fun enterTerminalFailure() {
         if (terminal) return
+        trace("terminal")
         val pendingNow = pending
         pending = null
         retryScheduled = false
@@ -558,6 +731,9 @@ class FogOverlaySurfaceCoordinator(
     }
 
     companion object {
+        /** Transitions kept for [recentTransitions]; enough for a few rebuild cycles. */
+        const val TRANSITION_TRACE_LIMIT = 24
+
         /** Idle sentinel for the programmed-flight ticket. */
         const val IDLE_FOG_CAMERA_FLIGHT = 0L
     }

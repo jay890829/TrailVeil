@@ -422,9 +422,16 @@ class GoogleFollowRecentreTest {
                         mapView.getTag(app.trailveil.R.id.map_fog_cover_up) == false
                 },
             )
-            val coverStartIndex = states.indexOfFirst { state ->
-                state.installedGeneration == stableGeneration && state.coverUp
+            // V02-012 design 2: a generation is installed at its reveal, beneath a held cover, so
+            // "installed and covered" first occurs at the stable generation's own install. The
+            // flight's cover is the first such state after the last healthy (uncovered) one.
+            val lastHealthyIndex = states.indexOfLast { state ->
+                state.installedGeneration == stableGeneration && !state.coverUp && state.pendingGeneration == null
             }
+            assertTrue("state stream never recorded the stable generation healthy", lastHealthyIndex >= 0)
+            val coverStartIndex = states.subList(lastHealthyIndex, states.size).indexOfFirst { state ->
+                state.installedGeneration == stableGeneration && state.coverUp
+            }.let { relative -> if (relative < 0) -1 else relative + lastHealthyIndex }
             val lowerIndex = states.indexOfFirst { state ->
                 state.installedGeneration != null &&
                     state.installedGeneration > stableGeneration &&

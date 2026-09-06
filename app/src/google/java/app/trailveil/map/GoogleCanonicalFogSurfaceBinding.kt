@@ -16,6 +16,7 @@ import app.trailveil.map.fog.FogPocMosaic
 import app.trailveil.map.fog.FogMosaicTile
 import app.trailveil.map.fog.FogPixelMask
 import app.trailveil.map.fog.FogProbeExclusionZone
+import app.trailveil.map.fog.FogRenderStyle
 import app.trailveil.map.fog.FogRequestedTileWindowRenderer
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogSnapshotPort
@@ -62,6 +63,9 @@ internal data class GoogleCanonicalFogState(
     val retryScheduled: Boolean,
     val lastCoverIntervalMillis: Long?,
     val maximumCoverIntervalMillis: Long,
+    /** V02-012: reveal beneath a raised cover to that cover's lowering on the passed verdict. */
+    val lastVerificationHoldMillis: Long? = null,
+    val maximumVerificationHoldMillis: Long = 0L,
 )
 
 /**
@@ -118,6 +122,12 @@ internal class GoogleCanonicalFogSurfaceBinding(
     @Volatile private var targetOverlayGeneration: Long? = null
     private var lastProvenRequestedKeys: Set<FogTileKey> = emptySet()
     private var bootstrapOverlay: TileOverlay? = null
+
+    /** V02-012 design 2: the cover state last seen, for its rising edge (see afterCoordinatorMutation). */
+    private var coverWasUp = false
+    private var revealedBeneathCoverAtNanos: Long? = null
+    private var lastVerificationHoldMillis: Long? = null
+    private var maximumVerificationHoldMillis: Long = 0L
     private var bootstrapProvider: GoogleFogTileProvider? = null
     private var pendingCoverageKeys: Set<FogTileKey>? = null
     private var installedCoverageKeys: Set<FogTileKey>? = null
@@ -141,6 +151,15 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private var strandedRestarts = 0
     @Volatile private var renderWork: RenderWork? = null
 
+    /** V02-012 diagnostics: the last render's key count and durations, for the gates string. */
+    private var lastRenderKeys: Int? = null
+    private var lastRenderMillis: Long? = null
+    private var lastPublishMillis: Long? = null
+
+    /** Origin of the timed traces (coordinator transitions, prover events), so they align. */
+    private val traceOriginMillis = SystemClock.elapsedRealtime()
+    private fun traceMillis(): Long = SystemClock.elapsedRealtime() - traceOriginMillis
+
     /** One generation-owned render budget, retained across a host stop. */
     private class RenderWork(
         val generation: FogTileGeneration,
@@ -162,6 +181,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         onProofObserved = onProofObserved,
         hostStopped = { hostStopped },
         onUnprovablePlan = onUnprovableProofPlan,
+        nowMillis = ::traceMillis,
     )
 
     private val overlayPort = object : FogOverlayPort {
@@ -191,7 +211,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
             actualRequests.begin(generationId)
             clearRecentRequests()
             val targetProvider = createProvider(targetGeneration = generationId)
-            val overlay = addOverlay(targetProvider, NEW_OVERLAY_Z)
+            val overlay = addOverlay(targetProvider, NEW_OVERLAY_Z, HIDDEN_FOG_TRANSPARENCY)
             if (overlay == null) {
                 targetProvider.releaseObservers()
                 handler.post { failGeneration(generationId, IllegalStateException("overlay attach failed")) }
@@ -214,6 +234,33 @@ internal class GoogleCanonicalFogSurfaceBinding(
             }
             lastRequestAtNanos = SystemClock.elapsedRealtimeNanos()
             scheduleDeliveryQuietCheck(generationId)
+        }
+
+        override fun revealOverlay(generationId: Long, previousGenerationId: Long?) {
+            assertMainThread()
+            // V02-012 design 2: one turn, no other renderer work in between, so the SDK can apply
+            // the show and the hide in the same frame. The bootstrap placeholder is already hidden
+            // and leaves in afterCoordinatorMutation once a generation is installed.
+            //
+            // The hide is conditional on the show, and that is a safety rule, not tidiness: the
+            // overlay can be absent (a post-attach failure is posted, so the coordinator already
+            // counts it attached) and `setTransparencySafely` swallows the SDK's own failures, so
+            // an unconditional hide can leave BOTH layers hidden with the cover down - bare
+            // basemap until a verification round trip notices. Keeping the predecessor visible is
+            // the fail-closed choice; `onRevealFailed` then raises the cover and rebuilds.
+            val shown = overlays[generationId]?.setTransparencySafely(VISIBLE_FOG_TRANSPARENCY) == true
+            if (!shown) {
+                handler.post {
+                    if (released) return@post
+                    coordinator.onRevealFailed(generationId)
+                    afterCoordinatorMutation()
+                }
+                return
+            }
+            previousGenerationId?.let { previous -> overlays[previous]?.setTransparencySafely(HIDDEN_FOG_TRANSPARENCY) }
+            // Beneath a raised cover the reveal is invisible until the verdict lowers the cover;
+            // the hold is measured from here to that lowering (reported in the state).
+            revealedBeneathCoverAtNanos = if (coordinator.coverUp) SystemClock.elapsedRealtimeNanos() else null
         }
 
         override fun removeOverlay(generationId: Long): Boolean {
@@ -259,9 +306,17 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private val snapshotPort = object : FogSnapshotPort {
         override fun prove(generationId: Long, onResult: (Boolean) -> Unit) {
             assertMainThread()
+            // V02-012 design 2: this is a VERIFICATION of an overlay already revealed at the fog
+            // display opacity; the prover reads it through the revealed-fog window.
             snapshotProver.prove(generationId) { passed ->
                 if (released) return@prove
                 onResult(passed)
+                // A refuted generation that is still the installed one stays hidden with the rest
+                // beneath the cover the coordinator has just raised or kept (no rising edge
+                // happens while the cover is already up); its successor is revealed anew.
+                if (!passed && coordinator.coverUp && coordinator.installedGenerationId == generationId) {
+                    hideOverlaysBeneathCover()
+                }
                 afterCoordinatorMutation()
                 // Complete-install staleness checks run inside onResult. Only notify the overlay
                 // renderer after the coordinator still owns this generation as installed and
@@ -294,9 +349,11 @@ internal class GoogleCanonicalFogSurfaceBinding(
     }
 
     init {
-        coordinator = FogOverlaySurfaceCoordinator(overlayPort, snapshotPort, cameraPort)
+        coordinator = FogOverlaySurfaceCoordinator(overlayPort, snapshotPort, cameraPort, nowMillis = ::traceMillis)
         bootstrapProvider = createProvider(targetGeneration = null)
-        bootstrapOverlay = addOverlay(requireNotNull(bootstrapProvider), OLD_OVERLAY_Z)
+        // V02-012 design 2: the fog-coloured cover is what hides the map before the first
+        // generation; the placeholder overlay exists for the adapter handover and stays hidden.
+        bootstrapOverlay = addOverlay(requireNotNull(bootstrapProvider), OLD_OVERLAY_Z, HIDDEN_FOG_TRANSPARENCY)
         if (bootstrapOverlay == null) {
             coordinator.onFirstComposition()
             coordinator.onFogRuntimeFailure()
@@ -372,7 +429,6 @@ internal class GoogleCanonicalFogSurfaceBinding(
         if (released) return
         cameraEpoch += 1L
         clearRecentRequests()
-        armPaletteRotationIfNeeded()
         coordinator.onCameraMoveStarted(reason.toFogReason())
         afterCoordinatorMutation()
     }
@@ -389,7 +445,6 @@ internal class GoogleCanonicalFogSurfaceBinding(
         assertMainThread()
         if (released || !baselineReady || !mapLoaded) return
         cameraEpoch += 1L
-        armPaletteRotationIfNeeded()
         coordinator.onCameraIdle()
         afterCoordinatorMutation()
     }
@@ -482,8 +537,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
                         FogSynchronizationRenderDecision.REFRESH_CURRENT_CAMERA
                     ) {
                         coordinator.onCanonicalRefreshRequired()
-                        armPaletteRotationIfNeeded()
-                        coordinator.onCameraIdle()
+                                        coordinator.onCameraIdle()
                         afterCoordinatorMutation()
                     }
                 }
@@ -547,7 +601,10 @@ internal class GoogleCanonicalFogSurfaceBinding(
             "coordinator[pending=${coordinator.pendingGenerationId} " +
             "installed=${coordinator.installedGenerationId} coverUp=${coordinator.coverUp} " +
             "reason=${coordinator.coverReason} terminal=${coordinator.terminal} " +
-            "retry=${coordinator.retryScheduled}] overlays=${overlays.keys} " +
+            "retry=${coordinator.retryScheduled} trace=${coordinator.recentTransitionsTimed}] " +
+            "render=[keys=$lastRenderKeys renderMs=$lastRenderMillis publishMs=$lastPublishMillis] " +
+            "prover=${snapshotProver.recentEvents} " +
+            "overlays=${overlays.keys} " +
             "target=$targetOverlayGeneration bootstrapOverlay=${bootstrapOverlay != null} " +
             "masks=${masksByGeneration.keys} pendingKeys=${pendingCoverageKeys?.size} " +
             "installedKeys=${installedCoverageKeys?.size} " +
@@ -558,7 +615,6 @@ internal class GoogleCanonicalFogSurfaceBinding(
 
     private fun requestCurrentViewportIfReady() {
         if (released || !baselineReady || !mapLoaded) return
-        armPaletteRotationIfNeeded()
         coordinator.onCameraIdle()
         afterCoordinatorMutation()
     }
@@ -621,11 +677,14 @@ internal class GoogleCanonicalFogSurfaceBinding(
         val job = scope.launch {
             var commitStarted = false
             try {
+                val renderStartedAtMillis = SystemClock.elapsedRealtime()
                 val masks = withTimeout(lease.remainingMillis.coerceAtLeast(1L)) {
                     withContext(Dispatchers.IO) {
                         requestedRenderer.render(work.coverage.center, work.requested)
                     }
                 }
+                lastRenderKeys = work.requested.size
+                lastRenderMillis = SystemClock.elapsedRealtime() - renderStartedAtMillis
                 ensureActive()
                 if (!isCurrentRender(work, lease)) return@launch
 
@@ -636,6 +695,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
                 if (!work.budget.complete(lease)) return@launch
                 work.activeLease = null
                 commitStarted = true
+                val publishStartedAtMillis = SystemClock.elapsedRealtime()
                 val published = withContext(Dispatchers.Default) {
                     if (!isCurrentRenderWork(work)) {
                         null
@@ -643,6 +703,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
                         adapter.publishMasks(work.generation, masks)
                     }
                 }
+                lastPublishMillis = SystemClock.elapsedRealtime() - publishStartedAtMillis
                 ensureActive()
                 if (!isCurrentRenderWork(work)) return@launch
                 if (published != true) {
@@ -958,6 +1019,11 @@ internal class GoogleCanonicalFogSurfaceBinding(
         pausedInstallTimeoutGeneration?.let { owner ->
             if (pending != owner) cancelInstallTimeout(owner)
         }
+        // V02-012 design 2: on the cover's rising edge every overlay is hidden beneath it, so the
+        // interval reads as uniform fog rather than fog stacked on fog. A generation revealed
+        // beneath the raised cover for its verification stays visible: that edge has passed.
+        if (coordinator.coverUp && !coverWasUp) hideOverlaysBeneathCover()
+        coverWasUp = coordinator.coverUp
         publishCoverInterval(coordinator.coverUp)
         onStateChanged(state())
         if (coordinator.terminal && !terminalPublished) {
@@ -970,8 +1036,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
                 {
                     retryPosted = false
                     if (!released) {
-                        armPaletteRotationIfNeeded()
-                        coordinator.onRetryFogOperation()
+                                        coordinator.onRetryFogOperation()
                         afterCoordinatorMutation()
                     }
                 },
@@ -1011,6 +1076,12 @@ internal class GoogleCanonicalFogSurfaceBinding(
         coverDeadline = null
     }
 
+    private fun hideOverlaysBeneathCover() {
+        (overlays.values + listOfNotNull(bootstrapOverlay)).forEach { overlay ->
+            overlay.setTransparencySafely(HIDDEN_FOG_TRANSPARENCY)
+        }
+    }
+
     private fun publishCoverInterval(coverUp: Boolean) {
         val now = SystemClock.elapsedRealtimeNanos()
         if (coverUp && !lastPublishedCoverUp) {
@@ -1018,6 +1089,11 @@ internal class GoogleCanonicalFogSurfaceBinding(
             if (!hostStopped) armCoverDeadline()
         } else if (!coverUp && lastPublishedCoverUp) {
             cancelCoverDeadline()
+            revealedBeneathCoverAtNanos?.let { revealed ->
+                lastVerificationHoldMillis = (now - revealed) / NANOS_PER_MILLISECOND
+                maximumVerificationHoldMillis = maxOf(maximumVerificationHoldMillis, requireNotNull(lastVerificationHoldMillis))
+            }
+            revealedBeneathCoverAtNanos = null
             val raised = coverRaisedAtNanos
             if (raised != null) {
                 lastCoverIntervalMillis = (now - raised) / NANOS_PER_MILLISECOND
@@ -1040,6 +1116,8 @@ internal class GoogleCanonicalFogSurfaceBinding(
         retryScheduled = coordinator.retryScheduled,
         lastCoverIntervalMillis = lastCoverIntervalMillis,
         maximumCoverIntervalMillis = maximumCoverIntervalMillis,
+        lastVerificationHoldMillis = lastVerificationHoldMillis,
+        maximumVerificationHoldMillis = maximumVerificationHoldMillis,
     )
 
     private fun requestedKeysForRender(): Set<FogTileKey> = synchronized(recentRequestLock) {
@@ -1138,12 +1216,13 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private fun addOverlay(
         tileProvider: GoogleFogTileProvider,
         zIndex: Float,
+        transparency: Float,
     ): TileOverlay? = try {
         map.addTileOverlay(
             TileOverlayOptions()
                 .tileProvider(tileProvider)
                 .fadeIn(false)
-                .transparency(0F)
+                .transparency(transparency)
                 .zIndex(zIndex),
         )
     } catch (_: Exception) {
@@ -1151,6 +1230,22 @@ internal class GoogleCanonicalFogSurfaceBinding(
     } catch (_: LinkageError) {
         null
     }
+
+    /**
+     * V02-012: display opacity of a fog overlay. Tiles stay fully opaque PNGs; the SDK-side
+     * transparency hides a pre-rendering overlay or shows a revealed one at the shared fog
+     * opacity. A thrown SDK error leaves the overlay as it was; the screen verification that
+     * follows every reveal is what catches a reveal that did not take.
+     */
+    private fun TileOverlay.setTransparencySafely(value: Float): Boolean =
+        try {
+            transparency = value
+            true
+        } catch (_: Exception) {
+            false
+        } catch (_: LinkageError) {
+            false
+        }
 
     private fun TileOverlay.removeSafely(): Boolean =
         try {
@@ -1161,13 +1256,6 @@ internal class GoogleCanonicalFogSurfaceBinding(
         } catch (_: LinkageError) {
             false
         }
-
-    private fun armPaletteRotationIfNeeded() {
-        val nextId = lastGenerationId + 1L
-        if (FogTilePngCodec.generationStartsNewPaletteCycle(nextId)) {
-            coordinator.onPaletteRotationDue()
-        }
-    }
 
     private fun publishFogRenderForCompatibility(
         coverage: FogViewportCoverageRequest,
@@ -1217,5 +1305,18 @@ internal class GoogleCanonicalFogSurfaceBinding(
         const val OLD_OVERLAY_Z = 10F
         const val NEW_OVERLAY_Z = 20F
         const val BOOTSTRAP_PLACEHOLDER_GENERATION = Long.MIN_VALUE
+
+        /**
+         * V02-012 design 2: an overlay that pre-renders (attached, delivering) or waits beneath
+         * the cover is fully transparent; the SDK still requests and draws its tiles.
+         */
+        const val HIDDEN_FOG_TRANSPARENCY = 1F
+
+        /**
+         * V02-012 (owner decision 2026-09-06): a revealed overlay is shown at the same opacity as
+         * the other provider's fog, `FogRenderStyle.fogAlpha` / 255 (184 / 255), so the basemap
+         * reads faintly through unexplored ground on both providers.
+         */
+        val VISIBLE_FOG_TRANSPARENCY: Float = 1F - FogRenderStyle().fogAlpha / 255F
     }
 }
