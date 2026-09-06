@@ -195,8 +195,8 @@ try {
     }
     $expectedFacts = [ordered]@{
         applicationId = 'app.trailveil'
-        versionName = '0.1.0'
-        versionCode = '1'
+        versionName = '0.2.0'
+        versionCode = '2'
         minSdk = '34'
         targetSdk = '36'
         debuggable = 'false'
@@ -221,7 +221,7 @@ try {
     ) {
         throw 'Internal and release APKs do not share applicationId app.trailveil.'
     }
-    if ($internalVersionName.Count -ne 1 -or $internalVersionName[0].Trim() -ne '0.1.0-internal') {
+    if ($internalVersionName.Count -ne 1 -or $internalVersionName[0].Trim() -ne '0.2.0-internal') {
         throw "Unexpected internal lineage version name: $($internalVersionName -join ', ')."
     }
     if ($internalVersionCode.Count -ne 1 -or $internalVersionCode[0].Trim() -notmatch '^\d+$') {
@@ -246,8 +246,8 @@ try {
         '.field public static final BUILD_TYPE:Ljava/lang/String; = "release"',
         '.field public static final DEBUG:Z = false',
         ".field public static final GIT_COMMIT:Ljava/lang/String; = `"$head`"",
-        '.field public static final VERSION_CODE:I = 0x1',
-        '.field public static final VERSION_NAME:Ljava/lang/String; = "0.1.0"'
+        '.field public static final VERSION_CODE:I = 0x2',
+        '.field public static final VERSION_NAME:Ljava/lang/String; = "0.2.0"'
     )
     foreach ($field in $expectedBuildConfigFields) {
         if ($field -notin $buildConfig) {

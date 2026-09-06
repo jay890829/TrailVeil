@@ -371,8 +371,11 @@ android {
         applicationId = "app.trailveil"
         minSdk = 34
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.1.0"
+        // V02-009: 0.2.0 is the first update over the public 0.1.0 (code 1). Same application
+        // ID, same lifetime signer, higher code, so Android installs it in place and the
+        // non-backed-up history survives; the release gate pins all three.
+        versionCode = 2
+        versionName = "0.2.0"
 
         // P5-002. Read on screen by the About row; also the only way a field report can name the
         // exact tree an installed internal APK came from.
