@@ -5,7 +5,9 @@ import android.graphics.Color
 import android.graphics.Rect
 import android.os.SystemClock
 import android.view.TextureView
+import androidx.core.graphics.createBitmap
 import androidx.core.graphics.get
+import androidx.core.graphics.scale
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -48,7 +50,7 @@ class GoogleFogHiddenOverlayPreRenderSpikeTest {
         val firstRequestNanos = AtomicLong(0L)
         val lastRequestNanos = AtomicLong(0L)
         private val png: ByteArray = run {
-            val bitmap = Bitmap.createBitmap(TILE_PX, TILE_PX, Bitmap.Config.ARGB_8888)
+            val bitmap = createBitmap(TILE_PX, TILE_PX)
             bitmap.eraseColor(Color.MAGENTA)
             val stream = ByteArrayOutputStream()
             bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
@@ -269,7 +271,7 @@ class GoogleFogHiddenOverlayPreRenderSpikeTest {
         val surface = with(SpikeScenarioSupport) { mapView.findRenderSurface() }
         val fast = (surface as? TextureView)?.let { texture ->
             try {
-                val small = Bitmap.createBitmap(texture.width / DOWNSCALE, texture.height / DOWNSCALE, Bitmap.Config.ARGB_8888)
+                val small = createBitmap(texture.width / DOWNSCALE, texture.height / DOWNSCALE)
                 texture.getBitmap(small)
                 SpikeScenarioSupport.CaptureResult(small, "TEXTURE_VIEW_QUARTER")
             } catch (_: Exception) {
@@ -301,7 +303,7 @@ class GoogleFogHiddenOverlayPreRenderSpikeTest {
             y += stride
         }
         val png = saveAs?.let { name ->
-            val scaled = if (fast != null) bitmap else Bitmap.createScaledBitmap(bitmap, bitmap.width / 4, bitmap.height / 4, true)
+            val scaled = if (fast != null) bitmap else bitmap.scale(bitmap.width / 4, bitmap.height / 4)
             SpikeEvidence.savePng(context, scaled, "prerender-$name.png").also { if (scaled !== bitmap) scaled.recycle() }
         }
         bitmap.recycle()
