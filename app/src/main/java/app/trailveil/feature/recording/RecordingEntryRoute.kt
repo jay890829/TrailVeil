@@ -54,6 +54,7 @@ import kotlinx.coroutines.withContext
 internal fun RecordingEntryRoute(
     activity: ComponentActivity,
     onOpenHistory: () -> Unit = {},
+    onOpenNotices: () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     DisposableEffect(Unit) {
@@ -736,6 +737,7 @@ internal fun RecordingEntryRoute(
         onBackgroundStartAction = { activity.openAppDetailsSettings() },
         onDismissBackgroundStartNotice = { backgroundStartNotice = false },
         onOpenHistory = onOpenHistory,
+        onOpenNotices = onOpenNotices,
         fogRuntime = fogRuntime,
         fogRequired = true,
         cameraRequest = cameraRequest,

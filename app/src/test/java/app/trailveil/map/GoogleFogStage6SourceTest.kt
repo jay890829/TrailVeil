@@ -463,10 +463,27 @@ class GoogleFogStage6SourceTest {
                     )
                 }
             }
-        assertFalse(
-            "no map style resource ships either",
-            moduleRoot().resolve("src/google/res/raw").exists(),
-        )
+        // No map STYLE resource ships either. This used to assert that `src/google/res/raw` did not
+        // exist at all, which was a cheap proxy for the same thing and stopped being true in
+        // `V02-016`: that directory now holds the Google build's third-party legal notices, which
+        // are text and are not a style. The ban is therefore stated as what criterion 6 forbids -
+        // a JSON style document, by extension and by the keys the SDK's own styling format uses -
+        // so a real map style still cannot arrive here under any filename.
+        moduleRoot().resolve("src/google/res/raw").listFiles().orEmpty().forEach { file ->
+            assertFalse(
+                "${file.name} is a JSON resource in the Google raw set; criterion 6 forbids a map " +
+                    "style resource and this is the shape one would take",
+                file.extension.equals("json", ignoreCase = true),
+            )
+            val text = file.readText()
+            listOf("\"featureType\"", "\"elementType\"", "\"stylers\"").forEach { marker ->
+                assertFalse(
+                    "${file.name} contains $marker, which is Google's map-styling format, and " +
+                        "criterion 6 forbids styling the production map",
+                    text.contains(marker),
+                )
+            }
+        }
     }
 
     /**

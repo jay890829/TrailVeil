@@ -9,6 +9,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -20,11 +21,17 @@ import app.trailveil.data.history.RecordingHistoryDetail
 import app.trailveil.data.history.RecordingHistorySession
 import app.trailveil.feature.history.RecordingHistoryDetailScreen
 import app.trailveil.feature.history.RecordingHistoryListScreen
+import app.trailveil.feature.notices.ThirdPartyNoticesScreen
 import app.trailveil.feature.recording.RecordingEntryRoute
+import app.trailveil.map.ProductionMapProvider
+import app.trailveil.map.providerThirdPartyNotices
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.withContext
 
 internal const val RecordingRoute = "recording"
 internal const val HistoryRoute = "history"
+internal const val NoticesRoute = "notices"
 private const val HistorySessionIdArgument = "sessionId"
 private const val HistoryDetailRoutePattern = "history/{$HistorySessionIdArgument}"
 
@@ -61,6 +68,7 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
             RecordingEntryRoute(
                 activity = activity,
                 onOpenHistory = { navController.navigate(HistoryRoute) },
+                onOpenNotices = { navController.navigate(NoticesRoute) },
             )
         }
         composable(
@@ -86,6 +94,17 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
             )
         }
         composable(
+            route = NoticesRoute,
+            popExitTransition = {
+                slideOutOfContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Right,
+                    animationSpec = tween(HistoryBackTransitionDurationMillis),
+                )
+            },
+        ) {
+            ThirdPartyNoticesRoute(onBack = navController::popBackStack)
+        }
+        composable(
             route = HistoryDetailRoutePattern,
             arguments = listOf(
                 navArgument(HistorySessionIdArgument) { type = NavType.LongType },
@@ -108,6 +127,30 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
 }
 
 internal const val HistoryBackTransitionDurationMillis = 250
+
+/**
+ * `V02-016`: the notices of whichever provider this variant was compiled with.
+ *
+ * Read off the main thread and behind a loading state, because one provider answers from a 76 KB
+ * packaged resource and the other from a call into Play services - neither belongs on the
+ * composition's dispatcher, and an empty screen while it happens would read as "there are none".
+ */
+@Composable
+private fun ThirdPartyNoticesRoute(onBack: () -> Unit) {
+    val context = LocalContext.current
+    var notices by remember(context) { mutableStateOf<String?>(null) }
+    var loading by remember(context) { mutableStateOf(true) }
+    LaunchedEffect(context) {
+        notices = withContext(Dispatchers.IO) { providerThirdPartyNotices(context) }
+        loading = false
+    }
+    ThirdPartyNoticesScreen(
+        providerName = ProductionMapProvider.providerName,
+        notices = notices,
+        onBack = onBack,
+        loading = loading,
+    )
+}
 
 @Composable
 private fun RecordingHistoryListRoute(

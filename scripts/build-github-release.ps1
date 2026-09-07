@@ -397,6 +397,12 @@ try {
     if ($packagedNoticeDigest -ne $expectedNoticeDigest) {
         throw "Packaged MapLibre notice digest $packagedNoticeDigest is incomplete or altered."
     }
+    # V02-016, the mirror of the Google side's own check: a Google artifact inside the MapLibre APK
+    # is the same V02-008 defect pointing the other way, and the notices are the piece of it a
+    # source-set mistake would move first.
+    if ($resourceText.Contains('google_third_party_notices')) {
+        throw 'Refusing to release: the candidate APK packages the Google third-party notices.'
+    }
 
     $postBuildStatus = @(Invoke-CheckedNative -FilePath 'git' `
         -ArgumentList @('-C', $repositoryRoot, 'status', '--porcelain', '--untracked-files=normal') `
@@ -618,6 +624,45 @@ try {
         # was split to prevent, so it is asserted on the artifact rather than assumed from the split.
         if ($googleResourceText.Contains('maplibre_third_party_notices')) {
             throw 'Refusing to release the Google APK: it packages the MapLibre third-party notices.'
+        }
+        # V02-016. The absence above is only half of it: an APK that packages NEITHER provider's
+        # notices would pass every check here while shipping a map with no attributions reachable
+        # from the app at all. So the presence is asserted too, and pinned by digest the way the
+        # MapLibre notice is, because a truncated or half-regenerated harvest is the failure this
+        # cannot otherwise see. The text is Google's own, taken from the `third_party_licenses.txt`
+        # and `.json` files each Play services AAR carries at its root; regenerate it and update
+        # this digest together, never one without the other.
+        $expectedGoogleNoticeDigest = '5feb0606e8600dc72bfddbcb834da6b472841925019b23327b0d928a4b38f223'
+        $googleNoticeSource = Join-Path $repositoryRoot 'app/src/google/res/raw/google_third_party_notices.txt'
+        $googleSourceNoticeDigest = Get-NormalizedTextSha256 -Text ([IO.File]::ReadAllText($googleNoticeSource))
+        if ($googleSourceNoticeDigest -ne $expectedGoogleNoticeDigest) {
+            throw "Google notice source digest $googleSourceNoticeDigest is not the pinned harvest."
+        }
+        $googleNoticeEntryMatch = [regex]::Match(
+            $googleResourceText,
+            'raw/google_third_party_notices[\s\S]*?\(file\)\s+(\S+)'
+        )
+        if (-not $googleNoticeEntryMatch.Success) {
+            throw 'Refusing to release the Google APK: it does not package the Google third-party notices resource.'
+        }
+        $googleArchive = [System.IO.Compression.ZipFile]::OpenRead($candidateGoogleApk)
+        try {
+            $googleNoticeEntry = $googleArchive.GetEntry($googleNoticeEntryMatch.Groups[1].Value)
+            if ($null -eq $googleNoticeEntry) {
+                throw 'The compiled Google notice resource has no APK ZIP entry.'
+            }
+            $googleNoticeReader = [IO.StreamReader]::new($googleNoticeEntry.Open(), [Text.UTF8Encoding]::new($false))
+            try {
+                $packagedGoogleNotice = $googleNoticeReader.ReadToEnd()
+            } finally {
+                $googleNoticeReader.Dispose()
+            }
+        } finally {
+            $googleArchive.Dispose()
+        }
+        $packagedGoogleNoticeDigest = Get-NormalizedTextSha256 -Text $packagedGoogleNotice
+        if ($packagedGoogleNoticeDigest -ne $expectedGoogleNoticeDigest) {
+            throw "Packaged Google notice digest $packagedGoogleNoticeDigest is incomplete or altered."
         }
 
         $googleDexPackages = @(Invoke-CheckedNative -FilePath $apkanalyzer `

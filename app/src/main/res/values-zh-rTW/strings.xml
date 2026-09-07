@@ -66,4 +66,10 @@
     <string name="map_center_latest_location">移至最新記錄位置並持續跟隨</string>
     <string name="map_following_latest_location">移至最新記錄位置（跟隨中）</string>
     <string name="history_open">探索歷史</string>
+    <string name="notices_menu">開放原始碼授權</string>
+    <string name="notices_title">開放原始碼授權</string>
+    <string name="notices_provider">這個版本使用 %1$s 繪製地圖。以下是它所包含的開放原始碼元件授權聲明。</string>
+    <string name="notices_back">返回</string>
+    <string name="notices_loading">正在載入授權聲明…</string>
+    <string name="notices_unavailable">無法載入這個版本的授權聲明。</string>
 </resources>

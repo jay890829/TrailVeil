@@ -163,6 +163,7 @@ internal object RecordingEntryTestTags {
     const val History = "recording_entry_history"
     const val Menu = "recording_entry_menu"
     const val Privacy = "recording_entry_privacy"
+    const val Notices = "recording_entry_notices"
     const val PrivacySheet = "recording_entry_privacy_sheet"
     const val PrivacyDismiss = "recording_entry_privacy_dismiss"
     const val RecordingStateDismiss = "recording_entry_recording_state_dismiss"
@@ -182,6 +183,7 @@ internal fun RecordingEntryScreen(
     modifier: Modifier = Modifier,
     onRecenter: () -> Unit = {},
     onOpenHistory: () -> Unit = {},
+    onOpenNotices: () -> Unit = {},
     onUserMovedCamera: () -> Unit = {},
     onBackgroundStartAction: () -> Unit = {},
     onDismissBackgroundStartNotice: () -> Unit = {},
@@ -284,6 +286,7 @@ internal fun RecordingEntryScreen(
                     onStart = onStart,
                     onStop = onStop,
                     onOpenHistory = onOpenHistory,
+                    onOpenNotices = onOpenNotices,
                     onOpenPrivacy = { privacyRequested = true },
                 )
                 Column(
@@ -393,6 +396,7 @@ private fun RecordingEntryMenu(
     onStart: () -> Unit,
     onStop: () -> Unit,
     onOpenHistory: () -> Unit,
+    onOpenNotices: () -> Unit,
     onOpenPrivacy: () -> Unit,
 ) {
     Box {
@@ -467,6 +471,16 @@ private fun RecordingEntryMenu(
                     onOpenPrivacy()
                 },
                 modifier = Modifier.testTag(RecordingEntryTestTags.Privacy),
+            )
+            // `V02-016`: reachable from the app, on both published APKs, each showing only its own
+            // provider's notices. Which set that is was decided at compile time by the source set.
+            DropdownMenuItem(
+                text = { Text(text = stringResource(R.string.notices_menu)) },
+                onClick = {
+                    onExpandedChange(false)
+                    onOpenNotices()
+                },
+                modifier = Modifier.testTag(RecordingEntryTestTags.Notices),
             )
         }
     }
