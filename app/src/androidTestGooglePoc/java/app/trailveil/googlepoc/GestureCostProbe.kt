@@ -7,6 +7,8 @@ import android.os.Debug
 import android.util.SparseIntArray
 import android.view.View
 import androidx.core.app.FrameMetricsAggregator
+import androidx.core.util.isEmpty
+import androidx.core.util.size
 
 /**
  * The two numbers `V03-011` needs that the pixel audit does not measure: frame cost and memory.
@@ -63,11 +65,11 @@ internal class GestureCostProbe private constructor(private val activity: Activi
     }
 
     private fun summarize(histogram: SparseIntArray?): GestureCost {
-        if (histogram == null || histogram.size() == 0) return GestureCost.NOT_MEASURED
+        if (histogram == null || histogram.isEmpty()) return GestureCost.NOT_MEASURED
         var total = 0
         var frozen = 0
         var worstMillis = 0
-        repeat(histogram.size()) { index ->
+        repeat(histogram.size) { index ->
             val durationMillis = histogram.keyAt(index)
             val count = histogram.valueAt(index)
             total += count
@@ -79,7 +81,7 @@ internal class GestureCostProbe private constructor(private val activity: Activi
         val percentileRank = (total * 95 + 99) / 100
         var cumulative = 0
         var p95Millis = 0
-        repeat(histogram.size()) { index ->
+        repeat(histogram.size) { index ->
             if (cumulative < percentileRank) {
                 cumulative += histogram.valueAt(index)
                 p95Millis = histogram.keyAt(index)
