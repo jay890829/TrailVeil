@@ -27,6 +27,7 @@ import app.trailveil.map.GoogleFogCoverageProfile
 import app.trailveil.map.GoogleMapSurfaceTestActivity
 import app.trailveil.map.GoogleMapSurfaceTestHooks
 import app.trailveil.map.ProviderStartupDecision
+import app.trailveil.map.fog.WebMercator
 import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.GoogleMap
 import com.google.android.gms.maps.MapView
@@ -39,6 +40,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
+import kotlin.math.floor
+import kotlin.math.hypot
 import org.junit.Assert.assertTrue
 
 /**
@@ -843,6 +846,15 @@ internal enum class GestureKind(
     val minimumTiltDegrees: Float? = null,
     val minimumBearingDegrees: Float? = null,
     /**
+     * Minimum ground translation, in TILES at the trial's floor zoom.
+     *
+     * Tiles rather than metres or pixels on purpose: the fog's published set is a tile rectangle
+     * and `V03-011` arm 1's ring is measured in tiles, so a pan of N tiles against a ring of p
+     * tiles is a direct comparison rather than a conversion. It is a distance, never a position -
+     * this audit stays coordinate-free.
+     */
+    val minimumPanTiles: Float? = null,
+    /**
      * True where the gesture provably leaves the published surround, so `coverRose` may be
      * required rather than merely bounded when it happens. Every zoom-OUT kind qualifies: the
      * viewport grows past the tile set the installed generation published, which is exactly the
@@ -897,6 +909,31 @@ internal enum class GestureKind(
         minimumTiltDegrees = 15f,
         requiresCoverToRise = true,
         startZoomHeadroomBelow = 2.5f,
+    ),
+
+    /**
+     * `V03-011`, and the reason it exists: **a padding ring is a pan device**, and until now this
+     * audit had no pan.
+     *
+     * `FogPaddingRingSurroundTest` establishes that a coverage key carries the zoom it was planned
+     * at, so a ring of any size is defeated by one integer zoom step. Four of the five kinds above
+     * are zoom gestures and the fifth turns the camera; running them under the ring arm would
+     * produce numbers that are structurally guaranteed to show no benefit, and would read as
+     * "prefetch does not work".
+     *
+     * [requiresCoverToRise] for the same reason a zoom-out qualifies: at the shipped
+     * `DEFAULT_PADDING_TILES = 0` the published rectangle is the visible one, so translating a
+     * whole tile leaves it, which is exactly what `onCameraMoveFrame` raises the cover on. That is
+     * the BASELINE expectation; under `PADDING_RING` the arm sets `coverExpected = false` and the
+     * same clause inverts into `COVER_STILL_ROSE`. The A/B is that inversion.
+     *
+     * No animation tail: the driver holds still before lifting precisely so the SDK's fling
+     * inertia never starts, which keeps this a pan rather than a fling.
+     */
+    PAN(
+        label = "oneFingerPan",
+        minimumPanTiles = 1.0f,
+        requiresCoverToRise = true,
     ),
 }
 
@@ -1116,6 +1153,26 @@ internal data class GestureTrialReport(
     val bearingDelta: Float
         get() = ((after.bearing - before.bearing) % 360f + 540f) % 360f - 180f
 
+    /**
+     * How far the camera centre travelled, in tiles at the floor zoom - a DISTANCE, never a place.
+     *
+     * Uses the fog's own projection rather than a private one, so the number is in the same units
+     * as the coverage planner's rectangle and can be compared to a ring's `paddingTiles` directly.
+     * The longitude difference is wrapped to the shortest way round, so a pan across the
+     * antimeridian reads as the small number it is instead of nearly a whole world.
+     */
+    val panTiles: Double
+        get() {
+            val zoom = floor(before.zoom.toDouble()).toInt().coerceIn(0, 22)
+            val tilesAcross = (1L shl zoom).toDouble()
+            val rawX = WebMercator.normalizedX(after.target.longitude) -
+                WebMercator.normalizedX(before.target.longitude)
+            val wrappedX = ((rawX + 1.5) % 1.0) - 0.5
+            val deltaY = WebMercator.normalizedY(after.target.latitude) -
+                WebMercator.normalizedY(before.target.latitude)
+            return hypot(wrappedX * tilesAcross, deltaY * tilesAcross)
+        }
+
     val touchDownGrowth: Int get() = touchDownsAfter - touchDownsBefore
 
     /** Per-frame reference: the start floor inside the gesture, the envelope of both after it. */
@@ -1185,6 +1242,7 @@ internal data class GestureTrialReport(
             "startZoom=${"%.3f".format(before.zoom)} " +
             "zoomDelta=${"%.3f".format(zoomDelta)} tiltDelta=${"%.2f".format(tiltDelta)} " +
             "bearingDelta=${"%.2f".format(bearingDelta)} " +
+            "panTiles=${"%.3f".format(panTiles)} " +
             "generation=$generationBefore->$generationAfter " +
             "touchDowns=$touchDownsBefore->$touchDownsAfter " +
             "injectedDowns=${drive.injectedDownCount} " +
@@ -2372,6 +2430,14 @@ internal object GestureExposureVerdict {
                 failures += "GESTURE_SWALLOWED - the camera turned by " +
                     "${"%.2f".format(abs(report.bearingDelta))} degrees, under the $minimum this " +
                     "kind must achieve: $line"
+            }
+        }
+        kind.minimumPanTiles?.let { minimum ->
+            if (report.panTiles < minimum) {
+                failures += "GESTURE_SWALLOWED - the camera travelled " +
+                    "${"%.3f".format(report.panTiles)} tiles at the floor zoom, under the " +
+                    "$minimum this kind must achieve, so it never left the published rectangle " +
+                    "and nothing about a pan was measured: $line"
             }
         }
         if (report.touchDownGrowth != report.drive.injectedDownCount) {
