@@ -34,10 +34,42 @@ internal data class GoogleFogCoverageProfile(
         require(paddingTiles >= 0) { "paddingTiles must be non-negative" }
         require(maxTiles > 0) { "maxTiles must be positive" }
         require(maxRequestedKeys > 0) { "maxRequestedKeys must be positive" }
+        require(cacheMaxBytes > 0L) { "cacheMaxBytes must be positive" }
         require(cacheMaxEntries >= maxTiles) {
             // Otherwise the ring is rendered and immediately evicted, and the arm measures cache
             // churn while reporting it as the cost of a ring.
             "cacheMaxEntries ($cacheMaxEntries) must hold a whole plan ($maxTiles)"
+        }
+        // The publish cap is the one that decides a generation, and it is NOT the plan.
+        //
+        // `FogTileProviderAdapter.publish` REJECTS a key once `candidate.size >= maxEntries` - it
+        // never evicts - and what it is handed is the UNION of the plan with the SDK's observed
+        // requests, rectangularly completed, bounded by [maxRequestedKeys]. A budget that holds a
+        // whole plan but not a whole union fails the generation at publish time with the cover up,
+        // which is the failure this arm exists to remove. Strictly greater because the cap is
+        // `>=`: room for exactly [maxRequestedKeys] entries rejects the last key of a full union.
+        //
+        // **Asserted for ring profiles only, deliberately.** The shipped [DEFAULT] sits exactly on
+        // that boundary (256 entries against a 256-key union) and has since long before this arm.
+        // Whether the shipped profile should have the extra entry is a real question and a
+        // separate change with its own verification; asserting it here would fail construction in
+        // every Google build, which is not a thing an arm-1 measurement is allowed to do.
+        if (paddingTiles > 0) {
+            require(cacheMaxEntries > maxRequestedKeys) {
+                "cacheMaxEntries ($cacheMaxEntries) must hold a whole publish " +
+                    "($maxRequestedKeys) with room for the key that reaches it"
+            }
+        }
+        require(maxRequestedKeys >= maxTiles) {
+            "maxRequestedKeys ($maxRequestedKeys) must hold the plan it is the union with " +
+                "($maxTiles)"
+        }
+        require(maxRequestedKeys <= FogViewportCoordinator.MAX_PROVIDER_VIEWPORT_TILES) {
+            // The union travels to FogViewportCoordinator.renderTiles, whose own `require` is a
+            // hard ceiling on ONE render. A profile allowed to plan a wider union than that only
+            // moves the failure to a later call, which is what the first version of this arm did.
+            "maxRequestedKeys ($maxRequestedKeys) exceeds one render's ceiling " +
+                "(${FogViewportCoordinator.MAX_PROVIDER_VIEWPORT_TILES})"
         }
     }
 
@@ -89,12 +121,18 @@ internal data class GoogleFogCoverageProfile(
                 label = "ring$paddingTiles",
                 paddingTiles = paddingTiles,
                 maxTiles = maxTiles,
-                // The union of the padded plan with the SDK's own observed requests.
-                maxRequestedKeys = maxTiles + DEFAULT_MAX_REQUESTED_KEYS,
-                cacheMaxEntries = maxTiles,
-                // Scaled with the entry count, so a fog tile's byte allowance is unchanged.
+                // The union of the padded plan with the SDK's observed requests. Capped at one
+                // render's ceiling rather than added to it: the union is what reaches
+                // `renderTiles`, so a larger bound here does not buy a larger ring, it buys a
+                // later crash. The first version of this arm asked for 512 and got exactly that.
+                maxRequestedKeys = maxTiles,
+                // One more than the union, because the publish cap rejects at `>=`.
+                cacheMaxEntries = maxTiles + 1,
+                // Scaled by entries, in Long arithmetic and in this order: the previous form
+                // divided first and would have silently produced a zero budget for any maxTiles
+                // below the default entry count.
                 cacheMaxBytes = FogTileCacheBudget().maxBytes *
-                    (maxTiles / FogTileCacheBudget().maxEntries),
+                    (maxTiles + 1).toLong() / FogTileCacheBudget().maxEntries.toLong(),
             )
         }
 

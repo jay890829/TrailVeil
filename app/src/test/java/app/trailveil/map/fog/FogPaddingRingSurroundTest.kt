@@ -159,9 +159,10 @@ class FogPaddingRingSurroundTest {
             narrowed.appliedPaddingTiles,
         )
         assertEquals(
-            "and the narrowed plan is exactly the unpadded plan, not some third thing",
-            atBudgetSize,
-            narrowed.keys.size,
+            "and the narrowed plan is exactly the unpadded plan, not some third thing of the " +
+                "same size",
+            FogViewportCoveragePlanner(paddingTiles = 0).plan(atBudget).keySet,
+            narrowed.keySet,
         )
 
         // Narrowing is not all-or-nothing: given a budget between the p=1 and p=2 costs, the p=2
@@ -199,6 +200,45 @@ class FogPaddingRingSurroundTest {
         val afforded = FogViewportCoveragePlanner(paddingTiles = 1, maxTiles = RING_ARM_MAX_TILES)
             .plan(atBudget)
         assertEquals("a budget with room keeps the ring", 1, afforded.appliedPaddingTiles)
+    }
+
+    /**
+     * The property that makes narrowing safe at all, which nothing else pins.
+     *
+     * A narrowed plan publishes LESS than was asked for, and the surround predicate is
+     * `published superset-of predicted`. That is only safe because narrowing floors at p = 0, which
+     * is the visible rectangle itself: for every p, the padded window contains the unpadded one, so
+     * whatever the budget does to the ring it can never remove a tile the camera can actually see.
+     * If this ever fails, a narrowed generation could publish a set that does not cover its own
+     * viewport, and the fog would be reasoning about ground it never rendered.
+     */
+    @Test
+    fun `a narrowed ring still contains every tile the unpadded plan needs`() {
+        val atBudget = wideViewport()
+        val unpadded = FogViewportCoveragePlanner(paddingTiles = 0).plan(atBudget).keySet
+        val budget = FogViewportCoveragePlanner(paddingTiles = 0).plan(atBudget).keys.size
+
+        // Narrowed all the way to nothing, and narrowed only part of the way: both contain it.
+        val toZero = FogViewportCoveragePlanner(paddingTiles = 3, maxTiles = budget).plan(atBudget)
+        assertEquals("the fixture must actually narrow to zero", 0, toZero.appliedPaddingTiles)
+        assertTrue(
+            "a ring narrowed to nothing must still contain the visible rectangle",
+            toZero.keySet.containsAll(unpadded),
+        )
+
+        val ringOne = FogViewportCoveragePlanner(paddingTiles = 1, maxTiles = RING_ARM_MAX_TILES)
+            .plan(atBudget)
+        val partly = FogViewportCoveragePlanner(paddingTiles = 3, maxTiles = ringOne.keys.size)
+            .plan(atBudget)
+        assertEquals("the fixture must narrow part of the way, not all", 1, partly.appliedPaddingTiles)
+        assertTrue(
+            "a partly narrowed ring must still contain the visible rectangle",
+            partly.keySet.containsAll(unpadded),
+        )
+        assertTrue(
+            "and must still contain everything the narrower ring would have",
+            partly.keySet.containsAll(toZero.keySet),
+        )
     }
 
     /**

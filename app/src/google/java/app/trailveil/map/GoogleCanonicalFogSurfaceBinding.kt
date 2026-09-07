@@ -191,6 +191,8 @@ internal class GoogleCanonicalFogSurfaceBinding(
 
     /** V02-012 diagnostics: the last render's key count and durations, for the gates string. */
     private var lastRenderKeys: Int? = null
+    /** The ring the last render's plan actually got, which a narrowed plan makes differ. */
+    private var lastAppliedPaddingTiles: Int = 0
     private var lastRenderMillis: Long? = null
     private var lastPublishMillis: Long? = null
 
@@ -677,7 +679,8 @@ internal class GoogleCanonicalFogSurfaceBinding(
             "installed=${coordinator.installedGenerationId} coverUp=${coordinator.coverUp} " +
             "reason=${coordinator.coverReason} terminal=${coordinator.terminal} " +
             "retry=${coordinator.retryScheduled} trace=${coordinator.recentTransitionsTimed}] " +
-            "render=[keys=$lastRenderKeys renderMs=$lastRenderMillis publishMs=$lastPublishMillis] " +
+            "render=[keys=$lastRenderKeys renderMs=$lastRenderMillis publishMs=$lastPublishMillis " +
+            "askedPadding=${coverageProfile.paddingTiles} appliedPadding=$lastAppliedPaddingTiles] " +
             "prover=${snapshotProver.recentEvents} " +
             "overlays=${overlays.keys} " +
             "target=$targetOverlayGeneration bootstrapOverlay=${bootstrapOverlay != null} " +
@@ -703,8 +706,15 @@ internal class GoogleCanonicalFogSurfaceBinding(
             val coverage = currentCoverageRequest()
                 ?: throw IllegalStateException("map projection unavailable")
             val actual = requestedKeysForRender()
+            val renderPlan = renderPlanner.plan(coverage)
+            // `V03-011` arm 1: the ring a plan ASKED for and the ring it GOT are not always the
+            // same, because an unaffordable ring is narrowed rather than refused. Recorded so a
+            // measurement can tell a narrowed arm from the arm it was labelled as; without it,
+            // ring(1) and ring(2) can collapse onto the same applied width on a large viewport and
+            // still be reported as two arms.
+            lastAppliedPaddingTiles = renderPlan.appliedPaddingTiles
             val requested = LinkedHashSet<FogTileKey>().apply {
-                addAll(renderPlanner.plan(coverage).keySet)
+                addAll(renderPlan.keySet)
                 addAll(actual)
             }
             if (requested.size > coverageProfile.maxRequestedKeys) {
