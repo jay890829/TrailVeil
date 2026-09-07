@@ -22,6 +22,8 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
 import app.trailveil.R
+import app.trailveil.map.GoogleFogCoverageArm
+import app.trailveil.map.GoogleFogCoverageProfile
 import app.trailveil.map.GoogleMapSurfaceTestActivity
 import app.trailveil.map.GoogleMapSurfaceTestHooks
 import app.trailveil.map.ProviderStartupDecision
@@ -796,6 +798,42 @@ internal enum class FogContinuityArm(
 
     /** Prototype A: one anchored image for the viewport plus guards beyond it. */
     MOSAIC_OVERLAY("mosaicOverlay", coverExpected = false),
+
+    ;
+
+    /**
+     * Puts the process into this arm, and must be called BEFORE the Activity is launched: a
+     * binding reads its coverage profile once, in its field initialisers, so a surface already
+     * attached will not change arm underneath a running trial. Pair with
+     * [GoogleFogCoverageArm.reset] in an `@After`, or the next test in the process inherits it.
+     */
+    fun install() {
+        GoogleFogCoverageArm.profile = coverageProfile()
+    }
+
+    private fun coverageProfile(): GoogleFogCoverageProfile = when (this) {
+        BASELINE -> GoogleFogCoverageProfile.DEFAULT
+        // Asymmetric by construction - render padded, predict unpadded - because
+        // `FogPaddingRingSurroundTest` showed that padding both sides of the surround test cancels
+        // exactly and buys no movement at all. `ring` also carries the budgets, which the shipped
+        // 256s cannot accommodate: the rectangular completion already runs at 240.
+        PADDING_RING -> GoogleFogCoverageProfile.ring(PADDING_RING_TILES)
+        // Prototype A does not change the coverage plan, it replaces the TileOverlay, and none of
+        // that is built. Installing the default here would let a mosaic trial run on the baseline
+        // surface and report the baseline's numbers under prototype A's name.
+        MOSAIC_OVERLAY -> throw UnsupportedOperationException(
+            "the mosaicOverlay arm has no surface yet; see `V03-011` sections 5 and 6",
+        )
+    }
+
+    private companion object {
+        /**
+         * One tile of ring. Enough to outlast a pan of one tile and no more - and nothing at all
+         * for a gesture that crosses an integer zoom boundary, which is four of the six kinds.
+         * Larger rings are quadratic in tiles rendered, which is what metric 3 exists to price.
+         */
+        const val PADDING_RING_TILES = 1
+    }
 }
 
 internal enum class GestureKind(

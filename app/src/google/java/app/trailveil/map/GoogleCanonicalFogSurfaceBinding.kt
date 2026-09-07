@@ -99,9 +99,31 @@ internal class GoogleCanonicalFogSurfaceBinding(
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val adapter = FogTileProviderAdapter()
+    /**
+     * Read once, here, so one surface cannot straddle two `V03-011` arms. A constant in every
+     * published build; see [googleFogCoverageProfile].
+     */
+    private val coverageProfile = googleFogCoverageProfile()
+    private val adapter = FogTileProviderAdapter(cacheBudget = coverageProfile.cacheBudget())
     private val actualRequests = FogActualTileRequestSet()
-    private val coveragePlanner = FogViewportCoveragePlanner()
+
+    /**
+     * What this surface RENDERS: the visible rectangle, plus the arm's ring if it has one.
+     *
+     * Distinct from [surroundPlanner] on purpose, and identical to it in every shipped build. See
+     * [GoogleFogCoverageProfile]: padding both the published set and the predicted set cancels
+     * exactly, so a ring is only worth rendering if the surround test does NOT pad its prediction.
+     */
+    private val renderPlanner = coverageProfile.renderPlanner()
+
+    /**
+     * What this surface REASONS about: the visible rectangle, never the ring.
+     *
+     * Used by the surround test that decides whether the safety cover rises, by the proof plan and
+     * by the compatibility render callback - all three of which ask "what must be fogged for what
+     * the user can see now", a question a pre-rendered ring is not part of.
+     */
+    private val surroundPlanner = coverageProfile.surroundPlanner()
     private val requestedRenderer = FogRequestedTileWindowRenderer(
         subrenderer = FogViewportBatchSubrenderer { request, keys ->
             runtime.viewportCoordinator.renderTiles(request, keys)
@@ -628,10 +650,10 @@ internal class GoogleCanonicalFogSurfaceBinding(
                 ?: throw IllegalStateException("map projection unavailable")
             val actual = requestedKeysForRender()
             val requested = LinkedHashSet<FogTileKey>().apply {
-                addAll(coveragePlanner.plan(coverage).keySet)
+                addAll(renderPlanner.plan(coverage).keySet)
                 addAll(actual)
             }
-            if (requested.size > MAX_REQUESTED_KEYS) {
+            if (requested.size > coverageProfile.maxRequestedKeys) {
                 throw IllegalStateException("actual request union exceeded bound")
             }
             coverage to requested.toSet()
@@ -883,7 +905,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         val coverage = currentCoverageRequest() ?: published
         val allMasks = masksByGeneration[generationId].orEmpty()
         val requiredFloorKeys = try {
-            coveragePlanner.plan(coverage).keySet
+            surroundPlanner.plan(coverage).keySet
         } catch (_: IllegalArgumentException) {
             return@let null
         }
@@ -1054,7 +1076,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
             viewport = current,
             recentActualRequests = actual,
             publishedKeys = available,
-            planner = coveragePlanner,
+            planner = surroundPlanner,
         )
     }
 
@@ -1187,7 +1209,9 @@ internal class GoogleCanonicalFogSurfaceBinding(
         }
 
     private fun recordRecentRequest(key: FogTileKey) = synchronized(recentRequestLock) {
-        if (key !in recentRequests && recentRequests.size >= MAX_REQUESTED_KEYS) {
+        if (key !in recentRequests &&
+            recentRequests.size >= coverageProfile.maxRequestedKeys
+        ) {
             recentRequestsOverflowed = true
         } else {
             recentRequests += key
@@ -1262,7 +1286,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         masks: Map<FogTileKey, FogPixelMask>,
     ) {
         val callback = onFogRendered ?: return
-        val floorKeys = coveragePlanner.plan(coverage).keys
+        val floorKeys = surroundPlanner.plan(coverage).keys
         if (!masks.keys.containsAll(floorKeys)) return
         val tiles = floorKeys.map { key -> FogMosaicTile(key, requireNotNull(masks[key])) }
         callback(
@@ -1292,7 +1316,6 @@ internal class GoogleCanonicalFogSurfaceBinding(
     }
 
     private companion object {
-        const val MAX_REQUESTED_KEYS = 256
         const val DELIVERY_POLL_MILLIS = 50L
         const val DELIVERY_QUIET_NANOS = 100L * 1_000_000L
         const val RENDER_TIMEOUT_MILLIS = 15_000L

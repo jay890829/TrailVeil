@@ -1,6 +1,7 @@
 package app.trailveil
 
 import java.io.File
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -319,6 +320,81 @@ class GooglePocBoundaryTest {
             "these need the debug-only Compose test manifest and cannot run under googlePoc: " +
                 "$offenders",
             offenders.isEmpty(),
+        )
+    }
+
+    /**
+     * `V03-011` arm 1: the ring knob is a harness fixture and must not exist in a published build.
+     *
+     * Same seam idiom as `googleMapOverlayObservationSeam` - the function is declared once per
+     * Google build type and the shared binding calls it - so this asserts the shape rather than the
+     * behaviour: `googleRelease` returns a constant and declares no mutable state at all, while
+     * `googlePoc` carries the selector. An arm object compiled into a release APK would change how
+     * much fog a real user's map renders.
+     */
+    @Test
+    fun onlyTheHarnessBuildTypeCanSelectAFogCoverageArm() {
+        val release = File(
+            moduleRoot(),
+            "src/googleRelease/java/app/trailveil/map/GoogleFogCoverageProfileSeam.kt",
+        ).readText()
+        val harness = File(
+            moduleRoot(),
+            "src/googlePoc/java/app/trailveil/map/GoogleFogCoverageProfileSeam.kt",
+        ).readText()
+
+        listOf(release, harness).forEach { seam ->
+            assertTrue(
+                "both build types must declare the same seam symbol, or a variant compiles neither",
+                seam.contains("internal fun googleFogCoverageProfile(): GoogleFogCoverageProfile"),
+            )
+        }
+        assertTrue(
+            "the release seam must be the shipped constant",
+            release.contains("GoogleFogCoverageProfile.DEFAULT"),
+        )
+        assertFalse(
+            "the release seam must declare no mutable state: $release",
+            release.contains("var ") || release.contains("@Volatile"),
+        )
+        assertTrue(
+            "the harness seam is where the selector lives",
+            harness.contains("object GoogleFogCoverageArm") && harness.contains("@Volatile"),
+        )
+    }
+
+    /**
+     * The asymmetry `FogPaddingRingSurroundTest` proved is load-bearing, pinned where it is wired.
+     *
+     * Padding the published set and the predicted set by the same amount cancels exactly, so a ring
+     * bought with one shared planner is rendered, paid for, and buys no camera movement. The two
+     * planners are therefore not interchangeable, and the surround predicate in particular must
+     * never be handed the padded one. Asserted on the source because the difference is invisible in
+     * every shipped build, where both planners are identical.
+     */
+    @Test
+    fun theSurroundTestIsNeverHandedThePaddedPlanner() {
+        val binding = File(
+            moduleRoot(),
+            "src/google/java/app/trailveil/map/GoogleCanonicalFogSurfaceBinding.kt",
+        ).readText()
+
+        assertTrue(
+            "the surround predicate must predict without the ring",
+            binding.contains("planner = surroundPlanner,"),
+        )
+        assertFalse(
+            "the surround predicate must never be handed the render planner",
+            binding.contains("planner = renderPlanner,"),
+        )
+        assertFalse(
+            "the binding must take its planners from the profile seam, not construct its own",
+            binding.contains("FogViewportCoveragePlanner("),
+        )
+        assertEquals(
+            "exactly one call site renders the ring: the published key set",
+            1,
+            binding.split("renderPlanner.plan(").size - 1,
         )
     }
 

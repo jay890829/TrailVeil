@@ -156,6 +156,44 @@ class FogPaddingRingSurroundTest {
         FogViewportCoveragePlanner(paddingTiles = 1, maxTiles = RING_ARM_MAX_TILES).plan(atBudget)
     }
 
+    /**
+     * The ring is a pan device, and four of the audit's six gesture kinds are not pans.
+     *
+     * A coverage key carries the zoom it was planned at, and the surround test predicts with the
+     * CURRENT camera's `floorZoom`. Cross one integer zoom boundary and every predicted key is at a
+     * zoom the published set contains none of, so the cover rises however wide the ring is. A pinch
+     * crosses those boundaries by construction; only a movement that stays within one floor zoom
+     * can be rescued by padding at all.
+     */
+    @Test
+    fun `no ring of any size survives a change of floor zoom`() {
+        val start = viewport(centerLongitude = 0.0)
+        val surroundPlanner = FogViewportCoveragePlanner(paddingTiles = 0)
+        val absurdRing = FogViewportCoveragePlanner(paddingTiles = 8, maxTiles = RING_ARM_MAX_TILES)
+        val published = absurdRing.plan(start).keySet
+
+        assertTrue(
+            "the fixture must actually be a large ring, or this proves only that 0 is small",
+            published.size > 200,
+        )
+        assertTrue(
+            "every published key is planned at the camera's floor zoom",
+            published.all { key -> key.zoom == ZOOM },
+        )
+
+        val zoomedIn = start.copy(floorZoom = ZOOM + 1)
+        assertFalse(
+            "one integer zoom step defeats a ring of 8 tiles: the predicted keys are at " +
+                "${ZOOM + 1} and the published set holds none",
+            fogViewportCoveredByPublishedTiles(
+                viewport = zoomedIn,
+                recentActualRequests = surroundPlanner.plan(zoomedIn).keySet,
+                publishedKeys = published,
+                planner = surroundPlanner,
+            ),
+        )
+    }
+
     /** A small viewport well away from both poles and the antimeridian. */
     private fun viewport(centerLongitude: Double): FogViewportCoverageRequest =
         FogViewportCoverageRequest(
