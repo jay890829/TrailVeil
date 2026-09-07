@@ -1,5 +1,7 @@
 package app.trailveil.map.fog
 
+import kotlin.math.abs
+import kotlin.math.hypot
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
@@ -125,13 +127,17 @@ class FogPaddingRingSurroundTest {
             ring.size,
         )
 
-        // The device figure, restated as arithmetic rather than re-measured here: `V03-011`
-        // section 9 recorded a 240-tile completion, which is 15x16, and ONE tile of padding takes
-        // it to 17x18. Bound to the real constant so that raising the shipped budget shows up here
-        // as the arm's premise changing rather than as a comment going quietly stale.
+        // The device figure, restated as arithmetic rather than re-measured here: a 240-tile
+        // completion, which is 15x16, taken to 17x18 by ONE tile of padding. Section 14b later
+        // established WHICH viewport that was - a 1080x2400 screen at 160 dpi, where the steep
+        // pose plans 234 - so this is the LARGE-viewport case, not a phone. On a phone-shaped
+        // viewport the same pose plans 40 and one ring tile costs 72. The arithmetic below is the
+        // reason the arm needs budget work at all, and it applies exactly where the plan is large.
+        // Bound to the real constant so that raising the shipped budget shows up here as the arm's
+        // premise changing rather than as a comment going quietly stale.
         val deviceRingTiles = (15 + 2) * (16 + 2)
         assertTrue(
-            "a single ring tile costs $deviceRingTiles on the measured viewport, which must " +
+            "a single ring tile costs $deviceRingTiles on the large viewport, which must " +
                 "exceed the shipped budget of " +
                 "${FogViewportCoveragePlanner.DEFAULT_MAX_TILES} or this arm needs no budget work",
             deviceRingTiles > FogViewportCoveragePlanner.DEFAULT_MAX_TILES,
@@ -195,6 +201,111 @@ class FogPaddingRingSurroundTest {
     }
 
     /** A small viewport well away from both poles and the antimeridian. */
+    /**
+     * `V03-011` section 14d, pinned on the host: the predicate is a RECTANGLE, so a ring is left
+     * when an axis runs out and never when a hypotenuse does.
+     *
+     * Measured first on a device, where a diagonal drag of 2.10 tiles straight-line travel stayed
+     * inside a one-tile ring and was briefly read as the ring outperforming its own width. It was
+     * not: each axis was under one tile. The trap is that a pan is naturally reported as a distance,
+     * and a distance is the one quantity this predicate never looks at.
+     *
+     * The move below is CHECKED to be diagonal-past-the-ring before it is used, so the case cannot
+     * quietly become vacuous if the fixture's geometry is ever retuned.
+     */
+    @Test
+    fun `a diagonal move past the ring in distance is still inside it on both axes`() {
+        val start = viewport(centerLongitude = 0.0)
+        val ringPlanner = FogViewportCoveragePlanner(paddingTiles = 1)
+        val surroundPlanner = FogViewportCoveragePlanner(paddingTiles = 0)
+        val published = ringPlanner.plan(start).keySet
+
+        val moved = movedViewport(
+            centerLongitude = ONE_TILE_DEGREES * 0.8,
+            centerLatitude = DIAGONAL_NORTH_DEGREES,
+        )
+        val tiles = (1 shl ZOOM).toDouble()
+        val deltaX = abs(
+            WebMercator.normalizedX(ONE_TILE_DEGREES * 0.8) - WebMercator.normalizedX(0.0),
+        ) * tiles
+        val deltaY = abs(
+            WebMercator.normalizedY(DIAGONAL_NORTH_DEGREES) - WebMercator.normalizedY(0.0),
+        ) * tiles
+        assertTrue(
+            "the fixture must actually be a diagonal that travels FURTHER than one tile: " +
+                "dx=$deltaX dy=$deltaY hypot=${hypot(deltaX, deltaY)}",
+            hypot(deltaX, deltaY) > 1.0,
+        )
+        assertTrue(
+            "...while staying under one tile on each axis, or this case proves nothing: " +
+                "dx=$deltaX dy=$deltaY",
+            deltaX < 1.0 && deltaY < 1.0,
+        )
+
+        assertTrue(
+            "a one-tile ring holds a move of ${hypot(deltaX, deltaY)} tiles, because the surround " +
+                "test is rectangle containment and neither axis left it",
+            fogViewportCoveredByPublishedTiles(
+                viewport = moved,
+                recentActualRequests = surroundPlanner.plan(moved).keySet,
+                publishedKeys = published,
+                planner = surroundPlanner,
+            ),
+        )
+    }
+
+    /**
+     * `V03-011` section 14d, second half: a ring of `p` holds MORE than `p` tiles of movement,
+     * because the published rectangle is tile-aligned and the viewport does not fill it.
+     *
+     * The capacity is `p` plus whatever the alignment leaves on the leading side, which is why the
+     * device measurements could not be predicted from `p` alone and why the arm's capacity is a
+     * property of where the camera sits inside the tile grid as well as of the ring.
+     */
+    @Test
+    fun `a ring of one holds more than one tile of movement, because tiles are aligned`() {
+        val start = viewport(centerLongitude = 0.0)
+        val published = FogViewportCoveragePlanner(paddingTiles = 1).plan(start).keySet
+        val surroundPlanner = FogViewportCoveragePlanner(paddingTiles = 0)
+
+        val beyondTheRing = viewport(centerLongitude = ONE_TILE_DEGREES * 1.4)
+        assertTrue(
+            "1.4 tiles is past the ring's nominal width and still covered: capacity is p plus the " +
+                "tile alignment slack, not p",
+            fogViewportCoveredByPublishedTiles(
+                viewport = beyondTheRing,
+                recentActualRequests = surroundPlanner.plan(beyondTheRing).keySet,
+                publishedKeys = published,
+                planner = surroundPlanner,
+            ),
+        )
+
+        // And the slack is finite, so the case is not vacuous: far enough out, the cover rises.
+        val wellPast = viewport(centerLongitude = ONE_TILE_DEGREES * 3.0)
+        assertFalse(
+            "the alignment slack is bounded; three tiles must still raise the cover",
+            fogViewportCoveredByPublishedTiles(
+                viewport = wellPast,
+                recentActualRequests = surroundPlanner.plan(wellPast).keySet,
+                publishedKeys = published,
+                planner = surroundPlanner,
+            ),
+        )
+    }
+
+    private fun movedViewport(
+        centerLongitude: Double,
+        centerLatitude: Double,
+    ): FogViewportCoverageRequest =
+        FogViewportCoverageRequest(
+            center = GeoPoint(centerLatitude, centerLongitude),
+            floorZoom = ZOOM,
+            nearLeft = GeoPoint(centerLatitude - 1.0, centerLongitude - 1.0),
+            farLeft = GeoPoint(centerLatitude + 1.0, centerLongitude - 1.0),
+            farRight = GeoPoint(centerLatitude + 1.0, centerLongitude + 1.0),
+            nearRight = GeoPoint(centerLatitude - 1.0, centerLongitude + 1.0),
+        )
+
     private fun viewport(centerLongitude: Double): FogViewportCoverageRequest =
         FogViewportCoverageRequest(
             center = GeoPoint(0.0, centerLongitude),
@@ -223,5 +334,12 @@ class FogPaddingRingSurroundTest {
         const val RING_TILES = 2
         /** Only large enough for the arm's padded plans; not a proposal for the shipped default. */
         const val RING_ARM_MAX_TILES = 512
+
+        /**
+         * A northward move that is under one tile in `y` while the eastward leg is 0.8 of one in
+         * `x`, so the pair travels further than a tile without either axis leaving the ring. The
+         * case asserts both halves of that before it uses it.
+         */
+        const val DIAGONAL_NORTH_DEGREES = 8.0
     }
 }
