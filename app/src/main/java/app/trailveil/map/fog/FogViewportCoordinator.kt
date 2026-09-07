@@ -146,6 +146,22 @@ class FogViewportCoordinator(
      * the batch seam used by providers whose visible screen needs more than the legacy 3x3 mosaic;
      * it deliberately reuses the same mutex, caches, spatial selection and canonical renderer.
      */
+    /**
+     * The revealed track geometry inside [bounds], as geometry rather than as a mask.
+     *
+     * `V03-013`: the raster path turns exactly these points into 256 px masks. A surface that
+     * draws reveals as shapes - the screen stencil, and any vector arm - needs them unrasterised,
+     * and must read them the same way the masks did or the two would disagree about what is
+     * revealed. Takes the same mutex and the same data source, so it cannot observe a half-merged
+     * reveal, and the radius each point is drawn at is [style]'s, which the caller can read.
+     *
+     * Not used by any published surface. It exists so an experimental one does not invent a second
+     * route to the canonical data, which is how two surfaces come to disagree.
+     */
+    suspend fun readRevealedSegments(bounds: ViewportBounds): List<TrackSegment> = mutex.withLock {
+        trackDataSource.read(bounds).toFogTrackSegments()
+    }
+
     suspend fun renderTiles(
         request: FogViewportRequest,
         keys: List<FogTileKey>,

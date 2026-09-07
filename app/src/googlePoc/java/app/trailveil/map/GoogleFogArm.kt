@@ -29,6 +29,13 @@ internal enum class GoogleFogArm(
     val paddingTiles: Int,
     /** Arm 2's anchored image instead of the shipped `TileOverlay`. */
     val mosaicOverlay: Boolean,
+    /**
+     * The owner's variant A: fog anchored to the screen, with the canonical fog turned OFF.
+     *
+     * The only arm here that removes the shipped surface rather than swapping it, which is why it
+     * is the only one that can fail open. Harness build type only.
+     */
+    val screenStencil: Boolean = false,
 ) {
     /** The shipped design, and the control every other row is read against. */
     BASELINE("baseline", "Baseline (shipped)", paddingTiles = 0, mosaicOverlay = false),
@@ -51,6 +58,20 @@ internal enum class GoogleFogArm(
      * width. Nothing in either implementation objects to the other being on.
      */
     RING_2_MOSAIC("ring2mosaic", "Ring 2 + Mosaic", paddingTiles = 2, mosaicOverlay = true),
+
+    /**
+     * The owner's variant A, built after they installed `AdSchl2E/open_world` and reported its
+     * camera lag as obvious. This one reads the projection every frame instead of caching a camera
+     * callback, and uses the SDK's projection so tilt is carried; whether that is enough is exactly
+     * what looking at it answers.
+     */
+    SCREEN_STENCIL(
+        "screenStencil",
+        "Screen stencil (variant A)",
+        paddingTiles = 0,
+        mosaicOverlay = false,
+        screenStencil = true,
+    ),
     ;
 
     /**
@@ -67,6 +88,7 @@ internal enum class GoogleFogArm(
             GoogleFogCoverageProfile.ring(paddingTiles)
         }
         GoogleFogCoverageArm.mosaicOverlay = mosaicOverlay
+        GoogleFogCoverageArm.screenStencil = screenStencil
     }
 
     companion object {

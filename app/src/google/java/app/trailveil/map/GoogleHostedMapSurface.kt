@@ -162,6 +162,13 @@ internal fun GoogleHostedMapSurface(
 ) {
     val contentDescription = stringResource(R.string.map_content_description)
     require(fogCoverTimeoutMillis > 0L) { "fogCoverTimeoutMillis must be positive" }
+    // `V03-013` arm `screenStencil` is the one arm that REMOVES the canonical fog instead of
+    // swapping it, so the tile surface is suppressed here and the stencil layer covers instead.
+    // Shadowed once, at the top, so every downstream use agrees; suppressing it per-call-site is
+    // how one of them would be missed and the two fogs drawn over each other. The published twin
+    // of this seam answers false unconditionally, so nothing here can fire outside the harness.
+    @Suppress("NAME_SHADOWING")
+    val fogRequired = fogRequired && !googleFogStencilActive()
     if (LocalInspectionMode.current) {
         Box(
             modifier = modifier
@@ -955,6 +962,14 @@ internal fun GoogleHostedMapSurface(
         // `V03-013`: names the fog arm this process bound with, so a hands-on trial cannot be
         // attributed to the wrong one. Bottom-start, clear of the status badges above. The
         // release twin of this seam draws nothing and cannot name an arm at all.
+        // `V03-013`: the screen-anchored arm. Drawn INSIDE the map's Box so it is a sibling of the
+        // map in the same composition, which is the closest an overlay can get to the SDK's own
+        // frame. Its published twin draws nothing.
+        GoogleFogStencilOverlay(
+            map = readyMap,
+            fogRuntime = fogRuntime,
+            modifier = Modifier.matchParentSize(),
+        )
         GoogleFogArmBadge(Modifier.align(Alignment.BottomStart))
     }
 }

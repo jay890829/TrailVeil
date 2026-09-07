@@ -28,10 +28,22 @@ internal object GoogleFogCoverageArm {
     @Volatile
     var mosaicOverlay: Boolean = false
 
+    /**
+     * `V03-013` arm `screenStencil`: replace the ground-anchored fog with a screen-anchored one.
+     *
+     * Separate from [mosaicOverlay] because it is not a surface the binding installs at all - it is
+     * a layer drawn beside the map in the Compose tree - and because it is the one arm that turns
+     * the canonical fog OFF rather than swapping it. That makes it the only fail-open arm here, so
+     * it gets its own name rather than hiding inside a surface selector.
+     */
+    @Volatile
+    var screenStencil: Boolean = false
+
     /** Restores the shipped profile and surface. Every arm test must call this in an `@After`. */
     fun reset() {
         profile = GoogleFogCoverageProfile.DEFAULT
         mosaicOverlay = false
+        screenStencil = false
     }
 }
 
