@@ -74,7 +74,18 @@ function Invoke-CheckedNative {
         [Parameter(Mandatory = $true)][string]$Description
     )
 
-    $output = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { $_.ToString() })
+    # PowerShell 5.1 wraps EVERY stderr line from a native command in a NativeCommandError, and
+    # this script runs with $ErrorActionPreference = 'Stop'. Without the guard below, a command
+    # that fails and explains itself on stderr terminates here as a raw NativeCommandError, and the
+    # message this function exists to produce - which command, which exit code, what it printed -
+    # is never reached. Lowered only around the call, restored in a finally.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& $FilePath @ArgumentList 2>&1 | ForEach-Object { $_.ToString() })
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "$Description failed with exit code ${LASTEXITCODE}:`n$($output -join "`n")"
     }
@@ -141,8 +152,23 @@ if ($resolvedOutput.StartsWith($repositoryPrefix, [System.StringComparison]::Ord
 
 # ---------------------------------------------------------------- is a twin needed at all
 
-& $adb @adbTarget shell run-as $PackageName true 2>&1 | Out-Null
-$alreadyDebuggable = $LASTEXITCODE -eq 0
+# `V02-013` item 5, 2026-09-07: this probe used to be the bare command, and it took the script down
+# on exactly the case it exists to detect. `run-as` on a non-debuggable package writes to stderr and
+# exits non-zero; under 'Stop' that stderr line is a terminating NativeCommandError, so the answer
+# "not debuggable" - the whole reason a twin install is needed - arrived as a crash instead of as a
+# false. The exit code is the answer; the output is not wanted at all.
+function Test-PackageDebuggable {
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        & $adb @adbTarget shell run-as $PackageName true 2>&1 | Out-Null
+    } finally {
+        $ErrorActionPreference = $previousPreference
+    }
+    return $LASTEXITCODE -eq 0
+}
+
+$alreadyDebuggable = Test-PackageDebuggable
 
 if ($alreadyDebuggable) {
     if ($TwinApk -or $RestoreApk) {
@@ -176,19 +202,30 @@ function Get-ApkFacts {
         throw "$Label APK does not report exactly one signer certificate digest."
     }
 
+    # Each of these was once written inline as `(Invoke-CheckedNative ...)[0].Trim()`, and every one
+    # of them was broken. PowerShell UNROLLS a one-element array when a function returns it, so a
+    # single-line answer came back as a [string]; `[0]` then took its first CHARACTER and `.Trim()`
+    # failed on a [char]. apkanalyzer prints exactly one line for all three of these queries, which
+    # is precisely the case that unrolls, so all three failed - on 2026-09-07, before a single byte
+    # had been installed, which is the one piece of luck in it. `@()` re-wraps the result.
+    $readValue = {
+        param([string]$Query, [string]$Description)
+
+        $lines = @(Invoke-CheckedNative -FilePath $apkanalyzer -Description $Description `
+            -ArgumentList @('manifest', $Query, $resolved))
+        if ($lines.Count -lt 1) {
+            throw "$Description returned no output."
+        }
+        return $lines[0].Trim()
+    }
+
     return [pscustomobject]@{
         Path = $resolved
         Label = $Label
         CertificateSha256 = $digests[0].Matches[0].Groups[1].Value
-        ApplicationId = (Invoke-CheckedNative -FilePath $apkanalyzer `
-            -ArgumentList @('manifest', 'application-id', $resolved) `
-            -Description "$Label application id")[0].Trim()
-        VersionCode = [long](Invoke-CheckedNative -FilePath $apkanalyzer `
-            -ArgumentList @('manifest', 'version-code', $resolved) `
-            -Description "$Label version code")[0].Trim()
-        Debuggable = (Invoke-CheckedNative -FilePath $apkanalyzer `
-            -ArgumentList @('manifest', 'debuggable', $resolved) `
-            -Description "$Label debuggable flag")[0].Trim()
+        ApplicationId = & $readValue 'application-id' "$Label application id"
+        VersionCode = [long](& $readValue 'version-code' "$Label version code")
+        Debuggable = & $readValue 'debuggable' "$Label debuggable flag"
     }
 }
 
@@ -302,8 +339,7 @@ try {
             Write-Warning ("RESTORE FAILED. The device is still carrying the debuggable twin. " +
                 "Install $($restore.Path) by hand before using the device again.")
         } else {
-            & $adb @adbTarget shell run-as $PackageName true 2>&1 | Out-Null
-            if ($LASTEXITCODE -eq 0) {
+            if (Test-PackageDebuggable) {
                 Write-Warning ('The restored build still answers `run-as`, so it is debuggable. ' +
                     'Check which APK was restored before using the device again.')
             } else {

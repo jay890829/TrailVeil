@@ -1,6 +1,7 @@
 package app.trailveil
 
 import java.io.File
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -102,6 +103,62 @@ class DeviceSnapshotScriptSourceTest {
         assertTrue(
             "the force-stop before the copy is gone",
             snapshotScript().contains("-Description 'Force-stop'"),
+        )
+    }
+
+    /**
+     * Both defects that stopped the first real run of this script, on 2026-09-07, before it had
+     * installed anything. Source pins because nothing in the build executes the script, and because
+     * neither is visible in its output until a device is attached and a real phone is mid-swap.
+     *
+     * 1. PowerShell 5.1 wraps every stderr line from a native command in a `NativeCommandError`,
+     *    and this script runs under `ErrorActionPreference = 'Stop'`. The probe that asks "is the
+     *    installed package debuggable" answers by running a command that FAILS when it is not - so
+     *    the answer the whole twin-install path depends on arrived as a crash instead of a false.
+     * 2. PowerShell unrolls a one-element array when a function returns it, so
+     *    `(Invoke-CheckedNative ...)[0].Trim()` took the first CHARACTER of a one-line answer and
+     *    called `.Trim()` on a `[char]`. All three manifest reads were written that way.
+     */
+    @Test
+    fun `native invocations survive stderr and one-line answers`() {
+        // Comment lines are stripped first. Both guards below are about what the script DOES, and
+        // the script explains each defect in prose that necessarily quotes the broken form - so a
+        // check over the raw text fails on its own documentation, which is how this test first ran.
+        val script = snapshotScript()
+            .lines()
+            .filterNot { line -> line.trimStart().startsWith("#") }
+            .joinToString(separator = "\n")
+
+        assertTrue(
+            "the debuggable probe must be the shared helper, not a bare command whose stderr is " +
+                "a terminating error under ErrorActionPreference = Stop",
+            script.contains("function Test-PackageDebuggable"),
+        )
+        assertEquals(
+            "both the twin decision and the post-restore check must go through that helper",
+            2,
+            script.split("Test-PackageDebuggable").size - 1 - 1,
+        )
+        assertEquals(
+            "every native call that can write to stderr must lower ErrorActionPreference around " +
+                "itself and restore it in a finally",
+            2,
+            script.split("\$ErrorActionPreference = 'Continue'").size - 1,
+        )
+        assertEquals(
+            "and each must put the previous value back",
+            2,
+            script.split("\$ErrorActionPreference = \$previousPreference").size - 1,
+        )
+
+        assertFalse(
+            "a one-line answer indexed straight off the call is the unrolling bug: PowerShell " +
+                "returns it as a String and [0] is then a Char",
+            script.contains(")[0].Trim()"),
+        )
+        assertTrue(
+            "the manifest reads must re-wrap the result with @() before indexing",
+            script.contains("\$lines = @(Invoke-CheckedNative"),
         )
     }
 
