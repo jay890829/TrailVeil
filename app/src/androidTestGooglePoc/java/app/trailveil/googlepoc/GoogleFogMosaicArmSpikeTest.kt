@@ -108,7 +108,7 @@ class GoogleFogMosaicArmSpikeTest {
                     driveHeldPinch(
                         harness = live,
                         label = "spread/${camera.name}",
-                        spans = SPREAD_SPANS,
+                        spans = SpikePinchGesture.SPREAD_SPANS,
                         minimumZoomChange = requireNotNull(GestureKind.PINCH_ZOOM_IN.minimumZoomIn),
                     )
                 }
@@ -185,7 +185,7 @@ class GoogleFogMosaicArmSpikeTest {
                 driveHeldPinch(
                     harness = live,
                     label = "pinchOut/${camera.name}",
-                    spans = PINCH_OUT_SPANS,
+                    spans = SpikePinchGesture.PINCH_OUT_SPANS,
                     minimumZoomChange = required,
                 )
             }
@@ -279,19 +279,12 @@ class GoogleFogMosaicArmSpikeTest {
     // ---- drivers ---------------------------------------------------------------------------------
 
     /**
-     * One held two-finger pinch, in either direction, retried with a wider opening each time.
+     * One held two-finger pinch, in either direction, through the shared injector.
      *
-     * The direction is read off the spans rather than passed: an opening that ends wider than it
-     * started is a zoom IN, and every engagement and travel test below is written in terms of "how
-     * far it went the way it was asked to go" so one body serves both cases.
-     *
-     * **Why the opening widens on a retry.** Google's scale detector has a minimum span, this file
-     * does not know what it is on this device, and a spread has to START narrow to have room to
-     * travel - the mirror image of the zoom-out case, whose start span is the widest of the three.
-     * A first attempt that opens too narrow engages nothing, which is indistinguishable at this
-     * level from a map that ignored the gesture. So each attempt opens wider than the last while
-     * keeping the span RATIO above what the required zoom change needs, and the accepted attempt
-     * records which rung it was on. Reaching the last rung and still failing throws, as before.
+     * The body lives in [SpikePinchGesture] because the boundary spike needs the same gesture for a
+     * different measurement, and because the reason it must be a GESTURE rather than a `moveCamera`
+     * is a property of `fogCameraReaction` rather than of this class. This wrapper only turns the
+     * injector's account of what it did into the audit's [GestureDrive].
      */
     private fun driveHeldPinch(
         harness: GestureExposureHarness,
@@ -299,92 +292,24 @@ class GoogleFogMosaicArmSpikeTest {
         spans: List<Pair<Float, Float>>,
         minimumZoomChange: Float,
     ): GestureDrive {
-        val origin = harness.viewOrigin()
         val size = harness.viewSize()
-        val width = size.first.toFloat()
-        val height = size.second.toFloat()
-        val centreX = origin[0] + width / 2f
-        val y = origin[1] + height * PINCH_POINTER_Y_FRACTION
-
-        fun pair(span: Float): List<FlingGestureInjector.TouchPoint> = listOf(
-            FlingGestureInjector.TouchPoint(centreX - span / 2f, y),
-            FlingGestureInjector.TouchPoint(centreX + span / 2f, y),
+        val attempt = SpikePinchGesture.drive(
+            label = label,
+            origin = harness.viewOrigin(),
+            width = size.first.toFloat(),
+            height = size.second.toFloat(),
+            pointerYFraction = SpikePinchGesture.POINTER_Y_FRACTION,
+            spans = spans,
+            minimumZoomChange = minimumZoomChange,
+            zoom = { harness.cameraPosition().zoom },
+            diagnostics = { harness.diagnostics() },
         )
-
-        var downs = 0
-        var attempts = 0
-        val notes = mutableListOf<String>()
-        repeat(GESTURE_ATTEMPTS) { attempt ->
-            attempts += 1
-            val rung = spans[attempt.coerceAtMost(spans.lastIndex)]
-            val startSpan = width * rung.first
-            val endSpan = width * rung.second
-            val zoomingIn = endSpan > startSpan
-            val zoomAtDown = harness.cameraPosition().zoom
-            fun travelled(): Float {
-                val zoom = harness.cameraPosition().zoom
-                return if (zoomingIn) zoom - zoomAtDown else zoomAtDown - zoom
-            }
-
-            val openedAt = SystemClock.elapsedRealtime()
-            val drive = FlingGestureInjector.withStream { stream ->
-                stream.down(pair(startSpan).first())
-                downs += 1
-                stream.pointerDown(pair(startSpan))
-                val engageSpan = startSpan + (endSpan - startSpan) * GESTURE_ENGAGE_TRAVEL
-                repeat(GESTURE_ENGAGE_MOVES) { move ->
-                    stream.move(
-                        pair(
-                            startSpan +
-                                (engageSpan - startSpan) * (move + 1) / GESTURE_ENGAGE_MOVES,
-                        ),
-                    )
-                    SystemClock.sleep(GESTURE_STEP_MILLIS)
-                }
-                val engagement = travelled()
-                if (engagement < MINIMUM_PINCH_ENGAGEMENT) {
-                    stream.liftAll(pair(engageSpan))
-                    notes += "rung=${rung.first}->${rung.second} " +
-                        "engagement=${"%.3f".format(engagement)}"
-                    return@withStream null
-                }
-                var span = engageSpan
-                var step = 0
-                while (step < GESTURE_MEASURED_STEPS) {
-                    step += 1
-                    span = engageSpan + (endSpan - engageSpan) * step / GESTURE_MEASURED_STEPS
-                    stream.move(pair(span))
-                    SystemClock.sleep(GESTURE_STEP_MILLIS)
-                    // Travel until the requirement is met with margin, then stop - the same rule
-                    // the parity gate's pinch uses, and for the same reason: a fixed span ratio
-                    // would be a guess at the SDK's span-to-zoom mapping in both directions.
-                    if (step % GESTURE_TRAVEL_CHECK_EVERY == 0 &&
-                        travelled() >= minimumZoomChange + ZOOM_TRAVEL_MARGIN
-                    ) {
-                        break
-                    }
-                }
-                // Held, so the audited window contains frames of a stopped camera at the new zoom
-                // rather than only frames of one still moving towards it.
-                SystemClock.sleep(GESTURE_HOLD_MILLIS)
-                stream.liftAll(pair(span))
-                GestureDrive(
-                    note = "$label ${if (zoomingIn) "spread" else "pinch"} " +
-                        "spanPx=${startSpan.toInt()}->${span.toInt()} moves=$step " +
-                        "travelled=${"%.3f".format(travelled())}",
-                    downAtMillis = openedAt,
-                    upAtMillis = SystemClock.elapsedRealtime(),
-                    injectedDownCount = downs,
-                    attempts = attempts,
-                )
-            }
-            if (drive != null) return drive
-            SystemClock.sleep(GESTURE_RETRY_SETTLE_MILLIS)
-        }
-        throw AssertionError(
-            "$label: the injected stream never engaged the SDK's scale detector in $attempts " +
-                "attempts ($downs injected ACTION_DOWNs): ${notes.joinToString(" ")} " +
-                harness.diagnostics(),
+        return GestureDrive(
+            note = attempt.note,
+            downAtMillis = attempt.downAtMillis,
+            upAtMillis = attempt.upAtMillis,
+            injectedDownCount = attempt.injectedDownCount,
+            attempts = attempt.attempts,
         )
     }
 
@@ -506,40 +431,12 @@ class GoogleFogMosaicArmSpikeTest {
         )
 
         /**
-         * Opening and closing spans for the SPREAD, in fractions of the map's width, widest travel
-         * first.
-         *
-         * Every rung keeps a span ratio above `2^(1.5 + 0.35)` = 3.61, which is what the kind's
-         * 1.5 levels plus the travel margin costs, so a later rung buys engagement without
-         * quietly buying a gesture too small to cross the boundary being measured. The closing
-         * spans stop short of the full width for the reason the parity gate's opening span does:
-         * a pointer at the very edge is in the system's back-gesture strip.
-         */
-        val SPREAD_SPANS = listOf(
-            0.16f to 0.86f,
-            0.20f to 0.86f,
-            0.24f to 0.90f,
-        )
-
-        /** The control's spans: the parity gate's own proven pinch, unchanged. */
-        val PINCH_OUT_SPANS = listOf(0.76f to 0.06f)
-
-        /**
          * Injection geometry and cadence, taken from `GoogleGestureExposureTest` because those are
          * the values this repository has already made deterministic on an emulator.
          */
-        const val PINCH_POINTER_Y_FRACTION = 0.52f
         const val TAP_POINTER_Y_FRACTION = 0.52f
         const val GESTURE_ATTEMPTS = 4
-        const val GESTURE_ENGAGE_MOVES = 8
-        const val GESTURE_ENGAGE_TRAVEL = 0.30f
-        const val GESTURE_MEASURED_STEPS = 30
-        const val GESTURE_STEP_MILLIS = 16L
-        const val GESTURE_TRAVEL_CHECK_EVERY = 5
         const val GESTURE_RETRY_SETTLE_MILLIS = 2_500L
-        const val GESTURE_HOLD_MILLIS = 600L
-        const val MINIMUM_PINCH_ENGAGEMENT = 0.03f
-        const val ZOOM_TRAVEL_MARGIN = 0.35f
 
         const val TAP_DURATION_MILLIS = 60L
         const val DOUBLE_TAP_GAP_MILLIS = 80L
