@@ -18,6 +18,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import app.trailveil.R
+import app.trailveil.harness.DemoExplorationSection
 import app.trailveil.map.MapLibreFogArm
 import kotlin.system.exitProcess
 
@@ -47,6 +48,10 @@ internal fun HarnessSettingsSection(modifier: Modifier = Modifier) {
             .testTag(HarnessSettingsTestTags.Section),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
+        // Demo data comes first because it is the precondition for the rest of this screen: on a
+        // fully fogged map every arm below renders the same thing, so a person who reaches the arm
+        // list first concludes the selector does nothing.
+        DemoExplorationSection()
         Text(
             text = stringResource(R.string.settings_fog_arm_section),
             style = MaterialTheme.typography.titleSmall,

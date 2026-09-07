@@ -70,6 +70,22 @@ private val openFreeMapBuildTypes = listOf("debug", "internal", "release")
  */
 private val googleBuildTypes = listOf("googlePoc", "googleRelease")
 
+/**
+ * `V03-013`: the two build types a person holds in their hand to compare fog arms, one per provider.
+ *
+ * It crosses the provider boundary above ON PURPOSE and that is safe, because what it scopes carries
+ * no map engine: the demo-data seeder writes rows into the app's own database and never touches a
+ * map SDK. The property this list actually enforces is the other one - that the seeder is absent
+ * from every build type that leaves this machine.
+ */
+private val harnessBuildTypes = listOf("debug", "googlePoc")
+
+// Harness means harness. A distributed build type appearing here would ship code whose whole job is
+// writing synthetic tracks into a real exploration database.
+require(harnessBuildTypes.none { it in listOf("internal", "release", "googleRelease") }) {
+    "harnessBuildTypes must contain no distributed build type"
+}
+
 // The two lists are the boundary. A build type in both would link both map engines, which is
 // the one arrangement Google Maps Platform Terms 3.2.3(e) forbids.
 require(openFreeMapBuildTypes.intersect(googleBuildTypes.toSet()).isEmpty()) {
@@ -511,6 +527,21 @@ android {
         getByName("googlePoc").res.srcDir("src/googlePoc/res")
         getByName("googlePoc").manifest.srcFile("src/googlePoc/AndroidManifest.xml")
         getByName("googleRelease").manifest.srcFile("src/google/AndroidManifest.xml")
+        // `V03-013`: the two HARNESS build types, and nothing else, share one demo-data tree.
+        //
+        // `googlePoc` and `debug` are the arm-comparison artifacts - one per provider - and both
+        // need the same thing: a way to put explored ground on the map without walking. Written
+        // once, because the alternative is the same seeding SQL in two build types where one copy
+        // drifts and seeds a slightly different shape, which turns a subjective A/B into a
+        // comparison of two different tracks. `release`, `internal` and `googleRelease` compile
+        // none of it, so no distributed artifact carries code that writes synthetic points into a
+        // real exploration database.
+        harnessBuildTypes.forEach { variant ->
+            getByName(variant).kotlin.srcDir("src/harness/java")
+            getByName(variant).res.srcDir("src/harness/res")
+            getByName("test${variant.replaceFirstChar(Char::uppercase)}")
+                .kotlin.srcDir("src/testHarness/java")
+        }
     }
 
     compileOptions {
