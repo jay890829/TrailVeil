@@ -20,7 +20,8 @@ import org.junit.rules.Timeout
 import org.junit.runner.RunWith
 
 /**
- * `V03-011` arm 1, measured: the same pan under `BASELINE` and under `PADDING_RING`.
+ * `V03-011` arm 1, measured: the same pan under `BASELINE` and under `PADDING_RING`, at a flat
+ * pose and at a tilted one.
  *
  * **Opt-in, and not a gate.** It is skipped unless `trailveilFogArmSpike=true` is passed, and it
  * asserts almost nothing: the numbers are emitted for the evidence file. Two reasons, both recorded
@@ -88,41 +89,47 @@ class GoogleFogPaddingRingArmSpikeTest {
         )
 
         val measured = mutableListOf<String>()
-        FogContinuityArm.entries
-            .filter { arm -> arm != FogContinuityArm.MOSAIC_OVERLAY }
-            .forEach { arm ->
+        val arms = FogContinuityArm.entries.filter { arm -> arm != FogContinuityArm.MOSAIC_OVERLAY }
+        START_CAMERAS.forEach { camera ->
+            arms.forEach { arm ->
                 // BEFORE the Activity launches: a binding reads its coverage profile once, in its
                 // field initialisers, so a surface already attached would stay on the old arm.
                 arm.install()
-                val report = runOneTrial(arm)
-                measured += "V03-011-ARM arm=${arm.label} ${report.describe()}"
+                val report = runOneTrial(arm, camera)
+                measured += "V03-011-ARM arm=${arm.label} pose=${camera.name} ${report.describe()}"
                 // The standard line too, into the standard file, so an arm trial is readable next
                 // to the parity gate's own trials rather than only in this spike's own stream.
                 GestureExposureVerdict.emit(report, bare = null)
             }
+        }
 
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         measured.forEach { line -> SpikeEvidence.emit(context, EVIDENCE_FILE, line) }
+        val expected = START_CAMERAS.size * arms.size
         assertTrue(
-            "both arms must have produced a trial; a run that measured nothing must not be read " +
-                "as a run that measured no difference. Got ${measured.size}",
-            measured.size == 2,
+            "every arm must have produced a trial at every pose; a run that measured nothing must " +
+                "not be read as a run that measured no difference. Got ${measured.size} of " +
+                "$expected",
+            measured.size == expected,
         )
     }
 
-    private fun runOneTrial(arm: FogContinuityArm): GestureTrialReport {
+    private fun runOneTrial(
+        arm: FogContinuityArm,
+        startCamera: GestureStartCamera,
+    ): GestureTrialReport {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             val harness = GestureExposureHarness.attach(scenario)
             try {
                 assertTrue(
-                    "arm=${arm.label}: no online basemap, so there were no real map pixels under " +
+                    "arm=${arm.label} pose=${startCamera.name}: no online basemap, so there were no real map pixels under " +
                         "the fog to judge. " + harness.diagnostics(),
                     harness.awaitUntil(BASEMAP_TIMEOUT_MILLIS) {
                         harness.basemapLoadState() == GestureExposureHarness.ONLINE_STATE
                     },
                 )
                 assertTrue(
-                    "arm=${arm.label}: the launcher never proved a first canonical generation, so " +
+                    "arm=${arm.label} pose=${startCamera.name}: the launcher never proved a first canonical generation, so " +
                         "a trial here could not tell a start camera that produced nothing from a " +
                         "surface that never installed anything. " + harness.diagnostics(),
                     harness.awaitUntil(FIRST_GENERATION_TIMEOUT_MILLIS) {
@@ -130,12 +137,12 @@ class GoogleFogPaddingRingArmSpikeTest {
                     },
                 )
                 assertTrue(
-                    "arm=${arm.label}: the entry route's one-shot camera flight was still in the " +
+                    "arm=${arm.label} pose=${startCamera.name}: the entry route's one-shot camera flight was still in the " +
                         "air, so it would have landed inside the audited gesture. " +
                         harness.diagnostics(),
                     harness.awaitQuietCamera(),
                 )
-                return harness.runTrial(GestureKind.PAN, START_CAMERA) { live -> drivePan(live) }
+                return harness.runTrial(GestureKind.PAN, startCamera) { live -> drivePan(live) }
             } finally {
                 harness.close()
             }
@@ -212,7 +219,7 @@ class GoogleFogPaddingRingArmSpikeTest {
         const val SPIKE_ARGUMENT = "trailveilFogArmSpike"
         const val EVIDENCE_FILE = "v03-011-arm-spike.txt"
 
-        /** Two arms, each a full launch plus a settle plus a trial. */
+        /** Two poses x two arms, each a full launch plus a settle plus a trial. */
         const val CASE_TIMEOUT_SECONDS = 600L
         const val BASEMAP_TIMEOUT_MILLIS = 60_000L
         const val FIRST_GENERATION_TIMEOUT_MILLIS = 45_000L
@@ -230,12 +237,32 @@ class GoogleFogPaddingRingArmSpikeTest {
         const val DRAG_STEP_MILLIS = 22L
         const val DRAG_HOLD_BEFORE_LIFT_MILLIS = 260L
 
-        /** Open ocean at exploration zoom: no labels to argue with, and the parity gate's own. */
-        val START_CAMERA = GestureStartCamera(
-            name = "openOceanExplorationZoom",
-            latitude = -25.5,
-            longitude = -130.5,
-            zoom = 16.0f,
+        /**
+         * Two poses, because the ring's cost is a property of the VIEWPORT, not of the app.
+         *
+         * Flat at exploration zoom is the parity gate's own camera and plans a small mosaic, where
+         * a ring is nearly free. Tilted is the pose section 9's 240-of-256 completion came from: a
+         * tilted camera sees far more ground, so its rectangle is the one a ring can push over the
+         * budget. Measuring only the flat pose would report that a ring is cheap and would be
+         * describing the emulator's viewport rather than the arm.
+         *
+         * Same place and same zoom in both, so the only variable is the pose. Open ocean: no labels
+         * to argue with.
+         */
+        val START_CAMERAS = listOf(
+            GestureStartCamera(
+                name = "flatExplorationZoom",
+                latitude = -25.5,
+                longitude = -130.5,
+                zoom = 16.0f,
+            ),
+            GestureStartCamera(
+                name = "tiltedExplorationZoom",
+                latitude = -25.5,
+                longitude = -130.5,
+                zoom = 16.0f,
+                tilt = 45.0f,
+            ),
         )
     }
 }
