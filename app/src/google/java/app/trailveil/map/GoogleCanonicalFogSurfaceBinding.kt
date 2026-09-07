@@ -128,6 +128,12 @@ internal class GoogleCanonicalFogSurfaceBinding(
         subrenderer = FogViewportBatchSubrenderer { request, keys ->
             runtime.viewportCoordinator.renderTiles(request, keys)
         },
+        // The union of the render plan with the SDK's observed requests reaches this renderer, so
+        // its own 256 is one of the budgets a ring pushes on - not, as first committed, one that
+        // stays put because padding does not change what the SDK asks for. It does not, but the
+        // padded PLAN travels the same path, and the window planner refuses a set larger than its
+        // bound before a single tile is rendered.
+        maxTiles = coverageProfile.maxRequestedKeys,
     )
     private val probePlanner = FogSnapshotVisualProbePlanner()
     private val synchronizationPolicy = FogSynchronizationRenderPolicy()

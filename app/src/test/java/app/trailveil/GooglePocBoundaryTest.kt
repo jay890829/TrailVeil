@@ -391,6 +391,13 @@ class GooglePocBoundaryTest {
             "the binding must take its planners from the profile seam, not construct its own",
             binding.contains("FogViewportCoveragePlanner("),
         )
+        assertTrue(
+            "every budget a ring pushes on must travel with the profile. The window renderer's " +
+                "own bound is one of them: the padded PLAN reaches it in the same union as the " +
+                "SDK's observed requests, and its planner refuses an oversized set before a tile " +
+                "is rendered",
+            binding.contains("maxTiles = coverageProfile.maxRequestedKeys,"),
+        )
         assertEquals(
             "exactly one call site renders the ring: the published key set",
             1,
