@@ -799,6 +799,17 @@ internal enum class FogContinuityArm(
     /** The cheap control: the same design with a prefetch ring, so the surround outlasts a gesture. */
     PADDING_RING("paddingRing", coverExpected = false),
 
+    /**
+     * The same control with twice the ring, because `p` turned out to be the whole story.
+     *
+     * Section 14b measured that `ring(p)` removes the cover if and only if the pan is shorter than
+     * about `p` tiles - `ring(1)` removed it for a 1.06-tile drag and for nothing longer, while
+     * still paying `(C + 2p)(R + 2p)`. A second rung is what turns that from an observation about
+     * one ring into a law with `p` as the variable, on a phone-shaped viewport rather than through
+     * a density proxy.
+     */
+    PADDING_RING_2("paddingRing2", coverExpected = false),
+
     /** Prototype A: one anchored image for the viewport plus guards beyond it. */
     MOSAIC_OVERLAY("mosaicOverlay", coverExpected = false),
 
@@ -821,6 +832,7 @@ internal enum class FogContinuityArm(
         // exactly and buys no movement at all. `ring` also carries the budgets, which the shipped
         // 256s cannot accommodate: the rectangular completion already runs at 240.
         PADDING_RING -> GoogleFogCoverageProfile.ring(PADDING_RING_TILES)
+        PADDING_RING_2 -> GoogleFogCoverageProfile.ring(PADDING_RING_2_TILES)
         // Prototype A does not change the coverage plan, it replaces the TileOverlay, and none of
         // that is built. Installing the default here would let a mosaic trial run on the baseline
         // surface and report the baseline's numbers under prototype A's name.
@@ -836,6 +848,9 @@ internal enum class FogContinuityArm(
          * Larger rings are quadratic in tiles rendered, which is what metric 3 exists to price.
          */
         const val PADDING_RING_TILES = 1
+
+        /** Two, so a pan between one and two tiles separates the two rings instead of both. */
+        const val PADDING_RING_2_TILES = 2
     }
 }
 
@@ -1162,16 +1177,37 @@ internal data class GestureTrialReport(
      * antimeridian reads as the small number it is instead of nearly a whole world.
      */
     val panTiles: Double
+        get() = hypot(panTilesX, panTilesY)
+
+    /**
+     * The same travel, per axis - which is the one the RING is actually judged against.
+     *
+     * `V03-011` section 14d: the surround predicate is rectangle containment, so a padded plan is
+     * left when EITHER axis runs out, never when a hypotenuse does. A diagonal drag can therefore
+     * report a large [panTiles] while staying inside a one-tile ring on both axes, which is exactly
+     * what a first attempt at bracketing the ring's capacity measured and misread. Reported
+     * separately so an evidence line cannot be read the wrong way twice.
+     */
+    val panTilesX: Double
         get() {
-            val zoom = floor(before.zoom.toDouble()).toInt().coerceIn(0, 22)
-            val tilesAcross = (1L shl zoom).toDouble()
+            val tilesAcross = panTileCount()
             val rawX = WebMercator.normalizedX(after.target.longitude) -
                 WebMercator.normalizedX(before.target.longitude)
             val wrappedX = ((rawX + 1.5) % 1.0) - 0.5
+            return abs(wrappedX * tilesAcross)
+        }
+
+    val panTilesY: Double
+        get() {
             val deltaY = WebMercator.normalizedY(after.target.latitude) -
                 WebMercator.normalizedY(before.target.latitude)
-            return hypot(wrappedX * tilesAcross, deltaY * tilesAcross)
+            return abs(deltaY * panTileCount())
         }
+
+    private fun panTileCount(): Double {
+        val zoom = floor(before.zoom.toDouble()).toInt().coerceIn(0, 22)
+        return (1L shl zoom).toDouble()
+    }
 
     val touchDownGrowth: Int get() = touchDownsAfter - touchDownsBefore
 
@@ -1244,6 +1280,7 @@ internal data class GestureTrialReport(
             "zoomDelta=${"%.3f".format(zoomDelta)} tiltDelta=${"%.2f".format(tiltDelta)} " +
             "bearingDelta=${"%.2f".format(bearingDelta)} " +
             "panTiles=${"%.3f".format(panTiles)} " +
+            "panTilesX=${"%.3f".format(panTilesX)} panTilesY=${"%.3f".format(panTilesY)} " +
             "generation=$generationBefore->$generationAfter " +
             "touchDowns=$touchDownsBefore->$touchDownsAfter " +
             "injectedDowns=${drive.injectedDownCount} " +
