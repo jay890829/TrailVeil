@@ -63,7 +63,22 @@ class FogMoveStartReachabilityTest {
                     ?.let { add("setOnCameraMoveStartedListener" to bracedBlock(it)) }
                 source.indexOf("fun onCameraMoveStarted")
                     .takeIf { it >= 0 }
-                    ?.let { add("fun onCameraMoveStarted" to bracedBlock(source.substring(it))) }
+                    ?.let { at ->
+                        val body = declarationBodyOrNull(source.substring(at))
+                        if (body == null) {
+                            // No body at all means an interface member, and there is
+                            // nothing to reach FROM a declaration. Skipping it is only safe
+                            // while that is the reason, so prove it rather than assume it.
+                            assertTrue(
+                                "${file.name} declares fun onCameraMoveStarted with no " +
+                                    "body and is not an interface, so this scan would be " +
+                                    "skipping a real handler",
+                                source.contains("interface "),
+                            )
+                        } else {
+                            add("fun onCameraMoveStarted" to body)
+                        }
+                    }
             }
             if (regions.isEmpty()) return@forEach
             regions.forEach { (shape, body) ->
@@ -80,6 +95,59 @@ class FogMoveStartReachabilityTest {
             "the scan matched no move-start region in any binding, so it proved nothing",
             scanned > 0,
         )
+    }
+
+    /**
+     * The body of the declaration starting at [text], or null when it declares no body.
+     *
+     * `V03-011` arm 2 added `GoogleFogSurfaceBinding`, the interface the host holds a fog surface
+     * by, and its file name matches this scan's filter. An interface member has no body, so the
+     * old unconditional `bracedBlock` threw "no braced block found" on it. Returning null is only
+     * half the fix: the caller must prove the reason is an interface, or a real handler written
+     * with a shape this parser does not understand would be silently skipped, which is exactly the
+     * failure this class's own KDoc records having had once already.
+     *
+     * Handles a block body, an expression body, and an explicit return type before either.
+     */
+    private fun declarationBodyOrNull(text: String): String? {
+        val open = text.indexOf('(')
+        if (open < 0) return null
+        var depth = 0
+        var afterParameters = -1
+        for (index in open until text.length) {
+            when (text[index]) {
+                '(' -> depth += 1
+                ')' -> {
+                    depth -= 1
+                    if (depth == 0) {
+                        afterParameters = index + 1
+                    }
+                }
+            }
+            if (afterParameters >= 0) break
+        }
+        if (afterParameters < 0) return null
+
+        var cursor = afterParameters
+        while (cursor < text.length && text[cursor].isWhitespace()) cursor += 1
+        if (cursor < text.length && text[cursor] == ':') {
+            // An explicit return type sits between the parameters and the body.
+            cursor += 1
+            while (cursor < text.length && text[cursor].isWhitespace()) cursor += 1
+            while (cursor < text.length && !text[cursor].isWhitespace() &&
+                text[cursor] != '{' && text[cursor] != '='
+            ) {
+                cursor += 1
+            }
+            while (cursor < text.length && text[cursor].isWhitespace()) cursor += 1
+        }
+        if (cursor >= text.length) return null
+        return when (text[cursor]) {
+            '{' -> bracedBlock(text.substring(cursor))
+            // An expression body is still a body and still has to be scanned.
+            '=' -> text.substring(cursor).substringBefore('\n')
+            else -> null
+        }
     }
 
     private fun functionBody(source: String, name: String): String {

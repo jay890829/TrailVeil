@@ -75,9 +75,9 @@ private class CameraFlightClaim(
 
 private fun claimCameraFlight(
     host: MapCameraFlightController,
-    owner: GoogleCanonicalFogSurfaceBinding?,
-    beginOwner: (GoogleCanonicalFogSurfaceBinding) -> Long,
-    endOwner: (GoogleCanonicalFogSurfaceBinding, Long) -> Boolean,
+    owner: GoogleFogSurfaceBinding?,
+    beginOwner: (GoogleFogSurfaceBinding) -> Long,
+    endOwner: (GoogleFogSurfaceBinding, Long) -> Boolean,
     onHostActiveChanged: (Boolean) -> Unit,
 ): CameraFlightClaim {
     val hostTicket = host.claim()
@@ -228,7 +228,7 @@ internal fun GoogleHostedMapSurface(
     val compassPlacement = remember(mapView) { GoogleCompassPlacement(mapView) }
     var binding by remember(mapView) { mutableStateOf<GoogleMapSurfaceBinding?>(null) }
     var fogBinding by remember(mapView) {
-        mutableStateOf<GoogleCanonicalFogSurfaceBinding?>(null)
+        mutableStateOf<GoogleFogSurfaceBinding?>(null)
     }
 
     // Re-stated on every composition rather than launched once: the SDK gives its compass no
@@ -460,7 +460,7 @@ internal fun GoogleHostedMapSurface(
     DisposableEffect(mapView, fogRuntime, fogRequired) {
         val effectEpoch = mapCallbackEpoch.incrementAndGet()
         var effectBinding: GoogleMapSurfaceBinding? = null
-        var effectFogBinding: GoogleCanonicalFogSurfaceBinding? = null
+        var effectFogBinding: GoogleFogSurfaceBinding? = null
         var earlyLoadedMap: GoogleMap? = null
         var loadedCallbackRetry: Runnable? = null
         try {
@@ -551,7 +551,7 @@ internal fun GoogleHostedMapSurface(
                     // The map binding owns overlay geometry and can therefore provide the
                     // proof planner with screen footprints. Construct it before the fog binding;
                     // camera callbacks capture the nullable binding until the latter exists.
-                    var newFogBinding: GoogleCanonicalFogSurfaceBinding? = null
+                    var newFogBinding: GoogleFogSurfaceBinding? = null
                     val newBinding = GoogleMapSurfaceBinding(
                         map = map,
                         mapView = mapView,

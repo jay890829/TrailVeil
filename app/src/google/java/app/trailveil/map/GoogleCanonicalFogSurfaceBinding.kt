@@ -96,7 +96,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
      * host passed nothing cannot observe that this seam exists.
      */
     private val installFaultForTesting: (() -> Unit)? = null,
-) {
+) : GoogleFogSurfaceBinding {
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     /**
@@ -393,13 +393,13 @@ internal class GoogleCanonicalFogSurfaceBinding(
         }
     }
 
-    fun onMapLoaded() {
+    override fun onMapLoaded() {
         assertMainThread()
         mapLoaded = true
         requestCurrentViewportIfReady()
     }
 
-    fun onHostStarted() {
+    override fun onHostStarted() {
         assertMainThread()
         if (released) return
         val resuming = hostStopped
@@ -437,7 +437,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
      * terminal failure on the recording screen — reproduced on API 36 before this guard existed.
      * Both are re-armed fresh by [onHostStarted].
      */
-    fun onHostStopped() {
+    override fun onHostStopped() {
         assertMainThread()
         if (released || hostStopped) return
         hostStopped = true
@@ -452,7 +452,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         pausedInstallTimeoutGeneration = activeInstall
     }
 
-    fun onCameraMoveStarted(reason: Int) {
+    override fun onCameraMoveStarted(reason: Int) {
         assertMainThread()
         if (released) return
         cameraEpoch += 1L
@@ -461,7 +461,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         afterCoordinatorMutation()
     }
 
-    fun onCameraMoveFrame() {
+    override fun onCameraMoveFrame() {
         assertMainThread()
         if (released) return
         cameraEpoch += 1L
@@ -469,7 +469,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         afterCoordinatorMutation()
     }
 
-    fun onCameraIdle() {
+    override fun onCameraIdle() {
         assertMainThread()
         if (released || !baselineReady || !mapLoaded) return
         cameraEpoch += 1L
@@ -477,28 +477,28 @@ internal class GoogleCanonicalFogSurfaceBinding(
         afterCoordinatorMutation()
     }
 
-    fun onCameraMoveCancelled() = onCameraIdle()
+    override fun onCameraMoveCancelled() = onCameraIdle()
 
     /** Claims the coordinator's SP10-verified ticket for an ordinary programmed camera move. */
-    fun beginProgrammedFlight(): Long {
+    override fun beginProgrammedFlight(): Long {
         assertMainThread()
         return coordinator.beginProgrammedFlight()
     }
 
     /** Releases a programmed flight only when its ticket is still current. */
-    fun endProgrammedFlight(ticket: Long): Boolean {
+    override fun endProgrammedFlight(ticket: Long): Boolean {
         assertMainThread()
         return coordinator.endProgrammedFlight(ticket)
     }
 
     /** Claims the follow-ease ticket and marks the move as exempt from the move-start cover. */
-    fun beginFollowEase(): Long {
+    override fun beginFollowEase(): Long {
         assertMainThread()
         return coordinator.beginFollowEase()
     }
 
     /** Releases a follow-ease ticket without letting a stale cancel clear a newer flight. */
-    fun endFollowEase(ticket: Long): Boolean {
+    override fun endFollowEase(ticket: Long): Boolean {
         assertMainThread()
         return coordinator.endFollowEase(ticket)
     }
@@ -509,12 +509,12 @@ internal class GoogleCanonicalFogSurfaceBinding(
     }
 
     /** Invalidates a proof that predates a newly published marker/track payload. */
-    fun onOverlayDataChanged() {
+    override fun onOverlayDataChanged() {
         assertMainThread()
         cameraEpoch += 1L
     }
 
-    fun release() {
+    override fun release() {
         assertMainThread()
         if (released) return
         released = true
@@ -610,7 +610,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
      * messages: a generation that stays pending with every worker idle has bailed out of
      * [startRender] or never been requested, and only these flags say which.
      */
-    fun describeForTesting(): String {
+    override fun describeForTesting(): String {
         val actual = actualRequests.snapshot()
         val recent = recentRequestedKeysOrNull()
         val pendingKeys = pendingCoverageKeys
