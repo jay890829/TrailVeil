@@ -196,8 +196,26 @@ internal class GoogleFogMosaicOverlayInstaller(
         // what a zoom-out uncovers - and the measurement said so: seven polygons attached and the
         // same 89.344% of bare basemap came back, because not one of them was anywhere near the
         // ground being exposed.
+        //
+        // Two things happen to those rectangles before any of them becomes a Polygon, and the
+        // proof failure that found them is recorded in section 15m of the evidence.
+        //
+        // `anchoredInsideWorld` is the geometry's own remedy for a quad lying wholly past the
+        // world's edge, which the renderer then draws twice - once where its coordinates put it and
+        // once where its repetition of world copies does - as a second coat of fog. A mosaic near
+        // the antimeridian is exactly where `longitudeGuardIntervals` emits such a quad.
+        //
+        // `splitForGooglePolygon` is the same defect arriving by the other road. The guard is
+        // authored for GeoJSON, whose convention makes an exactly-180-degree ring unambiguous, and
+        // it deliberately emits them: `splitForCanonicalGeoJson` stops splitting AT 180. A Google
+        // `Polygon` has no such convention - it joins consecutive vertices the short way round in
+        // longitude, and at exactly 180 there is no short way - so the ring may enclose the
+        // complementary half of the world, which contains the image. That is a second coat over
+        // every pixel the proof samples, and it is what generations 2, 3 and 4 died of.
         val rectangles = try {
             FogBackdropGeometry.extentGuard(imageExtent(mosaic)).rectangles
+                .map(FogBackdropGeometry::anchoredInsideWorld)
+                .flatMap { bounds -> bounds.splitForGooglePolygon() }
         } catch (_: IllegalArgumentException) {
             refuse("guardGeometry")
             return emptyList()
@@ -235,6 +253,25 @@ internal class GoogleFogMosaicOverlayInstaller(
             polygons += polygon
         }
         return polygons
+    }
+
+    /**
+     * Halves a guard rectangle until no ring spans enough longitude to be read the long way round.
+     *
+     * The ceiling is well under 180 rather than just under it. What a `Polygon` does at exactly 180
+     * is undefined rather than merely tight, and a rectangle whose width sits a rounding error
+     * below the boundary would put the whole surface on the far side of an SDK's tie-break. Halving
+     * costs one more polygon per split and nothing per frame.
+     */
+    private fun FogTileBounds.splitForGooglePolygon(): List<FogTileBounds> {
+        val width = eastLongitude - westLongitude
+        if (!width.isFinite() || width <= MAX_POLYGON_RING_DEGREES) return listOf(this)
+        val middle = (westLongitude + eastLongitude) / 2.0
+        if (middle <= westLongitude || middle >= eastLongitude) return listOf(this)
+        return listOf(
+            copy(eastLongitude = middle),
+            copy(westLongitude = middle),
+        ).flatMap { half -> half.splitForGooglePolygon() }
     }
 
     private fun removeSafely(polygon: Polygon) {
@@ -435,6 +472,9 @@ internal class GoogleFogMosaicOverlayInstaller(
          */
         const val BACKDROP_Z = 0.5f
         const val TRANSPARENT = 0
+
+        /** The widest longitude span handed to one `Polygon`; see [splitForGooglePolygon]. */
+        const val MAX_POLYGON_RING_DEGREES = 90.0
 
         const val MAX_LONGITUDE = 180.0
     }
