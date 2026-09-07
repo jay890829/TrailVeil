@@ -129,6 +129,19 @@ class GoogleFogPaddingRingArmSpikeTest {
         val endXFraction: Float,
         val startYFraction: Float,
         val endYFraction: Float,
+        /**
+         * How many times the same drag is injected inside ONE audited window.
+         *
+         * A ring is re-published around the new camera after each move, but only once a new
+         * generation has rendered - which the 420 dpi trials measured at 234 ms of render plus 94 ms
+         * of publish for 35 keys. A second drag arriving inside that gap meets the OLD ring. One
+         * drag cannot defeat `ring(1)` on a phone-shaped viewport because the screen is too small to
+         * ask for more than the ring holds; two drags in quick succession can ask for twice as much,
+         * and that is a thing users do.
+         */
+        val repeats: Int = 1,
+        /** Gap between repeats. Short on purpose: this is a flick-flick, not two decisions. */
+        val gapMillis: Long = 0L,
     )
 
     /**
@@ -177,6 +190,52 @@ class GoogleFogPaddingRingArmSpikeTest {
                 "nothing must not be read as a run that measured no difference. Got " +
                 "${measured.size} of $expected",
             measured.size == expected,
+        )
+    }
+
+    /**
+     * The edge a single drag cannot reach: two flicks before the ring has been re-published.
+     *
+     * Section 14d's conclusion is a statement about the SCREEN - one finger cannot ask for more
+     * ground than the ring holds, because the screen is only about 1.6 tiles wide. Two drags inside
+     * one audited window can ask for twice as much, and the fog only re-publishes its ring after a
+     * new generation renders (measured at 234 ms render plus 94 ms publish for 35 keys). So this is
+     * the realistic way a user defeats `ring(1)`, and it is worth knowing whether `ring(2)` - which
+     * bought nothing against one drag - earns its 63 keys here.
+     *
+     * Reported, never asserted, like everything else in this spike.
+     */
+    @Test
+    fun aSecondFlickBeforeTheRingIsRepublished() {
+        val arguments = InstrumentationRegistry.getArguments()
+        assumeTrue(
+            "the fog arm spike is opt-in; pass $SPIKE_ARGUMENT=true",
+            arguments.getString(SPIKE_ARGUMENT) == "true",
+        )
+        assumeTrue(
+            "the keyed googlePoc runtime is required; this spike measures, it closes nothing",
+            BuildConfig.GOOGLE_MAPS_POC_KEY_CONFIGURED,
+        )
+
+        val arms = listOf(
+            FogContinuityArm.BASELINE,
+            FogContinuityArm.PADDING_RING,
+            FogContinuityArm.PADDING_RING_2,
+        )
+        val measured = mutableListOf<String>()
+        arms.forEach { arm ->
+            arm.install()
+            val report = runOneTrial(arm, START_CAMERAS.first(), DOUBLE_FLICK)
+            measured += "V03-011-DOUBLE-FLICK arm=${arm.label} " + report.describe()
+            GestureExposureVerdict.emit(report, bare = null)
+        }
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        measured.forEach { line -> SpikeEvidence.emit(context, EVIDENCE_FILE, line) }
+        assertTrue(
+            "every ring width must have produced a trial; a run that measured nothing must not be " +
+                "read as a run that measured no difference. Got ${measured.size} of ${arms.size}",
+            measured.size == arms.size,
         )
     }
 
@@ -246,31 +305,35 @@ class GoogleFogPaddingRingArmSpikeTest {
             val before = harness.cameraPosition()
             val openedAt = SystemClock.elapsedRealtime()
             var liftedAt = openedAt
-            FlingGestureInjector.withStream { stream ->
-                stream.down(FlingGestureInjector.TouchPoint(startX, startY))
-                downs += 1
-                repeat(DRAG_STEPS) { step ->
-                    val progress = (step + 1).toFloat() / DRAG_STEPS
-                    stream.move(
-                        listOf(
-                            FlingGestureInjector.TouchPoint(
-                                startX + (endX - startX) * progress,
-                                startY + (endY - startY) * progress,
+            repeat(drag.repeats) { repeatIndex ->
+                if (repeatIndex > 0) SystemClock.sleep(drag.gapMillis)
+                FlingGestureInjector.withStream { stream ->
+                    stream.down(FlingGestureInjector.TouchPoint(startX, startY))
+                    downs += 1
+                    repeat(DRAG_STEPS) { step ->
+                        val progress = (step + 1).toFloat() / DRAG_STEPS
+                        stream.move(
+                            listOf(
+                                FlingGestureInjector.TouchPoint(
+                                    startX + (endX - startX) * progress,
+                                    startY + (endY - startY) * progress,
+                                ),
                             ),
-                        ),
-                    )
-                    SystemClock.sleep(DRAG_STEP_MILLIS)
+                        )
+                        SystemClock.sleep(DRAG_STEP_MILLIS)
+                    }
+                    // Held still, so the SDK sees a stopped finger and starts no fling.
+                    SystemClock.sleep(DRAG_HOLD_BEFORE_LIFT_MILLIS)
+                    stream.up(FlingGestureInjector.TouchPoint(endX, endY))
+                    liftedAt = SystemClock.elapsedRealtime()
                 }
-                // Held still, so the SDK sees a stopped finger and starts no fling.
-                SystemClock.sleep(DRAG_HOLD_BEFORE_LIFT_MILLIS)
-                stream.up(FlingGestureInjector.TouchPoint(endX, endY))
-                liftedAt = SystemClock.elapsedRealtime()
             }
             val after = harness.cameraPosition()
             val moved = before.target != after.target
             if (moved) {
                 return GestureDrive(
-                    note = "oneFingerPan drag=${drag.label} steps=$DRAG_STEPS " +
+                    note = "oneFingerPan drag=${drag.label} repeats=${drag.repeats} " +
+                        "gapMs=${drag.gapMillis} steps=$DRAG_STEPS " +
                         "holdMs=$DRAG_HOLD_BEFORE_LIFT_MILLIS",
                     downAtMillis = openedAt,
                     upAtMillis = liftedAt,
@@ -281,7 +344,7 @@ class GoogleFogPaddingRingArmSpikeTest {
             SystemClock.sleep(GESTURE_RETRY_SETTLE_MILLIS)
         }
         throw AssertionError(
-            "the map never moved for $attempts injected one-finger drags. " +
+            "the map never moved for $attempts injected one-finger drag rounds. " +
                 harness.diagnostics(),
         )
     }
@@ -356,6 +419,21 @@ class GoogleFogPaddingRingArmSpikeTest {
                 startYFraction = 0.45f,
                 endYFraction = 0.45f,
             ),
+        )
+
+        /**
+         * The same full-width drag, twice, with 120 ms between - a flick-flick rather than two
+         * decisions, and well inside the 234 + 94 ms a 35-key generation takes to render and
+         * publish. Asks for about twice one screen of ground, which is past what one ring holds.
+         */
+        val DOUBLE_FLICK = PanDrag(
+            label = "doubleFullWidthFlick",
+            startXFraction = 0.97f,
+            endXFraction = 0.03f,
+            startYFraction = 0.45f,
+            endYFraction = 0.45f,
+            repeats = 2,
+            gapMillis = 120L,
         )
 
         const val DRAG_STEPS = 16
