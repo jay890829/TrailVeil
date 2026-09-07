@@ -146,11 +146,28 @@ internal class GoogleFogVectorOverlayInstaller(
 
         installed[generationId] = Installed(
             polygons = attached,
-            extent = if (backdropComplete) {
-                FogBackdropGeometry.extent(mosaic)
-            } else {
-                imageExtent(mosaic)
-            },
+        // **The extent is the IMAGE, never the surround, and this is the correction the owner's
+        // "some places never reveal" report came down to.**
+        //
+        // `covers()` is what the coordinator asks to decide whether the camera has left what this
+        // surface can defend; a false answer suppresses the rebuild. Claiming
+        // `FogBackdropGeometry.extent` claimed the SURROUND - +/-40 tiles at the render zoom, which
+        // at z18 is kilometres - while the only ground carrying holes is the drawn image, a couple
+        // of tiles across. Everything between the two is the backdrop, which is uniform fog with no
+        // holes at all. So the surface answered "covered" for ground it merely PAINTS, and since a
+        // hand gesture yields LEAVE_PUBLISHED_COVERAGE and never sets `viewportDirty`, the idle
+        // rebuild was skipped: pan off the first image and every explored metre beyond it stays
+        // fogged for good, with the cover down and nothing to make it try again.
+        //
+        // The invariant this restores: answer from the ground this surface can REVEAL, never from
+        // the ground it can paint. Section 15k's defect was the same sentence with the opposite
+        // sign - claiming a reach that was not drawn - and it cost 89.344% of bare basemap.
+        //
+        // The price is real and is the right price: the claim is now small, so leaving the image
+        // raises the cover and forces a rebuild. That is exactly the churn the tile arms already
+        // pay, and paying it is what makes this arm comparable to them rather than flattered by a
+        // blindfold.
+            extent = imageExtent(mosaic),
             rings = decomposed.rects.size,
             truncated = decomposed.truncated,
         )
@@ -309,12 +326,19 @@ internal class GoogleFogVectorOverlayInstaller(
         /**
          * Sample the mask every this many pixels.
          *
-         * 1 traces the mask's own granularity, which is what section 15p describes, and costs the
-         * most rings. 2 halves the row count and is where a phone-shaped viewport stays inside a
-         * ring budget a `Polygon` can carry; the boundary it produces is coarser, and a coarser
-         * boundary here can only SHRINK what is revealed, never grow it - see
-         * `FogMaskContours.decompose`.
+         * **Was 2, and the owner found what that cost.** A cell counts as revealed only when EVERY
+         * pixel under it is, so a step of 2 erodes the reveal by up to one mask pixel on every
+         * boundary. Measured against the tile path on the same seeded track, that removed 7,253 of
+         * 256,293 revealed pixels - 2.8% of the explored ground, all of it around the edges, with
+         * only 167 pixels revealed that the tile path did not. "Shrink rather than grow" is the safe
+         * direction and it is still the wrong answer: this arm exists to be compared against the
+         * tile path by eye, and an arm that quietly under-reveals is not being compared, it is being
+         * misread.
+         *
+         * 1 traces the mask's own granularity, which is what section 15p describes. It costs more
+         * rings - and the ring count IS this arm's measurement, so paying it is the point rather
+         * than a regression. `describe()` reports the count and whether the budget truncated.
          */
-        const val DEFAULT_STEP = 2
+        const val DEFAULT_STEP = 1
     }
 }

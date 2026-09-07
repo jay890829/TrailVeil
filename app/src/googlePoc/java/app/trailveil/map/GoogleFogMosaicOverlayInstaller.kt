@@ -150,11 +150,28 @@ internal class GoogleFogMosaicOverlayInstaller(
         installed[generationId] = Installed(
             overlay = overlay,
             bitmap = bitmap,
-            extent = if (backdrop.isEmpty()) {
-                imageExtent(mosaic)
-            } else {
-                FogBackdropGeometry.extent(mosaic)
-            },
+        // **The extent is the IMAGE, never the surround, and this is the correction the owner's
+        // "some places never reveal" report came down to.**
+        //
+        // `covers()` is what the coordinator asks to decide whether the camera has left what this
+        // surface can defend; a false answer suppresses the rebuild. Claiming
+        // `FogBackdropGeometry.extent` claimed the SURROUND - +/-40 tiles at the render zoom, which
+        // at z18 is kilometres - while the only ground carrying holes is the drawn image, a couple
+        // of tiles across. Everything between the two is the backdrop, which is uniform fog with no
+        // holes at all. So the surface answered "covered" for ground it merely PAINTS, and since a
+        // hand gesture yields LEAVE_PUBLISHED_COVERAGE and never sets `viewportDirty`, the idle
+        // rebuild was skipped: pan off the first image and every explored metre beyond it stays
+        // fogged for good, with the cover down and nothing to make it try again.
+        //
+        // The invariant this restores: answer from the ground this surface can REVEAL, never from
+        // the ground it can paint. Section 15k's defect was the same sentence with the opposite
+        // sign - claiming a reach that was not drawn - and it cost 89.344% of bare basemap.
+        //
+        // The price is real and is the right price: the claim is now small, so leaving the image
+        // raises the cover and forces a rebuild. That is exactly the churn the tile arms already
+        // pay, and paying it is what makes this arm comparable to them rather than flattered by a
+        // blindfold.
+            extent = imageExtent(mosaic),
             backdrop = backdrop,
             width = width,
             height = height,

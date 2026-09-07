@@ -16,6 +16,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.geometry.Size
 import app.trailveil.data.map.ViewportBounds
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogTilePngCodec
@@ -80,7 +82,10 @@ internal fun GoogleFogStencilOverlay(
     // Geometry and projection move at completely different rates, so they are read on different
     // clocks: a Room read per frame would be absurd, and a projection read per query would be the
     // lag this arm exists to avoid.
-    var reveals by remember(map) { mutableStateOf<List<LatLng>>(emptyList()) }
+    // Kept as SEGMENTS rather than flattened points, because the canonical fog reveals the capsule
+    // swept between consecutive points in a segment - not the points. Flattening loses the only
+    // information that says which pairs are joined.
+    var reveals by remember(map) { mutableStateOf<List<List<LatLng>>>(emptyList()) }
     var frame by remember(map) { mutableIntStateOf(0) }
 
     LaunchedEffect(map, fogRuntime) {
@@ -99,8 +104,11 @@ internal fun GoogleFogStencilOverlay(
                 if (bounds != null) {
                     reveals = runCatching {
                         fogRuntime.viewportCoordinator.readRevealedSegments(bounds)
-                            .flatMap { segment -> segment.points }
-                            .map { point -> LatLng(point.latitude, point.longitude) }
+                            .map { segment ->
+                                segment.points.map { point ->
+                                    LatLng(point.latitude, point.longitude)
+                                }
+                            }
                     }.getOrDefault(reveals)
                 }
             }
@@ -141,31 +149,58 @@ internal fun GoogleFogStencilOverlay(
         val radiusPx = revealRadiusPixels(projection, size.width)
         if (radiusPx <= 0f) return@Canvas
         val feathered = radiusPx * FEATHER_SCALE
-        reveals.forEach { point ->
-            val screen = runCatching { projection.toScreenLocation(point) }.getOrNull()
-                ?: return@forEach
-            val centre = Offset(screen.x.toFloat(), screen.y.toFloat())
-            if (centre.x < -feathered || centre.y < -feathered ||
-                centre.x > size.width + feathered || centre.y > size.height + feathered
-            ) {
-                return@forEach
-            }
-            // A radial gradient rather than a hard circle, because the edge is free here: the same
-            // paint that removes the fog can taper it. `V03-002` owns the boundary's look; this is
-            // only the shape it comes out as on this arm.
-            drawCircle(
-                brush = Brush.radialGradient(
-                    colorStops = FEATHER_STOPS,
-                    center = centre,
+        reveals.forEach { segment ->
+            var previous: Offset? = null
+            segment.forEach inner@{ point ->
+                val screen = runCatching { projection.toScreenLocation(point) }.getOrNull()
+                    ?: return@inner
+                val centre = Offset(screen.x.toFloat(), screen.y.toFloat())
+                val offscreen = centre.x < -feathered || centre.y < -feathered ||
+                    centre.x > size.width + feathered || centre.y > size.height + feathered
+
+                // THE CAPSULE, and it is not a refinement. The canonical mask sweeps a disc ALONG
+                // the segment; drawing only the discs leaves fog between any two points further
+                // apart than the radius. Measured against the tile path on the same seeded track,
+                // the point-only version was missing 118,023 of 256,293 revealed pixels - 46% of
+                // the explored ground - because a walk's points are not always close together.
+                val start = previous
+                if (start != null && !(offscreen && isOffscreen(start, size, feathered))) {
+                    drawLine(
+                        color = Color.Black,
+                        start = start,
+                        end = centre,
+                        strokeWidth = radiusPx * 2f,
+                        cap = StrokeCap.Round,
+                        blendMode = BlendMode.Clear,
+                    )
+                }
+                previous = centre
+
+                if (offscreen) return@inner
+                // A radial gradient rather than a hard circle, because the edge is free here: the
+                // same paint that removes the fog can taper it. Drawn after the capsule so the
+                // taper is what a reader sees wherever points are dense, which on a real track is
+                // nearly everywhere. `V03-002` owns the boundary's look; this is only the shape it
+                // comes out as on this arm.
+                drawCircle(
+                    brush = Brush.radialGradient(
+                        colorStops = FEATHER_STOPS,
+                        center = centre,
+                        radius = feathered,
+                    ),
                     radius = feathered,
-                ),
-                radius = feathered,
-                center = centre,
-                blendMode = BlendMode.Clear,
-            )
+                    center = centre,
+                    blendMode = BlendMode.Clear,
+                )
+            }
         }
     }
 }
+
+/** Both ends off-screen on the same side means the capsule cannot cross the viewport. */
+private fun isOffscreen(point: Offset, size: Size, margin: Float): Boolean =
+    point.x < -margin || point.y < -margin || point.x > size.width + margin ||
+        point.y > size.height + margin
 
 /**
  * The reveal radius in screen pixels, measured through the SDK rather than recomputed.
@@ -203,12 +238,20 @@ private const val GEOMETRY_REFRESH_MILLIS = 400L
 private const val MIN_VISIBLE_RADIUS_PX = 0.75f
 private const val FEATHER_SCALE = 1.25f
 
-/** Solid to about 80% of the radius, then tapering - the shape a soft reveal edge wants. */
+/**
+ * Solid out to exactly the reveal radius, then tapering beyond it.
+ *
+ * **The first stop was 0.60, and with [FEATHER_SCALE] of 1.25 that put the fully-cleared radius at
+ * 18.75 m against the canonical fog's 25 m - every revealed shape a quarter short in every
+ * direction.** The taper is meant to soften the edge, not to move it inward: at 0.80 the solid core
+ * is `0.80 * 1.25 = 1.0` of the true radius, and the gradient spends its length OUTSIDE that,
+ * which is the side where erring costs a soft halo rather than unrevealed ground.
+ */
 private val FEATHER_STOPS = arrayOf(
     0.0f to Color.Black,
-    0.60f to Color.Black,
-    0.78f to Color.Black.copy(alpha = 0.85f),
-    0.88f to Color.Black.copy(alpha = 0.45f),
-    0.95f to Color.Black.copy(alpha = 0.15f),
+    0.80f to Color.Black,
+    0.87f to Color.Black.copy(alpha = 0.85f),
+    0.93f to Color.Black.copy(alpha = 0.45f),
+    0.97f to Color.Black.copy(alpha = 0.15f),
     1.0f to Color.Transparent,
 )
