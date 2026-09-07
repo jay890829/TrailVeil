@@ -8,6 +8,7 @@ import app.trailveil.BuildConfig
 import app.trailveil.MainActivity
 import app.trailveil.feature.recording.PermissionHistory
 import app.trailveil.feature.recording.PermissionHistoryStore
+import app.trailveil.map.GoogleFogCoverageArm
 import app.trailveil.map.GoogleMapSurfaceTestHooks
 import kotlin.math.abs
 import kotlin.math.cos
@@ -100,6 +101,11 @@ class GoogleGestureExposureTest {
      */
     @Before
     fun setUp() {
+        // This class certifies eight gesture parity rows against the SHIPPED fog configuration. A
+        // `V03-011` arm left installed by whatever ran before would silently re-point that
+        // certification at a measurement fixture, so the profile is reset going in as well as
+        // coming out.
+        GoogleFogCoverageArm.reset()
         permissionHistory = PermissionHistoryStore(
             InstrumentationRegistry.getInstrumentation().targetContext,
         )
@@ -121,6 +127,7 @@ class GoogleGestureExposureTest {
         // The fog-detached arm arms the test hooks; a case that failed an assertion mid-arm must
         // not leave a fog-free surface configured for whatever runs next.
         GoogleMapSurfaceTestHooks.reset()
+        GoogleFogCoverageArm.reset()
     }
 
     /**
