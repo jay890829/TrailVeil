@@ -1240,6 +1240,7 @@ internal data class GestureTrialReport(
             "coverProof=${coverPixelProof?.describe() ?: "none"} " +
             "coverProofAttempts=$coverProofAttempts " +
             "startZoom=${"%.3f".format(before.zoom)} " +
+            "startTilt=${"%.2f".format(before.tilt)} " +
             "zoomDelta=${"%.3f".format(zoomDelta)} tiltDelta=${"%.2f".format(tiltDelta)} " +
             "bearingDelta=${"%.2f".format(bearingDelta)} " +
             "panTiles=${"%.3f".format(panTiles)} " +
@@ -1439,6 +1440,16 @@ internal class GestureExposureHarness private constructor(
                 "${start.zoom}; the requested start camera was never reached, so nothing below " +
                 "measures the scene this trial names. " + diagnostics(),
             abs(settled.zoom - start.zoom) <= START_ZOOM_TOLERANCE,
+        )
+        assertTrue(
+            "${kind.label}/${start.name}: the SDK applied tilt ${settled.tilt} for a requested " +
+                "${start.tilt}, and bearing ${settled.bearing} for ${start.bearing}. Google's map " +
+                "clamps tilt as a function of zoom, so a pose naming a steep angle at a wide zoom " +
+                "silently becomes a shallower one - and the viewport is precisely what decides " +
+                "how many tiles the fog plans, so a measurement that varies the pose would be " +
+                "reading a scene it did not ask for. " + diagnostics(),
+            abs(settled.tilt - start.tilt) <= START_ANGLE_TOLERANCE_DEGREES &&
+                abs(settled.bearing - start.bearing) <= START_ANGLE_TOLERANCE_DEGREES,
         )
         assertTrue(
             "${kind.label}/${start.name}: canonical fog never installed a generation newer than " +
@@ -1914,6 +1925,14 @@ internal class GestureExposureHarness private constructor(
 
         /** The applied start zoom must be the requested one; a clamp is a failure, not a scene. */
         const val START_ZOOM_TOLERANCE = 0.05f
+
+        /**
+         * How far the settled pose may sit from the requested one, in degrees.
+         *
+         * Loose enough to absorb the SDK's own float rounding on a pose it accepted, tight enough
+         * that a clamp - which moves tilt by tens of degrees - can never pass as rounding.
+         */
+        const val START_ANGLE_TOLERANCE_DEGREES = 0.5f
 
         /** SP1's bound, reused unchanged. */
         const val EXCLUDED_PCT_BOUND = 5.0

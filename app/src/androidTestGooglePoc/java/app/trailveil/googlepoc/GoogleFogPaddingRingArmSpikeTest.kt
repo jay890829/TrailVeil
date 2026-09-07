@@ -20,8 +20,8 @@ import org.junit.rules.Timeout
 import org.junit.runner.RunWith
 
 /**
- * `V03-011` arm 1, measured: the same pan under `BASELINE` and under `PADDING_RING`, at a flat
- * pose and at a tilted one.
+ * `V03-011` arm 1, measured: the same pan under `BASELINE` and under `PADDING_RING`, at three
+ * poses.
  *
  * **Opt-in, and not a gate.** It is skipped unless `trailveilFogArmSpike=true` is passed, and it
  * asserts almost nothing: the numbers are emitted for the evidence file. Two reasons, both recorded
@@ -219,7 +219,7 @@ class GoogleFogPaddingRingArmSpikeTest {
         const val SPIKE_ARGUMENT = "trailveilFogArmSpike"
         const val EVIDENCE_FILE = "v03-011-arm-spike.txt"
 
-        /** Two poses x two arms, each a full launch plus a settle plus a trial. */
+        /** Three poses x two arms, each a full launch plus a settle plus a trial. */
         const val CASE_TIMEOUT_SECONDS = 600L
         const val BASEMAP_TIMEOUT_MILLIS = 60_000L
         const val FIRST_GENERATION_TIMEOUT_MILLIS = 45_000L
@@ -241,13 +241,13 @@ class GoogleFogPaddingRingArmSpikeTest {
          * Two poses, because the ring's cost is a property of the VIEWPORT, not of the app.
          *
          * Flat at exploration zoom is the parity gate's own camera and plans a small mosaic, where
-         * a ring is nearly free. Tilted is the pose section 9's 240-of-256 completion came from: a
-         * tilted camera sees far more ground, so its rectangle is the one a ring can push over the
-         * budget. Measuring only the flat pose would report that a ring is cheap and would be
+         * a ring is nearly free. Measuring only that would report that a ring is cheap and would be
          * describing the emulator's viewport rather than the arm.
          *
-         * Same place and same zoom in both, so the only variable is the pose. Open ocean: no labels
-         * to argue with.
+         * The other two say how the rectangle grows. `tilted` holds place and zoom and only changes
+         * the pose, so it is a clean one-variable step; `steepWideAngle` is the reconstruction of
+         * the pose that produced the 240-of-256 completion, and is the one the ring has to be
+         * affordable at. Open ocean throughout: no labels to argue with.
          */
         val START_CAMERAS = listOf(
             GestureStartCamera(
@@ -263,6 +263,34 @@ class GoogleFogPaddingRingArmSpikeTest {
                 zoom = 16.0f,
                 tilt = 45.0f,
             ),
+            GestureStartCamera(
+                name = "steepWideAngle",
+                latitude = -25.5,
+                longitude = -130.5,
+                zoom = WIDE_ZOOM,
+                tilt = WIDE_TILT,
+            ),
         )
+
+        /**
+         * The pose that actually produces a wide rectangle, reconstructed from `V02-012`.
+         *
+         * That task's three AVD runs of the shove-then-held-pinch trial reported
+         * `tiltDelta=61.94 zoomDelta=-1.871 installedKeys=240` - 240 published masks against the
+         * hard 256, which is where `V03-011`'s "the ring does not fit" claim comes from. `tilt=45`
+         * is nowhere near it: it moves a 3x5 mosaic to 3x7. The horizon is what explodes the
+         * floor-zoom bounding box, and it arrives near the SDK's tilt ceiling rather than halfway
+         * up. Stated as constants so a reader can see this pose is a reconstruction of a recorded
+         * measurement rather than a number picked to be large.
+         *
+         * **The zoom is not free, and this is measured rather than assumed.** Google's map clamps
+         * tilt as a function of zoom. A first attempt at `zoom=14.1` was granted **46.5 degrees**
+         * for a requested 61.9 - caught by `settleAtStartCamera`'s pose assertion, which exists
+         * because of this run - so the wide pose has to be asked for where the SDK will grant it.
+         * `V02-012`'s own trial reached that tilt after zooming OUT by 1.871, so its camera was
+         * higher-zoom still.
+         */
+        const val WIDE_TILT = 61.9f
+        const val WIDE_ZOOM = 16.1f
     }
 }
