@@ -41,13 +41,17 @@ internal object DemoExplorationTrack {
      * metres-per-degree-of-longitude term collapse, and the failure that produces is a track
      * smeared around the world rather than an exception anyone would see.
      */
-    fun around(latitude: Double, longitude: Double): List<DemoTrackPoint> {
+    fun around(
+        latitude: Double,
+        longitude: Double,
+        pointCount: Int = DEFAULT_POINTS,
+    ): List<DemoTrackPoint> {
         val anchorLatitude = latitude.coerceIn(MIN_ANCHOR_LATITUDE, MAX_ANCHOR_LATITUDE)
         val metresPerDegreeLongitude =
             METRES_PER_DEGREE_LATITUDE * cos(Math.toRadians(anchorLatitude))
         val anchorLongitude = WebMercator.wrapLongitude(longitude)
 
-        return offsets().map { (east, north) ->
+        return offsets(pointCount).map { (east, north) ->
             val pointLatitude =
                 (anchorLatitude + north / METRES_PER_DEGREE_LATITUDE).coerceIn(-85.0, 85.0)
             val pointLongitude =
@@ -56,16 +60,66 @@ internal object DemoExplorationTrack {
         }
     }
 
-    /** Metres east and north of the anchor. Split out so the shape can be reasoned about flat. */
-    fun offsets(): List<Pair<Double, Double>> {
-        val points = ArrayList<Pair<Double, Double>>(
-            CORRIDOR_POINTS + LOOP_POINTS + ISLAND_POINTS,
+    /**
+     * The walk as its three SEPARATE components, which is how it must be stored.
+     *
+     * The fog does not reveal points, it reveals the capsule swept between consecutive points in a
+     * SEGMENT. Storing all three components as one segment therefore draws two revealed corridors
+     * along the 700 m jumps between them - so the "detached island" is not detached, and the
+     * comparison fixture quietly contains two long straight reveals nobody designed. Measured on the
+     * emulator, those two bands are most of the 118,023 pixels the screen-stencil arm was missing
+     * against the tile path, because that arm draws circles at points and no capsule between them.
+     *
+     * Three segments is also what a real walk with two breaks in it looks like, so this is the
+     * honest shape rather than a workaround.
+     */
+    fun components(pointCount: Int = DEFAULT_POINTS): List<List<Pair<Double, Double>>> {
+        val all = offsets(pointCount)
+        val corridorPoints = pointCount * CORRIDOR_POINTS / DEFAULT_POINTS
+        val loopPoints = pointCount * LOOP_POINTS / DEFAULT_POINTS
+        return listOf(
+            all.subList(0, corridorPoints),
+            all.subList(corridorPoints, corridorPoints + loopPoints),
+            all.subList(corridorPoints + loopPoints, all.size),
         )
+    }
+
+    /** The same three components anchored on Earth, one list per segment. */
+    fun componentsAround(
+        latitude: Double,
+        longitude: Double,
+        pointCount: Int = DEFAULT_POINTS,
+    ): List<List<DemoTrackPoint>> {
+        val flat = around(latitude, longitude, pointCount)
+        val corridorPoints = pointCount * CORRIDOR_POINTS / DEFAULT_POINTS
+        val loopPoints = pointCount * LOOP_POINTS / DEFAULT_POINTS
+        return listOf(
+            flat.subList(0, corridorPoints),
+            flat.subList(corridorPoints, corridorPoints + loopPoints),
+            flat.subList(corridorPoints + loopPoints, flat.size),
+        )
+    }
+
+    /**
+     * Metres east and north of the anchor. Split out so the shape can be reasoned about flat.
+     *
+     * **The point count changes the SAMPLING, never the shape.** The three components keep the same
+     * share of the total at every density, so a 1024-point session and a 610-point one trace the
+     * same corridor, the same loop and the same island - one just walks it with shorter strides.
+     * That is what lets a dense load fixture and a sparse comparison fixture be looked at as the
+     * same walk.
+     */
+    fun offsets(pointCount: Int = DEFAULT_POINTS): List<Pair<Double, Double>> {
+        require(pointCount >= MIN_POINTS) { "pointCount must be at least $MIN_POINTS" }
+        val corridorPoints = pointCount * CORRIDOR_POINTS / DEFAULT_POINTS
+        val loopPoints = pointCount * LOOP_POINTS / DEFAULT_POINTS
+        val islandPoints = pointCount - corridorPoints - loopPoints
+        val points = ArrayList<Pair<Double, Double>>(pointCount)
 
         // The corridor: a long leg with one and a half waves across it, so the boundary presents
         // every angle rather than the two an axis-aligned shape would.
-        for (index in 0 until CORRIDOR_POINTS) {
-            val t = index.toDouble() / (CORRIDOR_POINTS - 1)
+        for (index in 0 until corridorPoints) {
+            val t = index.toDouble() / (corridorPoints - 1)
             points += Pair(
                 CORRIDOR_WEST_METRES + CORRIDOR_LENGTH_METRES * t,
                 CORRIDOR_AMPLITUDE_METRES * sin(TAU * CORRIDOR_WAVES * t),
@@ -73,8 +127,8 @@ internal object DemoExplorationTrack {
         }
 
         // The loop, closed and deliberately overlapping the corridor's east end.
-        for (index in 0 until LOOP_POINTS) {
-            val angle = TAU * index.toDouble() / LOOP_POINTS
+        for (index in 0 until loopPoints) {
+            val angle = TAU * index.toDouble() / loopPoints
             points += Pair(
                 LOOP_CENTRE_EAST_METRES + LOOP_RADIUS_METRES * cos(angle),
                 LOOP_CENTRE_NORTH_METRES + LOOP_RADIUS_METRES * sin(angle),
@@ -82,8 +136,8 @@ internal object DemoExplorationTrack {
         }
 
         // The island: far enough south-west that its reveal cannot touch the corridor's.
-        for (index in 0 until ISLAND_POINTS) {
-            val t = index.toDouble() / (ISLAND_POINTS - 1)
+        for (index in 0 until islandPoints) {
+            val t = index.toDouble() / (islandPoints - 1)
             points += Pair(
                 ISLAND_CENTRE_EAST_METRES + ISLAND_LENGTH_METRES * t,
                 ISLAND_CENTRE_NORTH_METRES + ISLAND_AMPLITUDE_METRES * sin(TAU * ISLAND_WAVES * t),
@@ -96,8 +150,8 @@ internal object DemoExplorationTrack {
      * The walk's length along the ground, so the seeded session can report a distance that matches
      * what it drew instead of a zero the history screen would show as an empty exploration.
      */
-    fun lengthMetres(): Double {
-        val offsets = offsets()
+    fun lengthMetres(pointCount: Int = DEFAULT_POINTS): Double {
+        val offsets = offsets(pointCount)
         var total = 0.0
         for (index in 1 until offsets.size) {
             val (east, north) = offsets[index]
@@ -113,12 +167,15 @@ internal object DemoExplorationTrack {
         return total
     }
 
-    /** How far apart consecutive points are along the corridor, for the spacing assertion. */
+    /** The reference split, and the denominator every other density is scaled against. */
     const val CORRIDOR_POINTS = 320
     const val LOOP_POINTS = 200
     const val ISLAND_POINTS = 90
 
-    const val TOTAL_POINTS = CORRIDOR_POINTS + LOOP_POINTS + ISLAND_POINTS
+    const val DEFAULT_POINTS = CORRIDOR_POINTS + LOOP_POINTS + ISLAND_POINTS
+
+    /** Below this the island cannot hold two points and the loop stops closing. */
+    const val MIN_POINTS = 60
 
     /**
      * A step longer than this is a jump between components rather than a stride.
@@ -158,10 +215,13 @@ internal object DemoExplorationTrack {
     /** The gap the island must keep from everything else, so it stays a separate component. */
     const val MIN_ISLAND_SEPARATION_METRES = 300.0
 
-    internal fun separationFromIsland(): Double {
-        val all = offsets()
-        val island = all.takeLast(ISLAND_POINTS)
-        val rest = all.dropLast(ISLAND_POINTS)
+    internal fun separationFromIsland(pointCount: Int = DEFAULT_POINTS): Double {
+        val all = offsets(pointCount)
+        val islandPoints = pointCount -
+            pointCount * CORRIDOR_POINTS / DEFAULT_POINTS -
+            pointCount * LOOP_POINTS / DEFAULT_POINTS
+        val island = all.takeLast(islandPoints)
+        val rest = all.dropLast(islandPoints)
         var closest = Double.MAX_VALUE
         island.forEach { (islandEast, islandNorth) ->
             rest.forEach { (east, north) ->

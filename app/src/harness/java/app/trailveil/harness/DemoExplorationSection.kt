@@ -21,17 +21,20 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import app.trailveil.R
 import java.util.Locale
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 internal object DemoExplorationTestTags {
     const val Section = "harness_settings_demo_data"
     const val Seed = "harness_settings_demo_seed"
+    const val SeedWorld = "harness_settings_demo_seed_world"
     const val Clear = "harness_settings_demo_clear"
     const val Status = "harness_settings_demo_status"
 }
 
 /**
- * `V03-013`: the control that puts revealed ground on the map, shared by both harness build types.
+ * `V03-013`: the controls that put revealed ground on the map, shared by both harness build types.
  *
  * One implementation rather than one per provider, because the arms are compared ACROSS providers
  * as well as within one: two copies of this that drifted would seed two different walks, and the
@@ -41,18 +44,27 @@ internal object DemoExplorationTestTags {
  * says "seeded" while the database is empty is worse than no button, because the conclusion drawn
  * from it - "this arm renders nothing" - looks exactly like the fog defect the harness exists to
  * find.
+ *
+ * The two seed buttons are not alternatives. The local one is what you compare arms on; the world
+ * one is a load fixture whose anchors are nowhere near you, so on its own it leaves your screen as
+ * fogged as an empty database would.
  */
 @Composable
 internal fun DemoExplorationSection(modifier: Modifier = Modifier) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var seeded by remember(context) { mutableIntStateOf(-1) }
+    var seededPoints by remember(context) { mutableIntStateOf(0) }
+    var seededSessions by remember(context) { mutableIntStateOf(0) }
     var anchorLabel by remember(context) { mutableStateOf<String?>(null) }
     var busy by remember(context) { mutableStateOf(false) }
+    var progress by remember(context) { mutableStateOf<Pair<Int, Int>?>(null) }
     var reload by remember(context) { mutableIntStateOf(0) }
 
     LaunchedEffect(context, reload) {
-        seeded = runCatching { DemoExplorationSeeder.seededPointCount(context) }.getOrDefault(0)
+        seededPoints = runCatching { DemoExplorationSeeder.seededPointCount(context) }
+            .getOrDefault(0)
+        seededSessions = runCatching { DemoExplorationSeeder.seededSessionCount(context) }
+            .getOrDefault(0)
     }
 
     Column(
@@ -67,17 +79,28 @@ internal fun DemoExplorationSection(modifier: Modifier = Modifier) {
         )
         Text(
             text = when {
+                progress != null -> stringResource(
+                    R.string.settings_demo_progress,
+                    progress?.first.toString(),
+                    progress?.second.toString(),
+                )
                 busy -> stringResource(R.string.settings_demo_working)
-                seeded <= 0 -> stringResource(R.string.settings_demo_status_empty)
+                seededPoints <= 0 -> stringResource(R.string.settings_demo_status_empty)
                 else -> stringResource(
                     R.string.settings_demo_status,
-                    seeded.toString(),
-                    anchorLabel ?: stringResource(R.string.settings_demo_anchor_unknown),
+                    seededSessions.toString(),
+                    seededPoints.toString(),
                 )
             },
             style = MaterialTheme.typography.bodySmall,
             modifier = Modifier.testTag(DemoExplorationTestTags.Status),
         )
+        anchorLabel?.let { label ->
+            Text(
+                text = stringResource(R.string.settings_demo_anchor, label),
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
         OutlinedButton(
             enabled = !busy,
             onClick = {
@@ -85,16 +108,9 @@ internal fun DemoExplorationSection(modifier: Modifier = Modifier) {
                 scope.launch {
                     val anchor = DemoExplorationSeeder.anchor(context)
                     val outcome = runCatching {
-                        DemoExplorationSeeder.seed(context, anchor)
+                        DemoExplorationSeeder.seedHere(context, anchor)
                     }.getOrNull()
-                    anchorLabel = outcome?.let { result ->
-                        String.format(
-                            Locale.US,
-                            "%.4f, %.4f",
-                            result.anchor.latitude,
-                            result.anchor.longitude,
-                        )
-                    }
+                    anchorLabel = outcome?.anchor?.let(::describe)
                     busy = false
                     reload += 1
                 }
@@ -104,6 +120,34 @@ internal fun DemoExplorationSection(modifier: Modifier = Modifier) {
                 .testTag(DemoExplorationTestTags.Seed),
         ) {
             Text(stringResource(R.string.settings_demo_seed))
+        }
+        OutlinedButton(
+            enabled = !busy,
+            onClick = {
+                busy = true
+                progress = 0 to DemoWorldAnchors.DEFAULT_SESSIONS
+                scope.launch {
+                    runCatching {
+                        DemoExplorationSeeder.seedWorld(context) { done, total ->
+                            withContext(Dispatchers.Main) { progress = done to total }
+                        }
+                    }
+                    anchorLabel = null
+                    progress = null
+                    busy = false
+                    reload += 1
+                }
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag(DemoExplorationTestTags.SeedWorld),
+        ) {
+            Text(
+                stringResource(
+                    R.string.settings_demo_seed_world,
+                    DemoWorldAnchors.DEFAULT_SESSIONS.toString(),
+                ),
+            )
         }
         OutlinedButton(
             enabled = !busy,
@@ -128,3 +172,6 @@ internal fun DemoExplorationSection(modifier: Modifier = Modifier) {
         )
     }
 }
+
+private fun describe(anchor: DemoExplorationSeeder.Anchor): String =
+    String.format(Locale.US, "%.4f, %.4f", anchor.latitude, anchor.longitude)

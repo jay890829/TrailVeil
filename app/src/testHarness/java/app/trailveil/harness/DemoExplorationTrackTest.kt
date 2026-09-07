@@ -26,7 +26,7 @@ class DemoExplorationTrackTest {
         val first = DemoExplorationTrack.around(25.03, 121.54)
         val second = DemoExplorationTrack.around(25.03, 121.54)
         assertEquals(first, second)
-        assertEquals(DemoExplorationTrack.TOTAL_POINTS, first.size)
+        assertEquals(DemoExplorationTrack.DEFAULT_POINTS, first.size)
     }
 
     /**

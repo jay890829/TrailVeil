@@ -4,10 +4,12 @@
 <resources>
     <string name="settings_demo_section">Demo exploration</string>
     <string name="settings_demo_status_empty">Nothing seeded. Every arm looks the same on a fully fogged map, so seed a walk before comparing.</string>
-    <string name="settings_demo_status">Seeded: %1$s points around %2$s</string>
-    <string name="settings_demo_anchor_unknown">the last seeded anchor</string>
+    <string name="settings_demo_status">Seeded: %1$s sessions, %2$s points</string>
+    <string name="settings_demo_anchor">Local walk centred on %1$s</string>
+    <string name="settings_demo_progress">Seeding %1$s / %2$s sessions…</string>
     <string name="settings_demo_working">Working…</string>
     <string name="settings_demo_seed">Seed a demo walk here</string>
+    <string name="settings_demo_seed_world">Seed %1$s sessions worldwide (load fixture)</string>
     <string name="settings_demo_clear">Clear demo data</string>
-    <string name="settings_demo_hint">Seeds a fixed synthetic walk — a curved corridor, a loop that crosses itself and a detached island — around your current location, or around a public park in Taipei if the device will not give one. The shape never changes, so switching arm is the only thing that differs between two looks. Points are marked as mock and can be cleared here.</string>
+    <string name="settings_demo_hint">The local walk is a fixed synthetic route — a curved corridor, a loop that crosses itself and a detached island — around your current location, or around a public park in Taipei if the device will not give one. Compare arms on that one. The worldwide fixture writes about 307,000 points scattered over the planet to load the database; its anchors are nowhere near you, so it leaves your own screen fogged. Both replace whatever was seeded before, are marked as mock, and are removed by Clear.</string>
 </resources>

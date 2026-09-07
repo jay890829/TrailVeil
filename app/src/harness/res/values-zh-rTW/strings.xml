@@ -2,10 +2,12 @@
 <resources>
     <string name="settings_demo_section">示範探索資料</string>
     <string name="settings_demo_status_empty">目前沒有示範資料。整片都是霧的時候每個 arm 看起來都一樣，先產生一段軌跡再比較。</string>
-    <string name="settings_demo_status">已產生 %1$s 點，中心 %2$s</string>
-    <string name="settings_demo_anchor_unknown">上次的中心</string>
+    <string name="settings_demo_status">已產生 %1$s 段、%2$s 個點</string>
+    <string name="settings_demo_anchor">本地軌跡中心 %1$s</string>
+    <string name="settings_demo_progress">產生中 %1$s / %2$s 段…</string>
     <string name="settings_demo_working">處理中…</string>
     <string name="settings_demo_seed">在這裡產生示範軌跡</string>
+    <string name="settings_demo_seed_world">產生全世界 %1$s 段（負載用）</string>
     <string name="settings_demo_clear">清除示範資料</string>
-    <string name="settings_demo_hint">在你目前的位置產生一段固定的合成軌跡：一條彎曲走廊、一個會自己交叉的環、以及一塊分離的小島。裝置若不給位置，就改用台北的一座公園。形狀每次都一樣，所以兩次觀察之間唯一的變數是 arm。這些點都標記為 mock，可以在這裡清除。</string>
+    <string name="settings_demo_hint">本地軌跡是一段固定的合成路線：一條彎曲走廊、一個會自己交叉的環、以及一塊分離的小島，中心是你目前的位置；裝置若不給位置就改用台北的一座公園。比較 arm 要用這一個。全世界那個會寫入約 307,000 個點散佈在全球，用來壓資料庫；它的中心點離你很遠，所以你自己的畫面還是整片霧。兩個都會覆蓋先前的示範資料，都標記為 mock，都可以用「清除」移除。</string>
 </resources>
