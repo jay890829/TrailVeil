@@ -1155,6 +1155,18 @@ internal data class GestureTrialReport(
                 frame.judged && !frame.coverUp && floor != null &&
                     GestureExposureVerdict.leaks(frame, floor)
             }} " +
+            // `V03-011`, the other half of metric 1. An arm can drive `inWindowExposedFrames` to
+            // zero by fogging EVERYTHING, and the survey's finding 1 is that the cover and a
+            // prototype's guards look identical on screen, so nothing above would separate "no
+            // leaks" from "a grey wall". This is the most-fogged uncovered frame in the window.
+            // Like the cost numbers it is an arm-to-arm comparison and not a threshold: panning
+            // onto never-visited ground legitimately lowers it, because that ground really is
+            // unexplored. -1 means the window held no judged uncovered frame to measure.
+            "mostFoggedInWindowExposedPct=" +
+            "${"%.3f".format(
+                inWindow.filter { it.judged && !it.coverUp }
+                    .minOfOrNull { it.tally.exposedPct } ?: -1.0,
+            )} " +
             "coverRose=$coverRose longestCoveredRunMs=$longestCoveredRunMillis " +
             "longestComposeCoveredRunMs=$longestComposeCoveredRunMillis " +
             "coverRises=$coverRises composeCoverRises=$composeCoverRises " +
