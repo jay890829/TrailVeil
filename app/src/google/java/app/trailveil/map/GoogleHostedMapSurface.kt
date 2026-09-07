@@ -624,8 +624,22 @@ internal fun GoogleHostedMapSurface(
                                 )
                                 currentOnFogFailure(failure)
                             },
-                            onFogRendered = { rendered ->
-                                currentOnFogRendered?.invoke(rendered)
+                            // Null when the caller passed null, and NOT an unconditional wrapper.
+                            // The binding treats this callback as the switch for its whole
+                            // compatibility publish (`onFogRendered ?: return`), and an
+                            // unconditional lambda whose body merely happens to be null-safe
+                            // never trips that switch - so every published generation composed a
+                            // full mosaic on the main thread and handed it to a callback that did
+                            // nothing. This callback has no production caller: both screens omit
+                            // it and only the instrumentation suites supply one, so in a shipped
+                            // build that was pure waste on the fog's own critical path.
+                            // `rememberUpdatedState` still forwards a later identity change of a
+                            // callback that was non-null when this binding was constructed, which
+                            // is the only case any caller has.
+                            onFogRendered = if (onFogRendered == null) {
+                                null
+                            } else {
+                                { rendered -> currentOnFogRendered?.invoke(rendered) }
                             },
                             onProofObserved = { observation ->
                                 currentOnFogProofForTesting?.invoke(observation)

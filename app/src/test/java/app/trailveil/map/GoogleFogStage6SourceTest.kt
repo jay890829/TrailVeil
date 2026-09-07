@@ -503,6 +503,47 @@ class GoogleFogStage6SourceTest {
         return source.length
     }
 
+    /**
+     * The compatibility publish is switched by a NULLABLE callback, so the host must not hand the
+     * binding an unconditional one.
+
+     * `publishFogRenderForCompatibility` opens with `onFogRendered ?: return` and, past it, calls
+     * `FogPocMosaic.compose` on the main thread for every published generation - a whole-mosaic
+     * ByteArray plus a copy of every mask. The host used to pass
+     * `onFogRendered = { rendered -> currentOnFogRendered?.invoke(rendered) }`: non-null always, so
+     * the switch never fired, and a shipped build composed that mosaic and handed it to a lambda
+     * whose body did nothing. Neither production screen supplies the callback; only the
+     * instrumentation suites do.
+
+     * Pinned as source shape rather than behaviour because the defect lives in a Compose call
+     * site's nullability, which no unit test can observe and which reads as correct at a glance.
+     */
+    @Test
+    fun theHostPassesTheFogRenderCallbackThroughInsteadOfWrappingItUnconditionally() {
+        val host = googleSource("GoogleHostedMapSurface.kt")
+        assertTrue(
+            "the host must decide onFogRendered's nullability from the caller's, or the " +
+                "binding's `onFogRendered ?: return` switch is dead",
+            host.contains("onFogRendered = if (onFogRendered == null) {"),
+        )
+        assertFalse(
+            "an unconditional wrapper is exactly the shape that broke this: its body is " +
+                "null-safe, but the lambda itself never is",
+            host.contains("onFogRendered = { rendered ->"),
+        )
+
+        val binding = googleSource("GoogleCanonicalFogSurfaceBinding.kt")
+        assertTrue(
+            "this case is only meaningful while the compatibility publish is still gated on the " +
+                "callback being null",
+            binding.contains("val callback = onFogRendered ?: return"),
+        )
+        assertTrue(
+            "...and only while what it guards is actually expensive",
+            binding.contains("mosaic = FogPocMosaic.compose(tiles)"),
+        )
+    }
+
     private fun googleSource(name: String): String = moduleRoot()
         .resolve("src/google/java/app/trailveil/map/$name")
         .readText()
