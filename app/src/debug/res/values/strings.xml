@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- `V03-013`: the harness selector's own copy, compiled into the `debug` build type alone.
+     `src/mapLibre` is compiled by `release` as well, so these cannot live there: a distributed
+     artifact must carry neither the arm selector nor the strings that name it. -->
+<resources>
+    <string name="settings_fog_arm_section">Fog mosaic</string>
+    <string name="settings_fog_arm_current">Current: %1$s  [padding=%2$s]</string>
+    <string name="settings_fog_arm_restart_hint">The fog runtime is built once per process and keeps the mosaic it was constructed with. Restart the app for a change to take effect.</string>
+    <string name="settings_fog_arm_restart">Quit app (apply on next launch)</string>
+</resources>

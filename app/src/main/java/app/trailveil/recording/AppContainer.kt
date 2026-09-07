@@ -22,6 +22,7 @@ import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogTilePipeline
 import app.trailveil.map.fog.FogTileRenderer
 import app.trailveil.map.fog.FogViewportCoordinator
+import app.trailveil.map.fogMosaicPaddingTiles
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
@@ -157,6 +158,10 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
                 trackDataSource = ViewportTrackDataSource(RoomViewportTrackPointReader(dao)),
                 pipeline = pipeline,
                 style = style,
+                // `V03-013`: a per-build-type seam. Every published variant answers with the
+                // shipped default; only a harness build can widen it, and widening only ever
+                // renders more fog around the same centre.
+                mosaicPaddingTiles = fogMosaicPaddingTiles(applicationContext),
             ),
             pointChanges = RoomPersistedTrackPointChangeFeed(dao),
         )

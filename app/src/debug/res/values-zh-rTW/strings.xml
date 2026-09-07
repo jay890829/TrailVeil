@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- `V03-013`: the harness selector's own copy, compiled into the `debug` build type alone.
+     `src/mapLibre` is compiled by `release` as well, so these cannot live there: a distributed
+     artifact must carry neither the arm selector nor the strings that name it. -->
+<resources>
+    <string name="settings_fog_arm_section">霧化拼貼</string>
+    <string name="settings_fog_arm_current">目前：%1$s  [padding=%2$s]</string>
+    <string name="settings_fog_arm_restart_hint">霧化執行環境在每個行程只建立一次，會沿用建立時的拼貼大小。請重新啟動 App 讓變更生效。</string>
+    <string name="settings_fog_arm_restart">結束 App（下次啟動套用）</string>
+</resources>

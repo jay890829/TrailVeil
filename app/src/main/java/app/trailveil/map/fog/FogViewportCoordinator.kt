@@ -78,6 +78,16 @@ class FogViewportCoordinator(
     val style: FogRenderStyle = FogRenderStyle(),
     private val renderVersion: Int = FogRenderVersions.CURRENT,
     private val queryMarginMeters: Double = DEFAULT_QUERY_MARGIN_METERS,
+    /**
+     * How far beyond the centre tile [render]'s mosaic reaches. 1 is the legacy 3x3.
+     *
+     * `V03-013`: the MapLibre analogue of the Google ring. It only ever renders MORE fog around
+     * the same centre, so like arm 1 it is a superset of what the smaller mosaic would have
+     * published and cannot expose ground the default would have covered. The default is
+     * deliberately unchanged, so a build that does not opt in renders exactly what it did before;
+     * the Google path does not come through here at all, it uses [renderTiles].
+     */
+    private val mosaicPaddingTiles: Int = DEFAULT_MOSAIC_PADDING_TILES,
 ) {
     private val mutex = Mutex()
     private val placeholderRenderer = FogTileRenderer(style)
@@ -105,6 +115,9 @@ class FogViewportCoordinator(
 
     init {
         require(renderVersion >= 0) { "renderVersion must be non-negative" }
+        require(mosaicPaddingTiles >= 1) {
+            "mosaicPaddingTiles must be at least 1; a zero-padding mosaic is a single tile"
+        }
         require(queryMarginMeters.isFinite() && queryMarginMeters >= style.revealRadiusMeters) {
             "queryMarginMeters must be finite and include the reveal radius"
         }
@@ -115,6 +128,7 @@ class FogViewportCoordinator(
             center = request.center,
             zoom = renderZoom(request.mapZoom),
             renderVersion = renderVersion,
+            paddingTiles = mosaicPaddingTiles,
         )
         val rendered = renderTilesLocked(request, keys)
         FogViewportRender(
@@ -296,6 +310,9 @@ class FogViewportCoordinator(
     companion object {
         // 100 m/s * 60 s accepted continuity ceiling + 25 m reveal radius + rounding allowance.
         const val DEFAULT_QUERY_MARGIN_METERS = 6_100.0
+        /** The legacy 3x3 mosaic `render` has always published. */
+        const val DEFAULT_MOSAIC_PADDING_TILES = 1
+
         const val MAX_PROVIDER_VIEWPORT_TILES = 256
 
         /** Four provider windows' worth; a plan of LOD windows for one camera is capped at one. */
