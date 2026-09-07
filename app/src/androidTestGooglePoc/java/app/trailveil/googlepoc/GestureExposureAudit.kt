@@ -770,6 +770,34 @@ internal class GestureExposureSampler(
  * `MINIMUM_ACCEPTED_SHOVE_TILT_DEGREES = 15.0`, `MINIMUM_ACCEPTED_ROTATE_DEGREES = 20.0`,
  * `MINIMUM_TAP_ZOOM_CHANGE = 0.5`).
  */
+/**
+ * Which fog design a trial is measuring.
+ *
+ * `V03-011`: the cover clauses were written when there was one design, and they encode its
+ * behaviour as a requirement - four of the six kinds assert the cover MUST rise. A design whose
+ * whole claim is that the cover no longer rises during a gesture therefore turns those four red for
+ * the right reason, and the harness could not tell that from a regression. The expectation has to
+ * belong to the arm rather than to the gesture, so an A/B between arms means something.
+ *
+ * Note what this unlocks rather than merely permits: covered frames are excluded from the leak
+ * rule, so on the baseline the in-window pixel claim is vacuous for exactly those four kinds. An
+ * arm that stops raising the cover is the first one for which that claim has content.
+ */
+internal enum class FogContinuityArm(
+    val label: String,
+    /** Whether a gesture that leaves today's published surround is still expected to cover. */
+    val coverExpected: Boolean,
+) {
+    /** Today's design: padding zero, one TileOverlay per generation, cover on leaving coverage. */
+    BASELINE("baseline", coverExpected = true),
+
+    /** The cheap control: the same design with a prefetch ring, so the surround outlasts a gesture. */
+    PADDING_RING("paddingRing", coverExpected = false),
+
+    /** Prototype A: one anchored image for the viewport plus guards beyond it. */
+    MOSAIC_OVERLAY("mosaicOverlay", coverExpected = false),
+}
+
 internal enum class GestureKind(
     val label: String,
     val minimumZoomOut: Float? = null,
@@ -1069,6 +1097,15 @@ internal data class GestureTrialReport(
                 .maxOfOrNull { it.tally.exposedPct } ?: 0.0)} " +
             "worstInWindowClusterPx=" +
             "${inWindow.filter { !it.coverUp }.maxOfOrNull { it.tally.largestClusterPx } ?: 0} " +
+            // `V03-011` metric 1. The failure string counts leaking frames across the window AND
+            // its tail; the number the spike has to report per arm is the in-window one, and it
+            // was not in the evidence line at all.
+            "inWindowExposedFrames=" +
+            "${inWindow.count { frame ->
+                val floor = floorFor(frame)
+                frame.judged && !frame.coverUp && floor != null &&
+                    GestureExposureVerdict.leaks(frame, floor)
+            }} " +
             "coverRose=$coverRose longestCoveredRunMs=$longestCoveredRunMillis " +
             "longestComposeCoveredRunMs=$longestComposeCoveredRunMillis " +
             "coverRises=$coverRises composeCoverRises=$composeCoverRises " +
@@ -2118,15 +2155,21 @@ internal object GestureExposureVerdict {
      * Returns the failure lines rather than throwing, so a multi-camera case reports every camera
      * that failed instead of the first.
      */
-    fun failuresFor(report: GestureTrialReport, bare: BareReading?): List<String> {
-        val line = report.describe()
+    fun failuresFor(
+        report: GestureTrialReport,
+        bare: BareReading?,
+        // `V03-011`: defaulted, so every existing caller keeps asserting today's design exactly as
+        // it did. Only a trial that says which arm it is measuring gets the other expectation.
+        arm: FogContinuityArm = FogContinuityArm.BASELINE,
+    ): List<String> {
+        val line = "arm=${arm.label} " + report.describe()
         val failures = mutableListOf<String>()
         failures += samplerFailures(report, line)
         failures += sensitivityFailures(report, bare, line)
         failures += windowFailures(report, line)
         failures += pixelFailures(report, line)
         failures += movementFailures(report, line)
-        failures += coverFailures(report, line)
+        failures += coverFailures(report, line, arm)
         return failures
     }
 
@@ -2261,9 +2304,21 @@ internal object GestureExposureVerdict {
         return failures
     }
 
-    private fun coverFailures(report: GestureTrialReport, line: String): List<String> {
+    private fun coverFailures(
+        report: GestureTrialReport,
+        line: String,
+        arm: FogContinuityArm,
+    ): List<String> {
         val failures = mutableListOf<String>()
-        if (report.kind.requiresCoverToRise && !report.coverRose) {
+        // `V03-011`: an arm that claims gesture-time continuity is measured by whether the cover
+        // stayed down, so a raised cover is its failure and a lowered one is not this harness's.
+        if (!arm.coverExpected && report.coverRose) {
+            failures += "COVER_STILL_ROSE - arm ${arm.label} claims the cover no longer rises " +
+                "during this gesture, and it rose anyway after " +
+                "${report.coverRises} rise(s), longest run ${report.longestCoveredRunMillis} ms. " +
+                "This is a measurement of the arm, not a fault in the harness: $line"
+        }
+        if (arm.coverExpected && report.kind.requiresCoverToRise && !report.coverRose) {
             failures += "COVER_NEVER_ROSE - this gesture leaves the published surround, so the " +
                 "opaque cover must have been raised at some sampled frame; without it every " +
                 "cover clause below would be skipped rather than satisfied: $line"
