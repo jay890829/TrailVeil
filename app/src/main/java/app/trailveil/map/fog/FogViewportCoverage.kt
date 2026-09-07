@@ -70,6 +70,14 @@ fun fogViewportCoveredByPublishedTiles(
 class FogViewportCoveragePlan internal constructor(
     val request: FogViewportCoverageRequest,
     keys: List<FogTileKey>,
+    /**
+     * The ring this plan was actually built with, which is not always the one asked for.
+     *
+     * `V03-011` arm 1: a padded plan that will not fit the budget is narrowed rather than refused,
+     * so a reader who assumes the requested padding would mis-attribute a cover that rose because
+     * the ring had been cut. Zero in every build that asks for no ring, which is every shipped one.
+     */
+    val appliedPaddingTiles: Int = 0,
 ) {
     val keys: List<FogTileKey> = Collections.unmodifiableList(ArrayList(keys))
     val keySet: Set<FogTileKey> = Collections.unmodifiableSet(LinkedHashSet(keys))
@@ -124,22 +132,51 @@ class FogViewportCoveragePlanner(
         val yFloorMin = floorToLong(projectedYMin)
         val yFloorMax = inclusiveTileEnd(projectedYMin, projectedYMax)
 
-        val xStartUnwrapped = addPadding(xFloorMin, -paddingTiles.toLong())
-        val xEndUnwrapped = addPadding(xFloorMax, paddingTiles.toLong())
-        val visibleXCount = inclusiveCount(xStartUnwrapped, xEndUnwrapped)
-        // A pair such as -180/180 is the same canonical meridian, but it can also be the
-        // projection's representation of a viewport wider than one world.  Treat an explicit
-        // whole-world raw span conservatively as full coverage rather than guessing the shorter
-        // interpretation and leaving an unfogged world copy outside the mask.
-        val fullWorld = rawLongitudeRange >= WORLD_LONGITUDE_DEGREES || visibleXCount >= tileCount
-        val xCount = if (fullWorld) tileCount else visibleXCount
-        val xFirst = if (fullWorld) 0L else xStartUnwrapped
-
-        val yStart = addPadding(yFloorMin, -paddingTiles.toLong()).coerceAtLeast(0L)
-        val yEnd = addPadding(yFloorMax, paddingTiles.toLong()).coerceAtMost(tileCount - 1L)
+        // `V03-011` arm 1. The ring is narrowed until it fits, instead of refusing the plan.
+        //
+        // Padding and the budget answer different questions. The ring is a continuity
+        // optimisation - it buys camera movement before the safety cover has to rise - while
+        // maxTiles is a hard ceiling on what one render may cost. On a viewport large enough for
+        // them to disagree, refusing spends the whole generation for the sake of tiles that were
+        // only ever an improvement: the render throws, the generation fails, and the user gets a
+        // fully covered screen. Section 14c of the arm's evidence measured exactly that, on a
+        // 160-dpi steep pose whose padded plan of about 300 keys met a 256-key ceiling.
+        //
+        // Narrowing is the behaviour that matches what the ring is for. It also removes the reason
+        // the arm was priced as more than a configuration change: with this, a profile may ask for
+        // any ring at all and a viewport that cannot afford it simply gets a smaller one.
+        //
+        // The UNPADDED plan is never narrowed and still throws. That case is a real error - the
+        // visible viewport alone does not fit the budget - and it is the shipped behaviour of every
+        // build using DEFAULT_PADDING_TILES, which this must not quietly change.
+        var applied = paddingTiles
+        var window = paddedWindow(
+            padding = applied,
+            xFloorMin = xFloorMin,
+            xFloorMax = xFloorMax,
+            yFloorMin = yFloorMin,
+            yFloorMax = yFloorMax,
+            tileCount = tileCount,
+            rawLongitudeRange = rawLongitudeRange,
+        )
+        while (applied > 0 && window.tileTotal > maxTiles.toLong()) {
+            applied -= 1
+            window = paddedWindow(
+                padding = applied,
+                xFloorMin = xFloorMin,
+                xFloorMax = xFloorMax,
+                yFloorMin = yFloorMin,
+                yFloorMax = yFloorMax,
+                tileCount = tileCount,
+                rawLongitudeRange = rawLongitudeRange,
+            )
+        }
+        val xCount = window.xCount
+        val xFirst = window.xFirst
+        val yStart = window.yStart
+        val yEnd = window.yEnd
+        val tileTotal = window.tileTotal
         require(yStart <= yEnd) { "visible viewport has no valid Web Mercator rows" }
-        val yCount = inclusiveCount(yStart, yEnd)
-        val tileTotal = multiplyCount(xCount, yCount)
         require(tileTotal <= maxTiles.toLong()) {
             "visible viewport requires $tileTotal tiles, maxTiles is $maxTiles"
         }
@@ -165,8 +202,48 @@ class FogViewportCoveragePlanner(
             }
             y += 1L
         }
-        return FogViewportCoveragePlan(request, keys)
+        return FogViewportCoveragePlan(request, keys, appliedPaddingTiles = applied)
     }
+
+    /** One candidate tile rectangle for a given ring width; arithmetic only, so retrying is cheap. */
+    private fun paddedWindow(
+        padding: Int,
+        xFloorMin: Long,
+        xFloorMax: Long,
+        yFloorMin: Long,
+        yFloorMax: Long,
+        tileCount: Long,
+        rawLongitudeRange: Double,
+    ): PaddedWindow {
+        val xStartUnwrapped = addPadding(xFloorMin, -padding.toLong())
+        val xEndUnwrapped = addPadding(xFloorMax, padding.toLong())
+        val visibleXCount = inclusiveCount(xStartUnwrapped, xEndUnwrapped)
+        // A pair such as -180/180 is the same canonical meridian, but it can also be the
+        // projection's representation of a viewport wider than one world.  Treat an explicit
+        // whole-world raw span conservatively as full coverage rather than guessing the shorter
+        // interpretation and leaving an unfogged world copy outside the mask.
+        val fullWorld = rawLongitudeRange >= WORLD_LONGITUDE_DEGREES || visibleXCount >= tileCount
+        val xCount = if (fullWorld) tileCount else visibleXCount
+        val xFirst = if (fullWorld) 0L else xStartUnwrapped
+        val yStart = addPadding(yFloorMin, -padding.toLong()).coerceAtLeast(0L)
+        val yEnd = addPadding(yFloorMax, padding.toLong()).coerceAtMost(tileCount - 1L)
+        val yCount = if (yStart <= yEnd) inclusiveCount(yStart, yEnd) else 0L
+        return PaddedWindow(
+            xFirst = xFirst,
+            xCount = xCount,
+            yStart = yStart,
+            yEnd = yEnd,
+            tileTotal = if (yCount == 0L) 0L else multiplyCount(xCount, yCount),
+        )
+    }
+
+    private class PaddedWindow(
+        val xFirst: Long,
+        val xCount: Long,
+        val yStart: Long,
+        val yEnd: Long,
+        val tileTotal: Long,
+    )
 
     private fun projectUnwrappedX(
         longitude: Double,

@@ -149,17 +149,56 @@ class FogPaddingRingSurroundTest {
             "fixture must sit under the budget unpadded, actual=$atBudgetSize",
             atBudgetSize <= FogViewportCoveragePlanner.DEFAULT_MAX_TILES,
         )
+        // The planner NARROWS the ring to what the budget can hold rather than refusing the plan.
+        // Before this arm it threw, which spent the whole generation - the render failed and the
+        // cover stayed up - for the sake of tiles that were only ever a continuity improvement.
+        val narrowed = FogViewportCoveragePlanner(paddingTiles = 1).plan(atBudget)
+        assertEquals(
+            "a ring that does not fit is dropped to the widest one that does, which here is none",
+            0,
+            narrowed.appliedPaddingTiles,
+        )
+        assertEquals(
+            "and the narrowed plan is exactly the unpadded plan, not some third thing",
+            atBudgetSize,
+            narrowed.keys.size,
+        )
+
+        // Narrowing is not all-or-nothing: given a budget between the p=1 and p=2 costs, the p=2
+        // planner comes back with p=1 rather than with none. Calibrated from the planner itself so
+        // the case cannot go stale against a fixture change.
+        val ringOneCost = FogViewportCoveragePlanner(paddingTiles = 1, maxTiles = RING_ARM_MAX_TILES)
+            .plan(atBudget).keys.size
+        val ringTwoCost = FogViewportCoveragePlanner(paddingTiles = 2, maxTiles = RING_ARM_MAX_TILES)
+            .plan(atBudget).keys.size
+        assertTrue(
+            "the fixture must separate the two ring widths, p1=$ringOneCost p2=$ringTwoCost",
+            ringOneCost < ringTwoCost,
+        )
+        val steppedDown = FogViewportCoveragePlanner(paddingTiles = 2, maxTiles = ringOneCost)
+            .plan(atBudget)
+        assertEquals(
+            "a budget that holds p=1 but not p=2 yields p=1",
+            1,
+            steppedDown.appliedPaddingTiles,
+        )
+        assertEquals("and costs exactly the p=1 plan", ringOneCost, steppedDown.keys.size)
+
+        // The UNPADDED plan is still refused when it genuinely does not fit. That is a real error
+        // rather than a ring that was too ambitious, and it is the shipped behaviour of every build
+        // that asks for no ring - which is all of them.
         val refused = assertThrows(IllegalArgumentException::class.java) {
-            FogViewportCoveragePlanner(paddingTiles = 1).plan(atBudget)
+            FogViewportCoveragePlanner(paddingTiles = 0, maxTiles = atBudgetSize - 1).plan(atBudget)
         }
         assertTrue(
-            "the planner must refuse the padded plan by budget, not by some other complaint: " +
-                "${refused.message}",
+            "the planner must refuse by budget, not by some other complaint: ${refused.message}",
             refused.message?.contains("maxTiles is") == true,
         )
-        // And it is not refused once the budget travels with the padding - which is the change the
-        // arm has to make, in the binding's adapter cache budget as well as here.
-        FogViewportCoveragePlanner(paddingTiles = 1, maxTiles = RING_ARM_MAX_TILES).plan(atBudget)
+
+        // And the ring is not narrowed at all once the budget travels with the padding.
+        val afforded = FogViewportCoveragePlanner(paddingTiles = 1, maxTiles = RING_ARM_MAX_TILES)
+            .plan(atBudget)
+        assertEquals("a budget with room keeps the ring", 1, afforded.appliedPaddingTiles)
     }
 
     /**

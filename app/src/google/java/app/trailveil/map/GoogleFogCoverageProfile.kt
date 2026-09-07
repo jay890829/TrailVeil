@@ -1,6 +1,7 @@
 package app.trailveil.map
 
 import app.trailveil.map.fog.FogTileCacheBudget
+import app.trailveil.map.fog.FogViewportCoordinator
 import app.trailveil.map.fog.FogViewportCoveragePlanner
 
 /**
@@ -74,9 +75,16 @@ internal data class GoogleFogCoverageProfile(
          */
         fun ring(paddingTiles: Int): GoogleFogCoverageProfile {
             require(paddingTiles > 0) { "a ring profile needs padding; use DEFAULT for none" }
-            // The measured 15x16 completion, padded, rounded up to a power of two. p=1 needs 306
-            // and p=2 needs 380.
-            val maxTiles = 512
+            // The coordinator's own ceiling, and the reason this is no longer 512.
+            //
+            // `FogViewportCoordinator.MAX_PROVIDER_VIEWPORT_TILES` is a hard `require` on one
+            // render, so a profile that let the planner build 512 keys only moved the failure
+            // one call later - section 14c, where a padded plan of about 300 keys failed the
+            // generation and left the cover up. Now that the planner narrows a ring that will not
+            // fit instead of refusing it, asking for exactly what a render may cost is the whole
+            // fix: a viewport with room gets the ring it asked for, and one without gets the
+            // widest ring it can afford rather than a failed generation.
+            val maxTiles = FogViewportCoordinator.MAX_PROVIDER_VIEWPORT_TILES
             return GoogleFogCoverageProfile(
                 label = "ring$paddingTiles",
                 paddingTiles = paddingTiles,
