@@ -12,6 +12,8 @@ import android.view.PixelCopy
 import android.view.SurfaceView
 import android.view.TextureView
 import android.view.View
+import android.provider.Settings
+import android.view.WindowInsets
 import android.view.ViewGroup
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.get
@@ -1438,6 +1440,38 @@ internal class GestureExposureHarness private constructor(
         location
     }
 
+    /**
+     * The left and right screen edges the system reserves for its own gestures, in pixels.
+     *
+     * On a phone using full-screen navigation, a drag that starts or ends inside these bands is
+     * taken by the platform as a back gesture and the app never sees it: measured on the designated
+     * POCO, where the two-flick trial reported "the map never moved for 4 injected one-finger drag
+     * rounds" for drags running 0.97 to 0.03 of the view width. A device that reserves nothing -
+     * three-button navigation, and every emulator configured that way - returns zeroes here and
+     * nothing downstream changes, which is what keeps figures taken before this comparable.
+     */
+    fun systemGestureEdges(): Pair<Int, Int> = onMain {
+        val reported = mapView.rootWindowInsets
+            ?.getInsets(WindowInsets.Type.systemGestures())
+            ?.let { gestures -> gestures.left to gestures.right }
+            ?: Pair(0, 0)
+        if (reported.first > 0 || reported.second > 0) return@onMain reported
+        // The designated phone reports 0/0 here and still eats an edge drag as Back, so the insets
+        // alone are not a sufficient signal. `navigation_mode` is: 2 is gesture navigation, which
+        // is exactly the configuration that reserves the side edges, and 0 (three buttons - every
+        // emulator here) reserves nothing. Falling back on the mode rather than always applying a
+        // margin is what keeps figures taken on the AVD comparable across this change.
+        val gestureNavigation = Settings.Secure.getInt(
+            mapView.context.contentResolver,
+            "navigation_mode",
+            0,
+        ) == GESTURE_NAVIGATION_MODE
+        if (!gestureNavigation) return@onMain Pair(0, 0)
+        val density = mapView.resources.displayMetrics.density
+        val edge = (GESTURE_NAVIGATION_EDGE_DP * density).toInt()
+        Pair(edge, edge)
+    }
+
     fun diagnostics(): String = onMain {
         "binding=${mapView.getTag(R.id.map_fog_binding_state)} " +
             "phase=${mapView.getTag(R.id.map_fog_phase)} " +
@@ -1990,6 +2024,18 @@ internal class GestureExposureHarness private constructor(
         const val POST_GESTURE_SAMPLE_MILLIS = 900L
         const val POST_COVER_SAMPLE_MILLIS = 700L
         const val GENERATION_TIMEOUT_MILLIS = 45_000L
+        /** `Settings.Secure.navigation_mode` when the system owns the side edges. */
+        const val GESTURE_NAVIGATION_MODE = 2
+
+        /**
+         * The side band to treat as the system's under gesture navigation.
+         *
+         * Wider than the platform's nominal 24 dp back area on purpose: the designated phone ate a
+         * drag whose endpoint sat at about 24.6 dp, so the nominal figure is a floor rather than
+         * the truth on an OEM build.
+         */
+        const val GESTURE_NAVIGATION_EDGE_DP = 48f
+
         const val COVER_SETTLE_TIMEOUT_MILLIS = 25_000L
         const val CAMERA_SETTLE_TIMEOUT_MILLIS = 12_000L
         const val CAMERA_STABLE_POLLS = 4

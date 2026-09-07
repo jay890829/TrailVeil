@@ -288,13 +288,25 @@ class GoogleFogPaddingRingArmSpikeTest {
      * the trial's own `GESTURE_SWALLOWED` clause is what decides whether the camera really moved
      * the tile this kind requires.
      */
+    private fun format(value: Float): String = "%.3f".format(value)
+
     private fun drivePan(harness: GestureExposureHarness, drag: PanDrag): GestureDrive {
         val origin = harness.viewOrigin()
         val size = harness.viewSize()
         val width = size.first.toFloat()
         val height = size.second.toFloat()
-        val startX = origin[0] + width * drag.startXFraction
-        val endX = origin[0] + width * drag.endXFraction
+        // Keep both ends out of the platform's own gesture bands. A drag that begins or ends
+        // inside them is consumed as a back gesture and the map never moves - which is exactly what
+        // this test reported on the designated phone before this clamp existed. The margin is added
+        // to the reserved inset rather than used instead of it, because the exclusion is a target
+        // area and landing on its exact boundary is not a design anyone should rely on.
+        val (gestureLeft, gestureRight) = harness.systemGestureEdges()
+        val safeLeft = origin[0] + gestureLeft + GESTURE_EDGE_MARGIN_PX
+        val safeRight = origin[0] + width - gestureRight - GESTURE_EDGE_MARGIN_PX
+        fun clampX(raw: Float): Float =
+            if (safeRight <= safeLeft) raw else raw.coerceIn(safeLeft, safeRight)
+        val startX = clampX(origin[0] + width * drag.startXFraction)
+        val endX = clampX(origin[0] + width * drag.endXFraction)
         val startY = origin[1] + height * drag.startYFraction
         val endY = origin[1] + height * drag.endYFraction
 
@@ -334,7 +346,14 @@ class GoogleFogPaddingRingArmSpikeTest {
                 return GestureDrive(
                     note = "oneFingerPan drag=${drag.label} repeats=${drag.repeats} " +
                         "gapMs=${drag.gapMillis} steps=$DRAG_STEPS " +
-                        "holdMs=$DRAG_HOLD_BEFORE_LIFT_MILLIS",
+                        "holdMs=$DRAG_HOLD_BEFORE_LIFT_MILLIS " +
+                        // What was actually injected, which is not always what the drag asked for:
+                        // the endpoints are clamped out of the platform's gesture bands, and a
+                        // reader comparing pan lengths across devices needs to see that.
+                        "askedX=${format(drag.startXFraction)}->${format(drag.endXFraction)} " +
+                        "injectedX=${format((startX - origin[0]) / width)}->" +
+                        "${format((endX - origin[0]) / width)} " +
+                        "gestureEdgesPx=$gestureLeft/$gestureRight",
                     downAtMillis = openedAt,
                     upAtMillis = liftedAt,
                     injectedDownCount = downs,
@@ -350,6 +369,16 @@ class GoogleFogPaddingRingArmSpikeTest {
     }
 
     private companion object {
+        /**
+         * Extra pixels beyond the reserved system-gesture inset, on each side.
+         *
+         * Small enough not to change what a pan measures where nothing is reserved - it is added to
+         * a zero inset and then clamped against endpoints already inside the view - and large
+         * enough that a drag does not begin on the exact pixel where the platform's exclusion area
+         * ends.
+         */
+        const val GESTURE_EDGE_MARGIN_PX = 24f
+
         const val SPIKE_ARGUMENT = "trailveilFogArmSpike"
         const val EVIDENCE_FILE = "v03-011-arm-spike.txt"
 
