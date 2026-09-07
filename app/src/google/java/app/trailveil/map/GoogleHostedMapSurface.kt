@@ -574,7 +574,10 @@ internal fun GoogleHostedMapSurface(
                         onCameraMoveCancelled = { newFogBinding?.onCameraMoveCancelled() },
                     )
                     newFogBinding = if (fogRequired && fogRuntime != null) {
-                        GoogleCanonicalFogSurfaceBinding(
+                        // Built through the context so that an alternative surface, when one
+                        // exists, is constructed from identical inputs by construction rather
+                        // than by two call sites kept in step by hand.
+                        GoogleFogSurfaceContext(
                             map = map,
                             runtime = fogRuntime,
                             onStateChanged = { state ->
@@ -660,7 +663,7 @@ internal fun GoogleHostedMapSurface(
                                     newBinding.revealOverlaysForGeneration(generation)
                                 }
                             },
-                        )
+                        ).canonicalBinding()
                     } else {
                         null
                     }
