@@ -1043,6 +1043,17 @@ internal data class GestureTrialReport(
      */
     val exclusionsGuessed: Boolean,
     val samplerFailure: Throwable?,
+    /**
+     * `V03-011` metrics 2 and 3: the frame cost of the gesture and the memory either side of it.
+     *
+     * Reported, never asserted on. Two reasons. The absolute numbers here are INFLATED by this
+     * harness: the exposure sampler is reading pixels back off the same surface at roughly 8 Hz
+     * throughout the window, and that load lands in these frame durations. Every arm carries the
+     * identical sampler, so comparing arms is sound while quoting a hitch as the app's own is not.
+     * And a threshold here would make a fog-continuity audit fail for a slow emulator, which is a
+     * different claim than the one this class exists to make.
+     */
+    val cost: GestureCost,
 ) {
     val motionEndMillis: Long get() = drive.upAtMillis + kind.animationTailMillis
 
@@ -1128,6 +1139,8 @@ internal data class GestureTrialReport(
             "touchDowns=$touchDownsBefore->$touchDownsAfter " +
             "injectedDowns=${drive.injectedDownCount} " +
             "exclusionsGuessed=$exclusionsGuessed " +
+            // `V03-011` metrics 2 and 3. See [cost]: sampler-inflated, comparable between arms.
+            "${cost.describe()} " +
             "samplerFailure=${samplerFailure?.javaClass?.simpleName ?: "none"}"
     }
 }
@@ -1414,10 +1427,17 @@ internal class GestureExposureHarness private constructor(
         val hostStopsBefore = hostStops.get()
         val hostStartsBefore = hostStarts.get()
         val sampler = GestureExposureSampler(mapView, capturer, exclusions)
+        // `V03-011` metrics 2 and 3, which nothing in this harness measured. Null - and so "not
+        // measured" rather than a failure - when the MapView is not hosted by an Activity, because
+        // an added number must never be what turns a fog trial red. See [GestureCostProbe] for why
+        // memory is a before/after pair here and a sampled peak in the scale benchmark.
+        val costProbe = GestureCostProbe.forView(mapView)
         var driven: GestureDrive? = null
         var frames: List<ExposureFrame> = emptyList()
         var coverSettled = false
+        var cost = GestureCost.NOT_MEASURED
         sampler.start()
+        costProbe?.start()
         try {
             driven = drive(this)
             SystemClock.sleep(POST_GESTURE_SAMPLE_MILLIS)
@@ -1428,9 +1448,16 @@ internal class GestureExposureHarness private constructor(
             coverSettled = awaitUntil(COVER_SETTLE_TIMEOUT_MILLIS) { coverUp() == false }
             SystemClock.sleep(POST_COVER_SAMPLE_MILLIS)
         } finally {
-            // Outside the try the sampler would outlive a throwing driver, leaving a readback loop
-            // running against this MapView for the rest of the process.
-            frames = sampler.stop()
+            // The probe closes first so its frame window ends where the trial's does, before the
+            // sampler's own teardown can contribute an outlier to a worst-frame number. Nested so
+            // that a throw from the probe still cannot skip the line below: outside the try the
+            // sampler would outlive a throwing driver, leaving a readback loop running against this
+            // MapView for the rest of the process.
+            try {
+                cost = costProbe?.stop() ?: GestureCost.NOT_MEASURED
+            } finally {
+                frames = sampler.stop()
+            }
         }
         val gesture = requireNotNull(driven)
         val after = cameraPosition()
@@ -1507,6 +1534,7 @@ internal class GestureExposureHarness private constructor(
             touchDownsAfter = touchDownCount(),
             exclusionsGuessed = exclusionsGuessed,
             samplerFailure = sampler.failure(),
+            cost = cost,
         )
     }
 
