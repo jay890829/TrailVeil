@@ -6,7 +6,9 @@ import app.trailveil.map.fog.FogMaskArgb
 import app.trailveil.map.fog.FogMosaicTile
 import app.trailveil.map.fog.FogPocMosaic
 import app.trailveil.map.fog.FogSurroundExtent
+import app.trailveil.map.fog.FogTileBounds
 import app.trailveil.map.fog.FogTileMosaic
+import app.trailveil.map.fog.FogTilePngCodec
 import app.trailveil.map.fog.FogViewportCoverageRequest
 import app.trailveil.map.fog.GeoPoint
 import app.trailveil.map.fog.WebMercator
@@ -16,6 +18,8 @@ import com.google.android.gms.maps.model.GroundOverlay
 import com.google.android.gms.maps.model.GroundOverlayOptions
 import com.google.android.gms.maps.model.LatLng
 import com.google.android.gms.maps.model.LatLngBounds
+import com.google.android.gms.maps.model.Polygon
+import com.google.android.gms.maps.model.PolygonOptions
 
 /**
  * `V03-011` arm 2 (prototype A): one generation, one anchored image, no tiles.
@@ -62,7 +66,15 @@ internal class GoogleFogMosaicOverlayInstaller(
     private class Installed(
         val overlay: GroundOverlay,
         val bitmap: Bitmap,
+        /**
+         * The ground this generation can actually defend.
+         *
+         * The image's own rectangle when the backdrop failed to attach, the whole surround when it
+         * did. See [imageExtent] for why answering with a reach that is not drawn is the one defect
+         * this class shipped, and [attachBackdrop] for what draws the rest of it.
+         */
         val extent: FogSurroundExtent,
+        val backdrop: List<Polygon>,
         val width: Int,
         val height: Int,
     )
@@ -130,15 +142,120 @@ internal class GoogleFogMosaicOverlayInstaller(
             return refuse("addGroundOverlay")
         }
 
+        // The backdrop, and the extent this generation may therefore claim. A failure here is
+        // not a failed generation: the image is already attached and correct, and answering from
+        // the image's own rectangle is the fail-closed reading of a surface that drew less than the
+        // tile path would have. It costs cover, never fog.
+        val backdrop = attachBackdrop(mosaic, generationId)
         installed[generationId] = Installed(
             overlay = overlay,
             bitmap = bitmap,
-            extent = imageExtent(mosaic),
+            extent = if (backdrop.isEmpty()) {
+                imageExtent(mosaic)
+            } else {
+                FogBackdropGeometry.extent(mosaic)
+            },
+            backdrop = backdrop,
             width = width,
             height = height,
         )
         return true
     }
+
+    /**
+     * Fills the ground BETWEEN the anchored image and the surround, which the tile path gets free.
+     *
+     * `V03-011` section 15k: the shipped fog is not only its tile rectangle. Every key outside the
+     * published set is answered by `GoogleGenerationBoundTileProvider` with opaque fog, so a
+     * `TileOverlay` covering the world IS its own backdrop and ground beyond the plan stays fogged
+     * without anything being drawn for it. One anchored image has no such answer, and the zoom-out
+     * control measured what that costs: 89.344% of the map on screen as bare basemap, because the
+     * installer reported the tile path's reach while drawing a fraction of it.
+     *
+     * The complement is `FogBackdropGeometry.extentGuard`, which the OTHER provider already draws
+     * as filled polygons - this is the same geometry through Google's `Polygon` instead of a
+     * GeoJSON source. Vector rather than raster on purpose: the backdrop is uniform fog, so it has
+     * no resolution to lose, and rasterising the surround into the mosaic instead would spend the
+     * image's pixel budget on ground that carries no information and would coarsen the reveal
+     * boundary that section 15l measures.
+     *
+     * Attached invisible, like the image, and revealed with it.
+     *
+     * **Colour matched to the generation, not to the default fog.** A published generation writes
+     * `FogTilePngCodec.colorForGeneration` into every fog pixel of its mask, and the snapshot proof
+     * recognises the surface by exactly that. A backdrop painted the default colour would put a
+     * seam between the image and its own surround at every generation whose signature is not the
+     * default, and would present the prover with two different fogs for one generation.
+     */
+    private fun attachBackdrop(mosaic: FogTileMosaic, generationId: Long): List<Polygon> {
+        // The complement of the IMAGE, not of the surround, and the first version of this got it
+        // wrong in a way only a device could show. `extentGuard(extent(mosaic))` is what the other
+        // provider passes, because there the mosaic is drawn inside a surround that reaches several
+        // screens further and the guard only has to fill what lies beyond THAT. Here the image is
+        // the whole of the drawn area, so the band between the image and the surround is exactly
+        // what a zoom-out uncovers - and the measurement said so: seven polygons attached and the
+        // same 89.344% of bare basemap came back, because not one of them was anywhere near the
+        // ground being exposed.
+        val rectangles = try {
+            FogBackdropGeometry.extentGuard(imageExtent(mosaic)).rectangles
+        } catch (_: IllegalArgumentException) {
+            refuse("guardGeometry")
+            return emptyList()
+        }
+        if (rectangles.isEmpty()) return emptyList()
+        val signature = FogTilePngCodec.colorForGeneration(generationId)
+        val fill = argb(VISIBLE_FOG_ALPHA, signature.red, signature.green, signature.blue)
+        val polygons = mutableListOf<Polygon>()
+        rectangles.forEach { bounds ->
+            val polygon = try {
+                map.addPolygon(
+                    PolygonOptions()
+                        .addAll(bounds.ring())
+                        // Rhumb lines, so a rectangle in longitude and latitude stays one: a
+                        // geodesic edge would bow away from the parallel it is supposed to follow
+                        // and leave a sliver of unfogged ground against the image.
+                        .geodesic(false)
+                        .fillColor(fill)
+                        .strokeWidth(0f)
+                        .strokeColor(TRANSPARENT)
+                        .zIndex(BACKDROP_Z)
+                        .visible(false)
+                        .clickable(false),
+                )
+            } catch (_: Exception) {
+                null
+            } catch (_: LinkageError) {
+                null
+            }
+            if (polygon == null) {
+                polygons.forEach { attached -> removeSafely(attached) }
+                refuse("addPolygon")
+                return emptyList()
+            }
+            polygons += polygon
+        }
+        return polygons
+    }
+
+    private fun removeSafely(polygon: Polygon) {
+        try {
+            polygon.remove()
+        } catch (_: Exception) {
+            // The surface is going away with it, or it is already gone.
+        } catch (_: LinkageError) {
+            // As above.
+        }
+    }
+
+    private fun FogTileBounds.ring(): List<LatLng> = listOf(
+        LatLng(southLatitude, westLongitude),
+        LatLng(southLatitude, eastLongitude),
+        LatLng(northLatitude, eastLongitude),
+        LatLng(northLatitude, westLongitude),
+    )
+
+    private fun argb(alpha: Int, red: Int, green: Int, blue: Int): Int =
+        (alpha shl 24) or (red shl 16) or (green shl 8) or blue
 
     /**
      * Shows the successor and, deliberately, leaves the predecessor alone.
@@ -149,6 +266,10 @@ internal class GoogleFogMosaicOverlayInstaller(
     override fun reveal(generationId: Long, previousGenerationId: Long?): Boolean {
         val entry = installed[generationId] ?: return false
         return try {
+            // The backdrop first. Both orders leave one frame imperfect and only this one errs
+            // towards MORE fog: showing the surround before the image can over-fog the middle for
+            // a frame, while showing the image first would show bare ground around it.
+            entry.backdrop.forEach { polygon -> polygon.isVisible = true }
             entry.overlay.transparency = VISIBLE_FOG_TRANSPARENCY
             true
         } catch (_: Exception) {
@@ -169,6 +290,7 @@ internal class GoogleFogMosaicOverlayInstaller(
             false
         }
         if (!removed) return false
+        entry.backdrop.forEach { polygon -> removeSafely(polygon) }
         installed.remove(generationId)
         entry.bitmap.recycle()
         return true
@@ -188,6 +310,7 @@ internal class GoogleFogMosaicOverlayInstaller(
             } catch (_: LinkageError) {
                 // As above.
             }
+            entry.backdrop.forEach { polygon -> removeSafely(polygon) }
             entry.bitmap.recycle()
         }
         installed.clear()
@@ -195,7 +318,7 @@ internal class GoogleFogMosaicOverlayInstaller(
 
     override fun describe(): String {
         val sizes = installed.entries.joinToString(",") { (id, entry) ->
-            "$id:${entry.width}x${entry.height}"
+            "$id:${entry.width}x${entry.height}+backdrop${entry.backdrop.size}"
         }
         return "mosaic gens=[$sizes] refusals=$refusals last=$lastRefusal"
     }
@@ -297,7 +420,21 @@ internal class GoogleFogMosaicOverlayInstaller(
         const val OLD_OVERLAY_Z = 0f
         const val NEW_OVERLAY_Z = 1f
         const val HIDDEN_FOG_TRANSPARENCY = 1f
-        const val VISIBLE_FOG_TRANSPARENCY = 1f - 184f / 255f
+        const val VISIBLE_FOG_ALPHA = 184
+        const val VISIBLE_FOG_TRANSPARENCY = 1f - VISIBLE_FOG_ALPHA / 255f
+
+        /**
+         * Between the demoted predecessor and this generation's own image.
+         *
+         * The SDK draws shapes above ground overlays whatever their z, so this cannot hide the
+         * image it belongs to - and it does not need to: the guard is the complement of that
+         * image's rectangle and the two are disjoint by construction. What it does cover for a
+         * moment is the PREDECESSOR's revealed ground, during the overlap the fail-closed reveal
+         * leaves open. That is more fog rather than less, which is the direction this surface is
+         * allowed to be wrong in.
+         */
+        const val BACKDROP_Z = 0.5f
+        const val TRANSPARENT = 0
 
         const val MAX_LONGITUDE = 180.0
     }
