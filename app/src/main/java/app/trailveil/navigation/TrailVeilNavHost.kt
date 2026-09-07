@@ -131,9 +131,10 @@ internal const val HistoryBackTransitionDurationMillis = 250
 /**
  * `V02-016`: the notices of whichever provider this variant was compiled with.
  *
- * Read off the main thread and behind a loading state, because one provider answers from a 76 KB
- * packaged resource and the other from a call into Play services - neither belongs on the
- * composition's dispatcher, and an empty screen while it happens would read as "there are none".
+ * Read off the main thread and behind a loading state, because both providers answer from a large
+ * packaged resource - 76 KB for MapLibre's own file, 388 KB for the Google harvest - and neither
+ * belongs on the composition's dispatcher. An empty screen while it happens would read as "there
+ * are none", which is the one thing this screen must never say by accident.
  */
 @Composable
 private fun ThirdPartyNoticesRoute(onBack: () -> Unit) {
