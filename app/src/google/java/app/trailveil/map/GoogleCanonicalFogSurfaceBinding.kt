@@ -20,6 +20,7 @@ import app.trailveil.map.fog.FogRenderStyle
 import app.trailveil.map.fog.FogRequestedTileWindowRenderer
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogSnapshotPort
+import app.trailveil.map.fog.FogSnapshotVisualProbePlan
 import app.trailveil.map.fog.FogSnapshotVisualProbePlanner
 import app.trailveil.map.fog.FogSynchronizationRenderDecision
 import app.trailveil.map.fog.FogSynchronizationRenderPolicy
@@ -684,6 +685,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
             "installedKeys=${installedCoverageKeys?.size} " +
             "recentRequests=${recentRequestedKeysOrNull()?.size} " +
             "provenRequested=${lastProvenRequestedKeys.size} " +
+            "proofPlanRefusals=$proofPlanRefusals " +
             "sinceLastRequestMs=${(SystemClock.elapsedRealtimeNanos() - lastRequestAtNanos) / 1_000_000L}"
     }
 
@@ -1024,31 +1026,61 @@ internal class GoogleCanonicalFogSurfaceBinding(
         }
     }
 
-    private fun freshProofPlan(generationId: Long) = coverageByGeneration[generationId]?.let { published ->
+    /**
+     * Why the last proof plan came back null. Diagnostic only, read by [describeForTesting].
+     *
+     * `V03-011` section 15n: on prototype A the prover's retry is the whole of a generation's
+     * second chance, because a `GroundOverlay` gives the delivery barrier nothing to observe and
+     * the reveal is what starts the proof. When that retry meets a null plan the generation's proof
+     * ends rather than re-attempting, and `plan:null` in the prover's trace cannot say which of the
+     * five refusals below fired - a camera that moved between attempts and a mask set that is short
+     * are different problems with different fixes, and they looked identical.
+     */
+    private val proofPlanRefusals = LinkedHashMap<String, Int>()
+
+    private fun refuseProofPlan(reason: String): FogSnapshotVisualProbePlan? {
+        // A tally rather than the latest, because a refusal that is later followed by a success is
+        // exactly the case worth seeing: the generation whose retry died still lost its proof. The
+        // reasons carry zoom values, so cap the distinct keys rather than trusting them to be few.
+        if (reason in proofPlanRefusals || proofPlanRefusals.size < MAX_PROOF_PLAN_REFUSAL_KINDS) {
+            proofPlanRefusals[reason] = (proofPlanRefusals[reason] ?: 0) + 1
+        }
+        return null
+    }
+
+    private fun freshProofPlan(generationId: Long): FogSnapshotVisualProbePlan? {
+        val published = coverageByGeneration[generationId] ?: return refuseProofPlan("noCoverage")
         val coverage = currentCoverageRequest() ?: published
         val allMasks = masksByGeneration[generationId].orEmpty()
         val requiredFloorKeys = try {
             surroundPlanner.plan(coverage).keySet
         } catch (_: IllegalArgumentException) {
-            return@let null
+            return refuseProofPlan("surroundPlan")
         }
-        val actual = recentRequestedKeysOrNull() ?: return@let null
-        if (!allMasks.keys.containsAll(requiredFloorKeys) || !allMasks.keys.containsAll(actual)) {
-            return@let null
+        val actual = recentRequestedKeysOrNull() ?: return refuseProofPlan("requestsOverflowed")
+        if (!allMasks.keys.containsAll(requiredFloorKeys)) {
+            return refuseProofPlan(
+                "floorShort:${requiredFloorKeys.count { key -> key !in allMasks.keys }}" +
+                    "/${requiredFloorKeys.size}@z${coverage.floorZoom}",
+            )
+        }
+        if (!allMasks.keys.containsAll(actual)) {
+            return refuseProofPlan("actualShort:${actual.count { key -> key !in allMasks.keys }}")
         }
         val masks = allMasks.filterKeys { key -> key.zoom == coverage.floorZoom }
         if (masks.isEmpty()) {
-            null
-        } else {
-            val zones = try {
-                exclusionZonesForProof()
-            } catch (_: Exception) {
-                listOf(wholeWorldFogProbeExclusionZone())
-            } catch (_: LinkageError) {
-                listOf(wholeWorldFogProbeExclusionZone())
-            }
-            probePlanner.plan(coverage, masks, exclusionZones = zones)
+            return refuseProofPlan(
+                "noMasksAtZoom:z${coverage.floorZoom}have${allMasks.keys.map { it.zoom }.toSortedSet()}",
+            )
         }
+        val zones = try {
+            exclusionZonesForProof()
+        } catch (_: Exception) {
+            listOf(wholeWorldFogProbeExclusionZone())
+        } catch (_: LinkageError) {
+            listOf(wholeWorldFogProbeExclusionZone())
+        }
+        return probePlanner.plan(coverage, masks, exclusionZones = zones)
     }
 
     private fun scheduleInstallTimeout(generationId: Long) {
@@ -1443,6 +1475,9 @@ internal class GoogleCanonicalFogSurfaceBinding(
     }
 
     private companion object {
+        /** Distinct [refuseProofPlan] reasons kept; the reasons carry zoom values. */
+        const val MAX_PROOF_PLAN_REFUSAL_KINDS = 8
+
         const val DELIVERY_POLL_MILLIS = 50L
         const val DELIVERY_QUIET_NANOS = 100L * 1_000_000L
         const val RENDER_TIMEOUT_MILLIS = 15_000L

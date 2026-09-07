@@ -213,7 +213,7 @@ internal class GoogleFogMosaicOverlayInstaller(
         // complementary half of the world, which contains the image. That is a second coat over
         // every pixel the proof samples, and it is what generations 2, 3 and 4 died of.
         val rectangles = try {
-            FogBackdropGeometry.extentGuard(imageExtent(mosaic)).rectangles
+            surroundComplementOfImage(mosaic)
                 .map(FogBackdropGeometry::anchoredInsideWorld)
                 .flatMap { bounds -> bounds.splitForGooglePolygon() }
         } catch (_: IllegalArgumentException) {
@@ -253,6 +253,68 @@ internal class GoogleFogMosaicOverlayInstaller(
             polygons += polygon
         }
         return polygons
+    }
+
+    /**
+     * The ground this generation claims but does not draw: the surround, minus the image.
+     *
+     * The first two versions of this complemented to the WHOLE WORLD, which is what
+     * `FogBackdropGeometry.extentGuard` builds, because that is what the tile path effectively
+     * covers - `GoogleGenerationBoundTileProvider` answers every key outside the published set with
+     * opaque fog, everywhere, forever. Copying that reach here was wrong twice over.
+     *
+     * It is wrong on contract. What this surface CLAIMS is `FogBackdropGeometry.extent(mosaic)`,
+     * the surround, and the coordinator raises the cover the moment the camera leaves it. Ground
+     * beyond the surround is the cover's job, not this backdrop's, so drawing it buys nothing.
+     *
+     * It is wrong in practice, and that is what found it. A world complement puts a quad from the
+     * surround's edge to `WebMercator.MAX_LATITUDE` across every longitude - in Mercator, the most
+     * distorted geometry the projection can express - and with those attached the SDK stopped
+     * answering `GoogleMap.snapshot()` at all: `V03-011` section 15o, generation 2's proof shows
+     * `attempt:1` with no `snapshot:` event ever following it, in both backdrop builds and in
+     * neither build without one. No snapshot is no proof, and no proof is a cover that never comes
+     * down.
+     *
+     * Four strips, each clipped to the surround, and any that comes out degenerate is dropped
+     * rather than emitted as a zero-area ring.
+     */
+    private fun surroundComplementOfImage(mosaic: FogTileMosaic): List<FogTileBounds> {
+        val surround = FogBackdropGeometry.extent(mosaic)
+        val image = mosaic.bounds
+        val north = WebMercator.latitudeAtNormalizedY(surround.northNormalizedY)
+        val south = WebMercator.latitudeAtNormalizedY(surround.southNormalizedY)
+        val halfDegrees = surround.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
+        // A surround that reaches all the way round has no east or west edge to complement; its
+        // north and south strips still span only the latitudes the surround owns.
+        val west = if (surround.wrapsWorld) {
+            -FogBackdropGeometry.WORLD_LONGITUDE_SPAN / 2.0
+        } else {
+            surround.centerLongitude - halfDegrees
+        }
+        val east = if (surround.wrapsWorld) {
+            FogBackdropGeometry.WORLD_LONGITUDE_SPAN / 2.0
+        } else {
+            surround.centerLongitude + halfDegrees
+        }
+        val strips = mutableListOf<FogTileBounds>()
+        fun add(westLongitude: Double, southLatitude: Double, eastLongitude: Double, northLatitude: Double) {
+            if (eastLongitude - westLongitude <= 0.0 || northLatitude - southLatitude <= 0.0) return
+            if (!westLongitude.isFinite() || !eastLongitude.isFinite()) return
+            if (!southLatitude.isFinite() || !northLatitude.isFinite()) return
+            strips += FogTileBounds(
+                westLongitude = westLongitude,
+                southLatitude = southLatitude,
+                eastLongitude = eastLongitude,
+                northLatitude = northLatitude,
+            )
+        }
+        // North and south own the full width, so the corners belong to them and the side strips
+        // only span the image's own latitudes. Same division of labour as extentGuard.
+        add(west, image.northLatitude, east, north)
+        add(west, south, east, image.southLatitude)
+        add(west, image.southLatitude, image.westLongitude, image.northLatitude)
+        add(image.eastLongitude, image.southLatitude, east, image.northLatitude)
+        return strips
     }
 
     /**
