@@ -16,9 +16,22 @@ internal object GoogleFogCoverageArm {
     @Volatile
     var profile: GoogleFogCoverageProfile = GoogleFogCoverageProfile.DEFAULT
 
-    /** Restores the shipped profile. Every arm test must call this in an `@After`. */
+    /**
+     * Arm 2 (prototype A): put the fog on one anchored image instead of a `TileOverlay`.
+     *
+     * Separate from [profile] because it selects a SURFACE rather than a coverage plan - arm
+     * 2 renders exactly what the shipped build renders and only changes how it reaches the
+     * screen. Keeping it out of `GoogleFogCoverageProfile` also keeps the arm-2 selector out
+     * of `src/google`, which every Google build type compiles: the enum value, the field and
+     * its factory would all have shipped in the published APK.
+     */
+    @Volatile
+    var mosaicOverlay: Boolean = false
+
+    /** Restores the shipped profile and surface. Every arm test must call this in an `@After`. */
     fun reset() {
         profile = GoogleFogCoverageProfile.DEFAULT
+        mosaicOverlay = false
     }
 }
 

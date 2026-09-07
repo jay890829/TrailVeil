@@ -810,7 +810,18 @@ internal enum class FogContinuityArm(
      */
     PADDING_RING_2("paddingRing2", coverExpected = false),
 
-    /** Prototype A: one anchored image for the viewport plus guards beyond it. */
+    /**
+     * Prototype A: one anchored image for the viewport instead of a `TileOverlay`.
+     *
+     * [coverExpected] is false for the claim it is actually making, which is narrower than
+     * "the cover never rises": no generation is BUILT during an in-extent gesture, so there
+     * is nothing for the cover to cover. A gesture that leaves the mosaic still publishes,
+     * still raises the cover and still proves before lowering it - the same rule as today.
+     * The measurement worth taking here is therefore a ZOOM: a coverage key carries the zoom
+     * it was planned at, so no tile ring survives an integer zoom step at any width, and a
+     * ground-anchored image has no such step to survive. Run on a pan it would tie with arm
+     * 1 at a fraction of arm 1`s cost, and that tie would read as prototype A failing.
+     */
     MOSAIC_OVERLAY("mosaicOverlay", coverExpected = false),
 
     ;
@@ -823,22 +834,21 @@ internal enum class FogContinuityArm(
      */
     fun install() {
         GoogleFogCoverageArm.profile = coverageProfile()
+        // Arm 2 changes the SURFACE, not the plan, so it rides a separate switch and leaves
+        // the coverage profile at the shipped constants.
+        GoogleFogCoverageArm.mosaicOverlay = this == MOSAIC_OVERLAY
     }
 
     private fun coverageProfile(): GoogleFogCoverageProfile = when (this) {
-        BASELINE -> GoogleFogCoverageProfile.DEFAULT
+        // Arm 2 renders exactly what the shipped build renders; only how it reaches the
+        // screen differs, which is the whole reason it can be compared to the baseline at all.
+        BASELINE, MOSAIC_OVERLAY -> GoogleFogCoverageProfile.DEFAULT
         // Asymmetric by construction - render padded, predict unpadded - because
         // `FogPaddingRingSurroundTest` showed that padding both sides of the surround test cancels
         // exactly and buys no movement at all. `ring` also carries the budgets, which the shipped
         // 256s cannot accommodate: the rectangular completion already runs at 240.
         PADDING_RING -> GoogleFogCoverageProfile.ring(PADDING_RING_TILES)
         PADDING_RING_2 -> GoogleFogCoverageProfile.ring(PADDING_RING_2_TILES)
-        // Prototype A does not change the coverage plan, it replaces the TileOverlay, and none of
-        // that is built. Installing the default here would let a mosaic trial run on the baseline
-        // surface and report the baseline's numbers under prototype A's name.
-        MOSAIC_OVERLAY -> throw UnsupportedOperationException(
-            "the mosaicOverlay arm has no surface yet; see `V03-011` sections 5 and 6",
-        )
     }
 
     private companion object {

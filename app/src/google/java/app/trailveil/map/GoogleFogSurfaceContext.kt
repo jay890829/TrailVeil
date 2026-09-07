@@ -51,4 +51,6 @@ internal fun GoogleFogSurfaceContext.canonicalBinding(): GoogleCanonicalFogSurfa
         onUnprovableProofPlan = onUnprovableProofPlan,
         onProofAccepted = onProofAccepted,
         installFaultForTesting = installFaultForTesting,
+        // Null in every shipped build, and the release seam cannot name an alternative.
+        overlayInstaller = googleFogOverlayInstaller(this),
     )

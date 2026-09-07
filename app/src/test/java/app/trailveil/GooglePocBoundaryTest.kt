@@ -414,5 +414,88 @@ class GooglePocBoundaryTest {
             }
         }
 
+    /**
+     * `V03-011` arm 2's surface must be ABSENT from a published build, not merely unselected.
+     *
+     * Prototype A replaces the fog's `TileOverlay` with one anchored image. The tempting place for
+     * its selector was a `surfaceKind` field on `GoogleFogCoverageProfile` - and that file is in
+     * `src/google`, which every Google build type compiles, so the enum value, the field and its
+     * factory would all have shipped. This repository already ruled on that shape once:
+     * `GoogleMapOverlayObservationSeam` records moving a null-by-default, cross-process-unreachable
+     * hook out of `src/google` because it was scaffolding in a public artifact all the same.
+     *
+     * So the choosing lives in a per-build-type seam. This asserts the three things that make the
+     * absence structural rather than assertional: both build types declare the same symbol, the
+     * release twin cannot name an implementation, and the implementation is in a source set the
+     * release variant does not compile.
+     *
+     * It also pins the fallback direction. A seam shaped "return the surface or null" invites a
+     * null that means NO surface, which on a real device is an unfogged basemap. Null here means
+     * the shipped tile path, and the binding's own signature is what makes that true.
+     */
+    @Test
+    fun onlyTheHarnessBuildTypeCanSelectTheMosaicFogSurface() {
+        val release = File(
+            moduleRoot(),
+            "src/googleRelease/java/app/trailveil/map/GoogleFogOverlayInstallerSeam.kt",
+        ).readText()
+        val harness = File(
+            moduleRoot(),
+            "src/googlePoc/java/app/trailveil/map/GoogleFogOverlayInstallerSeam.kt",
+        ).readText()
+
+        listOf(release, harness).forEach { seam ->
+            assertTrue(
+                "both build types must declare the same seam symbol, or a variant compiles neither",
+                seam.contains("internal fun googleFogOverlayInstaller("),
+            )
+        }
+        assertTrue(
+            "the release seam must return null unconditionally",
+            release.contains("): GoogleFogOverlayInstaller? = null"),
+        )
+        assertFalse(
+            "the release seam must not be able to name an implementation at all: $release",
+            release.contains("GoogleFogMosaicOverlayInstaller"),
+        )
+        assertFalse(
+            "the release seam must declare no mutable state: $release",
+            release.contains("var ") || release.contains("@Volatile"),
+        )
+        assertTrue(
+            "the harness seam is where the selector lives",
+            harness.contains("GoogleFogCoverageArm.mosaicOverlay") &&
+                harness.contains("GoogleFogMosaicOverlayInstaller("),
+        )
+
+        // The implementation itself is in a source set googleRelease does not compile, which is
+        // what makes the absence a property of the artifact rather than of this assertion.
+        assertTrue(
+            "the mosaic installer must live in src/googlePoc",
+            File(
+                moduleRoot(),
+                "src/googlePoc/java/app/trailveil/map/GoogleFogMosaicOverlayInstaller.kt",
+            ).isFile,
+        )
+        assertFalse(
+            "no mosaic surface may exist in src/google, which every Google build type compiles",
+            File(moduleRoot(), "src/google/java/app/trailveil/map")
+                .listFiles()
+                .orEmpty()
+                .any { file -> file.name.contains("MosaicOverlayInstaller") },
+        )
+
+        // Null means the shipped surface, never no surface.
+        val binding = File(
+            moduleRoot(),
+            "src/google/java/app/trailveil/map/GoogleCanonicalFogSurfaceBinding.kt",
+        ).readText()
+        assertTrue(
+            "the binding must take the installer as a nullable argument defaulting to none, so a " +
+                "null seam is the tile path rather than an unfogged map",
+            binding.contains("private val overlayInstaller: GoogleFogOverlayInstaller? = null,"),
+        )
+    }
+
     private fun moduleRoot(): File = File(repositoryRoot(), "app")
 }

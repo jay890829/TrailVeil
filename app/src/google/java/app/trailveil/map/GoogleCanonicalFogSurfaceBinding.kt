@@ -96,7 +96,16 @@ internal class GoogleCanonicalFogSurfaceBinding(
      * host passed nothing cannot observe that this seam exists.
      */
     private val installFaultForTesting: (() -> Unit)? = null,
-) : GoogleFogSurfaceBinding {
+    /**
+     * How a published generation is put on the map. Null - every shipped build - means tiles.
+     *
+     * `V03-011` arm 2 rasterises the same masks into one anchored image instead. Everything
+     * before that point is identical, so the prototype is an installer rather than a second
+     * binding; see [GoogleFogOverlayInstaller]. Only a per-build-type seam can supply one, and
+     * the `googleRelease` twin returns null unconditionally.
+     */
+    private val overlayInstaller: GoogleFogOverlayInstaller? = null,
+) {
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     /**
@@ -229,6 +238,10 @@ internal class GoogleCanonicalFogSurfaceBinding(
         override fun attachOverlay(generationId: Long) {
             assertMainThread()
             if (released || generationId !in generations) return
+            overlayInstaller?.let { installer ->
+                attachThroughInstaller(installer, generationId)
+                return
+            }
             if (!demoteExistingOverlays()) {
                 handler.post {
                     failGeneration(generationId, IllegalStateException("old overlay z-order failed"))
@@ -266,6 +279,19 @@ internal class GoogleCanonicalFogSurfaceBinding(
 
         override fun revealOverlay(generationId: Long, previousGenerationId: Long?) {
             assertMainThread()
+            overlayInstaller?.let { installer ->
+                if (!installer.reveal(generationId, previousGenerationId)) {
+                    handler.post {
+                        if (released) return@post
+                        coordinator.onRevealFailed(generationId)
+                        afterCoordinatorMutation()
+                    }
+                    return
+                }
+                revealedBeneathCoverAtNanos =
+                    if (coordinator.coverUp) SystemClock.elapsedRealtimeNanos() else null
+                return
+            }
             // V02-012 design 2: one turn, no other renderer work in between, so the SDK can apply
             // the show and the hide in the same frame. The bootstrap placeholder is already hidden
             // and leaves in afterCoordinatorMutation once a generation is installed.
@@ -293,6 +319,13 @@ internal class GoogleCanonicalFogSurfaceBinding(
 
         override fun removeOverlay(generationId: Long): Boolean {
             assertMainThread()
+            overlayInstaller?.let { installer ->
+                if (!installer.remove(generationId)) return false
+                generations.remove(generationId)
+                masksByGeneration.remove(generationId)
+                coverageByGeneration.remove(generationId)
+                return true
+            }
             val overlay = overlays[generationId]
             if (overlay != null && !overlay.removeSafely()) return false
             overlays.remove(generationId)
@@ -366,12 +399,20 @@ internal class GoogleCanonicalFogSurfaceBinding(
 
     private val cameraPort = object : FogCameraPort {
         override fun insidePublishedSurround(): Boolean {
+            overlayInstaller?.let { installer ->
+                return installer.covers(coordinator.installedGenerationId, visibleCornersOrEmpty())
+            }
             return insideCoverage(installedCoverageKeys)
         }
 
         override fun insidePendingSurround(): Boolean {
             // Completion asks about the generation it is just proving, before the coordinator
             // swaps the installed-generation identity. Movement never uses this pending read.
+            overlayInstaller?.let { installer ->
+                val generation = coordinator.pendingGenerationId
+                    ?: coordinator.installedGenerationId
+                return installer.covers(generation, visibleCornersOrEmpty())
+            }
             return insideCoverage(pendingCoverageKeys ?: installedCoverageKeys)
         }
     }
@@ -393,13 +434,13 @@ internal class GoogleCanonicalFogSurfaceBinding(
         }
     }
 
-    override fun onMapLoaded() {
+    fun onMapLoaded() {
         assertMainThread()
         mapLoaded = true
         requestCurrentViewportIfReady()
     }
 
-    override fun onHostStarted() {
+    fun onHostStarted() {
         assertMainThread()
         if (released) return
         val resuming = hostStopped
@@ -437,7 +478,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
      * terminal failure on the recording screen — reproduced on API 36 before this guard existed.
      * Both are re-armed fresh by [onHostStarted].
      */
-    override fun onHostStopped() {
+    fun onHostStopped() {
         assertMainThread()
         if (released || hostStopped) return
         hostStopped = true
@@ -452,7 +493,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         pausedInstallTimeoutGeneration = activeInstall
     }
 
-    override fun onCameraMoveStarted(reason: Int) {
+    fun onCameraMoveStarted(reason: Int) {
         assertMainThread()
         if (released) return
         cameraEpoch += 1L
@@ -461,7 +502,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         afterCoordinatorMutation()
     }
 
-    override fun onCameraMoveFrame() {
+    fun onCameraMoveFrame() {
         assertMainThread()
         if (released) return
         cameraEpoch += 1L
@@ -469,7 +510,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         afterCoordinatorMutation()
     }
 
-    override fun onCameraIdle() {
+    fun onCameraIdle() {
         assertMainThread()
         if (released || !baselineReady || !mapLoaded) return
         cameraEpoch += 1L
@@ -477,28 +518,28 @@ internal class GoogleCanonicalFogSurfaceBinding(
         afterCoordinatorMutation()
     }
 
-    override fun onCameraMoveCancelled() = onCameraIdle()
+    fun onCameraMoveCancelled() = onCameraIdle()
 
     /** Claims the coordinator's SP10-verified ticket for an ordinary programmed camera move. */
-    override fun beginProgrammedFlight(): Long {
+    fun beginProgrammedFlight(): Long {
         assertMainThread()
         return coordinator.beginProgrammedFlight()
     }
 
     /** Releases a programmed flight only when its ticket is still current. */
-    override fun endProgrammedFlight(ticket: Long): Boolean {
+    fun endProgrammedFlight(ticket: Long): Boolean {
         assertMainThread()
         return coordinator.endProgrammedFlight(ticket)
     }
 
     /** Claims the follow-ease ticket and marks the move as exempt from the move-start cover. */
-    override fun beginFollowEase(): Long {
+    fun beginFollowEase(): Long {
         assertMainThread()
         return coordinator.beginFollowEase()
     }
 
     /** Releases a follow-ease ticket without letting a stale cancel clear a newer flight. */
-    override fun endFollowEase(ticket: Long): Boolean {
+    fun endFollowEase(ticket: Long): Boolean {
         assertMainThread()
         return coordinator.endFollowEase(ticket)
     }
@@ -509,12 +550,12 @@ internal class GoogleCanonicalFogSurfaceBinding(
     }
 
     /** Invalidates a proof that predates a newly published marker/track payload. */
-    override fun onOverlayDataChanged() {
+    fun onOverlayDataChanged() {
         assertMainThread()
         cameraEpoch += 1L
     }
 
-    override fun release() {
+    fun release() {
         assertMainThread()
         if (released) return
         released = true
@@ -523,6 +564,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         coverDeadline = null
         handler.removeCallbacksAndMessages(null)
         snapshotProver.release()
+        overlayInstaller?.release()
         providers.values.forEach { tileProvider -> tileProvider.releaseObservers() }
         providers.clear()
         bootstrapProvider?.releaseObservers()
@@ -610,11 +652,15 @@ internal class GoogleCanonicalFogSurfaceBinding(
      * messages: a generation that stays pending with every worker idle has bailed out of
      * [startRender] or never been requested, and only these flags say which.
      */
-    override fun describeForTesting(): String {
+    fun describeForTesting(): String {
         val actual = actualRequests.snapshot()
         val recent = recentRequestedKeysOrNull()
         val pendingKeys = pendingCoverageKeys
+        // Empty in every shipped build. Present so that an arm-2 run cannot be mistaken for
+        // a tile run whose barrier happens to read zero.
+        val installer = overlayInstaller?.let { " installer[" + it.describe() + "]" }.orEmpty()
         return "baselineReady=$baselineReady mapLoaded=$mapLoaded hostStopped=$hostStopped " +
+            installer +
             "actual[gen=${actual.generation} requested=${actual.requestedCount} " +
             "delivered=${actual.deliveredCount} overflowed=${actual.overflowed} " +
             "barrier=${actual.barrierArmed}] " +
@@ -907,6 +953,77 @@ internal class GoogleCanonicalFogSurfaceBinding(
         afterCoordinatorMutation()
     }
 
+    /**
+     * `V03-011` arm 2: install a generation through the seam, and synthesize the drain it has no
+     * way to observe.
+     *
+     * A hidden `TileOverlay` still requests and draws its tiles - that is the whole pre-render
+     * mechanism the delivery barrier watches (see HIDDEN_FOG_TRANSPARENCY). An anchored image has
+     * nothing to fetch, so no request is ever logged and no barrier can arm. The gate that
+     * replaces it is the one that already follows: the coordinator reveals BEFORE it proves, and
+     * holds the cover until the snapshot proof passes.
+     *
+     * The post is load-bearing, not tidiness. `onGenerationPublished` sets `overlayAttached` only
+     * AFTER `attachOverlay` returns, and `onDeliveryBarrierDrained` returns immediately while that
+     * flag is false - so a drain synthesized on this turn would be a silent no-op, the install
+     * timeout would fire, and a first install classifies that terminal. A strictly later turn is
+     * the whole difference between this working and a permanently dead map.
+     */
+    private fun attachThroughInstaller(
+        installer: GoogleFogOverlayInstaller,
+        generationId: Long,
+    ) {
+        if (!installer.demoteExisting()) {
+            handler.post {
+                failGeneration(generationId, IllegalStateException("old overlay z-order failed"))
+            }
+            return
+        }
+        targetOverlayGeneration = generationId
+        val coverage = coverageByGeneration[generationId]
+        val masks = masksByGeneration[generationId]
+        // The floor rectangle, in row-major order, exactly as the compatibility publish
+        // builds it: `FogPocMosaic.compose` requires a complete rectangle, and the render
+        // key set is the plan UNIONED with the SDK`s observed requests, which is not one.
+        val floorKeys = coverage?.let {
+            try {
+                surroundPlanner.plan(it).keys
+            } catch (_: IllegalArgumentException) {
+                null
+            }
+        }
+        if (coverage == null || masks == null || floorKeys == null ||
+            !masks.keys.containsAll(floorKeys)
+        ) {
+            handler.post {
+                failGeneration(
+                    generationId,
+                    IllegalStateException("installer attach without a completed render"),
+                )
+            }
+            return
+        }
+        val tiles = floorKeys.map { key -> FogMosaicTile(key, requireNotNull(masks[key])) }
+        if (!installer.attach(generationId, coverage, tiles)) {
+            handler.post {
+                failGeneration(generationId, IllegalStateException("overlay attach failed"))
+            }
+            return
+        }
+        // Same position as the tile path: after the replacement is attached and recorded, so an
+        // injected fault takes the route a real post-attach failure takes.
+        val injectedRejection = installFaultRejectionOrNull()
+        if (injectedRejection != null) {
+            handler.post { failGeneration(generationId, injectedRejection) }
+            return
+        }
+        handler.post {
+            if (released || coordinator.pendingGenerationId != generationId) return@post
+            coordinator.onDeliveryBarrierDrained(generationId)
+            afterCoordinatorMutation()
+        }
+    }
+
     private fun freshProofPlan(generationId: Long) = coverageByGeneration[generationId]?.let { published ->
         val coverage = currentCoverageRequest() ?: published
         val allMasks = masksByGeneration[generationId].orEmpty()
@@ -1181,6 +1298,10 @@ internal class GoogleCanonicalFogSurfaceBinding(
     } catch (_: LinkageError) {
         null
     }
+
+    /** The camera's visible quad, for an installer answering the surround geometrically. */
+    private fun visibleCornersOrEmpty(): List<app.trailveil.map.fog.GeoPoint> =
+        currentCoverageRequest()?.visibleCorners().orEmpty()
 
     private fun createProvider(targetGeneration: Long?): GoogleFogTileProvider =
         GoogleFogTileProvider(

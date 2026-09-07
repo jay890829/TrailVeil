@@ -100,11 +100,12 @@ class FogMoveStartReachabilityTest {
     /**
      * The body of the declaration starting at [text], or null when it declares no body.
      *
-     * `V03-011` arm 2 added `GoogleFogSurfaceBinding`, the interface the host holds a fog surface
-     * by, and its file name matches this scan's filter. An interface member has no body, so the
-     * old unconditional `bracedBlock` threw "no braced block found" on it. Returning null is only
-     * half the fix: the caller must prove the reason is an interface, or a real handler written
-     * with a shape this parser does not understand would be silently skipped, which is exactly the
+     * The scan walks every `*SurfaceBinding*.kt` in `src/google`, and an interface declared there
+     * would match. An interface member has no body, so the old unconditional `bracedBlock` threw
+     * "no braced block found" on the first one it met - a `V03-011` seam that has since been
+     * withdrawn, but the hole it opened is real and stays closed. Returning null is only half
+     * the fix: the caller must prove the reason is an interface, or a real handler written with
+     * a shape this parser does not understand would be silently skipped, which is exactly the
      * failure this class's own KDoc records having had once already.
      *
      * Handles a block body, an expression body, and an explicit return type before either.
