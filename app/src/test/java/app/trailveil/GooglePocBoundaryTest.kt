@@ -497,5 +497,57 @@ class GooglePocBoundaryTest {
         )
     }
 
+    /**
+     * `V03-013`: the screen-anchored arm must not draw unless it is the arm that was selected.
+     *
+     * This is a regression test for a defect that shipped in the first arm-comparison APK and was
+     * caught by the owner rather than by anything here: [GoogleFogStencilOverlay] filled the screen
+     * with fog on EVERY arm, on top of whatever canonical fog that arm already drew. Two coats at
+     * alpha 184 composite to 0.92 instead of 0.72, so every Google arm rendered visibly darker with
+     * a second layer over it, and every hands-on comparison made in that state compared the wrong
+     * thing.
+     *
+     * The call site in `src/google` already suppresses the canonical fog when this arm is active,
+     * and its comment warns that per-call-site suppression is how a site gets missed - but nothing
+     * made the OVERLAY refuse to draw when it was not selected. The gate has to be inside the
+     * composable, and before the first draw, because that is the only place a future caller cannot
+     * route around. Asserting order rather than mere presence is the point: a gate that appears
+     * after `drawRect` is not a gate.
+     */
+    @Test
+    fun theScreenStencilOverlayRefusesToDrawUnlessItsArmIsSelected() {
+        val overlay = File(
+            moduleRoot(),
+            "src/googlePoc/java/app/trailveil/map/GoogleFogStencilOverlay.kt",
+        ).readText()
+
+        val gate = overlay.indexOf("if (!googleFogStencilActive()) return")
+        assertTrue(
+            "the stencil overlay must return early unless its arm is selected, or it draws a " +
+                "second coat of fog over every other arm",
+            gate >= 0,
+        )
+        val firstDraw = overlay.indexOf("drawRect(")
+        assertTrue("the overlay is expected to draw a fog rect", firstDraw >= 0)
+        assertTrue(
+            "the arm gate must come BEFORE the first draw; a gate after it does not gate anything",
+            gate < firstDraw,
+        )
+
+        // The published twin cannot even ask, so the gate is harness-only by construction.
+        val published = File(
+            moduleRoot(),
+            "src/googleRelease/java/app/trailveil/map/GoogleFogStencilSeam.kt",
+        ).readText()
+        assertTrue(
+            "the published twin must answer false unconditionally",
+            published.contains("internal fun googleFogStencilActive(): Boolean = false"),
+        )
+        assertFalse(
+            "the published twin must not be able to draw a stencil at all",
+            published.contains("drawRect("),
+        )
+    }
+
     private fun moduleRoot(): File = File(repositoryRoot(), "app")
 }

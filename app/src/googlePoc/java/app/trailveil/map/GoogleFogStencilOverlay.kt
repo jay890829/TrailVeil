@@ -62,6 +62,19 @@ internal fun GoogleFogStencilOverlay(
     fogRuntime: FogRuntime?,
     modifier: Modifier = Modifier,
 ) {
+    // THE GATE, and it belongs here rather than only at the call site.
+    //
+    // Without it this composable draws a full-screen coat of fog on EVERY arm, on top of whatever
+    // canonical fog that arm already draws - two coats at alpha 184 composite to 0.92 rather than
+    // 0.72, so every Google arm reads as "darker, with a second layer", and any hands-on comparison
+    // made in that state is comparing the wrong thing. The call site's own comment warns that
+    // suppressing the arm per-call-site is how a site gets missed and the two fogs end up drawn
+    // over each other; this is the guard that makes that warning structural instead of advisory.
+    //
+    // It also has to be the FIRST statement, before the null checks: returning here means the
+    // per-frame `withFrameNanos` loop and the 400 ms reveal query never start, so a non-stencil arm
+    // pays nothing for this layer existing in the build.
+    if (!googleFogStencilActive()) return
     if (map == null || fogRuntime == null) return
 
     // Geometry and projection move at completely different rates, so they are read on different
