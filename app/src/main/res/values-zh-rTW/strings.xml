@@ -72,4 +72,8 @@
     <string name="notices_back">返回</string>
     <string name="notices_loading">正在載入授權聲明…</string>
     <string name="notices_unavailable">無法載入這個版本的授權聲明。</string>
+    <string name="settings_title">設定</string>
+    <string name="settings_menu">設定</string>
+    <string name="settings_back">返回</string>
+    <string name="settings_about_section">關於</string>
 </resources>

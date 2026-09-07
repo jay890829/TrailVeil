@@ -55,6 +55,7 @@ internal fun RecordingEntryRoute(
     activity: ComponentActivity,
     onOpenHistory: () -> Unit = {},
     onOpenNotices: () -> Unit = {},
+    onOpenSettings: () -> Unit = {},
 ) {
     val scope = rememberCoroutineScope()
     DisposableEffect(Unit) {
@@ -738,6 +739,7 @@ internal fun RecordingEntryRoute(
         onDismissBackgroundStartNotice = { backgroundStartNotice = false },
         onOpenHistory = onOpenHistory,
         onOpenNotices = onOpenNotices,
+        onOpenSettings = onOpenSettings,
         fogRuntime = fogRuntime,
         fogRequired = true,
         cameraRequest = cameraRequest,

@@ -72,4 +72,8 @@
     <string name="notices_back">Back</string>
     <string name="notices_loading">Loading notices…</string>
     <string name="notices_unavailable">The notices for this build could not be loaded.</string>
+    <string name="settings_title">Settings</string>
+    <string name="settings_menu">Settings</string>
+    <string name="settings_back">Back</string>
+    <string name="settings_about_section">About</string>
 </resources>

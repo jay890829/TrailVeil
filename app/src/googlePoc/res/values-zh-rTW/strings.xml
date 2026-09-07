@@ -20,4 +20,8 @@
     <string name="google_poc_reason_load_timeout">Google 地圖未在時限內完成載入。</string>
     <string name="google_poc_fallback_without_guidance">Google Maps PoC 無法使用。\n%1$s\n\n探索記錄與歷史資料仍保存在本機，且未受影響。</string>
     <string name="google_poc_fallback_with_guidance">Google Maps PoC 無法使用。\n%1$s\n\n%2$s\n\n探索記錄與歷史資料仍保存在本機，且未受影響。</string>
+    <string name="fog_arm_current">目前：%1$s  [padding=%2$s mosaic=%3$s]</string>
+    <string name="settings_fog_arm_section">霧化方案</string>
+    <string name="settings_fog_arm_restart_hint">已經顯示在底下的地圖會沿用它建立時的方案。請重新啟動 App 讓選擇完全生效。</string>
+    <string name="settings_fog_arm_restart">結束 App（下次啟動套用）</string>
 </resources>

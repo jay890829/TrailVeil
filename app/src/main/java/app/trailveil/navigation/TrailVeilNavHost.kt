@@ -23,6 +23,7 @@ import app.trailveil.feature.history.RecordingHistoryDetailScreen
 import app.trailveil.feature.history.RecordingHistoryListScreen
 import app.trailveil.feature.notices.ThirdPartyNoticesScreen
 import app.trailveil.feature.recording.RecordingEntryRoute
+import app.trailveil.feature.settings.SettingsScreen
 import app.trailveil.map.ProductionMapProvider
 import app.trailveil.map.providerThirdPartyNotices
 import kotlinx.coroutines.Dispatchers
@@ -32,6 +33,7 @@ import kotlinx.coroutines.withContext
 internal const val RecordingRoute = "recording"
 internal const val HistoryRoute = "history"
 internal const val NoticesRoute = "notices"
+internal const val SettingsRoute = "settings"
 private const val HistorySessionIdArgument = "sessionId"
 private const val HistoryDetailRoutePattern = "history/{$HistorySessionIdArgument}"
 
@@ -69,6 +71,7 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
                 activity = activity,
                 onOpenHistory = { navController.navigate(HistoryRoute) },
                 onOpenNotices = { navController.navigate(NoticesRoute) },
+                onOpenSettings = { navController.navigate(SettingsRoute) },
             )
         }
         composable(
@@ -91,6 +94,23 @@ fun TrailVeilNavHost(activity: ComponentActivity) {
                 onOpenSession = { sessionId ->
                     navController.navigate(historyDetailRoute(sessionId))
                 },
+            )
+        }
+        // `V03-013`: settings, which is also where the harness build's fog-arm selector
+        // lives. Notices stays reachable from the menu as `V02-016` left it; this is a second
+        // path to the same destination, not a move.
+        composable(
+            route = SettingsRoute,
+            popExitTransition = {
+                slideOutOfContainer(
+                    towards = AnimatedContentTransitionScope.SlideDirection.Right,
+                    animationSpec = tween(HistoryBackTransitionDurationMillis),
+                )
+            },
+        ) {
+            SettingsScreen(
+                onBack = navController::popBackStack,
+                onOpenNotices = { navController.navigate(NoticesRoute) },
             )
         }
         composable(

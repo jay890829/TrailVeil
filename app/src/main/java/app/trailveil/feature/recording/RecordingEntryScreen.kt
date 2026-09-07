@@ -164,6 +164,7 @@ internal object RecordingEntryTestTags {
     const val Menu = "recording_entry_menu"
     const val Privacy = "recording_entry_privacy"
     const val Notices = "recording_entry_notices"
+    const val Settings = "recording_entry_settings"
     const val PrivacySheet = "recording_entry_privacy_sheet"
     const val PrivacyDismiss = "recording_entry_privacy_dismiss"
     const val RecordingStateDismiss = "recording_entry_recording_state_dismiss"
@@ -184,6 +185,7 @@ internal fun RecordingEntryScreen(
     onRecenter: () -> Unit = {},
     onOpenHistory: () -> Unit = {},
     onOpenNotices: () -> Unit = {},
+    onOpenSettings: () -> Unit = {},
     onUserMovedCamera: () -> Unit = {},
     onBackgroundStartAction: () -> Unit = {},
     onDismissBackgroundStartNotice: () -> Unit = {},
@@ -287,6 +289,7 @@ internal fun RecordingEntryScreen(
                     onStop = onStop,
                     onOpenHistory = onOpenHistory,
                     onOpenNotices = onOpenNotices,
+                    onOpenSettings = onOpenSettings,
                     onOpenPrivacy = { privacyRequested = true },
                 )
                 Column(
@@ -397,6 +400,7 @@ private fun RecordingEntryMenu(
     onStop: () -> Unit,
     onOpenHistory: () -> Unit,
     onOpenNotices: () -> Unit,
+    onOpenSettings: () -> Unit,
     onOpenPrivacy: () -> Unit,
 ) {
     Box {
@@ -481,6 +485,16 @@ private fun RecordingEntryMenu(
                     onOpenNotices()
                 },
                 modifier = Modifier.testTag(RecordingEntryTestTags.Notices),
+            )
+            // `V03-013`: settings. Last, because it is the least used of the four and the three
+            // above it are where `V02-016` and the history work left them.
+            DropdownMenuItem(
+                text = { Text(text = stringResource(R.string.settings_menu)) },
+                onClick = {
+                    onExpandedChange(false)
+                    onOpenSettings()
+                },
+                modifier = Modifier.testTag(RecordingEntryTestTags.Settings),
             )
         }
     }

@@ -28,6 +28,12 @@
             <meta-data
                 android:name="app.trailveil.map.GoogleMapWarmup"
                 android:value="androidx.startup" />
+            <!-- `V03-013`: applies the selected fog arm inside ContentProvider.onCreate, which is
+                 before Application.onCreate and before any composition - the only point early
+                 enough, because a fog binding reads the arm once in its field initialisers. -->
+            <meta-data
+                android:name="app.trailveil.map.GoogleFogArmInitializer"
+                android:value="androidx.startup" />
         </provider>
         <!-- `V02-005` stage 2, the launcher inversion: the production MainActivity and its real
              navigation graph ARE the googlePoc experience from here on. The PoC Activity is

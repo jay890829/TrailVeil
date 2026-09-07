@@ -20,6 +20,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalInspectionMode
@@ -951,5 +952,9 @@ internal fun GoogleHostedMapSurface(
         } else if (fogState?.retryScheduled == true && !fogCoverUp) {
             MapStatusBadge(stringResource(R.string.map_fog_unavailable))
         }
+        // `V03-013`: names the fog arm this process bound with, so a hands-on trial cannot be
+        // attributed to the wrong one. Bottom-start, clear of the status badges above. The
+        // release twin of this seam draws nothing and cannot name an arm at all.
+        GoogleFogArmBadge(Modifier.align(Alignment.BottomStart))
     }
 }
