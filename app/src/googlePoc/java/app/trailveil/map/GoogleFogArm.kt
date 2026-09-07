@@ -36,6 +36,8 @@ internal enum class GoogleFogArm(
      * is the only one that can fail open. Harness build type only.
      */
     val screenStencil: Boolean = false,
+    /** Prototype B's shape, with holes traced from the mask so no polygon library is needed. */
+    val vectorPolygon: Boolean = false,
 ) {
     /** The shipped design, and the control every other row is read against. */
     BASELINE("baseline", "Baseline (shipped)", paddingTiles = 0, mosaicOverlay = false),
@@ -72,6 +74,20 @@ internal enum class GoogleFogArm(
         mosaicOverlay = false,
         screenStencil = true,
     ),
+
+    /**
+     * Prototype B by the route that costs no dependency: one holed `Polygon` per generation, with
+     * the holes decomposed from the rendered mask. Section 15p predicts the boundary keeps today's
+     * staircase and hardens it; what is genuinely unknown is the RING COUNT, which the installer
+     * reports through the binding's gates line.
+     */
+    VECTOR(
+        "vector",
+        "Vector polygon (mask-traced)",
+        paddingTiles = 0,
+        mosaicOverlay = false,
+        vectorPolygon = true,
+    ),
     ;
 
     /**
@@ -89,6 +105,7 @@ internal enum class GoogleFogArm(
         }
         GoogleFogCoverageArm.mosaicOverlay = mosaicOverlay
         GoogleFogCoverageArm.screenStencil = screenStencil
+        GoogleFogCoverageArm.vectorPolygon = vectorPolygon
     }
 
     companion object {

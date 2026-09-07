@@ -11,8 +11,10 @@ package app.trailveil.map
  */
 internal fun googleFogOverlayInstaller(
     context: GoogleFogSurfaceContext,
-): GoogleFogOverlayInstaller? = if (GoogleFogCoverageArm.mosaicOverlay) {
-    GoogleFogMosaicOverlayInstaller(map = context.map)
-} else {
-    null
+): GoogleFogOverlayInstaller? = when {
+    // Exclusive by construction: the binding installs one installer, and `GoogleFogArm` is what
+    // guarantees no arm sets both selectors.
+    GoogleFogCoverageArm.vectorPolygon -> GoogleFogVectorOverlayInstaller(map = context.map)
+    GoogleFogCoverageArm.mosaicOverlay -> GoogleFogMosaicOverlayInstaller(map = context.map)
+    else -> null
 }

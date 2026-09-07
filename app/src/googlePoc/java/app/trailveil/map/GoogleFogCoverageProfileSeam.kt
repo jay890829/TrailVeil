@@ -39,11 +39,21 @@ internal object GoogleFogCoverageArm {
     @Volatile
     var screenStencil: Boolean = false
 
+    /**
+     * `V03-013` arm `vector`: the fog as a holed `Polygon` instead of tiles or an image.
+     *
+     * A surface selector like [mosaicOverlay], and exclusive with it - the binding installs one
+     * installer - so the arm enum is what keeps them from both being set.
+     */
+    @Volatile
+    var vectorPolygon: Boolean = false
+
     /** Restores the shipped profile and surface. Every arm test must call this in an `@After`. */
     fun reset() {
         profile = GoogleFogCoverageProfile.DEFAULT
         mosaicOverlay = false
         screenStencil = false
+        vectorPolygon = false
     }
 }
 
