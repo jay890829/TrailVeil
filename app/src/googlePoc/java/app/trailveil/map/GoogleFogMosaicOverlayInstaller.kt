@@ -9,6 +9,7 @@ import app.trailveil.map.fog.FogSurroundExtent
 import app.trailveil.map.fog.FogTileMosaic
 import app.trailveil.map.fog.FogViewportCoverageRequest
 import app.trailveil.map.fog.GeoPoint
+import app.trailveil.map.fog.WebMercator
 import com.google.android.gms.maps.GoogleMap
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.GroundOverlay
@@ -29,7 +30,7 @@ import com.google.android.gms.maps.model.LatLngBounds
  * **`googlePoc` only.** It is selected by a per-build-type seam whose `googleRelease` twin returns
  * null unconditionally and cannot name this class, so it is physically absent from a published APK.
  *
- * ### Three deliberate differences from the tile path, each fail-closed
+ * ### Four deliberate differences from the tile path, each fail-closed
  *
  * 1. **The predecessor is not hidden at the reveal.** The tile path may hide it, because its
  *    delivery barrier has already proven the successor's bytes reached the SDK. There is no such
@@ -43,6 +44,8 @@ import com.google.android.gms.maps.model.LatLngBounds
  *    into [-180, 180), which would silently anchor such an image the long way round the world.
  *    Refusing fails the generation, which raises the cover - correct, and loud.
  * 3. **The raster is capped, not tile-resolution.** See [targetSizeFor].
+ * 4. **The surround it reports is the IMAGE, not the tile path's backdrop.** See [imageExtent] -
+ *    the one place this class first got wrong, and the reason the spike has a zoom-out control.
  *
  * ### One thing measured rather than assumed
  *
@@ -130,7 +133,7 @@ internal class GoogleFogMosaicOverlayInstaller(
         installed[generationId] = Installed(
             overlay = overlay,
             bitmap = bitmap,
-            extent = FogBackdropGeometry.extent(mosaic),
+            extent = imageExtent(mosaic),
             width = width,
             height = height,
         )
@@ -212,6 +215,41 @@ internal class GoogleFogMosaicOverlayInstaller(
      * almost the whole world in the wrong direction - a silently misplaced fog image rather than a
      * failure. Refusing fails the generation and raises the cover.
      */
+    /**
+     * What this surface actually fogs: the anchored image, and nothing outside it.
+     *
+     * **Measured, after this returned the wrong answer.** The first version handed back
+     * `FogBackdropGeometry.extent(mosaic)`, which is what the shipped tile path answers with - and
+     * it is right there, because the tile path also installs a SURROUND backdrop reaching most of a
+     * world beyond the mosaic, so ground outside the tile rectangle is still fogged. Prototype A
+     * installs one image and no backdrop, so it inherited a promise it does not keep. The
+     * `V03-011` zoom-out control caught it: a pinch out of 2.32 levels left the cover down and put
+     * **89.344%** of the map on screen as bare basemap over unexplored ground, across 7 of 9
+     * judged in-window frames. Nothing else in the spike would have shown it - every other metric
+     * simply looked better.
+     *
+     * So the extent is the image's own rectangle. A viewport that leaves it is not covered, the
+     * cover rises, and a new generation is planned at the camera the gesture reached, exactly as
+     * the tile path does. That is what makes arm 2's claim the narrow one it was always stated as:
+     * an in-extent gesture builds nothing, and one that leaves still covers.
+     *
+     * [FogSurroundExtent.wrapsWorld] is false unconditionally. A mosaic wide enough to span the
+     * world would set it true through [FogBackdropGeometry], because the tile path installs a world
+     * copy on each side and so has no east or west edge to fall off; one image has both edges
+     * however wide it is.
+     */
+    private fun imageExtent(mosaic: FogTileMosaic): FogSurroundExtent {
+        val bounds = mosaic.bounds
+        return FogSurroundExtent(
+            centerLongitude = (bounds.westLongitude + bounds.eastLongitude) / 2.0,
+            halfWorlds = (bounds.eastLongitude - bounds.westLongitude) / 2.0 /
+                FogBackdropGeometry.WORLD_LONGITUDE_SPAN,
+            northNormalizedY = WebMercator.normalizedY(bounds.northLatitude),
+            southNormalizedY = WebMercator.normalizedY(bounds.southLatitude),
+            wrapsWorld = false,
+        )
+    }
+
     private fun boundsOrNull(mosaic: FogTileMosaic): LatLngBounds? {
         val bounds = mosaic.bounds
         if (bounds.westLongitude < -MAX_LONGITUDE || bounds.eastLongitude > MAX_LONGITUDE) {

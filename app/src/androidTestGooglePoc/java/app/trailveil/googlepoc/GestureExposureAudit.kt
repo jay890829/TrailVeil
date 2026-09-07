@@ -820,7 +820,7 @@ internal enum class FogContinuityArm(
      * The measurement worth taking here is therefore a ZOOM: a coverage key carries the zoom
      * it was planned at, so no tile ring survives an integer zoom step at any width, and a
      * ground-anchored image has no such step to survive. Run on a pan it would tie with arm
-     * 1 at a fraction of arm 1`s cost, and that tie would read as prototype A failing.
+     * 1 at a fraction of arm 1's cost, and that tie would read as prototype A failing.
      */
     MOSAIC_OVERLAY("mosaicOverlay", coverExpected = false),
 
@@ -959,6 +959,33 @@ internal enum class GestureKind(
         label = "oneFingerPan",
         minimumPanTiles = 1.0f,
         requiresCoverToRise = true,
+    ),
+
+    /**
+     * `V03-011` arm 2, and the only gesture that can tell prototype A from a padding ring.
+     *
+     * A coverage key carries the zoom it was planned at, so crossing an integer zoom boundary
+     * invalidates EVERY published key at once, whatever the ring width. Arm 1 measured a ring`s
+     * capacity in tiles of PAN precisely because a ring has no answer here: `ring(64)` is defeated
+     * by this gesture exactly as `ring(0)` is. A ground-anchored image has no such step to survive,
+     * because what it is anchored to is ground rather than a tile grid.
+     *
+     * **Zooming IN rather than out, and that is the whole design of the case.** Zoom-out grows the
+     * ground the camera sees, so it leaves a mosaic's extent geometrically and must still cover -
+     * see [PINCH_ZOOM_OUT], which arm 2 runs as its control. Zoom-in SHRINKS the visible ground, so
+     * it stays inside the extent by construction and the only thing that can still raise the cover
+     * is the tile grid's own zoom step. That makes the A/B a clean one-variable comparison: same
+     * plan, same render, same masks, one difference in how they reach the screen.
+     *
+     * [requiresCoverToRise] is deliberately false even though today's design does raise it here.
+     * Whether a shrinking viewport leaves the published set is a property of the coverage predicate,
+     * not of the gesture, and encoding today's answer as a requirement is exactly the mistake
+     * `V03-011` recorded when it moved the cover expectation onto the arm.
+     */
+    PINCH_ZOOM_IN(
+        label = "heldTwoFingerPinchZoomIn",
+        minimumZoomIn = 1.5f,
+        startZoomHeadroomAbove = 2.5f,
     ),
 }
 

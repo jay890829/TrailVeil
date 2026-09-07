@@ -984,7 +984,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         val masks = masksByGeneration[generationId]
         // The floor rectangle, in row-major order, exactly as the compatibility publish
         // builds it: `FogPocMosaic.compose` requires a complete rectangle, and the render
-        // key set is the plan UNIONED with the SDK`s observed requests, which is not one.
+        // key set is the plan UNIONED with the SDK's observed requests, which is not one.
         val floorKeys = coverage?.let {
             try {
                 surroundPlanner.plan(it).keys
