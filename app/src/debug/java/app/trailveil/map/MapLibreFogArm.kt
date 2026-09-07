@@ -24,6 +24,8 @@ internal enum class MapLibreFogArm(
     val label: String,
     /** Distance in tiles from the centre tile; 1 is the shipped 3x3. */
     val mosaicPaddingTiles: Int,
+    /** Draw the fog as tessellated geometry instead of a raster quad. */
+    val vectorFog: Boolean = false,
 ) {
     /** The shipped mosaic, and the control every other row is read against. */
     BASELINE("baseline", "Baseline (3x3)", FogViewportCoordinator.DEFAULT_MOSAIC_PADDING_TILES),
@@ -33,6 +35,14 @@ internal enum class MapLibreFogArm(
 
     /** 7x7: 49 tiles. The point at which the cost is worth watching as closely as the benefit. */
     MOSAIC_7("mosaic7", "Mosaic 7x7", 3),
+
+    /**
+     * The fog as geometry this renderer tessellates itself, with holes decomposed from the mask.
+     *
+     * Keeps the 3x3 mosaic: this arm changes HOW the generation is drawn, not how much of it is
+     * rendered, so it is read against `baseline` rather than against the wider mosaics.
+     */
+    VECTOR("vector", "Vector fog (mask-traced)", 1, vectorFog = true),
     ;
 
     companion object {

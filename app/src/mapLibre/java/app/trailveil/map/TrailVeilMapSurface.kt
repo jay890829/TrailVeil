@@ -1537,6 +1537,17 @@ private fun Style.installFogMosaicQuad(
     val coordinates = bounds.toQuad()
     check(getSource(sourceId) == null) { "$sourceId was not retired before slot reuse" }
     check(getLayer(layerId) == null) { "$layerId was not retired before slot reuse" }
+    val below = if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
+        FogOverlayIds.InstallGuardLayer
+    } else {
+        CurrentLocationOverlayIds.Layer
+    }
+    // `V03-013` arm `vector`: the same generation drawn as tessellated geometry instead of a
+    // raster quad, under the same id in the same slot so every retire and reuse path already
+    // written applies unchanged. The published twin of this seam answers false unconditionally and
+    // cannot name what it would have installed, so nothing below can be reached outside the
+    // harness build type.
+    if (installVectorFogIfArmed(this, sourceId, layerId, bounds, bitmap, below)) return
     addSource(ImageSource(sourceId, coordinates, bitmap))
     val layer = RasterLayer(layerId, sourceId).withProperties(
         PropertyFactory.rasterFadeDuration(0f),
@@ -1549,11 +1560,7 @@ private fun Style.installFogMosaicQuad(
             PropertyFactory.rasterOpacity(zoomOpacity)
         },
     )
-    if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
-        addLayerBelow(layer, FogOverlayIds.InstallGuardLayer)
-    } else {
-        addLayerBelow(layer, CurrentLocationOverlayIds.Layer)
-    }
+    addLayerBelow(layer, below)
 }
 
 private fun Style.removeFogGenerationInterior(slot: FogGenerationSlot): Boolean {
