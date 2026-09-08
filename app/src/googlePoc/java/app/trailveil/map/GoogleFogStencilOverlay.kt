@@ -17,13 +17,16 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.geometry.Size
 import app.trailveil.data.map.ViewportBounds
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogTilePngCodec
 import com.google.android.gms.maps.GoogleMap
 import com.google.android.gms.maps.model.LatLng
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 
 /** The harness twin: true when the owner has selected the stencil arm. */
 internal fun googleFogStencilActive(): Boolean = GoogleFogCoverageArm.screenStencil
@@ -102,13 +105,25 @@ internal fun GoogleFogStencilOverlay(
                     )
                 }.getOrNull()
                 if (bounds != null) {
+                    // Off the main dispatcher, and it is the `map` rather than the read that needs
+                    // it. Room already answers on its own executor, but rebuilding every point as a
+                    // `LatLng` resumed back here - on the UI thread - so at the load fixture's scale
+                    // this was a burst of a couple of hundred thousand allocations every 400 ms on
+                    // the one thread the frames are drawn on.
+                    //
+                    // The read stays UNCONDITIONAL rather than skipping when the bounds have not
+                    // moved. A recording session adds points while the camera sits still, and an
+                    // arm that stopped showing new ground until you panned would look exactly like
+                    // the under-reveal defect this harness exists to find.
                     reveals = runCatching {
-                        fogRuntime.viewportCoordinator.readRevealedSegments(bounds)
-                            .map { segment ->
-                                segment.points.map { point ->
-                                    LatLng(point.latitude, point.longitude)
+                        withContext(Dispatchers.Default) {
+                            fogRuntime.viewportCoordinator.readRevealedSegments(bounds)
+                                .map { segment ->
+                                    segment.points.map { point ->
+                                        LatLng(point.latitude, point.longitude)
+                                    }
                                 }
-                            }
+                        }
                     }.getOrDefault(reveals)
                 }
             }
@@ -149,12 +164,49 @@ internal fun GoogleFogStencilOverlay(
         val radiusPx = revealRadiusPixels(projection, size.width)
         if (radiusPx <= 0f) return@Canvas
         val feathered = radiusPx * FEATHER_SCALE
+
+        // ONE brush for the whole frame, positioned by moving the canvas instead of the gradient.
+        //
+        // `Brush.radialGradient` bakes its centre in, so a per-point centre meant a new brush per
+        // point per frame - and a `ShaderBrush` caches its native shader against the instance, so a
+        // new instance is a new `android.graphics.RadialGradient` allocated and thrown away every
+        // time. One session of a thousand points at 60 fps is 60,000 of those a second; the load
+        // fixture is two hundred such sessions, and that is what the owner felt as "very laggy at
+        // 200 sessions". Centred on the origin and translated per point, the shader is built once
+        // and reused.
+        val feather = Brush.radialGradient(
+            colorStops = FEATHER_STOPS,
+            center = Offset.Zero,
+            radius = feathered,
+        )
+        val skipSquared = DECIMATION_PX * DECIMATION_PX
+
         reveals.forEach { segment ->
             var previous: Offset? = null
             segment.forEach inner@{ point ->
                 val screen = runCatching { projection.toScreenLocation(point) }.getOrNull()
                     ?: return@inner
                 val centre = Offset(screen.x.toFloat(), screen.y.toFloat())
+
+                // SCREEN-SPACE DECIMATION, and what makes it allowed is that its error is bounded
+                // rather than assumed.
+                //
+                // Zoomed out far enough to see several sessions, a thousand-point walk lands inside
+                // a few pixels and every point after the first clears ground the first already
+                // cleared. Skipping one leaves the capsule running from the last point actually
+                // DRAWN, so the only ground that can be missed is what a disc at the skipped point
+                // reaches beyond a disc at the drawn one - at most [DECIMATION_PX] of one screen
+                // pixel. Under-revealing is precisely what the vector arm had to be fixed for, so
+                // the bound is the whole justification: this is not "close enough", it is half a
+                // pixel, which is finer than the canonical mask resolves at any zoom this arm can
+                // draw at.
+                val start = previous
+                if (start != null) {
+                    val dx = centre.x - start.x
+                    val dy = centre.y - start.y
+                    if (dx * dx + dy * dy <= skipSquared) return@inner
+                }
+
                 val offscreen = centre.x < -feathered || centre.y < -feathered ||
                     centre.x > size.width + feathered || centre.y > size.height + feathered
 
@@ -163,7 +215,6 @@ internal fun GoogleFogStencilOverlay(
                 // apart than the radius. Measured against the tile path on the same seeded track,
                 // the point-only version was missing 118,023 of 256,293 revealed pixels - 46% of
                 // the explored ground - because a walk's points are not always close together.
-                val start = previous
                 if (start != null && !(offscreen && isOffscreen(start, size, feathered))) {
                     drawLine(
                         color = Color.Black,
@@ -182,16 +233,14 @@ internal fun GoogleFogStencilOverlay(
                 // taper is what a reader sees wherever points are dense, which on a real track is
                 // nearly everywhere. `V03-002` owns the boundary's look; this is only the shape it
                 // comes out as on this arm.
-                drawCircle(
-                    brush = Brush.radialGradient(
-                        colorStops = FEATHER_STOPS,
-                        center = centre,
+                translate(centre.x, centre.y) {
+                    drawCircle(
+                        brush = feather,
                         radius = feathered,
-                    ),
-                    radius = feathered,
-                    center = centre,
-                    blendMode = BlendMode.Clear,
-                )
+                        center = Offset.Zero,
+                        blendMode = BlendMode.Clear,
+                    )
+                }
             }
         }
     }
@@ -237,6 +286,16 @@ private const val REVEAL_QUERY_MARGIN_DEGREES = 0.01
 private const val GEOMETRY_REFRESH_MILLIS = 400L
 private const val MIN_VISIBLE_RADIUS_PX = 0.75f
 private const val FEATHER_SCALE = 1.25f
+
+/**
+ * How far a point must project from the last one DRAWN before it is worth drawing, in screen pixels.
+ *
+ * Half a pixel, so the reveal this arm can miss by skipping is half a pixel. Chosen as a bound
+ * rather than as a speed knob: the number that makes this arm fast enough to judge is also the
+ * number that keeps it honest, and if those two ever disagree the honest one wins - an arm that
+ * under-reveals is not being compared, it is being misread.
+ */
+private const val DECIMATION_PX = 0.5f
 
 /**
  * Solid out to exactly the reveal radius, then tapering beyond it.
