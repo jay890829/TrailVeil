@@ -28,11 +28,12 @@ import kotlinx.coroutines.withContext
  *
  * - [seedHere] writes ONE session where the person is standing. This is the comparison fixture: the
  *   boundary has to be on the screen they are looking at, or there is nothing to judge.
- * - [seedWorld] writes 300 sessions of about a thousand points each, scattered over the planet by
- *   [DemoWorldAnchors]. This is the LOAD fixture, and it answers a different question - what the fog
- *   does when the database holds ~307,000 points and the explored ground is not all in one place.
- *   It is not a substitute for the first: its anchors are nowhere near the person, so on its own it
- *   leaves the screen exactly as fogged as an empty database does.
+ * - [seedRegion] writes 200 sessions of about a thousand points each, scattered across Taiwan's
+ *   bounding box by [DemoTaiwanAnchors]. This is the LOAD fixture, and it answers a different
+ *   question - what the fog does when the database holds ~205,000 points and the explored ground is
+ *   not all in one place. It is not a substitute for the first: its anchors are almost certainly not
+ *   where the person is standing, so on its own it leaves their screen as fogged as an empty
+ *   database does.
  *
  * **What is written is marked as what it is, in three independent ways**, because synthetic points
  * in a database whose whole purpose is a truthful record of where someone went is a thing that must
@@ -56,7 +57,7 @@ import kotlinx.coroutines.withContext
  * The transaction is Room's own, not the helper's, because ending a Room transaction is what
  * refreshes the invalidation tracker - and that is what makes the fog rebuild while you watch
  * instead of on the next launch. The world fixture takes one transaction PER SESSION rather than one
- * for all 300: it bounds how much is lost if something goes wrong, it lets progress be reported
+ * for all of them: it bounds how much is lost if something goes wrong, it lets progress be reported
  * truthfully, and it lets the map fill in as it goes.
  */
 internal object DemoExplorationSeeder {
@@ -156,15 +157,15 @@ internal object DemoExplorationSeeder {
     }
 
     /**
-     * The load fixture: many sessions, scattered, dense.
+     * The load fixture: many sessions, scattered across [DemoTaiwanAnchors]'s box, dense.
      *
      * [onProgress] is called with the number of sessions written so far. It is a suspend function so
      * the caller can hop to the main thread to touch UI state; this loop never does that itself.
      */
-    suspend fun seedWorld(
+    suspend fun seedRegion(
         context: Context,
-        sessions: Int = DemoWorldAnchors.DEFAULT_SESSIONS,
-        pointsPerSession: Int = DemoWorldAnchors.DEFAULT_POINTS_PER_SESSION,
+        sessions: Int = DemoTaiwanAnchors.DEFAULT_SESSIONS,
+        pointsPerSession: Int = DemoTaiwanAnchors.DEFAULT_POINTS_PER_SESSION,
         onProgress: suspend (Int, Int) -> Unit = { _, _ -> },
     ): Outcome = withContext(Dispatchers.IO) {
         val database = database(context)
@@ -172,7 +173,7 @@ internal object DemoExplorationSeeder {
         val distance = DemoExplorationTrack.lengthMetres(pointsPerSession)
         val now = System.currentTimeMillis()
         var written = 0
-        DemoWorldAnchors.anchors(sessions).forEachIndexed { index, anchor ->
+        DemoTaiwanAnchors.anchors(sessions).forEachIndexed { index, anchor ->
             val components = DemoExplorationTrack.componentsAround(
                 anchor.latitude,
                 anchor.longitude,

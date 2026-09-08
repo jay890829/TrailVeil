@@ -9,7 +9,7 @@
     <string name="settings_demo_progress">Seeding %1$s / %2$s sessions…</string>
     <string name="settings_demo_working">Working…</string>
     <string name="settings_demo_seed">Seed a demo walk here</string>
-    <string name="settings_demo_seed_world">Seed %1$s sessions worldwide (load fixture)</string>
+    <string name="settings_demo_seed_region">Seed %1$s sessions across Taiwan (load fixture)</string>
     <string name="settings_demo_clear">Clear demo data</string>
-    <string name="settings_demo_hint">The local walk is a fixed synthetic route — a curved corridor, a loop that crosses itself and a detached island — around your current location, or around a public park in Taipei if the device will not give one. Compare arms on that one. The worldwide fixture writes about 307,000 points scattered over the planet to load the database; its anchors are nowhere near you, so it leaves your own screen fogged. Both replace whatever was seeded before, are marked as mock, and are removed by Clear.</string>
+    <string name="settings_demo_hint">The local walk is a fixed synthetic route — a curved corridor, a loop that crosses itself and a detached island — around your current location, or around a public park in Taipei if the device will not give one. Compare arms on that one. The regional fixture writes about 205,000 points scattered across the Taiwan bounding box to load the database — many of them at sea, which loads it just as well; its anchors are almost certainly not where you are, so it leaves your own screen fogged. Both replace whatever was seeded before, are marked as mock, and are removed by Clear.</string>
 </resources>

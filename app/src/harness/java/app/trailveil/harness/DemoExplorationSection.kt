@@ -28,7 +28,7 @@ import kotlinx.coroutines.withContext
 internal object DemoExplorationTestTags {
     const val Section = "harness_settings_demo_data"
     const val Seed = "harness_settings_demo_seed"
-    const val SeedWorld = "harness_settings_demo_seed_world"
+    const val SeedRegion = "harness_settings_demo_seed_region"
     const val Clear = "harness_settings_demo_clear"
     const val Status = "harness_settings_demo_status"
 }
@@ -45,9 +45,9 @@ internal object DemoExplorationTestTags {
  * from it - "this arm renders nothing" - looks exactly like the fog defect the harness exists to
  * find.
  *
- * The two seed buttons are not alternatives. The local one is what you compare arms on; the world
- * one is a load fixture whose anchors are nowhere near you, so on its own it leaves your screen as
- * fogged as an empty database would.
+ * The two seed buttons are not alternatives. The local one is what you compare arms on; the
+ * regional one is a load fixture whose anchors are almost certainly not where you are standing, so
+ * on its own it leaves your screen as fogged as an empty database would.
  */
 @Composable
 internal fun DemoExplorationSection(modifier: Modifier = Modifier) {
@@ -125,10 +125,10 @@ internal fun DemoExplorationSection(modifier: Modifier = Modifier) {
             enabled = !busy,
             onClick = {
                 busy = true
-                progress = 0 to DemoWorldAnchors.DEFAULT_SESSIONS
+                progress = 0 to DemoTaiwanAnchors.DEFAULT_SESSIONS
                 scope.launch {
                     runCatching {
-                        DemoExplorationSeeder.seedWorld(context) { done, total ->
+                        DemoExplorationSeeder.seedRegion(context) { done, total ->
                             withContext(Dispatchers.Main) { progress = done to total }
                         }
                     }
@@ -140,12 +140,12 @@ internal fun DemoExplorationSection(modifier: Modifier = Modifier) {
             },
             modifier = Modifier
                 .fillMaxWidth()
-                .testTag(DemoExplorationTestTags.SeedWorld),
+                .testTag(DemoExplorationTestTags.SeedRegion),
         ) {
             Text(
                 stringResource(
-                    R.string.settings_demo_seed_world,
-                    DemoWorldAnchors.DEFAULT_SESSIONS.toString(),
+                    R.string.settings_demo_seed_region,
+                    DemoTaiwanAnchors.DEFAULT_SESSIONS.toString(),
                 ),
             )
         }

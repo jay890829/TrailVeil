@@ -7,7 +7,7 @@
     <string name="settings_demo_progress">產生中 %1$s / %2$s 段…</string>
     <string name="settings_demo_working">處理中…</string>
     <string name="settings_demo_seed">在這裡產生示範軌跡</string>
-    <string name="settings_demo_seed_world">產生全世界 %1$s 段（負載用）</string>
+    <string name="settings_demo_seed_region">在台灣產生 %1$s 段（負載用）</string>
     <string name="settings_demo_clear">清除示範資料</string>
-    <string name="settings_demo_hint">本地軌跡是一段固定的合成路線：一條彎曲走廊、一個會自己交叉的環、以及一塊分離的小島，中心是你目前的位置；裝置若不給位置就改用台北的一座公園。比較 arm 要用這一個。全世界那個會寫入約 307,000 個點散佈在全球，用來壓資料庫；它的中心點離你很遠，所以你自己的畫面還是整片霧。兩個都會覆蓋先前的示範資料，都標記為 mock，都可以用「清除」移除。</string>
+    <string name="settings_demo_hint">本地軌跡是一段固定的合成路線：一條彎曲走廊、一個會自己交叉的環、以及一塊分離的小島，中心是你目前的位置；裝置若不給位置就改用台北的一座公園。比較 arm 要用這一個。台灣那個會寫入約 205,000 個點散佈在台灣的外接矩形內，用來壓資料庫；不少會落在海上，壓資料庫的效果一樣。它的中心點多半不在你所在的位置，所以你自己的畫面還是整片霧。兩個都會覆蓋先前的示範資料，都標記為 mock，都可以用「清除」移除。</string>
 </resources>
