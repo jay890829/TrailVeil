@@ -14,6 +14,12 @@ import androidx.compose.ui.Modifier
  */
 @Suppress("UNUSED_PARAMETER")
 @Composable
-internal fun GoogleFogArmBadge(modifier: Modifier = Modifier) {
-    // Intentionally empty; see above.
+internal fun GoogleFogArmBadge(
+    modifier: Modifier = Modifier,
+    lastCoverMillis: Long? = null,
+    maximumCoverMillis: Long? = null,
+) {
+    // Intentionally empty; see above. The cover timings are accepted and dropped rather than left
+    // out of the signature, so the shared call site stays one call rather than a per-build-type
+    // one - the seam is the twin, not the site that uses it.
 }

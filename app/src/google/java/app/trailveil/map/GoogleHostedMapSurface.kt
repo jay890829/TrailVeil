@@ -970,6 +970,10 @@ internal fun GoogleHostedMapSurface(
             fogRuntime = fogRuntime,
             modifier = Modifier.matchParentSize(),
         )
-        GoogleFogArmBadge(Modifier.align(Alignment.BottomStart))
+        GoogleFogArmBadge(
+            modifier = Modifier.align(Alignment.BottomStart),
+            lastCoverMillis = fogState?.lastCoverIntervalMillis,
+            maximumCoverMillis = fogState?.maximumCoverIntervalMillis,
+        )
     }
 }

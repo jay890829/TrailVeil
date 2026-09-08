@@ -27,9 +27,26 @@ import androidx.compose.ui.unit.dp
  * the point is to report what the surface was BOUND with. The initializer applies the stored arm
  * before any composition, so the two agree; if they ever disagree, the stored value is the one the
  * next process will use and the honest thing to show.
+ *
+ * **It also carries how long the safety cover was last up, and the longest it has ever been up in
+ * this process.** The owner reported that on `mosaic` and the ring arms the cover "sometimes lasts
+ * a long time", and that is not a claim anyone can settle by looking - the cover is fog-coloured on
+ * purpose, so a cover that is up for two seconds and fog that is simply slow to clear are the same
+ * picture. The binding has measured both numbers all along
+ * ([GoogleCanonicalFogState.lastCoverIntervalMillis]) and showed them to nothing but tests. A
+ * hands-on comparison is the acceptance evidence for this task, so the number a hand-held trial
+ * turns on belongs where the hand can read it.
+ *
+ * The maximum is kept as well as the last, because the complaint is about the tail: an arm whose
+ * cover is usually 200 ms and occasionally 4 s is a different arm from one that is always 800 ms,
+ * and only the pair separates them.
  */
 @Composable
-internal fun GoogleFogArmBadge(modifier: Modifier = Modifier) {
+internal fun GoogleFogArmBadge(
+    modifier: Modifier = Modifier,
+    lastCoverMillis: Long? = null,
+    maximumCoverMillis: Long? = null,
+) {
     val context = LocalContext.current
     val arm = remember(context) { GoogleFogArm.stored(context) }
     Surface(
@@ -39,7 +56,13 @@ internal fun GoogleFogArmBadge(modifier: Modifier = Modifier) {
         shadowElevation = 2.dp,
     ) {
         Text(
-            text = "arm: ${arm.label}",
+            // Nothing is shown until a cover has actually risen and lowered, so a zero is never
+            // printed as if it were a measurement.
+            text = if (maximumCoverMillis != null && maximumCoverMillis > 0L) {
+                "arm: ${arm.label}  cover ${lastCoverMillis ?: 0L}ms max ${maximumCoverMillis}ms"
+            } else {
+                "arm: ${arm.label}"
+            },
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
             style = MaterialTheme.typography.labelSmall,
         )
