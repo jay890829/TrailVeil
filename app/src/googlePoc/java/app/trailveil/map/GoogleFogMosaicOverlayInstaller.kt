@@ -36,13 +36,16 @@ import com.google.android.gms.maps.model.PolygonOptions
  *
  * ### Four deliberate differences from the tile path, each fail-closed
  *
- * 1. **The predecessor is not hidden at the reveal.** The tile path may hide it, because its
- *    delivery barrier has already proven the successor's bytes reached the SDK. There is no such
- *    barrier here - a hidden `GroundOverlay` produces no pixels at all, so nothing can prove it
- *    before it is shown. Leaving the old layer up until `onVerification` removes it means the
- *    overlap is briefly fogged twice, which looks wrong for a few hundred milliseconds. The
- *    alternative is a frame of bare basemap. The coordinator already removes the predecessor after
- *    the proof, so this is a subtraction rather than new machinery.
+ * 1. **The predecessor IS hidden at the reveal - owner decision 2026-09-08, reversing what this
+ *    class originally did.** The old choice was to leave it up: there is no delivery barrier here,
+ *    so nothing proves the successor painted before it is shown, and a brief double coat of fog
+ *    was the fail-closed trade. The reasoning was right; the cost estimate was wrong. It budgeted
+ *    "a few hundred milliseconds" and measured on the device it lasted until the NEXT camera
+ *    movement - screen mean 50.8 against the tile path's 118.8, with this arm's own holes showing
+ *    the predecessor's fog through them. An arm whose boundary cannot be seen cannot be judged,
+ *    which is what these builds exist for. See [reveal] for what bounds the exposure now. The
+ *    vector installer deliberately does NOT follow: it never had the defect, and hiding there
+ *    loses the map.
  * 2. **A mosaic that crosses the antimeridian is refused.** `FogPocMosaic` deliberately leaves its
  *    longitude bounds unwrapped so a dateline mosaic is continuous; `LatLng` normalises longitude
  *    into [-180, 180), which would silently anchor such an image the long way round the world.
@@ -379,9 +382,32 @@ internal class GoogleFogMosaicOverlayInstaller(
      * See the class KDoc: with no delivery barrier there is nothing to prove the successor painted,
      * so hiding the predecessor here is the one action that could put bare basemap on screen.
      */
+    /**
+     * Shows the successor, then hides the predecessor.
+     *
+     * **Owner decision 2026-09-08, overriding this class's original choice.** It used to leave the
+     * predecessor up and wait for `onVerification` to remove it, on the reasoning that a hidden
+     * `GroundOverlay` produces no pixels and so nothing here can prove the successor painted before
+     * it is shown. That reasoning is unchanged and still correct; what was wrong was the cost it
+     * assumed. The KDoc budgeted "a few hundred milliseconds" of double fog, and measured on the
+     * device it lasted until the NEXT camera movement - screen mean 50.8 against the tile path's
+     * 118.8, with the arm's own holes showing the predecessor's fog through them. An arm nobody can
+     * see the boundary of cannot be judged, which is the entire purpose of these builds.
+     *
+     * Three things keep the exposure as small as the decision allows:
+     * 1. The successor is shown FIRST and the predecessor is hidden only if that succeeded, so a
+     *    failed reveal leaves both layers exactly as they were and stays fail-closed.
+     * 2. It HIDES rather than removes. The predecessor's overlay and backdrop are still installed
+     *    and still hold their bitmap, so `remove` remains the only thing that destroys anything.
+     * 3. The backdrop is hidden with the image, because a surround left visible under a hidden
+     *    image is the 15k shape again - fog claiming ground it no longer draws.
+     *
+     * The residual risk is the one the owner accepted: the SDK may not have painted the successor
+     * in the frame this returns, and that frame would then show basemap the user has not explored.
+     */
     override fun reveal(generationId: Long, previousGenerationId: Long?): Boolean {
         val entry = installed[generationId] ?: return false
-        return try {
+        val revealed = try {
             // The backdrop first. Both orders leave one frame imperfect and only this one errs
             // towards MORE fog: showing the surround before the image can over-fog the middle for
             // a frame, while showing the image first would show bare ground around it.
@@ -393,6 +419,22 @@ internal class GoogleFogMosaicOverlayInstaller(
         } catch (_: LinkageError) {
             false
         }
+        if (!revealed) return false
+        previousGenerationId?.let { previous -> hideGeneration(previous) }
+        return true
+    }
+
+    /**
+     * Takes one generation off the screen without destroying it.
+     *
+     * Best-effort per object rather than all-or-nothing: a predecessor half hidden is strictly less
+     * fog than one fully shown, and there is nothing useful to do with a failure here - the layer is
+     * already superseded and `remove` will take it either way.
+     */
+    private fun hideGeneration(generationId: Long) {
+        val entry = installed[generationId] ?: return
+        runCatching { entry.overlay.transparency = HIDDEN_FOG_TRANSPARENCY }
+        entry.backdrop.forEach { polygon -> runCatching { polygon.isVisible = false } }
     }
 
     override fun remove(generationId: Long): Boolean {

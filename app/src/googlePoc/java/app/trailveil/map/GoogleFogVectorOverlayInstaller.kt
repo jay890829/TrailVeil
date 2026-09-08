@@ -183,7 +183,7 @@ internal class GoogleFogVectorOverlayInstaller(
      */
     override fun reveal(generationId: Long, previousGenerationId: Long?): Boolean {
         val entry = installed[generationId] ?: return false
-        return entry.polygons.all { polygon ->
+        val revealed = entry.polygons.all { polygon ->
             try {
                 polygon.zIndex = NEW_POLYGON_Z
                 polygon.isVisible = true
@@ -194,6 +194,24 @@ internal class GoogleFogVectorOverlayInstaller(
                 false
             }
         }
+        if (!revealed) return false
+        // **This arm deliberately does NOT hide its predecessor, unlike the mosaic arm.**
+        //
+        // The owner's 2026-09-08 decision - hide immediately rather than wait for the verdict -
+        // was made about a defect this arm never had. Measured on the same seeded track, the
+        // mosaic arms held a second coat of fog after a camera jump (screen mean 50.8 against the
+        // tile path's 118.8) while this one read 119.0, so there is nothing here for a hide to fix.
+        //
+        // And hiding here breaks it. Both spellings were tried on the device: `isVisible = false`
+        // and, when that tore the renderer down mid-frame, a transparent fill instead. Both ended
+        // with "The online map could not start", against a build differing only by these lines
+        // that renders the arm normally. The distinguishing feature is this arm's own: its image
+        // polygon carries up to `FogMaskContours.MAX_RECTS` holes, and the mosaic arm's
+        // `GroundOverlay` carries none. Why exactly the SDK cannot survive touching it is not
+        // established, so this stays a measured refusal rather than an explained one.
+        //
+        // The predecessor is still removed by `remove` after the verdict, as it always was.
+        return true
     }
 
     override fun remove(generationId: Long): Boolean {
