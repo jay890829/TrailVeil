@@ -403,7 +403,9 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private val cameraPort = object : FogCameraPort {
         override fun insidePublishedSurround(): Boolean {
             overlayInstaller?.let { installer ->
-                return installer.covers(coordinator.installedGenerationId, visibleCornersOrEmpty())
+                val generation = coordinator.installedGenerationId
+                if (!installerStillResolves(generation)) return false
+                return installer.covers(generation, visibleCornersOrEmpty())
             }
             return insideCoverage(installedCoverageKeys)
         }
@@ -414,6 +416,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
             overlayInstaller?.let { installer ->
                 val generation = coordinator.pendingGenerationId
                     ?: coordinator.installedGenerationId
+                if (!installerStillResolves(generation)) return false
                 return installer.covers(generation, visibleCornersOrEmpty())
             }
             return insideCoverage(pendingCoverageKeys ?: installedCoverageKeys)
@@ -1230,6 +1233,42 @@ internal class GoogleCanonicalFogSurfaceBinding(
                 RETRY_FOG_MILLIS,
             )
         }
+    }
+
+    /**
+     * Whether an installer arm's anchored image is still FINE ENOUGH for the camera, not just big
+     * enough for it.
+     *
+     * **The owner found this by zooming out and back in: revealed segments collapsed to a few dots
+     * on the way out and stayed dots on the way back.** An installer arm publishes one bitmap
+     * anchored to a ground rectangle, so zooming in does not resample it - the SDK simply stretches
+     * what is there. A walk that rendered to two mask pixels at the zoom the image was built at is
+     * two mask pixels for ever, magnified into blobs, and the explored ground around it stays
+     * fogged.
+     *
+     * [GoogleFogOverlayInstaller.covers] cannot answer this and should not have to: it is handed
+     * the visible corners and nothing else, so it can only test containment. Containment is the
+     * whole answer on the extent axis and no answer at all on the resolution axis, and zooming in
+     * is the one move that changes the second without changing the first.
+     *
+     * The tile path never had this defect because it does not need this method - a coverage key
+     * carries the zoom it was planned at, so no tile ring survives an integer zoom step and a
+     * zoom-in re-renders by construction. This restores that same rule, at that same granularity,
+     * for the arms that answer through an installer instead: an image built at floor zoom 12 covers
+     * anything at 12 or below, and nothing above it.
+     *
+     * Zooming OUT is deliberately not refused here. A finer image than the camera needs is correct
+     * to keep, and a viewport that has grown past the rectangle is exactly what `covers` already
+     * catches.
+     *
+     * A generation with no recorded coverage yields to `covers` rather than inventing a refusal.
+     * This method exists to add the zoom term; where there is no planned zoom to compare against
+     * there is no zoom term to add, and refusing would raise the cover on a question nobody asked.
+     */
+    private fun installerStillResolves(generationId: Long?): Boolean {
+        val planned = coverageByGeneration[generationId ?: return false] ?: return true
+        val current = currentCoverageRequest() ?: return true
+        return current.floorZoom <= planned.floorZoom
     }
 
     private fun insideCoverage(coverageKeys: Set<FogTileKey>?): Boolean {
