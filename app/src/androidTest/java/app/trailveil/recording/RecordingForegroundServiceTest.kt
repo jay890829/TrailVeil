@@ -41,6 +41,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -54,22 +55,32 @@ class RecordingForegroundServiceTest {
             enableSystemLocation()
             grant(Manifest.permission.ACCESS_COARSE_LOCATION)
             grant(Manifest.permission.ACCESS_FINE_LOCATION)
-            assertEquals(
-                PackageManager.PERMISSION_DENIED,
-                context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS),
+            // P4-046, stated the way its sibling already states it. This case is *about* the
+            // ungranted path, so a granted permission does not make it fail - it makes it unable
+            // to run. `NotificationStartContinuationTest` skips loudly here; asserting instead
+            // turned one identical precondition violation into a red failure in this case and an
+            // honest skip in that one. Measured on the owner's phone (`za-phone-google-full-v4`):
+            // a single mid-suite grant, two differently-coloured results.
+            assumeTrue(
+                "P4-046: POST_NOTIFICATIONS is granted, so the ungranted start this case exists " +
+                    "to exercise cannot be arranged. Prepare the device from the host first: " +
+                    "adb shell pm revoke app.trailveil android.permission.POST_NOTIFICATIONS",
+                context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+                    PackageManager.PERMISSION_DENIED,
             )
 
             val application = context.applicationContext as TrailVeilApplication
             val repository = application.appContainer.recordingRepository
-            val sessionId = repository.beginStart(
-                operationId("begin"),
-                System.currentTimeMillis(),
-                "instrumentation",
-                bootId = thisBoot(),
-            ).sessionId
-
+            // This case is a visible-activity start, not restoration of a STARTING row at launch.
+            // Launch first, as the real UI does; the cold-start continuation has its own tests.
             val activity = ActivityScenario.launch(MainActivity::class.java)
             try {
+                val sessionId = repository.beginStart(
+                    operationId("begin"),
+                    System.currentTimeMillis(),
+                    "instrumentation",
+                    bootId = thisBoot(),
+                ).sessionId
                 activity.onActivity {
                     RecordingForegroundService.startFromVisibleActivity(it, sessionId)
                 }

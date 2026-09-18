@@ -13,11 +13,152 @@ import org.junit.Test
  */
 class FogOverlaySurfaceCoordinatorTest {
 
+    @Test fun `covered handover raises before render begins and lowers only on successor proof`() {
+        val h = Harness()
+        h.firstInstall()
+        h.overlay.requiresCover = true
+        h.overlay.onBegin = { assertTrue(h.coordinator.coverUp) }
+        h.snapshot.deliverImmediately = false
+        h.coordinator.onCameraMoveStarted(FogCameraMoveReason.DEVELOPER)
+        assertFalse(h.coordinator.coverUp)
+        h.coordinator.onCameraIdle()
+        assertEquals(FogCoverReason.HANDOVER, h.coordinator.coverReason)
+        val next = requireNotNull(h.coordinator.pendingGenerationId)
+        h.coordinator.onGenerationPublished(next)
+        h.coordinator.onDeliveryBarrierDrained(next)
+        assertTrue(h.coordinator.coverUp)
+        h.snapshot.heldCallbacks.single().second(true)
+        assertFalse(h.coordinator.coverUp)
+    }
+
+    @Test fun `old proof cannot lower cover while another covered handover is pending`() {
+        val h = Harness()
+        h.firstInstall()
+        h.overlay.requiresCover = true
+        h.snapshot.deliverImmediately = false
+        h.coordinator.onCanonicalRefreshRequired()
+        val second = h.install()
+        assertTrue(h.coordinator.coverUp)
+        h.coordinator.onCanonicalRefreshRequired()
+        h.coordinator.onCameraIdle()
+        val third = requireNotNull(h.coordinator.pendingGenerationId)
+        h.snapshot.heldCallbacks.single().second(true)
+        assertEquals(second, h.coordinator.installedGenerationId)
+        assertTrue(h.coordinator.coverUp)
+        h.coordinator.onGenerationPublished(third)
+        h.coordinator.onDeliveryBarrierDrained(third)
+        assertTrue(h.coordinator.coverUp)
+        h.snapshot.heldCallbacks.last().second(true)
+        assertFalse(h.coordinator.coverUp)
+    }
+
+    @Test fun `cover requirement does not rebuild an in extent gesture or replace palette reason`() {
+        val h = Harness()
+        val first = h.firstInstall()
+        h.overlay.requiresCover = true
+        h.coordinator.onCameraMoveStarted(FogCameraMoveReason.GESTURE)
+        h.coordinator.onCameraMoveFrame()
+        h.coordinator.onCameraIdle()
+        assertFalse(h.coordinator.coverUp)
+        assertNull(h.coordinator.pendingGenerationId)
+        assertEquals(first, h.coordinator.installedGenerationId)
+        h.coordinator.onPaletteRotationDue()
+        h.coordinator.onCameraIdle()
+        assertEquals(FogCoverReason.PALETTE_ROTATION, h.coordinator.coverReason)
+    }
+
+    @Test fun `default port keeps an in extent programmed handover unguarded`() {
+        val h = Harness()
+        h.firstInstall()
+        h.coordinator.onCameraMoveStarted(FogCameraMoveReason.DEVELOPER)
+        h.coordinator.onCameraIdle()
+        assertFalse(h.coordinator.coverUp)
+        assertTrue(h.coordinator.pendingGenerationId != null)
+    }
+
+    @Test fun `failed predecessor removal under handover guard remains terminal and covered`() {
+        val h = Harness()
+        h.firstInstall()
+        h.overlay.requiresCover = true
+        h.coordinator.onCanonicalRefreshRequired()
+        h.coordinator.onCameraIdle()
+        val next = requireNotNull(h.coordinator.pendingGenerationId)
+        h.overlay.removeSucceeds = false
+        h.coordinator.onGenerationPublished(next)
+        h.coordinator.onDeliveryBarrierDrained(next)
+        assertTrue(h.coordinator.terminal)
+        assertTrue(h.coordinator.coverUp)
+    }
+
+    @Test
+    fun `canonical replacement revokes a pending proof and waits for synchronization`() {
+        val harness = Harness()
+        harness.firstInstall()
+        harness.snapshot.deliverImmediately = false
+        harness.coordinator.onCanonicalRefreshRequired()
+        harness.coordinator.onCameraIdle()
+        val pending = requireNotNull(harness.coordinator.pendingGenerationId)
+        harness.coordinator.onGenerationPublished(pending)
+        harness.coordinator.onDeliveryBarrierDrained(pending)
+        val oldProof = harness.snapshot.heldCallbacks.single().second
+
+        harness.coordinator.onCanonicalResetRequired()
+        assertTrue(harness.coordinator.coverUp)
+        assertNull(harness.coordinator.pendingGenerationId)
+        // Delivery already made this the installed generation. It stays hidden beneath the
+        // cover until its successor can replace it; the old proof has lost cover permission.
+        assertEquals(pending, harness.coordinator.installedGenerationId)
+        oldProof(true)
+        assertTrue(harness.coordinator.coverUp)
+        assertNull(harness.coordinator.pendingGenerationId)
+
+        harness.snapshot.deliverImmediately = true
+        harness.install()
+        assertFalse(harness.coordinator.coverUp)
+    }
+
+    @Test
+    fun `canonical replacement removes an attached but undelivered generation`() {
+        val harness = Harness()
+        harness.firstInstall()
+        harness.coordinator.onCanonicalRefreshRequired()
+        harness.coordinator.onCameraIdle()
+        val pending = requireNotNull(harness.coordinator.pendingGenerationId)
+        harness.coordinator.onGenerationPublished(pending)
+
+        harness.coordinator.onCanonicalResetRequired()
+        harness.coordinator.onDeliveryBarrierDrained(pending)
+
+        assertTrue(harness.coordinator.coverUp)
+        assertNull(harness.coordinator.pendingGenerationId)
+        assertTrue(harness.overlay.log.contains("cancel($pending)"))
+        assertTrue(harness.overlay.log.contains("remove($pending)"))
+    }
+
+    @Test
+    fun `canonical replacement removal failure stays terminal under cover`() {
+        val harness = Harness()
+        harness.coordinator.onFirstComposition()
+        harness.coordinator.onCameraIdle()
+        val pending = requireNotNull(harness.coordinator.pendingGenerationId)
+        harness.coordinator.onGenerationPublished(pending)
+        harness.overlay.removeSucceeds = false
+
+        harness.coordinator.onCanonicalResetRequired()
+
+        assertTrue(harness.coordinator.terminal)
+        assertTrue(harness.coordinator.coverUp)
+    }
+
     private class FakeOverlayPort : FogOverlayPort {
+        var requiresCover = false
+        var onBegin: () -> Unit = {}
+        override fun requiresCoverForHandover(installedGenerationId: Long): Boolean = requiresCover
         val log = mutableListOf<String>()
         private var nextGenerationId = 0L
 
         override fun beginRebuild(handover: Boolean, paletteRotation: Boolean): Long {
+            onBegin()
             val id = ++nextGenerationId
             log += "begin($id,handover=$handover,rotation=$paletteRotation)"
             return id

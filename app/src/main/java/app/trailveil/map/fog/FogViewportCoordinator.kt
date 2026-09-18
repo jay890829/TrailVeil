@@ -3,6 +3,7 @@ package app.trailveil.map.fog
 import app.trailveil.data.map.ViewportBounds
 import app.trailveil.data.map.PersistedTrackPointChangeFeed
 import app.trailveil.data.db.TrackPointCells
+import app.trailveil.data.db.LatitudeBuckets
 import app.trailveil.data.map.ViewportTrackDataSource
 import kotlin.math.abs
 import kotlin.math.cos
@@ -25,10 +26,20 @@ data class FogViewportRequest(
 data class FogViewportRender(
     val request: FogViewportRequest,
     val keys: List<FogTileKey>,
-    /** What was actually read from canonical storage, or null when nothing had to be. */
+    /** Raster canonical query bounds, or null when no raster read was made. Native reads are separate. */
     val queryBounds: ViewportBounds?,
-    val mosaic: FogTileMosaic,
+    val presentation: FogViewportPresentation,
+    val nativeGeometryStatus: String? = null,
 )
+
+/** Immutable rendering identity, including world anchoring rather than only wrapped XYZ keys. */
+internal data class FogViewportFootprint(val keys: List<FogTileKey>, val layout: FogMosaicLayout) {
+    fun matches(render: FogViewportRender): Boolean =
+        keys == render.keys && layout.bounds == render.presentation.bounds &&
+            layout.tileCount == render.presentation.tileCount &&
+            layout.samplingGridWidth == render.presentation.samplingGridWidth &&
+            layout.samplingGridHeight == render.presentation.samplingGridHeight
+}
 
 /** One complete rectangular tile batch before provider-specific encoding or mosaic composition. */
 data class FogViewportTileRender(
@@ -63,6 +74,11 @@ class FogRuntime(
             Unit
         },
     )
+
+    internal val canonicalEpoch get() = changeSynchronizer.canonicalEpoch
+
+    internal suspend fun <T> replaceCanonicalData(mutation: suspend () -> T): T =
+        changeSynchronizer.replaceCanonicalData(mutation)
 }
 
 /**
@@ -88,9 +104,11 @@ class FogViewportCoordinator(
      * the Google path does not come through here at all, it uses [renderTiles].
      */
     private val mosaicPaddingTiles: Int = DEFAULT_MOSAIC_PADDING_TILES,
+    private val nativeGeometryEngine: FogNativeGeometryEngine? = null,
 ) {
     private val mutex = Mutex()
-    private val placeholderRenderer = FogTileRenderer(style)
+    /** Factory opts in only for the harness; generic/custom coordinator callers retain scalar rendering. */
+    internal var rasterProjectionEnabled: Boolean = false
     private val invalidator = FogTileInvalidator(0..22, style)
 
     /**
@@ -101,10 +119,11 @@ class FogViewportCoordinator(
      * otherwise every LOD but the last would be read as off-screen and invalidated by the next
      * reveal merge (found by the 2026-09-03 review of this change). A window at a new centre
      * replaces the set. The set is capped at [MAX_ACTIVE_VIEWPORT_KEYS], newest keys kept, so a
-     * camera that zooms in place cannot grow it without bound.
+     * camera that zooms in place cannot grow it without bound. A successful native presentation
+     * clears this raster-active set; its future point updates invalidate caches without delta paint.
      */
     private var activeViewportCenter: GeoPoint? = null
-    private var activeViewportKeys: Set<FogTileKey> = emptySet()
+    private var activeRasterViewportKeys: Set<FogTileKey> = emptySet()
 
     /**
      * Whether the process-scoped lock is held right now. A device test that finds a map with a
@@ -123,19 +142,46 @@ class FogViewportCoordinator(
         }
     }
 
-    suspend fun render(request: FogViewportRequest): FogViewportRender = mutex.withLock {
+    /** Pure, cheap enough for an idle identity check; [render] uses this very same calculation. */
+    internal fun footprint(request: FogViewportRequest): FogViewportFootprint {
         val keys = FogViewportTileGrid.around(
             center = request.center,
             zoom = renderZoom(request.mapZoom),
             renderVersion = renderVersion,
             paddingTiles = mosaicPaddingTiles,
         )
+        val layout = FogPocMosaic.layout(keys, style.tileSize).anchoredNear(request.center.longitude)
+        return FogViewportFootprint(keys, layout)
+    }
+
+    suspend fun render(
+        request: FogViewportRequest,
+        nativeGeometry: Boolean = false,
+    ): FogViewportRender = mutex.withLock {
+        val (keys, layout) = footprint(request)
+        val geometry = if (nativeGeometry) renderNativeGeometryLocked(layout.bounds) else null
+        val nativeStatus = if (nativeGeometry) nativeGeometryDescription() else null
+        // A late null/budget result may arrive after cancellation. A fully warm fallback has no
+        // suspension of its own, so reject it before it can publish raster-active bookkeeping.
+        if (nativeGeometry) currentCoroutineContext().ensureActive()
+        if (geometry != null) {
+            val presentation = FogNativePresentation(geometry, layout)
+            // The new active representation has no mask to delta-paint. Existing raster cache
+            // keys are still invalidated by mergePersistedReveals before a later fallback.
+            activeRasterViewportKeys = emptySet()
+            activeViewportCenter = request.center
+            return@withLock FogViewportRender(request, keys, null, presentation, nativeStatus)
+        }
         val rendered = renderTilesLocked(request, keys)
+        val mosaic = FogPocMosaic.compose(rendered.tiles).anchoredNear(request.center.longitude)
+        check(mosaic.bounds == layout.bounds && mosaic.tileCount == layout.tileCount &&
+            mosaic.samplingGridWidth == layout.samplingGridWidth && mosaic.samplingGridHeight == layout.samplingGridHeight)
         FogViewportRender(
             request = request,
             keys = rendered.keys,
             queryBounds = rendered.queryBounds,
-            mosaic = FogPocMosaic.compose(rendered.tiles).anchoredNear(request.center.longitude),
+            presentation = mosaic,
+            nativeGeometryStatus = nativeStatus,
         )
     }
 
@@ -161,6 +207,34 @@ class FogViewportCoordinator(
     suspend fun readRevealedSegments(bounds: ViewportBounds): List<TrackSegment> = mutex.withLock {
         trackDataSource.read(bounds).toFogTrackSegments()
     }
+
+    suspend fun renderNativeGeometry(bounds: FogTileBounds): FogNativeGeometry? = mutex.withLock {
+        renderNativeGeometryLocked(bounds)
+    }
+
+    /** Conservative opt-in hint only; unknown, already warm, or wrapped domains bypass retention. */
+    suspend fun nativeRawReadEnvelope(bounds: FogTileBounds): ViewportBounds? = mutex.withLock {
+        val windows = nativeGeometryEngine?.rawReadWindows(bounds, style)?.takeIf { it.isNotEmpty() }
+            ?: return@withLock null
+        val expanded = windows.map { FogViewportTileGrid.expandBounds(it, queryMarginMeters) }
+        if (expanded.any { it.west > it.east }) return@withLock null
+        ViewportBounds(expanded.minOf { it.south }, expanded.maxOf { it.north },
+            expanded.minOf { it.west }, expanded.maxOf { it.east })
+    }
+
+    fun nativeGeometryDescription(): String = nativeGeometryEngine?.description ?: "raster-fallback:disabled"
+
+    private suspend fun renderNativeGeometryLocked(bounds: FogTileBounds): FogNativeGeometry? =
+        nativeGeometryEngine?.renderBatched(bounds, style,
+            read = { partition ->
+                // The same continuity margin as raster reads, including off-partition predecessors.
+                trackDataSource.read(FogViewportTileGrid.expandBounds(partition, queryMarginMeters)).toFogTrackSegments()
+            },
+            readBatch = { partitions ->
+                trackDataSource.readBatch(partitions.map { FogViewportTileGrid.expandBounds(it, queryMarginMeters) })
+                    .map { it.toFogTrackSegments() }
+            },
+        )
 
     suspend fun renderTiles(
         request: FogViewportRequest,
@@ -204,39 +278,56 @@ class FogViewportCoordinator(
                 marginMeters = queryMarginMeters,
             )
         }
-        val selected = if (queryBounds == null) {
-            emptyMap()
+        val workProbe = currentCoroutineContext()[FogRasterWorkProbe]
+        val readStarted = workProbe?.let { System.nanoTime() }
+        val coarseRaster = queryBounds != null && TrackPointCells.coarseReadIsSubPixel(renderZoom(request.mapZoom))
+        val segments = if (queryBounds == null) {
+            emptyList()
         } else {
-            FogPocSpatialSelection.select(
-                missing,
                 // P4-037. At render zoom 0-1 the tile window IS the world, so this read has no
                 // bound to narrow and visits every point to draw a few sub-pixel dots. The decision
                 // is made here because it is a fact about the mask raster, which the data source
                 // deliberately knows nothing about.
                 trackDataSource.read(
                     bounds = queryBounds,
-                    coarse = TrackPointCells.coarseReadIsSubPixel(renderZoom(request.mapZoom)),
-                ).toFogTrackSegments(),
-                style,
-            )
+                    coarse = coarseRaster,
+                ).toFogTrackSegments()
         }
-        val tiles = keys.map { key ->
-            FogMosaicTile(
-                key = key,
-                mask = cachedMasks[key]
-                    ?: pipeline.load(key, selected[key].orEmpty()).mask,
+        if (readStarted != null) workProbe.readNanos.addAndGet(System.nanoTime() - readStarted)
+        val selectionStarted = workProbe?.let { System.nanoTime() }
+        val projectionContext = currentCoroutineContext()
+        // Broad raw queries amortize the projection frame; bucketed and coarse reads bypass it.
+        val wideRawRaster = queryBounds != null && !coarseRaster &&
+            LatitudeBuckets.of(queryBounds.north) - LatitudeBuckets.of(queryBounds.south) + 1 > LatitudeBuckets.MAX_BUCKETS
+        val rendered = FogRasterProjectionScope.withFrame(
+            rasterProjectionEnabled && wideRawRaster,
+            missing.firstOrNull()?.zoom ?: 0, style, segments, projectionContext::ensureActive,
+        ) {
+            val selected = if (queryBounds == null) emptyMap() else
+                FogPocSpatialSelection.select(missing, segments, style)
+            if (selectionStarted != null) workProbe.selectionNanos.addAndGet(System.nanoTime() - selectionStarted)
+            val paintStarted = workProbe?.let { System.nanoTime() }
+            val tiles = keys.map { key ->
+                FogMosaicTile(
+                    key = key,
+                    mask = cachedMasks[key]
+                        ?: pipeline.load(key, selected[key].orEmpty()).mask,
+                )
+            }
+            val rendered = FogViewportTileRender(
+                // Painting includes pipeline cache lookup/store; no provider encoding happens here.
+                request = request,
+                keys = keys,
+                queryBounds = queryBounds,
+                tiles = tiles,
             )
+            if (paintStarted != null) workProbe.paintNanos.addAndGet(System.nanoTime() - paintStarted)
+            rendered
         }
-        val rendered = FogViewportTileRender(
-            request = request,
-            keys = keys,
-            queryBounds = queryBounds,
-            tiles = tiles,
-        )
         // Publish the viewport only after every read/render/cache operation succeeded. A failed
         // replacement render must not make later reveal merges stop maintaining the last mosaic.
-        activeViewportKeys = if (activeViewportCenter == request.center) {
-            LinkedHashSet<FogTileKey>(activeViewportKeys).apply {
+        activeRasterViewportKeys = if (activeViewportCenter == request.center) {
+            LinkedHashSet<FogTileKey>(activeRasterViewportKeys).apply {
                 removeAll(keys.toSet())
                 addAll(keys)
                 while (size > MAX_ACTIVE_VIEWPORT_KEYS) remove(first())
@@ -255,18 +346,21 @@ class FogViewportCoordinator(
             zoom = renderZoom(request.mapZoom),
             renderVersion = renderVersion,
         )
-        val tiles = keys.map { key ->
-            FogMosaicTile(
-                key = key,
-                mask = placeholderRenderer.render(key, emptyList()),
-            )
-        }
+        // Every empty tile has exactly the same alpha. Keep the compose footprint while
+        // allocating its final pixels once, without per-tile masks or copyAlpha buffers.
+        val layout = FogPocMosaic.layout(keys, style.tileSize).anchoredNear(request.center.longitude)
+        val alpha = ByteArray(Math.multiplyExact(layout.samplingGridWidth, layout.samplingGridHeight))
+        alpha.fill(style.fogAlpha.toByte())
         return FogViewportRender(
             request = request,
             keys = keys,
             // Nothing was read; a placeholder reports no bounds rather than bounds it never used.
             queryBounds = null,
-            mosaic = FogPocMosaic.compose(tiles).anchoredNear(request.center.longitude),
+            presentation = FogTileMosaic(
+                FogPixelMask(layout.samplingGridWidth, layout.samplingGridHeight, alpha),
+                layout.bounds,
+                layout.tileCount,
+            ),
         )
     }
 
@@ -285,12 +379,15 @@ class FogViewportCoordinator(
             if (updates.isEmpty()) {
                 return@withLock FogRevealMerge(emptySet(), emptySet())
             }
+            // Invalidate before any cancellable raster work; a partial merge must not leave an
+            // apparently current geometry cache. Both representations use this mutex.
+            nativeGeometryEngine?.invalidate(updates, style)
             // Candidates come only from keys that exist: the byte-bounded memory and disk caches
             // plus the last successfully rendered viewport. The invalidator never materialises the
             // region between two points, so a far-apart same-segment pair costs a bounds test per
             // held key, not one allocation per tile of a rectangle at every zoom (the 2026-09-03
             // heap dump held 3.5 million such keys).
-            val maintainedKeys = pipeline.cachedKeys() + activeViewportKeys
+            val maintainedKeys = pipeline.cachedKeys() + activeRasterViewportKeys
             val candidateKeys = buildSet {
                 updates.forEach { update ->
                     // A page carries up to 256 points and the lock is held for the whole page, so
@@ -300,7 +397,7 @@ class FogViewportCoordinator(
                     addAll(invalidator.candidateKeysAmong(update, renderVersion, maintainedKeys))
                 }
             }
-            val activeKeys = candidateKeys.intersect(activeViewportKeys)
+            val activeKeys = candidateKeys.intersect(activeRasterViewportKeys)
             val offscreenKeys = candidateKeys - activeKeys
             val segments = updates.mapIndexed { index, update ->
                 TrackSegment(
@@ -318,7 +415,10 @@ class FogViewportCoordinator(
             )
         }
 
-    suspend fun clearDerivedCache() = mutex.withLock { pipeline.clear() }
+    suspend fun clearDerivedCache() = mutex.withLock {
+        nativeGeometryEngine?.clear()
+        pipeline.clear()
+    }
 
     private fun renderZoom(mapZoom: Double): Int =
         floor(mapZoom).toInt().coerceIn(0, 22)
@@ -347,6 +447,17 @@ class FogViewportCoordinator(
  * ground, named in the camera's own copy.
  */
 internal fun FogTileMosaic.anchoredNear(centerLongitude: Double): FogTileMosaic {
+    val anchored = bounds.anchoredNear(centerLongitude)
+    return if (anchored === bounds) this else copy(bounds = anchored)
+}
+
+internal fun FogMosaicLayout.anchoredNear(centerLongitude: Double): FogMosaicLayout {
+    val anchored = bounds.anchoredNear(centerLongitude)
+    return if (anchored === bounds) this else copy(bounds = anchored)
+}
+
+private fun FogTileBounds.anchoredNear(centerLongitude: Double): FogTileBounds {
+    val bounds = this
     val span = bounds.eastLongitude - bounds.westLongitude
     if (span <= 0.0 || !centerLongitude.isFinite()) return this
     // The centre of the mosaic is what should sit near the camera; anchoring on an edge would
@@ -355,12 +466,7 @@ internal fun FogTileMosaic.anchoredNear(centerLongitude: Double): FogTileMosaic 
     val worlds = Math.round((centerLongitude - currentCenter) / 360.0)
     if (worlds == 0L) return this
     val shift = worlds * 360.0
-    return copy(
-        bounds = bounds.copy(
-            westLongitude = bounds.westLongitude + shift,
-            eastLongitude = bounds.eastLongitude + shift,
-        ),
-    )
+    return copy(westLongitude = bounds.westLongitude + shift, eastLongitude = bounds.eastLongitude + shift)
 }
 
 object FogViewportTileGrid {
@@ -500,6 +606,9 @@ object FogViewportTileGrid {
             east = wrapBoundaryLongitude(east + longitudeMargin),
         )
     }
+
+    internal fun expandBounds(bounds: ViewportBounds, meters: Double): ViewportBounds =
+        bounds.expandByMeters(meters)
 
     private fun wrapBoundaryLongitude(longitude: Double): Double {
         var wrapped = longitude

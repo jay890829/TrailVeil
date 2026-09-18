@@ -2,6 +2,16 @@ package app.trailveil.map
 
 import android.graphics.Bitmap
 import app.trailveil.map.fog.FogTileBounds
+import app.trailveil.map.fog.FogNativeGeometry
+
+internal fun nativeTrackFogEnabled(): Boolean = false
+
+internal fun currentMapLibreFogRenderMode(): MapLibreFogRenderMode = MapLibreFogRenderMode(false, false)
+
+internal class PreparedNativeFog private constructor()
+@Suppress("UNUSED_PARAMETER")
+internal suspend fun prepareNativeFog(geometry: FogNativeGeometry): PreparedNativeFog =
+    error("native fog is not enabled in this build")
 
 /**
  * A distributed build draws its fog as the raster it always has.
@@ -17,6 +27,17 @@ internal fun installVectorFogIfArmed(
     sourceId: String,
     layerId: String,
     bounds: FogTileBounds,
-    bitmap: Bitmap,
+    bitmap: () -> Bitmap,
     belowLayerId: String,
+    enabled: Boolean = false,
 ): Boolean = false
+
+@Suppress("UNUSED_PARAMETER")
+internal fun installNativeFog(
+    style: org.maplibre.android.maps.Style,
+    sourceId: String,
+    layerId: String,
+    geometry: FogNativeGeometry,
+    prepared: PreparedNativeFog,
+    belowLayerId: String,
+): Unit = error("native fog is not enabled in this build")

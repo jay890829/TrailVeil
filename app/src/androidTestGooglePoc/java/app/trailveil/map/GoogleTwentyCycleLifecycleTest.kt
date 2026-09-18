@@ -88,10 +88,55 @@ class GoogleTwentyCycleLifecycleTest {
             // tags never move.
             var mapView = awaitLiveGeneration(scenario)
             var map = awaitMap(scenario, mapView)
+            if (InstrumentationRegistry.getArguments().getString("zCaptureProofFailure") == "true") {
+                // Observe the repeated failed proof before the existing 20-second hosted timeout
+                // removes the map. This opt-in diagnostic never supplies a passing verdict.
+                Thread.sleep(5_000L)
+                val liveViews = AtomicReference<List<MapView>>(emptyList())
+                scenario.onActivity { activity ->
+                    liveViews.set(activity.window.decorView.findMapViews().filter { it.isAttachedToWindow })
+                    InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                        putString("stream", "Z_PROOF_VIEW heldAttached=${mapView.isAttachedToWindow} " +
+                            "heldShown=${mapView.isShown} liveCount=${liveViews.get().size} " +
+                            liveViews.get().joinToString { live ->
+                                "same=${live === mapView}/cover=${live.getTag(R.id.map_fog_cover_up)}" +
+                                    "/generation=${live.getTag(R.id.map_fog_canonical_generation)}"
+                            } + "\n")
+                    })
+                }
+                liveViews.get().firstOrNull()?.let { live ->
+                    val liveMap = awaitMap(scenario, live)
+                    repeat(3) { index ->
+                        val captured = CountDownLatch(1)
+                        val image = AtomicReference<android.graphics.Bitmap?>()
+                        scenario.onActivity {
+                            liveMap.snapshot { bitmap -> image.set(bitmap); captured.countDown() }
+                        }
+                        val returned = captured.await(5, TimeUnit.SECONDS)
+                        val bitmap = image.get()
+                        if (returned && bitmap != null) {
+                            try {
+                                val directory = checkNotNull(InstrumentationRegistry.getInstrumentation()
+                                    .targetContext.getExternalFilesDir(null))
+                                java.io.File(directory, "z7-proof-failure-$index.png").outputStream().use {
+                                    bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+                                }
+                            } finally { bitmap.recycle() }
+                        }
+                        Thread.sleep(100)
+                    }
+                }
+            }
+            val initialCoverLowered = awaitTag(mapView, R.id.map_fog_cover_up) { it == false }
             assertTrue(
-                "the initial cover never lowered: " + describe(mapView),
-                awaitTag(mapView, R.id.map_fog_cover_up) { it == false },
+                "the initial cover never lowered (timeout state): " + describe(mapView),
+                initialCoverLowered,
             )
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                val evaluations = Regex("eval:[^@ ]+@\\d+").findAll(
+                    mapView.getTag(R.id.map_fog_binding_gates).toString()).map { it.value }.toList()
+                putString("stream", "Z_INITIAL_PROOF evaluations=$evaluations\n")
+            })
             val initialGeneration = requireNotNull(mapView.getTag(R.id.map_fog_canonical_generation))
 
             scenario.onActivity {

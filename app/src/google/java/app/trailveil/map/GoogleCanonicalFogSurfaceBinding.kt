@@ -13,6 +13,7 @@ import app.trailveil.map.fog.FogLifecycleBudget
 import app.trailveil.map.fog.FogOverlayPort
 import app.trailveil.map.fog.FogOverlaySurfaceCoordinator
 import app.trailveil.map.fog.FogPocMosaic
+import app.trailveil.map.fog.anchoredNear
 import app.trailveil.map.fog.FogMosaicTile
 import app.trailveil.map.fog.FogPixelMask
 import app.trailveil.map.fog.FogProbeExclusionZone
@@ -21,6 +22,8 @@ import app.trailveil.map.fog.FogRequestedTileWindowRenderer
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogSnapshotPort
 import app.trailveil.map.fog.FogSnapshotVisualProbePlan
+import app.trailveil.map.fog.FogSnapshotVisualProbePlanMemo
+import app.trailveil.map.fog.FogRasterWorkProbe
 import app.trailveil.map.fog.FogSnapshotVisualProbePlanner
 import app.trailveil.map.fog.FogSynchronizationRenderDecision
 import app.trailveil.map.fog.FogSynchronizationRenderPolicy
@@ -41,15 +44,22 @@ import com.google.android.gms.maps.model.TileOverlay
 import com.google.android.gms.maps.model.TileOverlayOptions
 import java.util.LinkedHashMap
 import java.util.LinkedHashSet
+import java.util.concurrent.atomic.AtomicInteger
+import kotlin.coroutines.AbstractCoroutineContextElement
+import kotlin.coroutines.CoroutineContext
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
@@ -64,9 +74,34 @@ internal data class GoogleCanonicalFogState(
     val retryScheduled: Boolean,
     val lastCoverIntervalMillis: Long?,
     val maximumCoverIntervalMillis: Long,
+    val surfaceDescription: String? = null,
     /** V02-012: reveal beneath a raised cover to that cover's lowering on the passed verdict. */
     val lastVerificationHoldMillis: Long? = null,
     val maximumVerificationHoldMillis: Long = 0L,
+    /**
+     * `V03-013`: where the wall time of the generation that lowered the last cover went, stage by
+     * stage, as one label (the live generation until a cover has lowered).
+     *
+     * Null until a generation has rendered. Names, milliseconds and counts only - no coordinates, no
+     * identifiers - so it can sit on the harness badge and in the gates tag. The cover interval
+     * the badge already shows is the sum a person feels; this is what it is made of, and without
+     * it no change to the rebuild path can claim to have moved anything.
+     */
+    val stageSummary: String? = null,
+    /**
+     * A person's gesture holds the camera and the binding's cover deadline is stopped for it
+     * (`REASON_GESTURE` move started after the first cover has lowered on a passed proof, not yet
+     * idle). The host's net waits longer than one window while this is true.
+     */
+    val gestureHeld: Boolean = false,
+    /**
+     * Counts the binding's re-arms at a gesture's settling idle. The host restarts its net only
+     * on these - never on the binding's first arm or a resume - so a runtime that arrives late
+     * still keeps the window that started with the first visible cover (V02-007).
+     */
+    val gestureSettleClock: Long = 0L,
+    /** Harness data replacement is waiting for canonical transactions, not the renderer. */
+    val canonicalReplacementInProgress: Boolean = false,
 )
 
 /**
@@ -106,9 +141,15 @@ internal class GoogleCanonicalFogSurfaceBinding(
      * the `googleRelease` twin returns null unconditionally.
      */
     private val overlayInstaller: GoogleFogOverlayInstaller? = null,
+    private val awaitCoverCommitted: suspend () -> Boolean = { false },
 ) {
     private val handler = Handler(Looper.getMainLooper())
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var nativeCoverCommitted = false
+    private var nativeCoverEpoch = 0L
+    private var nativeCoverCommitJob: Job? = null
+    private var nativeRetirementOwner: Long? = null
+    private var deferredDeliveryGeneration: Long? = null
     /**
      * Read once, here, so one surface cannot straddle two `V03-011` arms. A constant in every
      * published build; see [googleFogCoverageProfile].
@@ -136,7 +177,15 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private val surroundPlanner = coverageProfile.surroundPlanner()
     private val requestedRenderer = FogRequestedTileWindowRenderer(
         subrenderer = FogViewportBatchSubrenderer { request, keys ->
-            runtime.viewportCoordinator.renderTiles(request, keys)
+            runtime.viewportCoordinator.renderTiles(request, keys).also { rendered ->
+                // `V03-013` stage clocks: queryBounds is non-null only when this batch read Room,
+                // which separates a raster-cold generation from a raster-warm one. The counter is
+                // the render job's own (carried in its coroutine context), so a cancelled
+                // predecessor finishing its mutex section late cannot count against its successor.
+                if (rendered.queryBounds != null) {
+                    currentCoroutineContext()[RoomWindowCounter]?.count?.incrementAndGet()
+                }
+            }
         },
         // The union of the render plan with the SDK's observed requests reaches this renderer, so
         // its own 256 is one of the budgets a ring pushes on - not, as first committed, one that
@@ -146,8 +195,10 @@ internal class GoogleCanonicalFogSurfaceBinding(
         maxTiles = coverageProfile.maxRequestedKeys,
     )
     private val probePlanner = FogSnapshotVisualProbePlanner()
+    private val proofPlanMemo = FogSnapshotVisualProbePlanMemo()
     private val synchronizationPolicy = FogSynchronizationRenderPolicy()
     private val generations = LinkedHashMap<Long, FogTileGeneration>()
+    private val generationEpochs = LinkedHashMap<Long, Long>()
     private val renderJobs = LinkedHashMap<Long, Job>()
     private val overlays = LinkedHashMap<Long, TileOverlay>()
     private val providers = LinkedHashMap<Long, GoogleFogTileProvider>()
@@ -170,6 +221,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private var pendingCoverageKeys: Set<FogTileKey>? = null
     private var installedCoverageKeys: Set<FogTileKey>? = null
     private var baselineReady = false
+    private var appliedCanonicalEpoch = runtime.canonicalEpoch.value
     private var mapLoaded = false
     @Volatile private var hostStopped = false
     @Volatile private var released = false
@@ -179,6 +231,24 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private var installTimeoutGeneration: Long? = null
     private var pausedInstallTimeoutGeneration: Long? = null
     private var coverDeadline: Runnable? = null
+    /**
+     * A person's gesture holds the camera: `REASON_GESTURE` move started after the first cover has
+     * lowered, no idle yet (a fling counts until it settles). The cover deadline does not run
+     * while this is true; see [armCoverDeadline].
+     */
+    private var gestureHeld = false
+    /**
+     * The first cover has lowered on a passed proof. Until then the gesture rule is off and the
+     * first-composition cover keeps V02-007's bound. `coordinator.installedGenerationId` cannot
+     * serve as this gate: it is set at reveal, before the proof, so a first install whose proof
+     * keeps failing carries an installed id under the same first cover.
+     */
+    private var firstCoverLowered = false
+    /**
+     * Bumped when a gesture's settling idle re-arms the deadline; published so the host's net
+     * restarts with exactly those arms and no other (a late runtime keeps its original window).
+     */
+    private var gestureSettleClock = 0L
     private var coverRaisedAtNanos: Long? = null
     private var lastCoverIntervalMillis: Long? = null
     private var maximumCoverIntervalMillis = 0L
@@ -191,6 +261,42 @@ internal class GoogleCanonicalFogSurfaceBinding(
 
     /** V02-012 diagnostics: the last render's key count and durations, for the gates string. */
     private var lastRenderKeys: Int? = null
+    // `V03-013` stage clocks. lastRenderMillis stays the raster+prepare sum every existing
+    // reader expects; these split it and add the stages around it. All main-thread.
+    private var lastCoverToRenderMillis: Long? = null
+    private var lastRasterMillis: Long? = null
+    private var lastRasterRoomWindows: Int? = null
+
+    /** Per-render-job count of raster batches that read Room; lives in the job's coroutine context. */
+    private class RoomWindowCounter : AbstractCoroutineContextElement(RoomWindowCounter) {
+        val count = AtomicInteger(0)
+
+        companion object Key : CoroutineContext.Key<RoomWindowCounter>
+    }
+    private var lastPrepareMillis: Long? = null
+    private var lastAttachMillis: Long? = null
+    private var lastProofMillis: Long? = null
+    private var lastProofPlanMillis: Long? = null
+    private var lastProofPlanAttempts: Int = 0
+    private var proofPlanMillisAccumulated: Long = 0L
+    private var proofPlanAttemptsAccumulated: Int = 0
+    private var lastRasterWork: String? = null
+    // The stage line of the generation that lowered the last cover, captured on that lowering.
+    // The live clocks keep moving (a stale handover rebuild renders again beneath no cover), and
+    // the number a hand reads beside the cover interval must describe the same event.
+    private var coveredStageSummary: String? = null
+    private var coveredSurfaceDescription: String? = null
+    // `V03-013` per-cover-interval totals. Several generations can render beneath ONE cover (a
+    // stale handover rebuild, a refuted proof, a restart) and the stage line names only the last;
+    // these sum every generation since the cover rose, and split the wait into the gesture
+    // (cover rise -> the last camera idle) and the remainder.
+    private var lastCameraIdleAtMillis: Long? = null
+    private var lastCoverGestureMillis: Long? = null
+    private var intervalGenerations: Int = 0
+    private var intervalRasterMillis: Long = 0L
+    private var intervalPrepareMillis: Long = 0L
+    private var intervalProofMillis: Long = 0L
+    private var intervalProofAttempts: Int = 0
     /** The ring the last render's plan actually got, which a narrowed plan makes differ. */
     private var lastAppliedPaddingTiles: Int = 0
     private var lastRenderMillis: Long? = null
@@ -205,7 +311,10 @@ internal class GoogleCanonicalFogSurfaceBinding(
         val generation: FogTileGeneration,
         val coverage: FogViewportCoverageRequest,
         val requested: Set<FogTileKey>,
+        val required: Set<FogTileKey>,
+        val preferRequiredMasks: Boolean,
         val cameraEpoch: Long,
+        val canonicalEpoch: Long,
         val budget: FogLifecycleBudget,
     ) {
         @Volatile var activeLease: FogLifecycleBudget.Lease? = null
@@ -216,6 +325,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private lateinit var coordinator: FogOverlaySurfaceCoordinator
     private val snapshotProver = GoogleFogSnapshotProver(
         map = map,
+        scope = scope,
         planForAttempt = ::freshProofPlan,
         cameraEpoch = { cameraEpoch },
         onProofObserved = onProofObserved,
@@ -225,8 +335,12 @@ internal class GoogleCanonicalFogSurfaceBinding(
     )
 
     private val overlayPort = object : FogOverlayPort {
+        override fun requiresCoverForHandover(installedGenerationId: Long): Boolean =
+            overlayInstaller?.requiresCoverForHandover(installedGenerationId) == true
+
         override fun beginRebuild(handover: Boolean, paletteRotation: Boolean): Long {
             assertMainThread()
+            if (handover) latchNativeRetirement()
             val generation = if (handover) {
                 adapter.beginHandoverGeneration()
             } else {
@@ -234,6 +348,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
             }
             lastGenerationId = generation.id
             generations[generation.id] = generation
+            generationEpochs[generation.id] = runtime.canonicalEpoch.value
             handler.post { if (!released) startRender(generation) }
             return generation.id
         }
@@ -241,6 +356,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         override fun attachOverlay(generationId: Long) {
             assertMainThread()
             if (released || generationId !in generations) return
+            if (!isCanonicalGenerationCurrent(generationId)) return
             overlayInstaller?.let { installer ->
                 attachThroughInstaller(installer, generationId)
                 return
@@ -282,10 +398,12 @@ internal class GoogleCanonicalFogSurfaceBinding(
 
         override fun revealOverlay(generationId: Long, previousGenerationId: Long?) {
             assertMainThread()
+            if (!isCanonicalGenerationCurrent(generationId)) return
             overlayInstaller?.let { installer ->
                 if (!installer.reveal(generationId, previousGenerationId)) {
                     handler.post {
                         if (released) return@post
+                        snapshotProver.cancelGeneration(generationId)
                         coordinator.onRevealFailed(generationId)
                         afterCoordinatorMutation()
                     }
@@ -309,6 +427,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
             if (!shown) {
                 handler.post {
                     if (released) return@post
+                    snapshotProver.cancelGeneration(generationId)
                     coordinator.onRevealFailed(generationId)
                     afterCoordinatorMutation()
                 }
@@ -322,9 +441,13 @@ internal class GoogleCanonicalFogSurfaceBinding(
 
         override fun removeOverlay(generationId: Long): Boolean {
             assertMainThread()
+            snapshotProver.cancelGeneration(generationId)
             overlayInstaller?.let { installer ->
+                // A stale/reset callback must not retire polygons before the cover's buffer.
+                if (!nativeCoverCommitted && nativeRetirementOwner == generationId) return false
                 if (!installer.remove(generationId)) return false
                 generations.remove(generationId)
+                generationEpochs.remove(generationId)
                 masksByGeneration.remove(generationId)
                 coverageByGeneration.remove(generationId)
                 return true
@@ -334,6 +457,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
             overlays.remove(generationId)
             providers.remove(generationId)?.releaseObservers()
             generations.remove(generationId)
+            generationEpochs.remove(generationId)
             masksByGeneration.remove(generationId)
             coverageByGeneration.remove(generationId)
             return true
@@ -345,6 +469,8 @@ internal class GoogleCanonicalFogSurfaceBinding(
 
         override fun cancelRebuild(generationId: Long) {
             assertMainThread()
+            if (deferredDeliveryGeneration == generationId) deferredDeliveryGeneration = null
+            snapshotProver.cancelGeneration(generationId)
             val work = renderWork?.takeIf { it.generation.id == generationId }
             if (work != null) {
                 work.budget.cancel()
@@ -356,6 +482,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
             }
             renderJobs.remove(generationId)?.cancel()
             generations.remove(generationId)?.cancel()
+            generationEpochs.remove(generationId)
             actualRequests.cancel(generationId)
             // A bounded overflow belongs to the failed attempt. Rotating the request log here
             // lets the coordinator's retry fall back to the last proven set instead of repeatedly
@@ -370,10 +497,24 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private val snapshotPort = object : FogSnapshotPort {
         override fun prove(generationId: Long, onResult: (Boolean) -> Unit) {
             assertMainThread()
+            if (!isCanonicalGenerationCurrent(generationId)) return
+            val proofStartedAtMillis = SystemClock.elapsedRealtime()
+            proofPlanMillisAccumulated = 0L
+            proofPlanAttemptsAccumulated = 0
+            proofPlanMemo.clear()
             // V02-012 design 2: this is a VERIFICATION of an overlay already revealed at the fog
             // display opacity; the prover reads it through the revealed-fog window.
-            snapshotProver.prove(generationId) { passed ->
+            snapshotProver.prove(generationId,
+                snapshotNotBeforeMillis = overlayInstaller?.snapshotNotBeforeMillis(generationId) ?: 0L,
+            ) { passed ->
+                proofPlanMemo.clear()
                 if (released) return@prove
+                if (!isCanonicalGenerationCurrent(generationId)) return@prove
+                lastProofMillis = SystemClock.elapsedRealtime() - proofStartedAtMillis
+                lastProofPlanMillis = proofPlanMillisAccumulated
+                lastProofPlanAttempts = proofPlanAttemptsAccumulated
+                intervalProofMillis += SystemClock.elapsedRealtime() - proofStartedAtMillis
+                intervalProofAttempts += proofPlanAttemptsAccumulated
                 onResult(passed)
                 // A refuted generation that is still the installed one stays hidden with the rest
                 // beneath the cover the coordinator has just raised or kept (no rising edge
@@ -458,6 +599,8 @@ internal class GoogleCanonicalFogSurfaceBinding(
             false
         }
         if (resuming) {
+            // A stop ends any touch, and the SDK owes no idle for it.
+            gestureHeld = false
             // Re-arm a full window rather than resuming a partly-elapsed one: the time spent
             // stopped was time the surface had no way to make progress, so charging it against
             // the deadline would punish the user for backgrounding the app.
@@ -465,9 +608,11 @@ internal class GoogleCanonicalFogSurfaceBinding(
             val pausedInstall = pausedInstallTimeoutGeneration
             pausedInstallTimeoutGeneration = null
             pausedInstall?.let(::scheduleInstallTimeout)
+            onStateChanged(state())
         }
         if (!baselineReady) return
         resumePendingRenderIfNeeded()
+        deferredDeliveryGeneration?.let(::deliverAfterNativeCoverCommit)
         // A proof that was paused across ON_STOP keeps its attempt budget. Starting a second
         // re-proof here would silently replace it with a fresh ten-attempt budget.
         if (!proofResumed) coordinator.onStart()
@@ -488,6 +633,9 @@ internal class GoogleCanonicalFogSurfaceBinding(
         assertMainThread()
         if (released || hostStopped) return
         hostStopped = true
+        // Cancel an outstanding acknowledgement, but do not retire a successor already shown
+        // for proof when that same proof resumes. Its predecessor fence has finished.
+        invalidateNativeCoverCommit(preserveCommittedCover = true)
         snapshotProver.onHostStopped()
         // A render that is still reading canonical data is paused. Once its budget is complete,
         // the short adapter commit is allowed to finish; cancelling that phase would leave a
@@ -503,8 +651,20 @@ internal class GoogleCanonicalFogSurfaceBinding(
         assertMainThread()
         if (released) return
         cameraEpoch += 1L
+        snapshotProver.onInputsChanged()
         clearRecentRequests()
-        coordinator.onCameraMoveStarted(reason.toFogReason())
+        val fogReason = reason.toFogReason()
+        if (fogReason == FogCameraMoveReason.GESTURE && firstCoverLowered) {
+            // The person has the camera; the surface is not the one being waited for. Set before
+            // the coordinator runs so a cover it raises now waits for the idle, and so the state
+            // published below already carries the flag to the host's net. Only once the first
+            // cover has lowered on a passed proof: the first-composition cover keeps V02-007's
+            // bound, 20 s from the first visible cover whatever the finger does, because until
+            // something has proven the fallback provider is the better map.
+            gestureHeld = true
+            cancelCoverDeadline()
+        }
+        coordinator.onCameraMoveStarted(fogReason)
         afterCoordinatorMutation()
     }
 
@@ -512,16 +672,35 @@ internal class GoogleCanonicalFogSurfaceBinding(
         assertMainThread()
         if (released) return
         cameraEpoch += 1L
+        snapshotProver.onInputsChanged()
         coordinator.onCameraMoveFrame()
         afterCoordinatorMutation()
     }
 
     fun onCameraIdle() {
         assertMainThread()
-        if (released || !baselineReady || !mapLoaded) return
-        cameraEpoch += 1L
-        coordinator.onCameraIdle()
-        afterCoordinatorMutation()
+        lastCameraIdleAtMillis = SystemClock.elapsedRealtime()
+        val settledFromGesture = gestureHeld
+        gestureHeld = false
+        if (released) return
+        val ready = baselineReady && mapLoaded
+        if (ready) {
+            cameraEpoch += 1L
+            snapshotProver.onInputsChanged()
+            coordinator.onCameraIdle()
+        }
+        // The gesture that cancelled the window has settled: from here on only the surface's own
+        // rebuild, proof and retries can keep the cover up, and they get the full window. Armed
+        // before the publish below, so the host's net restarts with this clock. The not-ready
+        // path still arms and publishes: the synchronizer's refresh path drives the coordinator's
+        // idle without the mapLoaded gate, so a whole cycle - and the first lowering - can happen
+        // before onMapLoaded, and a settle that neither armed nor published would leave the
+        // binding without its bound and the host waiting its long net on a stale flag.
+        if (settledFromGesture && coordinator.coverUp && !coordinator.terminal && !hostStopped) {
+            gestureSettleClock += 1L
+            armCoverDeadline()
+        }
+        if (ready) afterCoordinatorMutation() else if (settledFromGesture) onStateChanged(state())
     }
 
     fun onCameraMoveCancelled() = onCameraIdle()
@@ -559,12 +738,15 @@ internal class GoogleCanonicalFogSurfaceBinding(
     fun onOverlayDataChanged() {
         assertMainThread()
         cameraEpoch += 1L
+        snapshotProver.onInputsChanged()
     }
 
     fun release() {
+        proofPlanMemo.clear()
         assertMainThread()
         if (released) return
         released = true
+        invalidateNativeCoverCommit()
         cancelInstallTimeout()
         coverDeadline?.let(handler::removeCallbacks)
         coverDeadline = null
@@ -584,6 +766,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         renderJobs.clear()
         generations.values.forEach(FogTileGeneration::cancel)
         generations.clear()
+        generationEpochs.clear()
         overlays.values.forEach { overlay -> overlay.removeSafely() }
         overlays.clear()
         bootstrapOverlay?.removeSafely()
@@ -593,28 +776,38 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private fun startSynchronization() {
         scope.launch {
             try {
-                val baseline = withTimeout(SYNCHRONIZATION_TIMEOUT_MILLIS) {
-                    withContext(Dispatchers.IO) { runtime.changeSynchronizer.synchronizeTo() }
-                }
-                ensureActive()
-                if (released) return@launch
-                synchronizationPolicy.onBaselineSynchronized(baseline)
-                baselineReady = true
-                requestCurrentViewportIfReady()
-                runtime.pointChanges.revisionsAfter(baseline.cursor).collect { revision ->
-                    val update = withTimeout(SYNCHRONIZATION_TIMEOUT_MILLIS) {
+                runtime.canonicalEpoch.collectLatest { epoch ->
+                    if (epoch != runtime.canonicalEpoch.value) return@collectLatest
+                    applyCanonicalEpoch(epoch)
+                    // Fixture replacement may span many transactions. Synchronization begins after
+                    // its completion publication, so fixture duration is not a render timeout.
+                    if (epoch % 2L != 0L) return@collectLatest
+                    val baseline = withTimeout(SYNCHRONIZATION_TIMEOUT_MILLIS) {
                         withContext(Dispatchers.IO) {
-                            runtime.changeSynchronizer.synchronizeTo(revision.latestCursor)
+                            runtime.changeSynchronizer.synchronizeTo(expectedCanonicalEpoch = epoch)
                         }
                     }
                     ensureActive()
-                    if (
-                        synchronizationPolicy.onRevisionSynchronized(update) ==
-                        FogSynchronizationRenderDecision.REFRESH_CURRENT_CAMERA
-                    ) {
-                        coordinator.onCanonicalRefreshRequired()
-                                        coordinator.onCameraIdle()
-                        afterCoordinatorMutation()
+                    if (released || baseline.superseded || epoch != runtime.canonicalEpoch.value) return@collectLatest
+                    synchronizationPolicy.onBaselineSynchronized(baseline)
+                    baselineReady = true
+                    requestCurrentViewportIfReady()
+                    runtime.pointChanges.revisionsAfter(baseline.cursor).collect { revision ->
+                        val update = withTimeout(SYNCHRONIZATION_TIMEOUT_MILLIS) {
+                            withContext(Dispatchers.IO) {
+                                runtime.changeSynchronizer.synchronizeTo(revision.latestCursor, epoch)
+                            }
+                        }
+                        ensureActive()
+                        if (
+                            !update.superseded && epoch == runtime.canonicalEpoch.value &&
+                            synchronizationPolicy.onRevisionSynchronized(update) ==
+                            FogSynchronizationRenderDecision.REFRESH_CURRENT_CAMERA
+                        ) {
+                            coordinator.onCanonicalRefreshRequired()
+                            coordinator.onCameraIdle()
+                            afterCoordinatorMutation()
+                        }
                     }
                 }
             } catch (timeout: TimeoutCancellationException) {
@@ -624,6 +817,32 @@ internal class GoogleCanonicalFogSurfaceBinding(
                 throw cancelled
             } catch (failure: Throwable) {
                 failSynchronization(failure)
+            }
+        }
+    }
+
+    private fun isCanonicalGenerationCurrent(generationId: Long): Boolean {
+        val epoch = generationEpochs[generationId] ?: return false
+        val currentEpoch = runtime.canonicalEpoch.value
+        if (epoch == currentEpoch && currentEpoch % 2L == 0L && baselineReady) return true
+        // Ports execute within coordinator transitions. Re-entering reset here would let the
+        // outer attach/reveal transition restore its stale local pending state after the reset.
+        handler.post { if (!released) applyCanonicalEpoch(runtime.canonicalEpoch.value) }
+        return false
+    }
+
+    private fun applyCanonicalEpoch(epoch: Long) {
+        if (appliedCanonicalEpoch != epoch) {
+            invalidateNativeCoverCommit()
+            baselineReady = false
+            appliedCanonicalEpoch = epoch
+            snapshotProver.release()
+            proofPlanMemo.clear()
+            coordinator.onCanonicalResetRequired()
+            afterCoordinatorMutation()
+            hideOverlaysBeneathCover()
+            if (epoch % 2L == 0L && coordinator.coverUp && !hostStopped && !gestureHeld) {
+                armCoverDeadline()
             }
         }
     }
@@ -646,6 +865,13 @@ internal class GoogleCanonicalFogSurfaceBinding(
             return
         }
         if (released) return
+        baselineReady = false
+        snapshotProver.release()
+        proofPlanMemo.clear()
+        // A failed append/revision read does not revoke previously proven canonical pixels.
+        // Real replacement epochs still enter applyCanonicalEpoch and retire beneath the cover.
+        // Preserve that cover if already raised; otherwise failRuntime can report/retry behind
+        // the last proven generation instead of treating a transient read error as a deletion.
         failRuntime(failure)
         handler.postDelayed(
             { if (!released) startSynchronization() },
@@ -678,12 +904,15 @@ internal class GoogleCanonicalFogSurfaceBinding(
             "lastGeneration=$lastGenerationId cameraEpoch=$cameraEpoch " +
             "installTimeout=$installTimeoutGeneration pausedInstallTimeout=$pausedInstallTimeoutGeneration " +
             "retryPosted=$retryPosted terminalPublished=$terminalPublished " +
+            "gestureHeld=$gestureHeld gestureSettles=$gestureSettleClock firstCoverLowered=$firstCoverLowered " +
+            "coverDeadlineArmed=${coverDeadline != null} " +
             "coordinator[pending=${coordinator.pendingGenerationId} " +
             "installed=${coordinator.installedGenerationId} coverUp=${coordinator.coverUp} " +
             "reason=${coordinator.coverReason} terminal=${coordinator.terminal} " +
             "retry=${coordinator.retryScheduled} trace=${coordinator.recentTransitionsTimed}] " +
             "render=[keys=$lastRenderKeys renderMs=$lastRenderMillis publishMs=$lastPublishMillis " +
             "askedPadding=${coverageProfile.paddingTiles} appliedPadding=$lastAppliedPaddingTiles] " +
+            "${stageSummary() ?: "stages=none"} " +
             "prover=${snapshotProver.recentEvents} " +
             "overlays=${overlays.keys} " +
             "target=$targetOverlayGeneration bootstrapOverlay=${bootstrapOverlay != null} " +
@@ -702,9 +931,15 @@ internal class GoogleCanonicalFogSurfaceBinding(
     }
 
     private fun startRender(generation: FogTileGeneration) {
+        if (!isCanonicalGenerationCurrent(generation.id)) return
         assertMainThread()
         if (released || hostStopped || !adapter.isCurrent(generation)) return
+        if (nativeCoverNeedsCommit()) {
+            ensureNativeCoverCommit()
+            return
+        }
         if (renderWork?.generation?.id == generation.id || generation.id in masksByGeneration) return
+        val preferRequiredMasks = overlayInstaller?.canPrepareFromRequiredMasks == true
         val renderInput = try {
             val coverage = currentCoverageRequest()
                 ?: throw IllegalStateException("map projection unavailable")
@@ -723,7 +958,12 @@ internal class GoogleCanonicalFogSurfaceBinding(
             if (requested.size > coverageProfile.maxRequestedKeys) {
                 throw IllegalStateException("actual request union exceeded bound")
             }
-            coverage to requested.toSet()
+            val required = if (preferRequiredMasks) LinkedHashSet<FogTileKey>().apply {
+                addAll(surroundPlanner.plan(coverage).keys)
+                addAll(actual)
+            } else requested
+            val frozenRequested = requested.toSet()
+            Triple(coverage, frozenRequested, if (preferRequiredMasks) required.toSet() else frozenRequested)
         } catch (failure: Exception) {
             failGeneration(generation.id, failure)
             return
@@ -731,12 +971,15 @@ internal class GoogleCanonicalFogSurfaceBinding(
             failGeneration(generation.id, failure)
             return
         }
-        val (coverage, requested) = renderInput
+        val (coverage, requested, required) = renderInput
         val work = RenderWork(
             generation = generation,
             coverage = coverage,
             requested = requested,
+            required = required,
+            preferRequiredMasks = preferRequiredMasks,
             cameraEpoch = cameraEpoch,
+            canonicalEpoch = checkNotNull(generationEpochs[generation.id]),
             budget = FogLifecycleBudget(RENDER_TIMEOUT_MILLIS),
         )
         renderWork = work
@@ -767,15 +1010,88 @@ internal class GoogleCanonicalFogSurfaceBinding(
             var commitStarted = false
             try {
                 val renderStartedAtMillis = SystemClock.elapsedRealtime()
+                // Sampled at render start, so a cover the camera raises DURING the render is not
+                // read back as a negative idle.
+                val coverRaisedBeforeRenderAtNanos = coverRaisedAtNanos
+                // Captured by the IO block and read after it returns; withContext orders the two.
+                var rasterMillis = 0L
+                var prepareMillis = 0L
+                val roomWindows = RoomWindowCounter()
+                val rasterWork = FogRasterWorkProbe()
                 val masks = withTimeout(lease.remainingMillis.coerceAtLeast(1L)) {
-                    withContext(Dispatchers.IO) {
-                        requestedRenderer.render(work.coverage.center, work.requested)
+                    withContext(Dispatchers.IO + roomWindows + rasterWork) {
+                        val rawEnvelope = if (overlayInstaller?.reusesCanonicalPoints == true) {
+                            val floorKeys = surroundPlanner.plan(work.coverage).keys
+                            val bounds = FogPocMosaic.layout(floorKeys, 256).anchoredNear(work.coverage.center.longitude).bounds
+                            runtime.viewportCoordinator.nativeRawReadEnvelope(bounds)
+                        } else null
+                        val rawPoints = rawEnvelope?.let { envelope ->
+                            app.trailveil.data.map.ViewportRawPointMemo(isCurrent = {
+                                work.canonicalEpoch % 2L == 0L && work.canonicalEpoch == runtime.canonicalEpoch.value
+                            }, requiredCaptureBounds = envelope)
+                        }
+                        try {
+                            withContext(rawPoints ?: kotlin.coroutines.EmptyCoroutineContext) {
+                                app.trailveil.map.fog.renderFogWithRequiredMasks(
+                                    requested = work.requested,
+                                    required = work.required,
+                                    preferRequired = work.preferRequiredMasks,
+                                    maxTiles = coverageProfile.maxRequestedKeys,
+                                    render = { keys ->
+                                        val started = SystemClock.elapsedRealtime()
+                                        requestedRenderer.render(work.coverage.center, keys).also {
+                                            rasterMillis += SystemClock.elapsedRealtime() - started
+                                        }
+                                    },
+                                    prepare = { masks ->
+                                      overlayInstaller?.let { installer ->
+                                        rawPoints?.seal()
+                                        val prepareStartedAtMillis = SystemClock.elapsedRealtime()
+                                        val tiles = surroundPlanner.plan(work.coverage).keys.map { key ->
+                                            FogMosaicTile(key, checkNotNull(masks[key]))
+                                        }
+                                        installer.prepare(work.generation.id, work.coverage, tiles)
+                                        prepareMillis = SystemClock.elapsedRealtime() - prepareStartedAtMillis
+                                        installer.hasPreparedNativeGeometry(work.generation.id)
+                                      } ?: false
+                                    },
+                                )
+                            }
+                        } finally {
+                            if (rawPoints != null) withContext(NonCancellable) { rawPoints.close() }
+                        }
                     }
                 }
                 lastRenderKeys = work.requested.size
+                lastRasterWork = "${rasterWork.readNanos.get() / 1_000_000}/" +
+                    "${rasterWork.selectionNanos.get() / 1_000_000}/${rasterWork.paintNanos.get() / 1_000_000}"
                 lastRenderMillis = SystemClock.elapsedRealtime() - renderStartedAtMillis
+                lastRasterMillis = rasterMillis
+                lastRasterRoomWindows = roomWindows.count.get()
+                lastPrepareMillis = prepareMillis
+                intervalGenerations += 1
+                intervalRasterMillis += rasterMillis
+                intervalPrepareMillis += prepareMillis
+                lastCoverGestureMillis = coverRaisedBeforeRenderAtNanos?.let { raised ->
+                    lastCameraIdleAtMillis?.let { idleAt -> idleAt - raised / NANOS_PER_MILLISECOND }
+                }?.takeIf { it >= 0L }
+                // From the cover rising on the move frame to the first byte of render work: the
+                // gesture's own remainder, the idle wait and two handler hops. It is inside every
+                // cover reading and is not render cost, so it is named apart from it.
+                lastCoverToRenderMillis = coverRaisedBeforeRenderAtNanos?.let { raised ->
+                    renderStartedAtMillis - raised / NANOS_PER_MILLISECOND
+                }?.takeIf { it >= 0L }
                 ensureActive()
                 if (!isCurrentRender(work, lease)) return@launch
+
+                // A move can raise the native cover while this generation is doing CPU work.
+                // Do not publish/attach/reveal through that later fence either.
+                if (nativeCoverNeedsCommit()) {
+                    ensureNativeCoverCommit()
+                    nativeCoverCommitJob?.join()
+                    ensureActive()
+                    if (!isCurrentRender(work, lease) || nativeCoverNeedsCommit() || coordinator.terminal) return@launch
+                }
 
                 // The render budget ends before the adapter commit. ON_STOP can therefore pause
                 // only the canonical read; it cannot cancel a commit after the generation's result
@@ -789,7 +1105,14 @@ internal class GoogleCanonicalFogSurfaceBinding(
                     if (!isCurrentRenderWork(work)) {
                         null
                     } else {
-                        adapter.publishMasks(work.generation, masks)
+                        // An installer that never reads PNG tiles gets the currency gate alone: an
+                        // empty publish still runs isCurrent, stamps the generation and returns
+                        // false for a superseded one, without encoding a byte. Null installer
+                        // (every shipped build) keeps the full publish.
+                        adapter.publishMasks(
+                            work.generation,
+                            if (overlayInstaller?.publishesMaskTiles == false) emptyMap() else masks,
+                        )
                     }
                 }
                 lastPublishMillis = SystemClock.elapsedRealtime() - publishStartedAtMillis
@@ -840,10 +1163,12 @@ internal class GoogleCanonicalFogSurfaceBinding(
         lease: FogLifecycleBudget.Lease,
     ): Boolean =
         !released && !hostStopped && renderWork === work && work.activeLease == lease &&
+            work.canonicalEpoch == runtime.canonicalEpoch.value &&
             adapter.isCurrent(work.generation) && work.budget.isCurrent(lease)
 
     private fun isCurrentRenderWork(work: RenderWork): Boolean =
-        !released && renderWork === work && adapter.isCurrent(work.generation)
+        !released && renderWork === work && adapter.isCurrent(work.generation) &&
+            work.canonicalEpoch == runtime.canonicalEpoch.value
 
     private fun pauseActiveRender() {
         val work = renderWork ?: return
@@ -958,13 +1283,14 @@ internal class GoogleCanonicalFogSurfaceBinding(
     private fun onActualDeliveryBarrierDrained(generationId: Long) {
         assertMainThread()
         if (released || coordinator.pendingGenerationId != generationId) return
+        if (!isCanonicalGenerationCurrent(generationId)) return
         val completed = actualRequests.consumeCompleted(generationId) ?: run {
             scheduleDeliveryQuietCheck(generationId)
             return
         }
         lastProvenRequestedKeys = completed
         providers[generationId]?.setCanonicalDeliveryObserver(null)
-        coordinator.onDeliveryBarrierDrained(generationId)
+        deliverAfterNativeCoverCommit(generationId)
         afterCoordinatorMutation()
     }
 
@@ -1019,7 +1345,10 @@ internal class GoogleCanonicalFogSurfaceBinding(
             return
         }
         val tiles = floorKeys.map { key -> FogMosaicTile(key, requireNotNull(masks[key])) }
-        if (!installer.attach(generationId, coverage, tiles)) {
+        val attachStartedAtMillis = SystemClock.elapsedRealtime()
+        val attached = installer.attach(generationId, coverage, tiles)
+        lastAttachMillis = SystemClock.elapsedRealtime() - attachStartedAtMillis
+        if (!attached) {
             handler.post {
                 failGeneration(generationId, IllegalStateException("overlay attach failed"))
             }
@@ -1034,7 +1363,8 @@ internal class GoogleCanonicalFogSurfaceBinding(
         }
         handler.post {
             if (released || coordinator.pendingGenerationId != generationId) return@post
-            coordinator.onDeliveryBarrierDrained(generationId)
+            if (!isCanonicalGenerationCurrent(generationId)) return@post
+            deliverAfterNativeCoverCommit(generationId)
             afterCoordinatorMutation()
         }
     }
@@ -1061,7 +1391,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
         return null
     }
 
-    private fun freshProofPlan(generationId: Long): FogSnapshotVisualProbePlan? {
+    private suspend fun freshProofPlan(generationId: Long, attempt: Int): FogSnapshotVisualProbePlan? {
         val published = coverageByGeneration[generationId] ?: return refuseProofPlan("noCoverage")
         val coverage = currentCoverageRequest() ?: published
         val allMasks = masksByGeneration[generationId].orEmpty()
@@ -1093,7 +1423,26 @@ internal class GoogleCanonicalFogSurfaceBinding(
         } catch (_: LinkageError) {
             listOf(wholeWorldFogProbeExclusionZone())
         }
-        return probePlanner.plan(coverage, masks, exclusionZones = zones)
+        val planStartedAtMillis = SystemClock.elapsedRealtime()
+        // SDK state and generation maps are captured on main. The copied map, value objects and
+        // published read-only masks are the only worker inputs; no Google API runs on Default.
+        val capturedZones = zones.toList()
+        // Every attempt still validates current SDK coverage/requests/zones above. Only the pure
+        // computation can be reused, with exact viewport values and identical mask objects.
+        val bank = app.trailveil.map.fog.FogProbeCandidateBank.forAttempt(attempt)
+        val cached = proofPlanMemo.find(generationId, coverage, masks, capturedZones, bank)
+        val plan = cached ?: withContext(Dispatchers.Default) {
+            val workerJob = checkNotNull(currentCoroutineContext()[Job])
+            probePlanner.plan(coverage, masks, exclusionZones = capturedZones,
+                candidateBank = bank,
+                checkActive = { workerJob.ensureActive() })
+        }.also { computed ->
+            proofPlanMemo.remember(generationId, coverage, masks, capturedZones, computed, bank)
+        }
+        return plan.also {
+            proofPlanMillisAccumulated += SystemClock.elapsedRealtime() - planStartedAtMillis
+            proofPlanAttemptsAccumulated += 1
+        }
     }
 
     private fun scheduleInstallTimeout(generationId: Long) {
@@ -1212,21 +1561,30 @@ internal class GoogleCanonicalFogSurfaceBinding(
         // V02-012 design 2: on the cover's rising edge every overlay is hidden beneath it, so the
         // interval reads as uniform fog rather than fog stacked on fog. A generation revealed
         // beneath the raised cover for its verification stays visible: that edge has passed.
-        if (coordinator.coverUp && !coverWasUp) hideOverlaysBeneathCover()
+        val coverRose = coordinator.coverUp && !coverWasUp
+        if (coverRose) latchNativeRetirement()
+        if (!coordinator.coverUp) invalidateNativeCoverCommit()
         coverWasUp = coordinator.coverUp
+        val publishTerminal = coordinator.terminal && !terminalPublished
+        if (publishTerminal) {
+            // Stop before either host callback; reserving the notification also prevents a
+            // synchronous state observer from publishing the same terminal transition twice.
+            snapshotProver.release()
+            proofPlanMemo.clear()
+            terminalPublished = true
+        }
         publishCoverInterval(coordinator.coverUp)
         onStateChanged(state())
-        if (coordinator.terminal && !terminalPublished) {
-            terminalPublished = true
-            onTerminalFailure()
-        }
+        // The host adds its ViewOverlay synchronously; only now may retirement be requested.
+        if (coverRose || nativeCoverNeedsCommit()) hideOverlaysBeneathCover()
+        if (publishTerminal) onTerminalFailure()
         if (coordinator.retryScheduled && !retryPosted) {
             retryPosted = true
             handler.postDelayed(
                 {
                     retryPosted = false
-                    if (!released) {
-                                        coordinator.onRetryFogOperation()
+                    if (!released && baselineReady) {
+                        coordinator.onRetryFogOperation()
                         afterCoordinatorMutation()
                     }
                 },
@@ -1266,6 +1624,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
      * there is no zoom term to add, and refusing would raise the cover on a question nobody asked.
      */
     private fun installerStillResolves(generationId: Long?): Boolean {
+        if (overlayInstaller?.requiresRasterResolution(generationId) == false) return true
         val planned = coverageByGeneration[generationId ?: return false] ?: return true
         val current = currentCoverageRequest() ?: return true
         return current.floorZoom <= planned.floorZoom
@@ -1284,11 +1643,31 @@ internal class GoogleCanonicalFogSurfaceBinding(
         )
     }
 
+    /**
+     * The cover's wall-clock bound: [MAXIMUM_COVER_MILLIS] from arming to terminal failure.
+     *
+     * It bounds the surface's own work - rebuild, proof, retries - and not the person's. Armed on
+     * the cover's rising edge; once the first cover has lowered on a passed proof, cancelled when a
+     * gesture takes the camera and re-armed in full when that gesture settles ([onCameraIdle],
+     * which is the only arm the host's own net restarts on); re-armed in full when the host
+     * resumes. A cover that
+     * rises under a held gesture is armed by the idle instead, and the runnable refuses to fire
+     * under a gesture the SDK never reported settling. Programmed flights keep the running window:
+     * nothing a person does is being waited for there. The first-composition cover is outside the
+     * rule on purpose: nothing has proven yet, so 20 s from the first visible cover stands.
+     *
+     * Before this rule (owner decision 2026-09-10) the window ran from the rising edge whatever the
+     * finger did. Pauses shorter than one render+proof cycle never lower the cover, so a repeated
+     * pan kept ONE cover up for the whole exploration and a 19.6 s phone reading came within
+     * 424 ms of tearing the map down with the person's own hand as the only delay.
+     */
     private fun armCoverDeadline() {
         cancelCoverDeadline()
+        if (runtime.canonicalEpoch.value % 2L != 0L) return
         val deadline = Runnable {
             coverDeadline = null
-            if (!released && coordinator.coverUp && !coordinator.terminal) {
+            if (!released && runtime.canonicalEpoch.value % 2L == 0L &&
+                !gestureHeld && coordinator.coverUp && !coordinator.terminal) {
                 coordinator.onCoverDeadlineExceeded()
                 afterCoordinatorMutation()
             }
@@ -1303,18 +1682,111 @@ internal class GoogleCanonicalFogSurfaceBinding(
     }
 
     private fun hideOverlaysBeneathCover() {
+        // Unlike a state publication, this call explicitly requests retirement (including a
+        // canonical reset while the cover was already up). Capture its native owner too.
+        latchNativeRetirement()
+        if (nativeCoverNeedsCommit()) {
+            ensureNativeCoverCommit()
+            return
+        }
         (overlays.values + listOfNotNull(bootstrapOverlay)).forEach { overlay ->
             overlay.setTransparencySafely(HIDDEN_FOG_TRANSPARENCY)
         }
+        // The installer arms' layers as well: left beneath the cover they read as a second coat
+        // of fog ((41,52,58) against the fog's (68,88,97) on the AVD), which the owner saw as a
+        // darker cover. See GoogleFogOverlayInstaller.hideBeneathCover.
+        overlayInstaller?.hideBeneathCover()
+    }
+
+    private fun nativeCoverNeedsCommit(): Boolean = coordinator.coverUp && !nativeCoverCommitted && nativeRetirementOwner != null
+
+    private fun latchNativeRetirement() {
+        if (!coordinator.coverUp || nativeCoverCommitted || nativeRetirementOwner != null) return
+        val installed = coordinator.installedGenerationId ?: return
+        if (overlayInstaller?.requiresCoverForHandover(installed) == true) nativeRetirementOwner = installed
+    }
+
+    private fun deliverAfterNativeCoverCommit(generationId: Long) {
+        if (released || coordinator.pendingGenerationId != generationId || !isCanonicalGenerationCurrent(generationId)) {
+            if (deferredDeliveryGeneration == generationId) deferredDeliveryGeneration = null
+            return
+        }
+        if (hostStopped || nativeCoverNeedsCommit()) {
+            deferredDeliveryGeneration = generationId
+            ensureNativeCoverCommit()
+            return
+        }
+        deferredDeliveryGeneration = null
+        coordinator.onDeliveryBarrierDrained(generationId)
+    }
+
+    private fun invalidateNativeCoverCommit(preserveCommittedCover: Boolean = false) {
+        nativeCoverEpoch += 1L
+        nativeCoverCommitJob?.cancel()
+        nativeCoverCommitJob = null
+        if (!preserveCommittedCover) {
+            nativeCoverCommitted = false
+            nativeRetirementOwner = null
+        }
+    }
+
+    private fun ensureNativeCoverCommit() {
+        if (released || hostStopped || coordinator.terminal || !nativeCoverNeedsCommit() || nativeCoverCommitJob != null) return
+        val epoch = nativeCoverEpoch
+        val canonicalEpoch = runtime.canonicalEpoch.value
+        val job = scope.launch(start = CoroutineStart.LAZY) {
+            val committed = try {
+                withTimeout(1_000L) { awaitCoverCommitted() }
+            } catch (_: TimeoutCancellationException) {
+                false
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                false
+            }
+            if (released || hostStopped || nativeCoverEpoch != epoch || runtime.canonicalEpoch.value != canonicalEpoch ||
+                !coordinator.coverUp || coordinator.terminal) return@launch
+            if (!committed) {
+                // Unsupported rendering or a missing frame is bounded failure. Keep the old
+                // native polygons, keep the cover requested, and let the host replace the map.
+                onFogFailure(IllegalStateException("native handover cover frame not committed"))
+                coordinator.onCoverDeadlineExceeded()
+                afterCoordinatorMutation()
+                return@launch
+            }
+            nativeCoverCommitted = true
+            hideOverlaysBeneathCover()
+            deferredDeliveryGeneration?.let(::deliverAfterNativeCoverCommit)
+            afterCoordinatorMutation()
+            resumePendingRenderIfNeeded()
+        }
+        nativeCoverCommitJob = job
+        job.invokeOnCompletion {
+            if (nativeCoverCommitJob === job) nativeCoverCommitJob = null
+        }
+        // An installed-generation re-proof can request hiding directly from its callback,
+        // before afterCoordinatorMutation. Every entry must publish the real host cover first.
+        publishCoverInterval(coordinator.coverUp)
+        onStateChanged(state())
+        job.start()
     }
 
     private fun publishCoverInterval(coverUp: Boolean) {
+        if (runtime.canonicalEpoch.value % 2L != 0L) cancelCoverDeadline()
         val now = SystemClock.elapsedRealtimeNanos()
         if (coverUp && !lastPublishedCoverUp) {
             coverRaisedAtNanos = now
-            if (!hostStopped) armCoverDeadline()
+            intervalGenerations = 0
+            intervalRasterMillis = 0L
+            intervalPrepareMillis = 0L
+            intervalProofMillis = 0L
+            intervalProofAttempts = 0
+            // A cover that rises under a held gesture is armed by the idle that ends the gesture.
+            if (!hostStopped && !gestureHeld) armCoverDeadline()
         } else if (!coverUp && lastPublishedCoverUp) {
             cancelCoverDeadline()
+            // A cover lowers on a passed proof and nothing else; the gesture rule waits for this.
+            firstCoverLowered = true
             revealedBeneathCoverAtNanos?.let { revealed ->
                 lastVerificationHoldMillis = (now - revealed) / NANOS_PER_MILLISECOND
                 maximumVerificationHoldMillis = maxOf(maximumVerificationHoldMillis, requireNotNull(lastVerificationHoldMillis))
@@ -1328,6 +1800,8 @@ internal class GoogleCanonicalFogSurfaceBinding(
                     requireNotNull(lastCoverIntervalMillis),
                 )
             }
+            coveredStageSummary = stageSummary()
+            coveredSurfaceDescription = overlayInstaller?.describe()
             coverRaisedAtNanos = null
         }
         lastPublishedCoverUp = coverUp
@@ -1342,9 +1816,68 @@ internal class GoogleCanonicalFogSurfaceBinding(
         retryScheduled = coordinator.retryScheduled,
         lastCoverIntervalMillis = lastCoverIntervalMillis,
         maximumCoverIntervalMillis = maximumCoverIntervalMillis,
+        // Same rule as stageSummary: the installer line beside a cover interval describes the
+        // generation that lowered that cover, not whichever generation attached last.
+        surfaceDescription = coveredSurfaceDescription ?: overlayInstaller?.describe(),
         lastVerificationHoldMillis = lastVerificationHoldMillis,
         maximumVerificationHoldMillis = maximumVerificationHoldMillis,
+        stageSummary = coveredStageSummary ?: stageSummary(),
+        gestureHeld = gestureHeld,
+        gestureSettleClock = gestureSettleClock,
+        canonicalReplacementInProgress = runtime.canonicalEpoch.value % 2L != 0L,
     )
+
+    /**
+     * One label for the last generation's stages, or null before any render. Milliseconds and
+     * counts only. `idle` is cover-rise to render start; `raster` and `prepare` split renderMs;
+     * `room` is how many raster batches had to read Room (0 = every tile came from a cache);
+     * `hold` (reveal-beneath-cover to verdict) equalled `proof` on every reading and is not printed;
+     * `plan` is the proof planner's total across attempts with the attempt count; `proof` is the
+     * whole verification.
+     */
+    private fun stageSummary(): String? {
+        val raster = lastRasterMillis ?: return null
+        // The interval totals and the prover digest lead. The badge is capped at ten lines and a
+        // phone-width badge ellipsises the tail, and a cover that outlived one generation is
+        // explained by `gens`, the attempt total and the digest - never by the last generation's
+        // own clocks (a 19.6 s phone reading lost exactly those fields to the cap).
+        return "sum[gens=$intervalGenerations raster=$intervalRasterMillis prepare=$intervalPrepareMillis " +
+            "proof=$intervalProofMillis/$intervalProofAttempts] " +
+            proofNotes() + " " +
+            "stages[idle=${lastCoverToRenderMillis ?: "-"} gesture=${lastCoverGestureMillis ?: "-"} " +
+            "raster=$raster room=${lastRasterRoomWindows ?: "-"} " +
+            "prepare=${lastPrepareMillis ?: "-"} publish=${lastPublishMillis ?: "-"} " +
+            "attach=${lastAttachMillis ?: "-"} plan=${lastProofPlanMillis ?: "-"}/$lastProofPlanAttempts " +
+            "proof=${lastProofMillis ?: "-"} keys=${lastRenderKeys ?: "-"} rasterWork=${lastRasterWork ?: "-"}]"
+    }
+
+    /**
+     * Why the proofs went the way they did: the plan-refusal tally (reason -> count, reasons carry
+     * a zoom and a key count, never a coordinate) and the prover's recent event names with their
+     * timestamps stripped. Diagnostic text for the harness badge; nothing reads it back.
+     */
+    private fun proofNotes(): String {
+        val refusals = proofPlanRefusals.entries.joinToString(",") { (reason, count) -> "$reason=$count" }
+        // Run-length digest of the prover's recent event NAMES: `eval:false` keeps its verdict,
+        // everything else is cut at the first ':'; consecutive repeats collapse to `name×n`. Per-tile
+        // colour dumps and the colour window are gates-tag material, not badge text.
+        val names = snapshotProver.recentEvents.asSequence()
+            .map { event -> event.substringBefore('@') }
+            .filterNot { event -> event.startsWith("tiles:") || event.startsWith("window=") || event == "retry" }
+            .map { event -> if (event.startsWith("eval:")) event.split(':').take(2).joinToString(":") else event.substringBefore(':') }
+            .toList().takeLast(PROOF_NOTE_EVENTS)
+        val digest = StringBuilder()
+        var index = 0
+        while (index < names.size) {
+            var run = 1
+            while (index + run < names.size && names[index + run] == names[index]) run += 1
+            if (digest.isNotEmpty()) digest.append(',')
+            digest.append(names[index])
+            if (run > 1) digest.append('\u00d7').append(run)
+            index += run
+        }
+        return (if (refusals.isEmpty()) "" else "refusals[$refusals] ") + "prover[$digest]"
+    }
 
     private fun requestedKeysForRender(): Set<FogTileKey> = synchronized(recentRequestLock) {
         if (recentRequestsOverflowed) {
@@ -1502,7 +2035,7 @@ internal class GoogleCanonicalFogSurfaceBinding(
                 request = FogViewportRequest(coverage.center, coverage.floorZoom.toDouble()),
                 keys = floorKeys,
                 queryBounds = null,
-                mosaic = FogPocMosaic.compose(tiles),
+                presentation = FogPocMosaic.compose(tiles),
             ),
         )
     }
@@ -1536,6 +2069,10 @@ internal class GoogleCanonicalFogSurfaceBinding(
         const val RETRY_FOG_MILLIS = 1_000L
         const val NANOS_PER_MILLISECOND = 1_000_000L
         const val MAXIMUM_COVER_MILLIS = 20_000L
+
+        /** How many of the prover's most recent events the badge's stage line quotes. */
+        private const val PROOF_NOTE_EVENTS = 40
+
         const val OLD_OVERLAY_Z = 10F
         const val NEW_OVERLAY_Z = 20F
         const val BOOTSTRAP_PLACEHOLDER_GENERATION = Long.MIN_VALUE

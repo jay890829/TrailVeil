@@ -5,73 +5,38 @@ import androidx.core.content.edit
 import app.trailveil.map.fog.FogViewportCoordinator
 
 /**
- * `V03-013`: the fog arms this provider's harness can select.
- *
- * This provider starts from a better place than the other one, and the arm list reflects that.
- * Its fog is already an anchored mosaic that survives a gesture, so there is no cover to remove
- * and nothing here is putting out a fire; what these arms buy is how far the camera can travel
- * before the mosaic runs out.
- *
- * [mosaicPaddingTiles] is the same lever in a different place: `FogViewportTileGrid.around`
- * already took a padding and `FogViewportCoordinator.render` simply never passed one, so the
- * legacy 3x3 is padding 1. Raising it renders MORE fog around the same centre, which makes each
- * arm a superset of the one below it - it cannot expose ground the default would have covered.
+ * Historical regression controls on MapLibre's fixed centre-tile grid; the final default is native 5x5.
+ * Base 3x3 is the smaller native control, not Google's viewport-shaped floor planner.
+ * Both 5x5 arms actually publish the larger extent; their ring can buy camera travel.
  */
 internal enum class MapLibreFogArm(
-    /** Stable key written to preferences; never localise or renumber it. */
     val id: String,
-    /** What the settings screen shows. */
     val label: String,
-    /** Distance in tiles from the centre tile; 1 is the shipped 3x3. */
     val mosaicPaddingTiles: Int,
-    /** Draw the fog as tessellated geometry instead of a raster quad. */
-    val vectorFog: Boolean = false,
+    val trackVector: Boolean = false,
 ) {
-    /** The shipped mosaic, and the control every other row is read against. */
-    BASELINE("baseline", "Baseline (3x3)", FogViewportCoordinator.DEFAULT_MOSAIC_PADDING_TILES),
-
-    /** 5x5: 25 tiles for 9, so roughly 2.8x the render for one extra tile of travel per axis. */
-    MOSAIC_5("mosaic5", "Mosaic 5x5", 2),
-
-    /** 7x7: 49 tiles. The point at which the cost is worth watching as closely as the benefit. */
-    MOSAIC_7("mosaic7", "Mosaic 7x7", 3),
-
-    /**
-     * The fog as geometry this renderer tessellates itself, with holes decomposed from the mask.
-     *
-     * Keeps the 3x3 mosaic: this arm changes HOW the generation is drawn, not how much of it is
-     * rendered, so it is read against `baseline` rather than against the wider mosaics.
-     */
-    VECTOR("vector", "Vector fog (mask-traced)", 1, vectorFog = true),
+    TRACK_VECTOR_FLOOR("trackVectorFloor", "Track vector (base 3x3)",
+        FogViewportCoordinator.DEFAULT_MOSAIC_PADDING_TILES, trackVector = true),
+    // Keep the old id and extent: existing MapLibre trackVector users selected native 5x5.
+    TRACK_VECTOR_RING("trackVector", "Track vector (ring 2, 5x5)", 2, trackVector = true),
+    RING_2("mosaic5", "Ring 2 (raster, 5x5)", 2),
     ;
 
     companion object {
         private const val PREFERENCES = "trailveil-fog-arm"
         private const val KEY = "arm"
+        /** Final owner-selected scheme. Historical enum values remain only for regression probes. */
+        val DEFAULT = TRACK_VECTOR_RING
 
-        /** The arm a fresh install runs, so an unconfigured harness measures the shipped design. */
-        val DEFAULT = BASELINE
+        /** Old, unknown and absent saved choices all resolve to the final scheme. */
+        fun fromId(@Suppress("UNUSED_PARAMETER") id: String?): MapLibreFogArm = DEFAULT
 
-        fun fromId(id: String?): MapLibreFogArm = entries.firstOrNull { it.id == id } ?: DEFAULT
+        /** No preference read: even a malformed retired value cannot affect startup. */
+        fun stored(@Suppress("UNUSED_PARAMETER") context: Context): MapLibreFogArm = DEFAULT
 
-        /**
-         * Read where the fog runtime is built rather than at process start.
-         *
-         * Unlike the other provider's selector there is no ordering problem to solve here: the
-         * value is a constructor argument to [FogViewportCoordinator], so whatever is stored when
-         * the runtime is constructed is what that runtime uses for its life. Changing it still
-         * needs a restart, because the runtime is built once per process.
-         */
-        fun stored(context: Context): MapLibreFogArm = fromId(
-            context.applicationContext
-                .getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
-                .getString(KEY, null),
-        )
-
-        /** `commit = true` because the settings screen offers to quit the process straight after. */
+        /** Legacy preference fixture writer; this no longer changes the running or next-launch scheme. */
         fun store(context: Context, arm: MapLibreFogArm) {
-            context.applicationContext
-                .getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
+            context.applicationContext.getSharedPreferences(PREFERENCES, Context.MODE_PRIVATE)
                 .edit(commit = true) { putString(KEY, arm.id) }
         }
     }

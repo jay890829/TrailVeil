@@ -49,6 +49,8 @@ enum class FogCoverReason {
     VIEWPORT_EXIT,
     PROGRAMMED_EXIT,
     PALETTE_ROTATION,
+    CANONICAL_RESET,
+    HANDOVER,
     RUNTIME_FAILURE,
 }
 
@@ -77,6 +79,8 @@ fun classifyFogInstallFailure(hasProvenGeneration: Boolean): FogInstallFailureCl
  * binding use only.
  */
 interface FogOverlayPort {
+    /** True when two visible generations cannot be safely verified together. Default tile handover is unchanged. */
+    fun requiresCoverForHandover(installedGenerationId: Long): Boolean = false
     /**
      * Starts rendering a new generation and returns its id. [handover] keeps the currently
      * published adapter set serving until the new one publishes (adapter handover); otherwise
@@ -376,6 +380,25 @@ class FogOverlaySurfaceCoordinator(
         canonicalDirty = true
     }
 
+    /** Shrinking canonical data revokes old reveals; never hand them over as still-valid coverage. */
+    fun onCanonicalResetRequired() {
+        if (terminal) return
+        raiseCover(FogCoverReason.CANONICAL_RESET)
+        canonicalDirty = true
+        viewportDirty = true
+        retryScheduled = false
+        val previousPending = pending
+        pending = null
+        previousPending?.let { rebuilding ->
+            overlayPort.cancelRebuild(rebuilding.generationId)
+            if (rebuilding.overlayAttached && !overlayPort.removeOverlay(rebuilding.generationId)) {
+                enterTerminalFailure()
+            }
+        }
+        // The binding waits for canonical synchronization before asking onCameraIdle to rebuild.
+        // raiseCover also invalidated a previous proof's permission to lower this cover.
+    }
+
     /** The palette generation counter reached a rotation boundary. */
     fun onPaletteRotationDue() {
         paletteRotationDue = true
@@ -506,6 +529,13 @@ class FogOverlaySurfaceCoordinator(
 
     private fun beginRebuild(handover: Boolean, paletteRotation: Boolean) {
         if (paletteRotation) raiseCover(FogCoverReason.PALETTE_ROTATION)
+        if (handover && installedGenerationId?.let(overlayPort::requiresCoverForHandover) == true) {
+            // The binding publishes this rising edge before its posted render/attach work. Its
+            // existing cover hook retires the revealed predecessor; the successor is shown and
+            // proven later beneath the already-raised cover, never stacked over the predecessor.
+            if (!coverUp) raiseCover(FogCoverReason.HANDOVER)
+            else coverHeldForVerification = null // an older proof cannot release the successor's guard
+        }
         canonicalDirty = false
         viewportDirty = false
         val generationId = overlayPort.beginRebuild(

@@ -7,18 +7,32 @@ import android.graphics.PixelFormat
 import android.graphics.drawable.Drawable
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
 import android.view.WindowInsets
 import android.widget.ImageView
 import app.trailveil.R
 import app.trailveil.map.fog.FogTilePngCodec
 import com.google.android.gms.maps.MapView
+import kotlin.coroutines.resume
+import kotlinx.coroutines.suspendCancellableCoroutine
 
 /**
- * Non-interactive ViewOverlay guard toggled synchronously inside camera callbacks.
+ * Non-interactive ViewOverlay guard raised synchronously inside camera callbacks.
  *
  * Compose still publishes semantics/state, but it cannot promise that recomposition draws before
  * the SDK's next renderer frame. A drawable in MapView's own ViewOverlay is added before the camera
  * callback returns, covers SDK labels/tiles immediately, and never participates in touch dispatch.
+ *
+ * Lowering is the other direction and settles first. The verdict that lowers the cover is read
+ * from a snapshot the SDK rendered, but the frame the SDK shows next is not that snapshot: a
+ * successor revealed for the proof can compose one renderer frame after the View frame that
+ * removed the cover, and with its predecessor already hidden at reveal that frame has nothing
+ * beneath it. Measured on the API 36 AVD (`V03-013`, raster-fallback dateline handover): the
+ * first frame after `lower` read about 11 % bare basemap, the next was whole. So the drawable
+ * stays for [LOWER_SETTLE_MILLIS] and leaves on the animation frame after that; a raise in
+ * between cancels the lowering, and [release] lowers at once. The published
+ * `map_fog_synchronous_cover_up` tag mirrors the drawable, not the request, so an audit that
+ * reads it sees those frames as what they are: covered.
  */
 internal class GoogleFogSafetyOverlay(
     private val mapView: MapView,
@@ -36,6 +50,8 @@ internal class GoogleFogSafetyOverlay(
     )
     private var visible = false
     private var released = false
+    private var pendingLower: Runnable? = null
+    private var visibilityEpoch = 0L
     private val layoutListener = View.OnLayoutChangeListener { _, left, top, right, bottom, _, _, _, _ ->
         drawable.setBounds(0, 0, right - left, bottom - top)
         positionAttributionAboveSystemBars()
@@ -48,16 +64,98 @@ internal class GoogleFogSafetyOverlay(
     }
 
     fun setVisible(show: Boolean) {
-        if (released || visible == show) return
-        visible = show
-        mapView.setTag(R.id.map_fog_synchronous_cover_up, show)
+        if (released) return
         if (show) {
-            drawable.setBounds(0, 0, mapView.width, mapView.height)
-            mapView.overlay.add(drawable)
-        } else {
-            mapView.overlay.remove(drawable)
+            cancelPendingLower()
+            raiseNow()
+        } else if (visible && pendingLower == null) {
+            scheduleLower()
         }
+    }
+
+    /** A submitted cover frame, not a claim that SurfaceFlinger has already displayed it. */
+    suspend fun awaitCommitted(): Boolean {
+        if (released || !visible || !mapView.isAttachedToWindow || !mapView.isHardwareAccelerated) return false
+        val epoch = visibilityEpoch
+        return suspendCancellableCoroutine { continuation ->
+            val observer = mapView.viewTreeObserver
+            if (!observer.isAlive) {
+                continuation.resume(false)
+                return@suspendCancellableCoroutine
+            }
+            // Register during the next pre-draw, after the newly added drawable is in this
+            // traversal. A callback registered against an already in-flight frame is insufficient.
+            lateinit var preDraw: ViewTreeObserver.OnPreDrawListener
+            val committed = Runnable {
+                mapView.post {
+                    if (continuation.isActive) {
+                        continuation.resume(!released && visible && visibilityEpoch == epoch && mapView.isAttachedToWindow)
+                    }
+                }
+            }
+            preDraw = ViewTreeObserver.OnPreDrawListener {
+                if (observer.isAlive) observer.removeOnPreDrawListener(preDraw)
+                if (continuation.isActive && !released && visible && visibilityEpoch == epoch) {
+                    observer.registerFrameCommitCallback(committed)
+                } else if (continuation.isActive) {
+                    continuation.resume(false)
+                }
+                true
+            }
+            observer.addOnPreDrawListener(preDraw)
+            continuation.invokeOnCancellation {
+                mapView.post {
+                    if (observer.isAlive) {
+                        observer.removeOnPreDrawListener(preDraw)
+                        observer.unregisterFrameCommitCallback(committed)
+                    }
+                }
+            }
+            mapView.invalidate()
+        }
+    }
+
+    private fun raiseNow() {
+        if (visible) return
+        visible = true
+        visibilityEpoch += 1L
+        mapView.setTag(R.id.map_fog_synchronous_cover_up, true)
+        drawable.setBounds(0, 0, mapView.width, mapView.height)
+        mapView.overlay.add(drawable)
         mapView.invalidate()
+    }
+
+    private fun lowerNow() {
+        if (!visible) return
+        visible = false
+        visibilityEpoch += 1L
+        mapView.setTag(R.id.map_fog_synchronous_cover_up, false)
+        mapView.overlay.remove(drawable)
+        mapView.invalidate()
+    }
+
+    /** Settle, then align with a frame: the drawable leaves on the animation frame after the delay. */
+    private fun scheduleLower() {
+        val lower = object : Runnable {
+            private var aligned = false
+            override fun run() {
+                if (pendingLower !== this || released) return
+                if (!aligned) {
+                    aligned = true
+                    mapView.postOnAnimation(this)
+                    return
+                }
+                pendingLower = null
+                lowerNow()
+            }
+        }
+        pendingLower = lower
+        mapView.postDelayed(lower, LOWER_SETTLE_MILLIS)
+    }
+
+    private fun cancelPendingLower() {
+        pendingLower?.let { lower -> mapView.removeCallbacks(lower) }
+        pendingLower = null
     }
 
     /**
@@ -81,7 +179,8 @@ internal class GoogleFogSafetyOverlay(
 
     fun release() {
         if (released) return
-        setVisible(false)
+        cancelPendingLower()
+        lowerNow()
         mapView.removeOnLayoutChangeListener(layoutListener)
         released = true
     }
@@ -110,6 +209,12 @@ internal class GoogleFogSafetyOverlay(
     }
 
     private companion object {
+        /**
+         * How long a lowered cover keeps drawing before it leaves: three 60 Hz frames, six at
+         * 120 Hz, against a measured one-frame gap. Time rather than a frame count so a faster
+         * display does not shorten the margin the SDK's renderer is given.
+         */
+        const val LOWER_SETTLE_MILLIS = 50L
         const val ATTRIBUTION_BOTTOM_TOLERANCE_PX = 200
         const val ATTRIBUTION_START_TOLERANCE_PX = 180
         const val ATTRIBUTION_NAVIGATION_GUTTER_PX = 8

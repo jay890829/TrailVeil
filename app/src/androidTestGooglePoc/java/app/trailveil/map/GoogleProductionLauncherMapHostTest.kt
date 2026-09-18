@@ -1,9 +1,11 @@
 package app.trailveil.map
 
+import android.Manifest
 import app.trailveil.map.fog.FogTilePngCodec
 import app.trailveil.map.fog.FogTileColor
 import android.graphics.Bitmap
 import android.graphics.Color
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.View
 import android.view.ViewGroup
@@ -15,6 +17,7 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
 import app.trailveil.R
+import app.trailveil.feature.recording.PermissionHistory
 import app.trailveil.feature.recording.PermissionHistoryStore
 import app.trailveil.googlepoc.FlingGestureInjector
 import com.google.android.gms.maps.CameraUpdateFactory
@@ -66,7 +69,10 @@ class GoogleProductionLauncherMapHostTest {
             }
 
             val firstGeneration = awaitGeneration(mapView)
-            assertEquals(false, mapView.getTag(R.id.map_fog_cover_up))
+            // Installation precedes the snapshot verdict; V02-012 deliberately holds the cover
+            // across that interval. Wait for the existing proof gate before auditing interaction.
+            assertTrue("first installed generation never passed its cover-held proof",
+                awaitTag(mapView, R.id.map_fog_cover_up) { it == false })
             scenario.onActivity {
                 requireNotNull(mapRef.get()).animateCamera(
                     CameraUpdateFactory.newLatLngZoom(LatLng(-33.8688, 151.2093), 12f),
@@ -100,9 +106,22 @@ class GoogleProductionLauncherMapHostTest {
             InstrumentationRegistry.getInstrumentation().targetContext,
         )
         val originalHistory = runBlocking { historyStore.current() }
+        // This case asserts real screen pixels over a full-bleed map, so every card the entry
+        // screen may draw is part of its oracle. Copying the stored history would inherit
+        // `hasRequestedNotifications` from whatever ran before, and with POST_NOTIFICATIONS denied
+        // - the state P4-046 requires the host to prepare - the state machine then reports
+        // DENIED_OPEN_SETTINGS and the app correctly draws its notification notice across the map.
+        // Measured: 5 of 9 samples off fog, two of them the notice's own #FFFFD8E4. Pin the whole
+        // profile the way `GoogleGestureExposureTest` does rather than inherit one.
         runBlocking {
             historyStore.replaceForTesting(
-                originalHistory.copy(hasSeenIntroduction = true),
+                PermissionHistory(
+                    hasSeenIntroduction = true,
+                    hasRequestedLocation = true,
+                    hasRetriedLocation = true,
+                    hasRequestedPreciseUpgrade = true,
+                    hasRequestedNotifications = false,
+                ),
             )
         }
         try {
@@ -129,6 +148,27 @@ class GoogleProductionLauncherMapHostTest {
                 },
             )
             assertTrue(awaitTag(mapView, R.id.map_fog_cover_up) { it == false })
+            // The cover frame below is a full-screen capture over a full-bleed map, so any card the
+            // entry screen draws lands inside its samples. A completed result's card expires on its
+            // own; a failed or interrupted one persists until acknowledged. Use the card's real
+            // dismiss action - no Room data is touched - and then require the fixture to be clear,
+            // naming whatever is left, exactly as `GestureExposureAudit` does for the same reason.
+            var terminalAcknowledged = false
+            scenario.onActivity { terminalAcknowledged = acknowledgeMapAuditTerminalNotice(mapView) }
+            var liveNotices = emptySet<String>()
+            val fixtureIsClear = run {
+                repeat(100) {
+                    scenario.onActivity { liveNotices = liveMapAuditNotices(mapView) }
+                    if (liveNotices.isEmpty()) return@run true
+                    Thread.sleep(100L)
+                }
+                false
+            }
+            assertTrue(
+                "this map-only fixture contains unexpected notice cards: $liveNotices " +
+                    "(terminalAcknowledged=$terminalAcknowledged, ${notificationPrecondition()})",
+                fixtureIsClear,
+            )
             val beforeFlingGeneration = mapView.getTag(R.id.map_fog_canonical_generation)
             val beforeTouchCount = (mapView.getTag(R.id.map_touch_down_count) as? Int) ?: 0
             val beforeLongitude = AtomicReference<Double>()
@@ -150,14 +190,26 @@ class GoogleProductionLauncherMapHostTest {
                     if (mapView.getTag(R.id.map_fog_synchronous_cover_up) == true) {
                         coverObserved.set(true)
                         if (coverFrame.get() == null) {
-                            val firstFrame = CountDownLatch(1)
+                            // The cover is a View drawable and the basemap is the SDK's own
+                            // renderer; the two are not presented in the same frame.
+                            // `GoogleFogSafetyOverlay` measured that seam from the other side - "the
+                            // first frame after `lower` read about 11 % bare basemap, the next was
+                            // whole" - and compensates with its LOWER_SETTLE_MILLIS. Raising has the
+                            // same seam, and this capture was taking the first frame: measured at one
+                            // pose, a settled covered frame is 89.7 % inside the fog window with no
+                            // pixel above luminance 250, while a first-frame capture read 81.8 % with
+                            // 1.07 % above it - undimmed SDK labels that the next frame covers. Wait
+                            // for the frame after, which is the overlay's own remedy.
+                            val settledFrame = CountDownLatch(1)
                             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                                 Choreographer.getInstance().postFrameCallback {
-                                    firstFrame.countDown()
+                                    Choreographer.getInstance().postFrameCallback {
+                                        settledFrame.countDown()
+                                    }
                                 }
                             }
                             if (
-                                firstFrame.await(1, TimeUnit.SECONDS) &&
+                                settledFrame.await(1, TimeUnit.SECONDS) &&
                                 mapView.getTag(R.id.map_fog_synchronous_cover_up) == true
                             ) {
                                 coverFrame.compareAndSet(
@@ -199,9 +251,31 @@ class GoogleProductionLauncherMapHostTest {
             assertTrue("the fling never raised the safety cover", coverObserved.get())
             val capturedCover = coverFrame.get()
             assertNotNull("no screen frame was captured while the cover was up", capturedCover)
+            var noticesAtCapture = emptySet<String>()
+            scenario.onActivity { noticesAtCapture = liveMapAuditNotices(mapView) }
             requireNotNull(capturedCover).let { bitmap ->
                 try {
-                    assertFogCoverPixels(bitmap, location, mapSize)
+                    assertFogCoverPixels(
+                        bitmap,
+                        location,
+                        mapSize,
+                        "${notificationPrecondition()} liveNotices=$noticesAtCapture",
+                    )
+                } catch (failure: AssertionError) {
+                    // Colour names alone have now sent two plausible causes to the bin. Keep the
+                    // exact frame that was judged, plus the screen as it stands when the judgement
+                    // failed, so the next step is looking rather than guessing.
+                    throw AssertionError(
+                        "${failure.message} coverFrame=${saveFrame(bitmap, "fling-cover")} " +
+                            "screenNow=${
+                                saveFrame(
+                                    InstrumentationRegistry.getInstrumentation()
+                                        .uiAutomation
+                                        .takeScreenshot(),
+                                    "fling-screen-after",
+                                )
+                            }",
+                    )
                 } finally {
                     bitmap.recycle()
                 }
@@ -242,14 +316,18 @@ class GoogleProductionLauncherMapHostTest {
     fun backgroundingWithTheCoverUpDoesNotTerminateTheProductionMap() {
         ActivityScenario.launch(MainActivity::class.java).use { scenario ->
             val beforeStop = awaitMapView(scenario)
-            // Assert rather than assume the precondition. Without this the case passes vacuously
-            // whenever the first generation happens to install before the stop: no deadline is
-            // armed, so surviving the dwell proves nothing about lifecycle gating.
-            assertEquals(
-                "the cover was already down before backgrounding, so no bounded deadline was " +
-                    "armed and this run did not exercise the lifecycle gate",
-                true,
-                beforeStop.getTag(R.id.map_fog_cover_up),
+            // Assert rather than assume the precondition - but ARRANGE it first. Asserting alone
+            // made the outcome depend on whether the first generation happened to finish before
+            // the stop, which is a property of the hardware, not of the gate: on the owner's phone
+            // the cover is already down by the time awaitMapView returns, so the case failed there
+            // while passing 3 of 3 when its class ran alone. Raising a fresh cover makes the
+            // precondition deterministic without weakening it - a run that still cannot arm one
+            // fails, and says so.
+            assertTrue(
+                "no safety cover could be raised before backgrounding, so no bounded deadline was " +
+                    "armed and this run did not exercise the lifecycle gate: " +
+                    describe("watched", beforeStop),
+                armAFreshCover(scenario, beforeStop),
             )
             scenario.moveToState(Lifecycle.State.CREATED)
             Thread.sleep(BACKGROUND_DWELL_MILLIS)
@@ -316,13 +394,46 @@ class GoogleProductionLauncherMapHostTest {
     }
 
     /**
+     * The notification precondition travels with the failure on purpose: a notice card drawn over
+     * the map reads as ordinary off-fog pixels, and naming the state that produces it turns that
+     * into a one-line diagnosis instead of an A/B run.
+     */
+    /** Failure-only: the judged frame is the evidence, and colour names have not been enough. */
+    private fun saveFrame(bitmap: Bitmap, label: String): String = runCatching {
+        val directory = InstrumentationRegistry.getInstrumentation()
+            .targetContext
+            .getExternalFilesDir(null)
+        val file = java.io.File(directory, "$label.png")
+        file.outputStream().use { stream ->
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+        }
+        file.absolutePath
+    }.getOrElse { "unsaved:${it.javaClass.simpleName}" }
+
+    private fun notificationPrecondition(): String {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val granted = context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED
+        val history = runBlocking { PermissionHistoryStore(context).current() }
+        return "notificationsGranted=$granted " +
+            "hasRequestedNotifications=${history.hasRequestedNotifications}"
+    }
+
+    /**
      * Every sample is reported, not just the first mismatch.
      *
      * "pixel N was not fog" cannot distinguish a cover that failed to draw from a frame that captured
      * nothing at all, and those need opposite fixes. The geometry is included for the same reason: a
-     * sample can only mean something if it actually landed inside the captured map.
+     * sample can only mean something if it actually landed inside the captured map. The notification
+     * precondition rides along because a notice card over the map is indistinguishable from bare
+     * basemap at the pixel level.
      */
-    private fun assertFogCoverPixels(bitmap: Bitmap, origin: IntArray, size: IntArray) {
+    private fun assertFogCoverPixels(
+        bitmap: Bitmap,
+        origin: IntArray,
+        size: IntArray,
+        precondition: String,
+    ) {
         // V02-012 design 2: the cover is the default fog colour at the shared fog opacity, so a
         // covered pixel is fog blended over the basemap - the codec's revealed-fog window. Labels
         // and icons draw beneath the cover (dimmed, never bare), so the rule is the prover's
@@ -352,6 +463,7 @@ class GoogleProductionLauncherMapHostTest {
                 "b${FogTilePngCodec.revealedFogChannelRange(FogTilePngCodec.DEFAULT_FOG_COLOR.blue, 2)} " +
                 "bitmap=${bitmap.width}x${bitmap.height} config=${bitmap.config} " +
                 "mapOrigin=${origin[0]},${origin[1]} mapSize=${size[0]}x${size[1]} " +
+                "$precondition " +
                 "mismatched=${mismatched.size}/${readings.size} (at most ${readings.size - COVER_STRONG_MATCHES} allowed) samples=[" +
                 readings.joinToString(" ") { (point, inBitmap, actual) ->
                     "${point.first},${point.second}=" +
@@ -423,6 +535,47 @@ class GoogleProductionLauncherMapHostTest {
             "cover=${mapView.getTag(R.id.map_fog_cover_up)} " +
             "syncCover=${mapView.getTag(R.id.map_fog_synchronous_cover_up)} " +
             "attached=${mapView.isAttachedToWindow} shown=${mapView.isShown}]"
+
+    /**
+     * Raise a safety cover and return once it is observed up, so the caller can background the host
+     * while a bounded deadline is actually armed.
+     *
+     * The cover and its 20 s deadline are armed on the *rising* edge of a generation, so this drives
+     * one rather than waiting for the app to produce one on its own. A move to a low zoom is chosen
+     * deliberately: a wide viewport is this app's expensive raster, which holds the cover up long
+     * enough to be seen at a 50 ms poll instead of racing a sub-frame window. Two zooms alternate so
+     * a second attempt is a real camera change rather than a no-op the coordinator can coalesce.
+     */
+    private fun armAFreshCover(
+        scenario: ActivityScenario<MainActivity>,
+        mapView: MapView,
+    ): Boolean {
+        if (mapView.getTag(R.id.map_fog_cover_up) == true) return true
+        val mapReady = CountDownLatch(1)
+        val mapRef = AtomicReference<com.google.android.gms.maps.GoogleMap>()
+        scenario.onActivity {
+            mapView.getMapAsync { map ->
+                mapRef.set(map)
+                mapReady.countDown()
+            }
+        }
+        if (!mapReady.await(30, TimeUnit.SECONDS)) return false
+        repeat(4) { attempt ->
+            scenario.onActivity {
+                requireNotNull(mapRef.get()).moveCamera(
+                    CameraUpdateFactory.newLatLngZoom(
+                        LatLng(25.033, 121.5654),
+                        if (attempt % 2 == 0) 4f else 5f,
+                    ),
+                )
+            }
+            repeat(100) {
+                if (mapView.getTag(R.id.map_fog_cover_up) == true) return true
+                Thread.sleep(50L)
+            }
+        }
+        return mapView.getTag(R.id.map_fog_cover_up) == true
+    }
 
     private fun awaitTag(
         mapView: MapView,

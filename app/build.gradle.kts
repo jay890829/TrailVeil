@@ -539,6 +539,7 @@ android {
         harnessBuildTypes.forEach { variant ->
             getByName(variant).kotlin.srcDir("src/harness/java")
             getByName(variant).res.srcDir("src/harness/res")
+            getByName(variant).assets.srcDir("src/harness/assets")
             getByName("test${variant.replaceFirstChar(Char::uppercase)}")
                 .kotlin.srcDir("src/testHarness/java")
         }
@@ -831,6 +832,20 @@ fun registerProviderBoundaryCheck(variant: String, google: Boolean) {
                 val googleMapsClasses = dexCount("Lcom/google/android/gms/maps/")
                 val mapLibreNative = nativeLibraries.any { it.contains("maplibre") }
 
+                val trackGeometryClasses = dexCount("Lorg/locationtech/jts/")
+                if (variant in harnessBuildTypes) {
+                    check(trackGeometryClasses > 0 && dexCount("TrackRegionGeometryEngine") > 0) {
+                        "$variant APK lost the native track geometry experiment"
+                    }
+                    check(zip.getEntry("assets/licenses/jts-1.20.0-EDL.txt") != null) {
+                        "$variant APK lost the geometry dependency license"
+                    }
+                } else {
+                    check(trackGeometryClasses == 0 && dexCount("TrackRegionGeometryEngine") == 0) {
+                        "$variant APK carries harness-only track geometry"
+                    }
+                }
+
                 if (google) {
                     // Positive control first: if this reader cannot find the provider that IS
                     // here, its findings about the one that is not are worthless.
@@ -1114,6 +1129,10 @@ kotlin {
 }
 
 dependencies {
+    // V03-013 track-derived geometry: physically absent from all distributed variants.
+    harnessBuildTypes.forEach { variant ->
+        add("${variant}Implementation", "org.locationtech.jts:jts-core:1.20.0")
+    }
     implementation(platform(libs.compose.bom))
     androidTestImplementation(platform(libs.compose.bom))
 

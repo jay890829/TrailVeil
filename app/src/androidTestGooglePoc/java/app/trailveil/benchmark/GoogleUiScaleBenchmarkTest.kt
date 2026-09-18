@@ -12,6 +12,9 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.BuildConfig
+import app.trailveil.map.GoogleFogArm
+import app.trailveil.map.GoogleFogCoverageArm
+import app.trailveil.map.GoogleCanonicalFogSurfaceBinding
 import app.trailveil.MainActivity
 import app.trailveil.R
 import app.trailveil.data.db.TrailVeilDatabase
@@ -77,6 +80,38 @@ import org.junit.runner.RunWith
  */
 @RunWith(AndroidJUnit4::class)
 class GoogleUiScaleBenchmarkTest {
+    private val existingDataMode get() = InstrumentationRegistry.getArguments()
+        .getString(ExistingDemoFrameFixture.ARGUMENT) == "true"
+    private var existingFixture: ExistingDemoFrameFixture? = null
+    private data class CameraFence(val binding: GoogleCanonicalFogSurfaceBinding, val epoch: Long, val idleAt: Long, val generation: Long)
+    private var cameraFence: CameraFence? = null
+
+    /** Read this exact build's internal clocks on Main; a renamed field must fail the test. */
+    private fun bindingClock(binding: GoogleCanonicalFogSurfaceBinding, name: String): Long =
+        GoogleCanonicalFogSurfaceBinding::class.java.getDeclaredField(name).let {
+            it.isAccessible = true; checkNotNull(it.get(binding) as? Long) { "Binding clock $name is unavailable" }
+        }
+
+    private fun selectedNativeReady(mapView: View): Boolean {
+        val binding = mapView.getTag(R.id.map_fog_binding_instance) as? GoogleCanonicalFogSurfaceBinding ?: return false
+        val generation = (mapView.getTag(R.id.map_fog_canonical_generation) as? String)?.toLongOrNull() ?: return false
+        val state = binding.describeForTesting()
+        val fence = cameraFence
+        return GoogleFogArm.DEFAULT == GoogleFogArm.TRACK_VECTOR &&
+            GoogleFogArm.activeArm == GoogleFogArm.TRACK_VECTOR &&
+            GoogleFogCoverageArm.trackVector && GoogleFogCoverageArm.profile.paddingTiles == 0 &&
+            !GoogleFogCoverageArm.mosaicOverlay && !GoogleFogCoverageArm.screenStencil && !GoogleFogCoverageArm.vectorPolygon &&
+            state.startsWith("baselineReady=true mapLoaded=true hostStopped=false ") &&
+            state.contains("installer[trackNative[") && state.contains("released=false renderWork=null ") &&
+            state.contains("coordinator[pending=null installed=$generation coverUp=false reason=null terminal=false retry=false trace=") &&
+            !binding.programmedFlightActive() &&
+            (fence == null || (fence.binding === binding && generation >= fence.generation &&
+                bindingClock(binding, "cameraEpoch") > fence.epoch &&
+                bindingClock(binding, "lastCameraIdleAtMillis") > fence.idleAt)) &&
+            ExistingDemoFrameFixture.noNoticeCards(mapView)
+    }
+
+
     @Test
     fun mainMapPanZoomAndLifecycleRecoveryAtCanonicalScale() {
         assumeTrue(
@@ -92,70 +127,74 @@ class GoogleUiScaleBenchmarkTest {
         if (enforcePhysicalGate) {
             assertTrue("The designated mid-range gate cannot run on an emulator", !isEmulator())
         }
-        populateEmptyProductionDatabase()
+        existingFixture = if (existingDataMode) ExistingDemoFrameFixture() else null
+        if (!existingDataMode) populateEmptyProductionDatabase()
 
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            val activity = scenario.requireActivity()
-            // Exclude provider startup and the initial canonical rebuild from the fixed operation
-            // histogram. Readiness itself remains a hard precondition for collecting samples.
-            awaitMapState(scenario)
-            val frameMetrics = FrameMetricsAggregator(FrameMetricsAggregator.TOTAL_DURATION)
-            frameMetrics.add(activity)
-            try {
-                performDeterministicPanAndZoom(scenario)
-                val metrics = frameMetrics.remove(activity)
-                    ?.getOrNull(FrameMetricsAggregator.TOTAL_INDEX)
-                val summary = summarize(metrics)
-                // A count, not a presence check. See [MIN_FRAME_SAMPLES]: a run that
-                // reports too few frames has not measured a slow map, it has failed to
-                // see the map, and its p95 must not be quoted as one.
-                assertTrue(
-                    "Only ${summary.total} frames were sampled during Google pan/zoom, below the " +
-                        "$MIN_FRAME_SAMPLES floor. $PAN_ZOOM_ITERATIONS animations of " +
-                        "${CAMERA_ANIMATION_MILLIS}ms cannot yield this few if the aggregator can " +
-                        "see the map, so frameP95=${summary.p95Millis}ms and " +
-                        "frozenRatio=${summary.frozenRatio} from this run are not " +
-                        "measurements. First thing to check: whether the map draws through the " +
-                        "activity window this aggregator watches.",
-                    summary.total >= MIN_FRAME_SAMPLES,
-                )
-                assertTrue("p95 frame time was invalid: ${summary.p95Millis}", summary.p95Millis >= 0)
-                assertTrue(
-                    "Frozen-frame ratio was invalid: ${summary.frozenRatio}",
-                    summary.frozenRatio in 0.0..1.0,
-                )
-                if (enforcePhysicalGate) {
+        existingFixture.use {
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                val activity = scenario.requireActivity()
+                // Exclude provider startup and the initial canonical rebuild from the fixed operation
+                // histogram. Readiness itself remains a hard precondition for collecting samples.
+                awaitMapState(scenario)
+                val frameMetrics = FrameMetricsAggregator(FrameMetricsAggregator.TOTAL_DURATION)
+                frameMetrics.add(activity)
+                try {
+                    performDeterministicPanAndZoom(scenario)
+                    val metrics = frameMetrics.remove(activity)
+                        ?.getOrNull(FrameMetricsAggregator.TOTAL_INDEX)
+                    val summary = summarize(metrics)
+                    // A count, not a presence check. See [MIN_FRAME_SAMPLES]: a run that
+                    // reports too few frames has not measured a slow map, it has failed to
+                    // see the map, and its p95 must not be quoted as one.
                     assertTrue(
-                        "Pan/zoom p95 exceeded ${MAX_FRAME_P95_MILLIS}ms: " +
-                            "${summary.p95Millis}ms",
-                        summary.p95Millis <= MAX_FRAME_P95_MILLIS,
+                        "Only ${summary.total} frames were sampled during Google pan/zoom, below the " +
+                            "$MIN_FRAME_SAMPLES floor. $PAN_ZOOM_ITERATIONS animations of " +
+                            "${CAMERA_ANIMATION_MILLIS}ms cannot yield this few if the aggregator can " +
+                            "see the map, so frameP95=${summary.p95Millis}ms and " +
+                            "frozenRatio=${summary.frozenRatio} from this run are not " +
+                            "measurements. First thing to check: whether the map draws through the " +
+                            "activity window this aggregator watches.",
+                        summary.total >= MIN_FRAME_SAMPLES,
                     )
+                    assertTrue("p95 frame time was invalid: ${summary.p95Millis}", summary.p95Millis >= 0)
                     assertTrue(
-                        "Frozen-frame ratio must be below $MAX_FROZEN_RATIO: " +
-                            "${summary.frozenRatio}",
-                        summary.frozenRatio < MAX_FROZEN_RATIO,
+                        "Frozen-frame ratio was invalid: ${summary.frozenRatio}",
+                        summary.frozenRatio in 0.0..1.0,
                     )
-                }
-                val expectedCamera = readCamera(scenario)
-                val expectedFogGeneration = readFogGeneration(scenario)
+                    if (enforcePhysicalGate) {
+                        assertTrue(
+                            "Pan/zoom p95 exceeded ${MAX_FRAME_P95_MILLIS}ms: " +
+                                "${summary.p95Millis}ms",
+                            summary.p95Millis <= MAX_FRAME_P95_MILLIS,
+                        )
+                        assertTrue(
+                            "Frozen-frame ratio must be below $MAX_FROZEN_RATIO: " +
+                                "${summary.frozenRatio}",
+                            summary.frozenRatio < MAX_FROZEN_RATIO,
+                        )
+                    }
+                    existingFixture?.assertUnchanged("after-pan-zoom")
+                    val expectedCamera = readCamera(scenario)
+                    val expectedFogGeneration = readFogGeneration(scenario)
 
-                repeat(LIFECYCLE_RECOVERY_COUNT) { recoveryIndex ->
-                    scenario.moveToState(Lifecycle.State.CREATED)
-                    awaitHostStopped(scenario, recoveryIndex + 1)
-                    scenario.moveToState(Lifecycle.State.RESUMED)
-                    awaitMapState(
-                        scenario = scenario,
-                        expectedCamera = expectedCamera,
-                        requireOrientation = true,
-                        minimumFogGeneration = expectedFogGeneration,
-                        recoveryNumber = recoveryIndex + 1,
-                    )
+                    repeat(LIFECYCLE_RECOVERY_COUNT) { recoveryIndex ->
+                        scenario.moveToState(Lifecycle.State.CREATED)
+                        awaitHostStopped(scenario, recoveryIndex + 1)
+                        scenario.moveToState(Lifecycle.State.RESUMED)
+                        awaitMapState(
+                            scenario = scenario,
+                            expectedCamera = expectedCamera,
+                            requireOrientation = true,
+                            minimumFogGeneration = expectedFogGeneration,
+                            recoveryNumber = recoveryIndex + 1,
+                        )
+                    }
+                    report(summary, enforcePhysicalGate)
+                } finally {
+                    // A crash or ANR prevents a lifecycle transition or map-ready callback from
+                    // completing, and therefore fails this instrumentation test.
+                    frameMetrics.stop()
                 }
-                report(summary, enforcePhysicalGate)
-            } finally {
-                // A crash or ANR prevents a lifecycle transition or map-ready callback from
-                // completing, and therefore fails this instrumentation test.
-                frameMetrics.stop()
             }
         }
     }
@@ -190,7 +229,14 @@ class GoogleUiScaleBenchmarkTest {
             val map = awaitMap(scenario)
             val target = CAMERA_STEPS[index % CAMERA_STEPS.size]
             val settled = CountDownLatch(1)
+            val liveView = awaitMapView(scenario)
             scenario.onActivity {
+                if (existingDataMode) {
+                    val binding = checkNotNull(liveView.getTag(R.id.map_fog_binding_instance) as? GoogleCanonicalFogSurfaceBinding)
+                    cameraFence = CameraFence(binding, bindingClock(binding, "cameraEpoch"),
+                        bindingClock(binding, "lastCameraIdleAtMillis"),
+                        checkNotNull((liveView.getTag(R.id.map_fog_canonical_generation) as? String)?.toLongOrNull()))
+                }
                 map.animateCamera(
                     CameraUpdateFactory.newLatLngZoom(target.location, target.zoom),
                     CAMERA_ANIMATION_MILLIS,
@@ -215,9 +261,10 @@ class GoogleUiScaleBenchmarkTest {
                     .target(target.location)
                     .zoom(target.zoom)
                     .build(),
-                minimumFogGeneration = completedFogGeneration + 1L,
+                minimumFogGeneration = completedFogGeneration + if (existingDataMode) 0L else 1L,
             )
             completedFogGeneration = requireNotNull(rendered.fogGeneration)
+            cameraFence = null
         }
     }
 
@@ -260,7 +307,9 @@ class GoogleUiScaleBenchmarkTest {
                     MapState(
                         mapVisible = mapView.isShown,
                         camera = map.cameraPosition,
-                        coverDown = mapView.getTag(R.id.map_fog_cover_up) == false,
+                        coverDown = mapView.getTag(R.id.map_fog_cover_up) == false &&
+                            mapView.getTag(R.id.map_fog_synchronous_cover_up) == false &&
+                            (!existingDataMode || selectedNativeReady(mapView)),
                         // GoogleHostedMapSurface publishes the canonical generation as the decimal
                         // string of the Long id, not as a Long. Read it as it is actually typed.
                         fogGeneration =
@@ -372,7 +421,7 @@ class GoogleUiScaleBenchmarkTest {
 
     private fun report(summary: FrameSummary, enforcePhysicalGate: Boolean) {
         val deviceClass = when {
-            enforcePhysicalGate -> "designated mid-range physical device"
+            enforcePhysicalGate -> if (existingDataMode) "designated physical device" else "designated mid-range physical device"
             isEmulator() -> "emulator; engineering evidence only"
             else -> "physical device not designated as mid-range; engineering evidence only"
         }
@@ -381,14 +430,15 @@ class GoogleUiScaleBenchmarkTest {
             Bundle().apply {
                 putString(
                     "stream",
-                    "TrailVeil Google UI scale benchmark seed=${ScaleBenchmarkFixture.SEED} " +
-                        "points=$CANONICAL_POINT_COUNT panZoom=$PAN_ZOOM_ITERATIONS " +
+                    "TrailVeil Google UI scale benchmark " +
+                        (existingFixture?.description ?: "seed=${ScaleBenchmarkFixture.SEED} points=$CANONICAL_POINT_COUNT") +
+                        " panZoom=$PAN_ZOOM_ITERATIONS " +
                         "lifecycleRecoveries=$LIFECYCLE_RECOVERY_COUNT " +
                         "frameP95=${summary.p95Millis}ms " +
                         "frozenRatio=${"%.4f".format(Locale.US, summary.frozenRatio)} " +
                         "frames=${summary.total}; basemap=google-live; $deviceClass; " +
                         if (enforcePhysicalGate) {
-                            "mid-range performance gate enforced\n"
+                            if (existingDataMode) "designated-device frame gate enforced\n" else "mid-range performance gate enforced\n"
                         } else {
                             "no device performance gate applied\n"
                         },

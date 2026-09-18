@@ -3,8 +3,10 @@ package app.trailveil.map
 import app.trailveil.map.fog.FogBackdropGeometry
 import app.trailveil.map.fog.FogTileBounds
 import app.trailveil.map.fog.FogTileMosaic
+import app.trailveil.map.fog.FogViewportPresentation
 import app.trailveil.map.fog.WebMercator
 import com.google.android.gms.maps.model.LatLng
+import app.trailveil.harness.NativeFogBackdropGeometry
 
 /**
  * The `Polygon` geometry both non-tile arms need, in one place because getting it wrong reveals
@@ -48,47 +50,11 @@ internal object GoogleFogPolygonGeometry {
      * belong to them, the same division of labour as `extentGuard`. Any strip that comes out
      * degenerate is dropped rather than emitted as a zero-area ring.
      */
-    fun surroundComplementOf(mosaic: FogTileMosaic): List<FogTileBounds> {
-        val surround = FogBackdropGeometry.extent(mosaic)
-        val image = mosaic.bounds
-        val north = WebMercator.latitudeAtNormalizedY(surround.northNormalizedY)
-        val south = WebMercator.latitudeAtNormalizedY(surround.southNormalizedY)
-        val halfDegrees = surround.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
-        // A surround that reaches all the way round has no east or west edge to complement; its
-        // north and south strips still span only the latitudes the surround owns.
-        val west = if (surround.wrapsWorld) {
-            -FogBackdropGeometry.WORLD_LONGITUDE_SPAN / 2.0
-        } else {
-            surround.centerLongitude - halfDegrees
-        }
-        val east = if (surround.wrapsWorld) {
-            FogBackdropGeometry.WORLD_LONGITUDE_SPAN / 2.0
-        } else {
-            surround.centerLongitude + halfDegrees
-        }
-        val strips = mutableListOf<FogTileBounds>()
-        fun add(
-            westLongitude: Double,
-            southLatitude: Double,
-            eastLongitude: Double,
-            northLatitude: Double,
-        ) {
-            if (eastLongitude - westLongitude <= 0.0 || northLatitude - southLatitude <= 0.0) return
-            if (!westLongitude.isFinite() || !eastLongitude.isFinite()) return
-            if (!southLatitude.isFinite() || !northLatitude.isFinite()) return
-            strips += FogTileBounds(
-                westLongitude = westLongitude,
-                southLatitude = southLatitude,
-                eastLongitude = eastLongitude,
-                northLatitude = northLatitude,
-            )
-        }
-        add(west, image.northLatitude, east, north)
-        add(west, south, east, image.southLatitude)
-        add(west, image.southLatitude, image.westLongitude, image.northLatitude)
-        add(image.eastLongitude, image.southLatitude, east, image.northLatitude)
-        return strips
-    }
+    fun surroundComplementOf(mosaic: FogTileMosaic): List<FogTileBounds> =
+        NativeFogBackdropGeometry.complement(FogBackdropGeometry.extent(mosaic), mosaic.bounds)
+
+    fun backdropRectangles(mosaic: FogViewportPresentation): List<FogTileBounds> =
+        NativeFogBackdropGeometry.googleRectangles(FogBackdropGeometry.extent(mosaic), mosaic.bounds)
 
     /** A rectangle as a Google ring. Counter-clockwise is not required; closure is implicit. */
     fun ring(bounds: FogTileBounds): List<LatLng> = listOf(

@@ -9,6 +9,7 @@ import android.view.View
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -32,6 +33,7 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -58,6 +60,13 @@ private const val MAP_STATE_PROVIDER = "google"
 private const val DETAIL_SINGLE_POINT_ZOOM = 16.0f
 private const val DETAIL_BOUNDS_PADDING_PX = 72
 private const val MAP_LOADED_CALLBACK_RETRY_MILLIS = 100L
+
+/**
+ * How many cover windows the host's net waits while the binding reports a held gesture, where the
+ * binding's own deadline is deliberately stopped. Three: long enough that no realistic drag is
+ * charged, short enough that a binding which died mid-gesture still cannot leave the cover up.
+ */
+private const val HELD_GESTURE_NET_WINDOWS = 3L
 
 /** One host claim plus the optional provider-policy claim owned by the binding at launch time. */
 private class CameraFlightClaim(
@@ -588,6 +597,11 @@ internal fun GoogleHostedMapSurface(
                         GoogleFogSurfaceContext(
                             map = map,
                             runtime = fogRuntime,
+                            awaitCoverCommitted = {
+                                compositionActive.get() && mapCallbackEpoch.get() == effectEpoch &&
+                                    synchronousFogCover.awaitCommitted() &&
+                                    compositionActive.get() && mapCallbackEpoch.get() == effectEpoch
+                            },
                             onStateChanged = { state ->
                                 if (
                                     compositionActive.get() &&
@@ -909,14 +923,27 @@ internal fun GoogleHostedMapSurface(
     // Hosted-surface deadline starts with the first visible cover, before the asynchronously
     // loaded FogRuntime exists. `fogRuntime` is intentionally NOT a key: null -> ready at 19 s
     // retains the original deadline instead of granting another full window.
-    LaunchedEffect(mapView, fogRequired, fogCoverUp, fogCoverTimeoutMillis, lifecycle) {
-        if (!fogRequired || !fogCoverUp) return@LaunchedEffect
+    //
+    // Once the binding exists it owns the deadline (its clock stops while a person's gesture holds
+    // the camera and restarts in full when that gesture settles; `gestureSettleClock` counts those
+    // settles and nothing else - not the binding's first arm, so a runtime that arrives at 19 s
+    // still keeps this window). This effect is the net for a binding that stopped publishing - a
+    // superseded epoch publishes neither the cover nor its own terminal decision (V02-007) - so it
+    // restarts with the binding's settle clock, and while the binding reports a held gesture
+    // it waits HELD_GESTURE_NET_WINDOWS full windows rather than none: a cover never lives forever.
+    // An explicit harness canonical replacement pauses this renderer net until its transactions
+    // finish; runtime arrival alone remains absent from the keys and cannot extend the window.
+    val fogGestureHeld = fogState?.gestureHeld == true
+    val fogGestureSettleClock = fogState?.gestureSettleClock ?: 0L
+    val canonicalReplacementInProgress = fogState?.canonicalReplacementInProgress == true
+    LaunchedEffect(mapView, fogRequired, fogCoverUp, fogCoverTimeoutMillis, lifecycle, fogGestureSettleClock, fogGestureHeld, canonicalReplacementInProgress) {
+        if (!fogRequired || !fogCoverUp || canonicalReplacementInProgress) return@LaunchedEffect
         // Gated on STARTED for the same reason the binding's own deadline is: a stopped renderer
         // issues no tile requests and cannot serve a snapshot, so the cover has no way to lower and
         // this would terminate the surface purely for being backgrounded. repeatOnLifecycle
         // cancels the wait on stop and starts a fresh full window on return.
         lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
-            delay(fogCoverTimeoutMillis)
+            delay(if (fogGestureHeld) fogCoverTimeoutMillis * HELD_GESTURE_NET_WINDOWS else fogCoverTimeoutMillis)
             if (fogCoverUp && compositionActive.get()) {
                 currentOnTerminalFailure(ProviderFallbackReason.INITIALIZATION_FAILURE)
             }
@@ -971,9 +998,16 @@ internal fun GoogleHostedMapSurface(
             modifier = Modifier.matchParentSize(),
         )
         GoogleFogArmBadge(
-            modifier = Modifier.align(Alignment.BottomStart),
+            // Capped in width: the stage line made the badge wrap across the whole bottom edge and
+            // under the host's bottom-end controls (recentre, start exploring). 240 dp leaves the
+            // trailing ~40% of a 411 dp phone width to those controls.
+            modifier = Modifier
+                .align(Alignment.BottomStart)
+                .widthIn(max = 240.dp),
             lastCoverMillis = fogState?.lastCoverIntervalMillis,
             maximumCoverMillis = fogState?.maximumCoverIntervalMillis,
+            surfaceDescription = fogState?.surfaceDescription,
+            stageSummary = fogState?.stageSummary,
         )
     }
 }

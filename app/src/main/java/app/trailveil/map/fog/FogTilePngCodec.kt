@@ -18,7 +18,9 @@ data class FogTileColor(
 }
 
 /**
- * Encodes the SDK-independent fog mask as a deterministic 8-bit RGBA PNG.
+ * Encodes the SDK-independent fog mask as a deterministic PNG with exact binary alpha.
+ * Mixed masks use two 8-bit RGBA palette entries and lossless one-bit indices; uniform opaque
+ * tiles retain the bounded RGBA PNG cache. No pixel colour or opacity is quantized.
  *
  * The Google provider treats alpha zero as explored and every non-zero canonical fog value as
  * fully opaque. This prevents default Google labels/POIs from remaining legible through the
@@ -181,6 +183,10 @@ object FogTilePngCodec {
         require(mask.width == TILE_SIZE && mask.height == TILE_SIZE) {
             "fog masks must be exactly ${TILE_SIZE}x$TILE_SIZE"
         }
+        if (mask.hasCompleteRasterData && mask.hasNoTransparentPixels()) return opaqueEncodedCopy(color)
+        if (mask.hasCompleteRasterData) {
+            return encodeRows(mask.indexedPngRows(), color)
+        }
         val rawRows = ByteArray((TILE_SIZE * 4 + 1) * TILE_SIZE)
         for (y in 0 until TILE_SIZE) {
             val rowOffset = y * (TILE_SIZE * 4 + 1)
@@ -197,24 +203,39 @@ object FogTilePngCodec {
         return encodeRows(rawRows)
     }
 
-    /** Builds an opaque tile without constructing a mask or using a transparent NO_TILE value. */
-    fun opaquePlaceholder(color: FogTileColor = DEFAULT_FOG_COLOR): ByteArray {
-        val rawRows = ByteArray((TILE_SIZE * 4 + 1) * TILE_SIZE)
-        for (y in 0 until TILE_SIZE) {
-            val rowOffset = y * (TILE_SIZE * 4 + 1)
-            rawRows[rowOffset] = 0
-            for (x in 0 until TILE_SIZE) {
-                val pixelOffset = rowOffset + 1 + x * 4
-                rawRows[pixelOffset] = color.red.toByte()
-                rawRows[pixelOffset + 1] = color.green.toByte()
-                rawRows[pixelOffset + 2] = color.blue.toByte()
-                rawRows[pixelOffset + 3] = 0xff.toByte()
+    // Only eight fixed-size opaque PNGs, keyed by immutable RGB. Each caller owns its returned copy.
+    private val opaqueEncoded = LinkedHashMap<FogTileColor, ByteArray>(8, 0.75f, true)
+    private fun opaqueEncodedCopy(color: FogTileColor): ByteArray {
+        synchronized(opaqueEncoded) { opaqueEncoded[color]?.let { return it.copyOf() } }
+        val computed = opaquePlaceholder(color)
+        return synchronized(opaqueEncoded) {
+            val owned = opaqueEncoded[color] ?: computed.also {
+                opaqueEncoded[color] = it
+                while (opaqueEncoded.size > 8) {
+                    val iterator = opaqueEncoded.entries.iterator(); iterator.next(); iterator.remove()
+                }
             }
+            owned.copyOf()
         }
-        return encodeRows(rawRows)
     }
 
-    private fun encodeRows(rawRows: ByteArray): ByteArray {
+    /** Builds an opaque tile without constructing a mask or using a transparent NO_TILE value. */
+    fun opaquePlaceholder(color: FogTileColor = DEFAULT_FOG_COLOR): ByteArray = encodeRows(opaqueRows(color))
+
+    private fun opaqueRows(color: FogTileColor): ByteArray {
+        val row = ByteArray(TILE_SIZE * 4)
+        for (x in 0 until TILE_SIZE) {
+            val offset = x * 4
+            row[offset] = color.red.toByte(); row[offset + 1] = color.green.toByte()
+            row[offset + 2] = color.blue.toByte(); row[offset + 3] = 0xff.toByte()
+        }
+        val stride = TILE_SIZE * 4 + 1
+        val rows = ByteArray(stride * TILE_SIZE)
+        for (y in 0 until TILE_SIZE) row.copyInto(rows, y * stride + 1)
+        return rows
+    }
+
+    private fun encodeRows(rawRows: ByteArray, paletteColor: FogTileColor? = null): ByteArray {
         val compressed = Deflater(Deflater.BEST_SPEED).run {
             setInput(rawRows)
             finish()
@@ -236,12 +257,19 @@ object FogTilePngCodec {
             writeChunk("IHDR", byteArrayOf(
                 0, 0, 1, 0, // width 256
                 0, 0, 1, 0, // height 256
-                8, // bit depth
-                6, // truecolour with alpha
+                if (paletteColor == null) 8 else 1, // sample depth or palette index depth
+                if (paletteColor == null) 6 else 3, // RGBA or indexed colour
                 0, // compression method
                 0, // filter method
                 0, // no interlace
             ))
+            if (paletteColor != null) {
+                writeChunk("PLTE", byteArrayOf(
+                    paletteColor.red.toByte(), paletteColor.green.toByte(), paletteColor.blue.toByte(),
+                    paletteColor.red.toByte(), paletteColor.green.toByte(), paletteColor.blue.toByte(),
+                ))
+                writeChunk("tRNS", byteArrayOf(0, 0xff.toByte()))
+            }
             writeChunk("IDAT", compressed)
             writeChunk("IEND", ByteArray(0))
         }.toByteArray()

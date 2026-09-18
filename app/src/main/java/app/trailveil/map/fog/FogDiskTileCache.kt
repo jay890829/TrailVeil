@@ -187,8 +187,9 @@ class FogDiskTileCache(
     }
 
     private fun trimToSize(): Boolean {
-        cleanupTemporaryFiles(rootDirectory)
-        val files = maskFiles(rootDirectory).sortedWith(
+        // Every tile write trims. Collect entries and remove owned orphan temporaries in the same
+        // traversal instead of stat'ing the entire cache tree twice; durability and LRU stay intact.
+        val files = maskFiles(rootDirectory, cleanupTemporaries = true).sortedWith(
             compareBy<File>(File::lastModified).thenBy(File::getAbsolutePath),
         )
         var byteCount = files.sumOf(File::length)
@@ -263,11 +264,18 @@ class FogDiskTileCache(
         if (file.isDirectory) file.listFiles().orEmpty().forEach(::cleanupTemporaryFiles)
     }
 
-    private fun maskFiles(file: File): List<File> {
+    private fun maskFiles(file: File, cleanupTemporaries: Boolean = false): List<File> {
         if (!file.exists() || Files.isSymbolicLink(file.toPath())) return emptyList()
-        if (file.isFile) return if (entryRenderVersion(file) != null) listOf(file) else emptyList()
+        if (file.isFile) {
+            if (cleanupTemporaries && file.name.startsWith(".y") &&
+                file.name.contains(".mask.") && file.name.endsWith(".tmp")) {
+                file.delete()
+                return emptyList()
+            }
+            return if (entryRenderVersion(file) != null) listOf(file) else emptyList()
+        }
         if (!file.isDirectory) return emptyList()
-        return file.listFiles().orEmpty().flatMap(::maskFiles)
+        return file.listFiles().orEmpty().flatMap { child -> maskFiles(child, cleanupTemporaries) }
     }
 
     private fun entryRenderVersion(file: File): Int? = entryKey(file)?.renderVersion

@@ -2,6 +2,7 @@ package app.trailveil.recording
 
 import android.content.Context
 import android.location.LocationManager
+import android.os.Build
 import app.trailveil.data.db.TrailVeilDatabase
 import app.trailveil.data.location.LocationEngine
 import app.trailveil.data.location.PlatformLocationEngine
@@ -9,6 +10,7 @@ import app.trailveil.data.history.RecordingHistoryDataSource
 import app.trailveil.data.history.RoomRecordingHistoryDataSource
 import app.trailveil.data.map.RoomPersistedTrackPointChangeFeed
 import app.trailveil.data.map.RoomViewportTrackPointReader
+import app.trailveil.data.map.enableWideRawReads
 import app.trailveil.data.map.ViewportTrackDataSource
 import app.trailveil.data.recording.RecordingOperationId
 import app.trailveil.data.recording.ReconcileStartingResult
@@ -23,6 +25,7 @@ import app.trailveil.map.fog.FogTilePipeline
 import app.trailveil.map.fog.FogTileRenderer
 import app.trailveil.map.fog.FogViewportCoordinator
 import app.trailveil.map.fogMosaicPaddingTiles
+import app.trailveil.map.fogNativeGeometryEngine
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
@@ -153,16 +156,21 @@ internal class AppContainer(context: Context) : RecordingRuntimeDependencies {
             diskCache = diskCache,
             renderMask = FogTileRenderer(style)::render,
         )
+        val nativeEngine = fogNativeGeometryEngine()
+        val reader = RoomViewportTrackPointReader(dao).apply {
+            if (nativeEngine != null && Build.VERSION.SDK_INT >= 35) enableWideRawReads(database)
+        }
         return FogRuntime(
             viewportCoordinator = FogViewportCoordinator(
-                trackDataSource = ViewportTrackDataSource(RoomViewportTrackPointReader(dao)),
+                trackDataSource = ViewportTrackDataSource(reader),
                 pipeline = pipeline,
                 style = style,
                 // `V03-013`: a per-build-type seam. Every published variant answers with the
                 // shipped default; only a harness build can widen it, and widening only ever
                 // renders more fog around the same centre.
                 mosaicPaddingTiles = fogMosaicPaddingTiles(applicationContext),
-            ),
+                nativeGeometryEngine = nativeEngine,
+            ).apply { rasterProjectionEnabled = nativeEngine != null },
             pointChanges = RoomPersistedTrackPointChangeFeed(dao),
         )
     }

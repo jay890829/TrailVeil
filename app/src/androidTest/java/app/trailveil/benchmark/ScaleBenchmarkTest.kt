@@ -179,10 +179,10 @@ class ScaleBenchmarkTest {
         style: FogRenderStyle,
         expected: FogViewportRender? = null,
     ) {
-        check(render.keys.isNotEmpty() && render.mosaic.tileCount == render.keys.size) {
+        check(render.keys.isNotEmpty() && render.presentation.tileCount == render.keys.size) {
             "Fog render did not produce the requested tile mosaic"
         }
-        val alpha = render.mosaic.mask.copyAlpha()
+        val alpha = (render.presentation as app.trailveil.map.fog.FogTileMosaic).mask.copyAlpha()
         check(alpha.any { value -> (value.toInt() and 0xff) < style.fogAlpha }) {
             "Fog render contained no canonical reveal pixels"
         }

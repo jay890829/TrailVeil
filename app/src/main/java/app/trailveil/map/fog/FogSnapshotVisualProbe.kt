@@ -62,10 +62,22 @@ data class FogProbeExclusionZone(
 }
 
 /** Immutable visual-install oracle input for one exact provider viewport. */
+enum class FogProbeCandidateBank(val reverseX: Boolean, val reverseY: Boolean) {
+    FORWARD(false, false), REVERSE_X(true, false), REVERSE_Y(false, true), REVERSE_XY(true, true);
+
+    companion object {
+        fun forAttempt(attempt: Int): FogProbeCandidateBank {
+            require(attempt > 0)
+            return entries[(attempt - 1) % entries.size]
+        }
+    }
+}
+
 class FogSnapshotVisualProbePlan internal constructor(
     coverageKeys: Set<FogTileKey>,
     probesByKey: Map<FogTileKey, List<FogSnapshotVisualProbe>>,
     zoneBlockedKeys: Set<FogTileKey> = emptySet(),
+    val candidateBank: FogProbeCandidateBank = FogProbeCandidateBank.FORWARD,
 ) {
     val coverageKeys: Set<FogTileKey> =
         Collections.unmodifiableSet(LinkedHashSet(coverageKeys))
@@ -174,7 +186,11 @@ class FogSnapshotVisualProbePlanner(
         request: FogViewportCoverageRequest,
         masks: Map<FogTileKey, FogPixelMask>,
         exclusionZones: List<FogProbeExclusionZone> = emptyList(),
+        candidateBank: FogProbeCandidateBank = FogProbeCandidateBank.FORWARD,
+        /** Called at bounded work boundaries; cancellation throws rather than returning a partial plan. */
+        checkActive: () -> Unit = {},
     ): FogSnapshotVisualProbePlan {
+        checkActive()
         require(masks.isNotEmpty()) { "visual probe masks must not be empty" }
         require(masks.keys.all { key -> key.zoom == request.floorZoom }) {
             "visual probe masks must match the viewport zoom"
@@ -206,19 +222,23 @@ class FogSnapshotVisualProbePlanner(
         // that is not convex takes the per-pixel path for every tile, so the plan is identical
         // either way. The full-world rule is the y-range test isVisible applies, at tile grain.
         val convexPolygon = !fullWorld && isConvex(polygon)
-        val fullWorldMinimumY = polygon.minOf(ProjectedProbePoint::y)
-        val fullWorldMaximumY = polygon.maxOf(ProjectedProbePoint::y)
+        val preparedPolygon = PreparedProbePolygon(
+            polygon, if (convexPolygon) prepareSeparatingAxes(polygon) else emptyList(),
+        )
+        val fullWorldMinimumY = preparedPolygon.minimumY
+        val fullWorldMaximumY = preparedPolygon.maximumY
 
         /** Whether the projected rectangle (tile units, one world column) can hold a visible pixel centre. */
         fun rectangleMayHoldVisiblePixel(x0: Double, y0: Double, x1: Double, y1: Double): Boolean = when {
             fullWorld -> y0 < fullWorldMaximumY && y1 > fullWorldMinimumY
-            convexPolygon -> rectangleMeetsConvexPolygon(x0, y0, x1, y1, polygon)
+            convexPolygon -> rectangleMeetsConvexPolygon(x0, y0, x1, y1, preparedPolygon)
             else -> true
         }
 
         val probesByKey = LinkedHashMap<FogTileKey, List<FogSnapshotVisualProbe>>()
         val zoneBlockedKeys = LinkedHashSet<FogTileKey>()
         masks.forEach { (key, mask) ->
+            checkActive()
             require(mask.width > 0 && mask.height > 0) { "visual probe mask must be non-empty" }
             val nearestWorld = round((centerX - (key.x + 0.5)) / tileCount).toInt()
             val worldColumns = ((nearestWorld - 1)..(nearestWorld + 1)).map { world ->
@@ -231,12 +251,14 @@ class FogSnapshotVisualProbePlanner(
             val selection = findVisibleOpaqueProbes(
                 key = key,
                 mask = mask,
-                polygon = polygon,
+                polygon = preparedPolygon,
                 worldColumns = worldColumns,
                 tileCount = tileCount,
                 fullWorld = fullWorld,
                 exclusionZones = exclusionZones,
+                candidateBank = candidateBank,
                 rectangleMayHoldVisiblePixel = ::rectangleMayHoldVisiblePixel,
+                checkActive = checkActive,
             )
             if (selection.probes.isNotEmpty()) {
                 probesByKey[key] = selection.probes
@@ -246,7 +268,8 @@ class FogSnapshotVisualProbePlanner(
                 zoneBlockedKeys += key
             }
         }
-        return FogSnapshotVisualProbePlan(masks.keys, probesByKey, zoneBlockedKeys)
+        checkActive()
+        return FogSnapshotVisualProbePlan(masks.keys, probesByKey, zoneBlockedKeys, candidateBank)
     }
 
     private class ProbeSelection(
@@ -257,28 +280,51 @@ class FogSnapshotVisualProbePlanner(
     private fun findVisibleOpaqueProbes(
         key: FogTileKey,
         mask: FogPixelMask,
-        polygon: List<ProjectedProbePoint>,
+        polygon: PreparedProbePolygon,
         worldColumns: List<Int>,
         tileCount: Int,
         fullWorld: Boolean,
         exclusionZones: List<FogProbeExclusionZone>,
+        candidateBank: FogProbeCandidateBank,
         rectangleMayHoldVisiblePixel: (Double, Double, Double, Double) -> Boolean,
+        checkActive: () -> Unit,
     ): ProbeSelection {
         val probes = ArrayList<FogSnapshotVisualProbe>(blocksPerAxis * blocksPerAxis)
         var visibleOpaqueSeen = false
+        // Local to this mask/search. Empty zones or no visible opaque pixels allocate no cache arrays.
+        // Oversized dimensions retain the original calculation instead of growing this cache.
+        var latitudes: DoubleArray? = null
+        var longitudes: DoubleArray? = null
         fun outsideZones(x: Int, y: Int): Boolean {
             visibleOpaqueSeen = true
             if (exclusionZones.isEmpty()) return true
-            val normalizedX = (key.x + (x + 0.5) / mask.width) / tileCount
-            val normalizedY = (key.y + (y + 0.5) / mask.height) / tileCount
-            val latitude = WebMercator.latitudeAtNormalizedY(normalizedY)
-            val longitude = normalizedX * 360.0 - 180.0
+            val rows = latitudes ?: if (mask.height <= MAX_EXCLUSION_AXIS_CACHE) {
+                DoubleArray(mask.height) { Double.NaN }.also { latitudes = it }
+            } else null
+            val columns = longitudes ?: if (mask.width <= MAX_EXCLUSION_AXIS_CACHE) {
+                DoubleArray(mask.width) { Double.NaN }.also { longitudes = it }
+            } else null
+            // Preserve the exact arithmetic order. Valid tile pixel centres project finitely,
+            // so NaN is only an uncomputed marker; signed zero is retained as a cached value.
+            var latitude = if (rows == null) Double.NaN else rows[y]
+            if (latitude.isNaN()) {
+                val normalizedY = (key.y + (y + 0.5) / mask.height) / tileCount
+                latitude = WebMercator.latitudeAtNormalizedY(normalizedY)
+                if (rows != null) rows[y] = latitude
+            }
+            var longitude = if (columns == null) Double.NaN else columns[x]
+            if (longitude.isNaN()) {
+                val normalizedX = (key.x + (x + 0.5) / mask.width) / tileCount
+                longitude = normalizedX * 360.0 - 180.0
+                if (columns != null) columns[x] = longitude
+            }
             return exclusionZones.none { zone -> zone.contains(latitude, longitude) }
         }
         for (blockY in 0 until blocksPerAxis) {
             val yStart = blockY * mask.height / blocksPerAxis
             val yEnd = (blockY + 1) * mask.height / blocksPerAxis
             for (blockX in 0 until blocksPerAxis) {
+                checkActive()
                 val xStart = blockX * mask.width / blocksPerAxis
                 val xEnd = (blockX + 1) * mask.width / blocksPerAxis
                 // V02-012 design 2h: the tile cull at block grain. A tile the visible trapezoid
@@ -304,7 +350,7 @@ class FogSnapshotVisualProbePlanner(
                 val separation = maxOf(1, minOf(xEnd - xStart, yEnd - yStart) / 2)
                 val chosen = ArrayList<ProbePixel>(CANDIDATES_PER_BLOCK)
                 val strongCount = collectSeparatedPixels(
-                    mask, xStart, xEnd, yStart, yEnd, separation, chosen,
+                    mask, xStart, xEnd, yStart, yEnd, separation, chosen, candidateBank, checkActive,
                 ) { x, y ->
                     hasOpaqueNeighbourhood(mask, x, y) &&
                         isVisible(key, mask, x, y, polygon, worldColumns, fullWorld) &&
@@ -313,7 +359,7 @@ class FogSnapshotVisualProbePlanner(
                 // Weak pixels only fill the slots the strong pass could not, and they are appended
                 // after them, so a block's first candidate stays the best evidence available.
                 collectSeparatedPixels(
-                    mask, xStart, xEnd, yStart, yEnd, separation, chosen,
+                    mask, xStart, xEnd, yStart, yEnd, separation, chosen, candidateBank, checkActive,
                 ) { x, y ->
                     mask.alphaAt(x, y) != 0 &&
                         isVisible(key, mask, x, y, polygon, worldColumns, fullWorld) &&
@@ -353,19 +399,42 @@ class FogSnapshotVisualProbePlanner(
         yEnd: Int,
         separation: Int,
         into: MutableList<ProbePixel>,
+        candidateBank: FogProbeCandidateBank,
+        checkActive: () -> Unit,
         predicate: (Int, Int) -> Boolean,
     ): Int {
         var added = 0
         if (into.size >= CANDIDATES_PER_BLOCK) return added
-        for (y in yStart until yEnd) {
-            for (x in xStart until xEnd) {
+        val canScanNonZero = mask.hasCompleteRasterData &&
+            xStart >= 0 && xEnd <= mask.width && yStart >= 0 && yEnd <= mask.height
+        val rows = if (candidateBank.reverseY) (yEnd - 1 downTo yStart) else (yStart until yEnd)
+        for ((rowOrdinal, y) in rows.withIndex()) {
+            // A row check every eight rows bounds cancellation work without making a Job lookup
+            // part of every tiny candidate row. Each block/tile also checks before it starts.
+            if (rowOrdinal % 8 == 0) checkActive()
+            // Pay the scanner call only on rows whose block interval begins transparent.
+            // Dense rows keep the original per-pixel loop. Decide again after each callback,
+            // including in the weak pass; an empty interval must not read its first pixel.
+            val scanNonZero = !candidateBank.reverseX && canScanNonZero &&
+                xStart < xEnd && mask.alphaAt(xStart, y) == 0
+            var x = if (candidateBank.reverseX) xEnd - 1 else xStart
+            while (if (candidateBank.reverseX) x >= xStart else x < xEnd) {
+                // A zero centre cannot pass either predicate. Keep every row checkpoint and
+                // revisit live bytes on each scan; no zero summary survives a callback or pass.
+                // Truncated masks retain the original per-pixel access and exception order.
+                if (scanNonZero) {
+                    x = mask.nextNonZeroX(y, x, xEnd)
+                    if (x == xEnd) break
+                }
                 val crowded = into.any { chosen ->
                     maxOf(abs(chosen.x - x), abs(chosen.y - y)) < separation
                 }
-                if (crowded || !predicate(x, y)) continue
-                into += ProbePixel(x, y)
-                added += 1
-                if (into.size >= CANDIDATES_PER_BLOCK) return added
+                if (!crowded && predicate(x, y)) {
+                    into += ProbePixel(x, y)
+                    added += 1
+                    if (into.size >= CANDIDATES_PER_BLOCK) return added
+                }
+                x += if (candidateBank.reverseX) -1 else 1
             }
         }
         return added
@@ -386,24 +455,22 @@ class FogSnapshotVisualProbePlanner(
         mask: FogPixelMask,
         x: Int,
         y: Int,
-        polygon: List<ProjectedProbePoint>,
+        polygon: PreparedProbePolygon,
         worldColumns: List<Int>,
         fullWorld: Boolean,
     ): Boolean {
         val projectedY = key.y + (y + 0.5) / mask.height
-        return worldColumns.any { column ->
-            val point = ProjectedProbePoint(
-                x = column + (x + 0.5) / mask.width,
-                y = projectedY,
-            )
-            if (fullWorld) {
-                val minimumY = polygon.minOf(ProjectedProbePoint::y)
-                val maximumY = polygon.maxOf(ProjectedProbePoint::y)
-                point.y in minimumY..maximumY
+        val fractionalX = (x + 0.5) / mask.width
+        for (index in worldColumns.indices) {
+            val projectedX = worldColumns[index] + fractionalX
+            val visible = if (fullWorld) {
+                projectedY >= polygon.minimumY && projectedY <= polygon.maximumY
             } else {
-                pointInPolygon(point, polygon)
+                pointInPolygon(projectedX, projectedY, polygon.vertices)
             }
+            if (visible) return true
         }
+        return false
     }
 
     /** Strictly convex, in either winding; a degenerate or reflex polygon answers false. */
@@ -436,10 +503,37 @@ class FogSnapshotVisualProbePlanner(
         y0: Double,
         x1: Double,
         y1: Double,
-        polygon: List<ProjectedProbePoint>,
+        polygon: PreparedProbePolygon,
     ): Boolean {
-        if (polygon.all { point -> point.x < x0 } || polygon.all { point -> point.x > x1 }) return false
-        if (polygon.all { point -> point.y < y0 } || polygon.all { point -> point.y > y1 }) return false
+        if (polygon.maximumX < x0 || polygon.minimumX > x1) return false
+        if (polygon.maximumY < y0 || polygon.minimumY > y1) return false
+        for (index in polygon.axes.indices) {
+            val axis = polygon.axes[index]
+            val normalX = axis.normalX
+            val normalY = axis.normalY
+            var squareMinimum = Double.POSITIVE_INFINITY
+            var squareMaximum = Double.NEGATIVE_INFINITY
+            // Match the original nested x-then-y iteration and each multiply/add exactly.
+            var projected = x0 * normalX + y0 * normalY
+            squareMinimum = minOf(squareMinimum, projected)
+            squareMaximum = maxOf(squareMaximum, projected)
+            projected = x0 * normalX + y1 * normalY
+            squareMinimum = minOf(squareMinimum, projected)
+            squareMaximum = maxOf(squareMaximum, projected)
+            projected = x1 * normalX + y0 * normalY
+            squareMinimum = minOf(squareMinimum, projected)
+            squareMaximum = maxOf(squareMaximum, projected)
+            projected = x1 * normalX + y1 * normalY
+            squareMinimum = minOf(squareMinimum, projected)
+            squareMaximum = maxOf(squareMaximum, projected)
+            if (squareMaximum < axis.polygonMinimum || axis.polygonMaximum < squareMinimum) return false
+        }
+        return true
+    }
+
+    /** The request has four visible corners; these immutable projections are shared by all blocks. */
+    private fun prepareSeparatingAxes(polygon: List<ProjectedProbePoint>): List<ProbeSeparatingAxis> {
+        val axes = ArrayList<ProbeSeparatingAxis>(polygon.size)
         var previous = polygon.last()
         for (current in polygon) {
             val normalX = -(current.y - previous.y)
@@ -453,30 +547,23 @@ class FogSnapshotVisualProbePlanner(
                 polygonMinimum = minOf(polygonMinimum, projected)
                 polygonMaximum = maxOf(polygonMaximum, projected)
             }
-            var squareMinimum = Double.POSITIVE_INFINITY
-            var squareMaximum = Double.NEGATIVE_INFINITY
-            for (cornerX in doubleArrayOf(x0, x1)) {
-                for (cornerY in doubleArrayOf(y0, y1)) {
-                    val projected = cornerX * normalX + cornerY * normalY
-                    squareMinimum = minOf(squareMinimum, projected)
-                    squareMaximum = maxOf(squareMaximum, projected)
-                }
-            }
-            if (squareMaximum < polygonMinimum || polygonMaximum < squareMinimum) return false
+            axes += ProbeSeparatingAxis(normalX, normalY, polygonMinimum, polygonMaximum)
         }
-        return true
+        return axes
     }
 
     private fun pointInPolygon(
-        point: ProjectedProbePoint,
+        pointX: Double,
+        pointY: Double,
         polygon: List<ProjectedProbePoint>,
     ): Boolean {
         var inside = false
         var previous = polygon.last()
-        polygon.forEach { current ->
+        for (index in polygon.indices) {
+            val current = polygon[index]
             if (
-                (current.y > point.y) != (previous.y > point.y) &&
-                point.x < (previous.x - current.x) * (point.y - current.y) /
+                (current.y > pointY) != (previous.y > pointY) &&
+                pointX < (previous.x - current.x) * (pointY - current.y) /
                 (previous.y - current.y) + current.x
             ) {
                 inside = !inside
@@ -505,9 +592,25 @@ class FogSnapshotVisualProbePlanner(
     }
 
     private data class ProjectedProbePoint(val x: Double, val y: Double)
+    private class PreparedProbePolygon(
+        val vertices: List<ProjectedProbePoint>,
+        val axes: List<ProbeSeparatingAxis>,
+    ) {
+        val minimumX = vertices.minOf(ProjectedProbePoint::x)
+        val maximumX = vertices.maxOf(ProjectedProbePoint::x)
+        val minimumY = vertices.minOf(ProjectedProbePoint::y)
+        val maximumY = vertices.maxOf(ProjectedProbePoint::y)
+    }
+    private data class ProbeSeparatingAxis(
+        val normalX: Double,
+        val normalY: Double,
+        val polygonMinimum: Double,
+        val polygonMaximum: Double,
+    )
     private data class ProbePixel(val x: Int, val y: Int)
 
     companion object {
+        private const val MAX_EXCLUSION_AXIS_CACHE = 1024
         const val DEFAULT_BLOCKS_PER_AXIS = 16
 
         /**

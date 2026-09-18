@@ -1,5 +1,7 @@
 package app.trailveil.googlepoc
 
+import app.trailveil.map.acknowledgeMapAuditTerminalNotice
+import app.trailveil.map.liveMapAuditNotices
 import app.trailveil.map.fog.FogTilePngCodec
 import app.trailveil.map.fog.FogTileColor
 import android.graphics.Bitmap
@@ -197,6 +199,12 @@ internal object GestureExposurePixels {
         var analyzed = 0
         var excluded = 0
         var exposed = 0
+        // Classification is a pure function of this complete ARGB value. Keep only the last
+        // non-excluded sample, local to this frame; counting and cluster membership remain per
+        // sample. An explicit flag is required because every Int (including 0) is a valid pixel.
+        var hasLastPixel = false
+        var lastPixel = 0
+        var lastIsExposed = false
         var y = top
         var gridY = 0
         while (y < bottom && gridY < rows) {
@@ -208,7 +216,12 @@ internal object GestureExposurePixels {
                 if (exclusions.none { rect -> rect.contains(screenX, y) }) {
                     analyzed += 1
                     val pixel = row[x]
-                    if (!SpikeCaptureSupport.isFogFamily(pixel) && !isSafetyCover(pixel)) {
+                    if (!hasLastPixel || pixel != lastPixel) {
+                        lastIsExposed = !SpikeCaptureSupport.isFogFamily(pixel) && !isSafetyCover(pixel)
+                        lastPixel = pixel
+                        hasLastPixel = true
+                    }
+                    if (lastIsExposed) {
                         exposed += 1
                         exposedGrid[gridY * columns + gridX] = true
                     }
@@ -672,6 +685,10 @@ internal class GestureExposureSampler(
      * and the WORST reading is retained, so a single lucky sample cannot bury a mismatch.
      */
     private fun corroborateCoverInScreenPixels() {
+        InstrumentationRegistry.getInstrumentation().runOnMainSync {
+            val notices = liveMapAuditNotices(mapView)
+            check(notices.isEmpty()) { "Map audit fixture contains unexpected notice cards: $notices" }
+        }
         val capture = SpikeScenarioSupport.captureScreenTruth(mapView) ?: return
         val bitmap = capture.bitmap
         try {
@@ -825,6 +842,10 @@ internal enum class FogContinuityArm(
      * 1 at a fraction of arm 1's cost, and that tie would read as prototype A failing.
      */
     MOSAIC_OVERLAY("mosaicOverlay", coverExpected = false),
+    TRACK_NATIVE("trackNative", coverExpected = false),
+
+    /** `V03-013` A/B: the native surface with the shipped (floor-only) coverage profile. */
+    TRACK_NATIVE_FLOOR("trackNativeFloor", coverExpected = false),
 
     ;
 
@@ -835,22 +856,24 @@ internal enum class FogContinuityArm(
      * [GoogleFogCoverageArm.reset] in an `@After`, or the next test in the process inherits it.
      */
     fun install() {
+        GoogleFogCoverageArm.reset()
         GoogleFogCoverageArm.profile = coverageProfile()
         // Arm 2 changes the SURFACE, not the plan, so it rides a separate switch and leaves
         // the coverage profile at the shipped constants.
         GoogleFogCoverageArm.mosaicOverlay = this == MOSAIC_OVERLAY
+        GoogleFogCoverageArm.trackVector = this == TRACK_NATIVE || this == TRACK_NATIVE_FLOOR
     }
 
     private fun coverageProfile(): GoogleFogCoverageProfile = when (this) {
         // Arm 2 renders exactly what the shipped build renders; only how it reaches the
         // screen differs, which is the whole reason it can be compared to the baseline at all.
-        BASELINE, MOSAIC_OVERLAY -> GoogleFogCoverageProfile.DEFAULT
+        BASELINE, MOSAIC_OVERLAY, TRACK_NATIVE_FLOOR -> GoogleFogCoverageProfile.DEFAULT
         // Asymmetric by construction - render padded, predict unpadded - because
         // `FogPaddingRingSurroundTest` showed that padding both sides of the surround test cancels
         // exactly and buys no movement at all. `ring` also carries the budgets, which the shipped
         // 256s cannot accommodate: the rectangular completion already runs at 240.
         PADDING_RING -> GoogleFogCoverageProfile.ring(PADDING_RING_TILES)
-        PADDING_RING_2 -> GoogleFogCoverageProfile.ring(PADDING_RING_2_TILES)
+        PADDING_RING_2, TRACK_NATIVE -> GoogleFogCoverageProfile.ring(PADDING_RING_2_TILES)
     }
 
     private companion object {
@@ -882,7 +905,7 @@ internal enum class GestureKind(
      */
     val minimumPanTiles: Float? = null,
     /**
-     * True where the gesture provably leaves the published surround, so `coverRose` may be
+     * True where the trial requires a guarded transition, so `coverRose` may be
      * required rather than merely bounded when it happens. Every zoom-OUT kind qualifies: the
      * viewport grows past the tile set the installed generation published, which is exactly the
      * condition `FogOverlaySurfaceCoordinator.onCameraMoveFrame` raises the cover on. Zoom-IN and
@@ -989,6 +1012,14 @@ internal enum class GestureKind(
         minimumZoomIn = 1.5f,
         startZoomHeadroomAbove = 2.5f,
     ),
+    /** SDK-driven movement, with no injected pointer; audits the native handover guard and tail. */
+    PROGRAMMED_ZOOM_IN(
+        label = "programmedZoomIn",
+        minimumZoomIn = 0.9f,
+        requiresCoverToRise = true,
+        animationTailMillis = 800L,
+        startZoomHeadroomAbove = 1.5f,
+    ),
 }
 
 /** A start camera for a trial. Reached exactly or the trial fails; never silently clamped. */
@@ -1004,7 +1035,7 @@ internal data class GestureStartCamera(
 /**
  * What one injected gesture actually did, reported by the driver rather than inferred.
  *
- * [downAtMillis] and [upAtMillis] delimit the ACCEPTED stream on the sampler's own clock, so the
+ * [downAtMillis] and [upAtMillis] delimit the accepted stream (or programmed action) on the sampler's own clock, so the
  * pixel claim can be evaluated over the gesture instead of over the post-gesture settle.
  * [injectedDownCount] counts every `ACTION_DOWN` the driver injected, including the ones belonging
  * to rejected engagement attempts, because `GestureOwningGoogleMapView.dispatchTouchEvent`
@@ -1426,7 +1457,10 @@ internal class GestureExposureHarness private constructor(
     fun fogPhase(): String? = onMain { mapView.getTag(R.id.map_fog_phase)?.toString() }
 
     /** The binding's gates tag: coordinator transition trace and prover events, ids and names. */
-    fun fogGates(): String? = onMain { mapView.getTag(R.id.map_fog_binding_gates)?.toString() }
+    fun fogGates(): String? = onMain {
+        (mapView.getTag(R.id.map_fog_binding_instance) as? app.trailveil.map.GoogleCanonicalFogSurfaceBinding)
+            ?.describeForTesting() ?: mapView.getTag(R.id.map_fog_binding_gates)?.toString()
+    }
 
     fun touchDownCount(): Int = onMain {
         (mapView.getTag(R.id.map_touch_down_count) as? Int) ?: 0
@@ -1644,6 +1678,19 @@ internal class GestureExposureHarness private constructor(
         drive: (GestureExposureHarness) -> GestureDrive,
     ): GestureTrialReport {
         val before = settleAtStartCamera(kind, start)
+        // A completed result expires; failed/interrupted history requires acknowledgement.
+        // Use its real terminal-only dismiss action before measurement, preserving all Room data.
+        // Active/starting and every other unexpected card still invalidate this map-only fixture.
+        var acknowledged = false
+        scenario.onActivity { acknowledged = acknowledgeMapAuditTerminalNotice(mapView) }
+        InstrumentationRegistry.getInstrumentation().sendStatus(0, android.os.Bundle().apply {
+            putString("stream", "Z_MAP_AUDIT terminalAcknowledged=$acknowledged\n")
+        })
+        var notices = emptySet<String>()
+        check(awaitUntil(10_000L) {
+            scenario.onActivity { notices = liveMapAuditNotices(mapView) }
+            notices.isEmpty()
+        }) { "Map audit fixture contains unexpected notice cards: $notices" }
         val (exclusions, exclusionsGuessed) = exclusionRects()
         val startFloors = measureFloor("${kind.label}/${start.name} start", exclusions)
         val touchDownsBefore = touchDownCount()
@@ -1710,7 +1757,7 @@ internal class GestureExposureHarness private constructor(
                 "been replaced by the provider-unavailable surface and will not come back " +
                 "without the surface being rebuilt. Which deadline fired is NOT established by " +
                 "this run; see `V02-007` section 5b for the candidates and what separates them. " +
-                "teardown=[$teardown] " +
+                "teardown=[$teardown] gates=[${fogGates()}] " +
                 "lastBasemapState=${lastBasemapState(frames)} " +
                 "coverShape=[${witnessShape(frames) { frame -> frame.coverUp }}] " +
                 "maxFrameGapMs=${maxFrameGapMillis(frames)} " +
@@ -2436,6 +2483,9 @@ internal object GestureExposureVerdict {
         // `V03-011`: defaulted, so every existing caller keeps asserting today's design exactly as
         // it did. Only a trial that says which arm it is measuring gets the other expectation.
         arm: FogContinuityArm = FogContinuityArm.BASELINE,
+        // A native arm promises continuity only inside its extent; its outside-extent negative
+        // control must require the safety cover rather than treating that protection as failure.
+        coverExpected: Boolean = arm.coverExpected,
     ): List<String> {
         val line = "arm=${arm.label} " + report.describe()
         val failures = mutableListOf<String>()
@@ -2444,7 +2494,7 @@ internal object GestureExposureVerdict {
         failures += windowFailures(report, line)
         failures += pixelFailures(report, line)
         failures += movementFailures(report, line)
-        failures += coverFailures(report, line, arm)
+        failures += coverFailures(report, line, arm, coverExpected)
         return failures
     }
 
@@ -2591,18 +2641,19 @@ internal object GestureExposureVerdict {
         report: GestureTrialReport,
         line: String,
         arm: FogContinuityArm,
+        coverExpected: Boolean,
     ): List<String> {
         val failures = mutableListOf<String>()
         // `V03-011`: an arm that claims gesture-time continuity is measured by whether the cover
         // stayed down, so a raised cover is its failure and a lowered one is not this harness's.
-        if (!arm.coverExpected && report.coverRose) {
+        if (!coverExpected && report.coverRose) {
             failures += "COVER_STILL_ROSE - arm ${arm.label} claims the cover no longer rises " +
                 "during this gesture, and it rose anyway after " +
                 "${report.coverRises} rise(s), longest run ${report.longestCoveredRunMillis} ms. " +
                 "This is a measurement of the arm, not a fault in the harness: $line"
         }
-        if (arm.coverExpected && report.kind.requiresCoverToRise && !report.coverRose) {
-            failures += "COVER_NEVER_ROSE - this gesture leaves the published surround, so the " +
+        if (coverExpected && report.kind.requiresCoverToRise && !report.coverRose) {
+            failures += "COVER_NEVER_ROSE - this trial requires a guarded transition, so the " +
                 "opaque cover must have been raised at some sampled frame; without it every " +
                 "cover clause below would be skipped rather than satisfied: $line"
         }

@@ -8,6 +8,7 @@ import android.graphics.Rect
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.WindowInsets
+import androidx.core.graphics.createBitmap
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -32,6 +33,8 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
 import kotlinx.coroutines.runBlocking
 import org.junit.After
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -93,18 +96,32 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
     val timeout: Timeout = Timeout.seconds(CASE_TIMEOUT_SECONDS)
 
     private var database: TrailVeilDatabase? = null
-    private val fogStates = CopyOnWriteArrayList<GoogleCanonicalFogState>()
+    /**
+     * One published fog state, stamped in the instant the binding published it.
+     *
+     * Stamped HERE rather than read from a view tag. The tags are written from a `SideEffect`,
+     * a recomposition after the state changed, so two publications inside one frame COALESCE
+     * and a whole phase can reach the tags as nothing at all. This callback runs synchronously
+     * on the main thread inside the binding's own publication, so it is lossless.
+     */
+    private data class StampedFogState(val atMillis: Long, val state: GoogleCanonicalFogState)
+
+    private val fogStates = CopyOnWriteArrayList<StampedFogState>()
     private val mapViewRef = AtomicReference<MapView?>(null)
     private val mapRef = AtomicReference<GoogleMap?>(null)
 
     @Before
-    fun setUp() = GoogleMapSurfaceTestHooks.reset()
+    fun setUp() {
+        GoogleMapSurfaceTestHooks.reset()
+        GoogleFogArm.DEFAULT.apply()
+    }
 
     @After
     fun tearDown() {
         // Always release the seam, including on a failed assertion: a fault left installed would
         // fault every later case's installs, and none of them would say why. `reset()` owns that.
         GoogleMapSurfaceTestHooks.reset()
+        GoogleFogArm.DEFAULT.apply()
         database?.close()
         database = null
     }
@@ -119,11 +136,48 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
      */
     @Test
     fun aFaultedCanonicalInstallKeepsTheProvenGenerationPresentedUntilTheRetrySucceeds() {
+        GoogleFogArm.RING_2.apply()
+        assertFaultedInstallRecovery(expectHandoverCover = false)
+    }
+
+    @Test
+    fun aFaultedTrackInstallStaysCoveredAndRecoversWithoutPresentingABareFrame() {
+        GoogleFogArm.DEFAULT.apply()
+        assertFaultedInstallRecovery(expectHandoverCover = true)
+    }
+
+    @Test
+    fun badgeExclusionKeepsTheOneTileHoleSignal() {
+        val colour = FogTilePngCodec.colorForGeneration(1L)
+        fun channel(value: Int) = FogTilePngCodec.revealedFogChannelRange(value).let { (it.first + it.last) / 2 }
+        val fog = Color.rgb(channel(colour.red), channel(colour.green), channel(colour.blue))
+        assertTrue(isFogOrCover(fog))
+        assertFalse(isFogOrCover(Color.WHITE))
+        val bitmap = createBitmap(GRID_COLUMNS * 10, GRID_ROWS * 10, Bitmap.Config.ARGB_8888)
+        try {
+            bitmap.eraseColor(fog)
+            val exclusion = listOf(Rect(0, 0, 160, 140))
+            val size = intArrayOf(bitmap.width, bitmap.height)
+            val full = requireNotNull(tally(bitmap, intArrayOf(0, 0), size, exclusion))
+            assertEquals(0, full.largestUncoveredCluster)
+            // Eight by eleven grid cells, outside the UI exclusion: the original one-tile alarm.
+            val hole = IntArray(80 * 110) { Color.WHITE }
+            bitmap.setPixels(hole, 0, 80, 200, 350, 80, 110)
+            val counterexample = requireNotNull(tally(bitmap, intArrayOf(0, 0), size, exclusion))
+            assertEquals(full.analyzed, counterexample.analyzed)
+            assertEquals(TILE_HOLE_CELLS, counterexample.largestUncoveredCluster)
+            assertTrue(counterexample.largestUncoveredCluster > CLUSTER_MARGIN_CELLS)
+        } finally { bitmap.recycle() }
+    }
+
+    private fun assertFaultedInstallRecovery(expectHandoverCover: Boolean) {
         assumeTrue(
             "faulting a real canonical install requires the keyed googlePoc runtime",
             BuildConfig.GOOGLE_MAPS_POC_KEY_CONFIGURED,
         )
         withSettledFogSurface { hosted ->
+            assertTrue("fixture did not install the requested native/tile owner: " + describe(hosted.mapView),
+                describe(hosted.mapView).contains("installer[trackNative[") == expectHandoverCover)
             val rejections = AtomicInteger(0)
             val stateMark = fogStates.size
             GoogleMapSurfaceTestHooks.fogInstallFault = {
@@ -151,7 +205,8 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             }
             val rejectedAttaches = rejections.get()
             val samples = sampler.samples.toList()
-            val faultedStates = fogStates.toList().drop(stateMark)
+            val faultedStates = fogStates.toList().drop(stateMark).map { it.state }
+            assertTrue("a recoverable fault must not terminalize the surface", faultedStates.none { it.terminal })
 
             assertNull(
                 "the screen sampler died instead of finishing its window: " +
@@ -183,7 +238,7 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                     "complete proven generation presented; the camera never moved, so nothing " +
                     "else could ask for one: ${coveredFrames.size}/${samples.size} frames were " +
                     "covered: " + describeStates(faultedStates) + " " + describe(hosted.mapView),
-                coveredFrames.isEmpty(),
+                if (expectHandoverCover) coveredFrames.size == samples.size else coveredFrames.isEmpty(),
             )
             // Positive attribution, so "nothing happened" cannot pass as "the retry arm held": the
             // binding must have published the RETRY_BEHIND_PLACEHOLDERS state itself.
@@ -193,7 +248,7 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                     describeStates(faultedStates),
                 faultedStates.any { state ->
                     state.retryScheduled &&
-                        !state.coverUp &&
+                        state.coverUp == expectHandoverCover &&
                         !state.terminal &&
                         state.installedGeneration?.toString() == hosted.proven
                 },
@@ -259,14 +314,21 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                     "recovered=$recovered abandoned=$abandoned",
                 recovered !in abandoned,
             )
-            assertNull(
-                "the retry raised the opaque cover on its way in, so the map was blanked while a " +
-                    "complete proven generation was available to keep presenting: " +
-                    coverRoseDuringRecovery + " " + describe(hosted.mapView),
-                coverRoseDuringRecovery,
-            )
+            if (expectHandoverCover) {
+                assertTrue("Track handover must finish with both cover witnesses down: " + describe(hosted.mapView),
+                    awaitUntil(RECOVERY_POLLS * POLL_MILLIS) {
+                        val current = readTags(hosted.mapView)
+                        !current.coverUp && !current.synchronousCoverUp && current.generation == recovered
+                    })
+            } else {
+                assertNull(
+                    "the raster retry raised the opaque cover despite a proven generation: " +
+                        coverRoseDuringRecovery + " " + describe(hosted.mapView),
+                    coverRoseDuringRecovery,
+                )
+            }
             report(
-                "fog_install_fault rejectedAttaches=$rejectedAttaches " +
+                "fog_install_fault trackCover=$expectHandoverCover rejectedAttaches=$rejectedAttaches " +
                     "auditedFrames=${samples.size} publishedStates=${faultedStates.size} " +
                     "baseline=${percent(hosted.baseline)} " +
                     "worst=${percent(samples.minOf { sample -> sample.coveredFraction })} " +
@@ -298,11 +360,18 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         withSettledFogSurface { hosted ->
             val sampler = Sampler(hosted.mapView)
             val samplerFailure: Throwable?
+            var stateMark = fogStates.size
             sampler.start()
             try {
                 // A short pre-roll, so the "before" side of the swap is captured by construction
                 // rather than by winning a race with the append on the very first capture.
                 SystemClock.sleep(PRE_SWAP_ROLL_MILLIS)
+                // Everything the witness may look at has to have happened AFTER the stimulus.
+                // Without this mark the span search runs over the whole of `fogStates`, which has
+                // been accumulating since launch, and an abandoned rebuild from calibration would
+                // let a settled pre-roll frame discharge the witness - green, and proving nothing.
+                // The faulted case above already takes this mark; this one did not.
+                stateMark = fogStates.size
                 appendCanonicalPoint(hosted.dao, hosted.recording, sequence = 0L)
                 val advanced = awaitTag(
                     hosted.mapView,
@@ -344,13 +413,55 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             )
             // The in-flight witness. Without it every frame could come from either settled side and
             // the claim would be about two static scenes rather than about the transition between
-            // them: the pending slot is published from `beginRebuild` and cleared at the proof, so a
-            // frame carrying one is a frame taken while the replacement overlay was being installed.
+            // them.
+            //
+            // It used to require a sampled frame whose published `pendingSlot` was non-null, and
+            // that was wrong twice over. Aim: `pending` is set in `beginRebuild` and cleared at
+            // `revealAndComplete`, and measured on the owner's phone that phase is 21-35 ms while
+            // one capture cycle is ~55 ms, so no capture can ever sit inside it - the case was
+            // asking for something unobtainable on fast hardware. Attribution: the tag was read
+            // BEFORE the screenshot, so even a matching sample only proved a tag read happened in
+            // the window, while its pixels came from an unbounded interval afterwards.
+            //
+            // Both halves now come from instruments that can carry them. The span is the SAFETY
+            // COVER interval - raised in `beginRebuild` before `pending` is set, held across the
+            // reveal for verification, and lowered only on the passed verdict - taken from the
+            // stamped, uncoalesced state stream. Measured, it is 222 ms on the owner's phone in
+            // a full suite and 280 ms alone; 205 ms and 499 ms on the emulator. A ~55 ms capture
+            // bracket fits inside any of those with room, and it is the interval that actually
+            // carries the risk: the predecessor is retired beneath the raised cover and removed
+            // at the verdict. (An earlier draft said "169-215 ms"; the measurements above
+            // superseded it and the stale range outlived them.)
+            // predecessor is retired beneath the raised cover and removed at the verdict.
+            //
+            // Only CLOSED spans observed to open after the stimulus count, so the window cannot
+            // silently swallow the settled pre-roll.
+            val swapStates = fogStates.toList()
+            // Fail closed when nothing was published before the stimulus. `coverSpans` opens a
+            // span on a false->true edge, so assuming "cover was down" would let a cover that
+            // was ALREADY up read as newly opened and satisfy the non-vacuity check - a false
+            // pass. Assuming it was up merely declines to count that span, which fails the
+            // assertion instead. `withSettledFogSurface` makes `stateMark >= 1`, so this
+            // default is unreachable from here; it is the safe one because `coverSpans` is a
+            // general helper and a future caller need not carry that guarantee.
+            val settledBefore = swapStates.take(stateMark).lastOrNull()?.state?.coverUp ?: true
+            val spans = coverSpans(swapStates.drop(stateMark), settledBefore)
             assertTrue(
-                "no sampled frame carried a pending generation, so nothing was captured inside " +
-                    "the install window this case claims to audit: " +
-                    "frames=${samples.size} " + describe(hosted.mapView),
-                samples.any { sample -> sample.pendingSlot != null },
+                "the swap published no closed cover span, so there was no transition to audit: " +
+                    "states=${swapStates.size - stateMark} " + describe(hosted.mapView),
+                spans.isNotEmpty(),
+            )
+            val readInsideSpan = samples.filter { sample -> spans.any { it.read(sample) } }
+            // Hoisted: a string template cannot span concatenated literals.
+            val captureMillis = samples.map { it.capturedToMillis - it.capturedFromMillis }
+            val spanMillis = spans.map { it.durationMillis }
+            assertTrue(
+                "no frame's pixels were read inside the cover span this case audits, so " +
+                    "nothing was captured during the transition: frames=${samples.size} " +
+                    "spanMillis=$spanMillis " +
+                    "captureMillis=${captureMillis.minOrNull()}..${captureMillis.maxOrNull()} " +
+                    describe(hosted.mapView),
+                readInsideSpan.isNotEmpty(),
             )
             // The floor is only a reference for these frames if the scene did not change under
             // them. This is the assertion whose absence made the first version of this case red.
@@ -368,7 +479,9 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             )
             report(
                 "fog_generation_swap auditedFrames=${samples.size} " +
-                    "inFlightFrames=${samples.count { sample -> sample.pendingSlot != null }} " +
+                    "spanMillis=$spanMillis " +
+                    "inSpanFrames=${readInsideSpan.size} " +
+                    "pendingTagFrames=${samples.count { sample -> sample.pendingSlot != null }} " +
                     "baseline=${percent(hosted.baseline)} " +
                     "worst=${percent(samples.minOf { sample -> sample.coveredFraction })} " +
                     "baselineCluster=${hosted.baselineCluster} " +
@@ -411,7 +524,27 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         val synchronousCoverUp: Boolean,
     )
 
+    /** A closed interval during which the safety cover was up, from the stamped state stream. */
+    private data class CoverSpan(val fromMillis: Long, val toMillis: Long) {
+        val durationMillis: Long get() = toMillis - fromMillis
+
+        /**
+         * Whether [sample]'s pixels were read inside this span.
+         *
+         * `takeScreenshot()` returns the last COMPOSITED frame, not one composited during the
+         * call, so a capture that merely starts after the span opened can still hand back the
+         * settled scene from before it - which is the exact thing this witness exists to exclude.
+         * The opening edge is therefore pushed out by one vsync; the closing edge needs no such
+         * margin because the cover outlives the closing publication by design.
+         */
+        fun read(sample: ScreenSample): Boolean =
+            sample.capturedFromMillis >= fromMillis + FRAME_SETTLE_MILLIS &&
+                sample.capturedToMillis <= toMillis
+    }
+
     private data class ScreenSample(
+        val capturedFromMillis: Long,
+        val capturedToMillis: Long,
         val coveredFraction: Double,
         val analyzedPoints: Int,
         val largestUncoveredCluster: Int,
@@ -450,7 +583,9 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         GoogleMapSurfaceTestHooks.cameraRequest = FIXED_CAMERA
         GoogleMapSurfaceTestHooks.onMapViewCreated.set { view -> mapViewRef.set(view) }
         GoogleMapSurfaceTestHooks.onMapReady.set { map -> mapRef.set(map) }
-        GoogleMapSurfaceTestHooks.onFogState.set { state -> fogStates += state }
+        GoogleMapSurfaceTestHooks.onFogState.set { state ->
+            fogStates += StampedFogState(SystemClock.elapsedRealtime(), state)
+        }
         ActivityScenario.launch(GoogleMapSurfaceTestActivity::class.java).use {
             val mapView = awaitMapView()
             val map = awaitMap()
@@ -594,6 +729,30 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
      * taking full-screen bitmaps for the rest of the process and perturb every later case in the
      * shard; the deadline is what makes that impossible rather than unlikely.
      */
+    /**
+     * Closed cover spans in [states], given whether the cover was up immediately before them.
+     *
+     * A span is recorded only where this list saw it both OPEN and CLOSE, so a span already in
+     * flight before the stimulus is never mistaken for one the stimulus caused - its opening
+     * timestamp would be unknown, and a window with an unknown start can admit pixels from before
+     * it.
+     */
+    private fun coverSpans(states: List<StampedFogState>, coverUpBefore: Boolean): List<CoverSpan> {
+        val spans = mutableListOf<CoverSpan>()
+        var previous = coverUpBefore
+        var openedAt: Long? = null
+        states.forEach { stamped ->
+            val up = stamped.state.coverUp
+            if (!previous && up) openedAt = stamped.atMillis
+            if (previous && !up) {
+                openedAt?.let { spans += CoverSpan(it, stamped.atMillis) }
+                openedAt = null
+            }
+            previous = up
+        }
+        return spans
+    }
+
     private inner class Sampler(private val mapView: MapView) {
         val samples = CopyOnWriteArrayList<ScreenSample>()
         private val running = AtomicBoolean(true)
@@ -675,11 +834,18 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         }
         if (size[0] <= 0 || size[1] <= 0) return null
         val published = tags.get() ?: return null
+        // Bracketed around the capture ALONE. The pixels this returns were composited at some
+        // instant at or before `capturedTo`; nothing outside this bracket bounds them, which is
+        // why the tags read above are diagnostics here and never attribution.
+        val capturedFrom = SystemClock.elapsedRealtime()
         val bitmap = InstrumentationRegistry.getInstrumentation().uiAutomation.takeScreenshot()
             ?: return null
+        val capturedTo = SystemClock.elapsedRealtime()
         return try {
             tally(bitmap, origin, size, exclusions.get())?.let { counted ->
                 ScreenSample(
+                    capturedFromMillis = capturedFrom,
+                    capturedToMillis = capturedTo,
                     coveredFraction = counted.covered.toDouble() / counted.analyzed,
                     analyzedPoints = counted.analyzed,
                     largestUncoveredCluster = counted.largestUncoveredCluster,
@@ -1058,6 +1224,13 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
         const val SAMPLER_JOIN_MILLIS = 10_000L
 
         /** A capture loop may never outlive the case that started it, however that case ended. */
+        /**
+         * One vsync at 60 Hz. `takeScreenshot()` hands back the last composited frame, so a
+         * capture beginning at the instant a span opened can still return the frame from before
+         * it; a capture beginning one frame later cannot.
+         */
+        const val FRAME_SETTLE_MILLIS = 17L
+
         const val SAMPLER_LIFETIME_MILLIS = 120_000L
 
         const val CALIBRATION_SAMPLES = 4

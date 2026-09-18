@@ -21,6 +21,7 @@ import app.trailveil.R
 import app.trailveil.TrailVeilApplication
 import app.trailveil.recording.RecordingForegroundService
 import java.io.FileInputStream
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
@@ -55,6 +56,38 @@ class AbandonedRecordingStateTest {
 
     private val context: Context = ApplicationProvider.getApplicationContext()
     private val container get() = (context as TrailVeilApplication).appContainer
+
+    /** Every session id this class inserted, so the sweep below can be exact rather than broad. */
+    private val seededSessionIds = mutableSetOf<Long>()
+
+    /**
+     * Leave nothing durable behind at an id this class may reserve again.
+     *
+     * Each case already deletes its own session in a `finally`, and on a disposable emulator that
+     * was enough. It is not enough on a device that keeps its data: `recording_operation_receipts`
+     * and `recording_location_receipt_retention_states` are keyed on `session_id` with no foreign
+     * key, so deleting the session leaves those rows, and `pendingStopRequestForSession` keys on
+     * the session id alone. A later run that reserved the same id then inherited the earlier run's
+     * pending Stop and closed its row `COMPLETED` - measured on the owner's phone as
+     * `z9-phone-google-full-v3`, and not reproducible on an emulator, which starts empty.
+     *
+     * This also covers the rows a throw during seeding leaks, which no `finally` can reach because
+     * the seeding happens before the `try`.
+     */
+    @After
+    fun removeEveryRowThisClassSeeded() {
+        if (seededSessionIds.isEmpty()) return
+        val sqlite = container.databaseForTesting().openHelper.writableDatabase
+        val ids = seededSessionIds.joinToString(",")
+        seededSessionIds.clear()
+        // Exact ids only - never a marker or a time window. The same table holds the owner's real
+        // recordings on a real device.
+        sqlite.execSQL("DELETE FROM recording_operation_receipts WHERE session_id IN ($ids)")
+        sqlite.execSQL(
+            "DELETE FROM recording_location_receipt_retention_states WHERE session_id IN ($ids)",
+        )
+        sqlite.execSQL("DELETE FROM recording_sessions WHERE id IN ($ids)")
+    }
 
     @Test
     fun anExplorationOwnedByADeadRuntimeIsTakenBackWhenTheAppReturns() {
@@ -346,6 +379,15 @@ class AbandonedRecordingStateTest {
                 waited += POLL_MILLIS
             }
 
+            // The reason first, because it is the one that names a cause. A row closed by an
+            // inherited pending Stop carries `STOP:user_notification_stop` in this column, and
+            // reading that rather than only `status != INTERRUPTED` is the difference between a
+            // diagnosis and a symptom. It cost a phone run to learn that.
+            assertEquals(
+                "the repaired row was labelled with the wrong reason; states seen: $everShown",
+                "INTERRUPT:$STORAGE_FAILURE",
+                sessionColumn(sqlite, sessionId, "stop_reason"),
+            )
             // Closed correctly, which is what "once storage recovers" means here: the retry that
             // the repair path already performs succeeds against a database that can be written.
             assertEquals(
@@ -364,15 +406,6 @@ class AbandonedRecordingStateTest {
             assertTrue(
                 "the announced exploration was resumed instead of ended",
                 !hasRecoverySegment(sqlite, sessionId),
-            )
-            // The reason the runtime actually stopped for, all the way to the column the history
-            // screen renders. Its sibling three tests up asserts the same column for the reboot
-            // case; without this one, hard-coding `device_restarted` in the repair would record a
-            // full disk as a reboot and every test in the tree would still pass.
-            assertEquals(
-                "the repaired row was labelled with the wrong reason",
-                "INTERRUPT:$STORAGE_FAILURE",
-                sessionColumn(sqlite, sessionId, "stop_reason"),
             )
         } finally {
             RecordingForegroundService.stopFromVisibleActivity(context, sessionId)
@@ -546,6 +579,17 @@ class AbandonedRecordingStateTest {
      * the owner that is still alive, and that one field is the entire difference between the two
      * defects this class covers.
      */
+    // `MAX(id)` here has a known race - it can read a row this fixture did not insert - and
+    // `SELECT last_insert_rowid()` is the obvious replacement. **It was tried, and it regressed
+    // on the owner's phone** (`za-phone-google-full-v5`): the first case passed, its `@After`
+    // then deleted the wrong id, the seeded `active_slot = 1` row survived, and every later case
+    // in the class died on `UNIQUE constraint failed: recording_sessions.active_slot` - which
+    // reads exactly like a product bug and is not one. `SupportSQLiteDatabase.query()` need not
+    // run on the connection `execSQL()` just used, and `last_insert_rowid()` is per-connection
+    // state. Anyone re-attempting this must keep the write and the readback on ONE connection
+    // (a transaction pins the thread's connection) or use an insert API that returns the rowid,
+    // and must prove it by running this class alone and checking the table is empty afterwards -
+    // the host gates and lint did not catch it, only a device did.
     private fun seedAbandonedSession(
         sqlite: SupportSQLiteDatabase,
         ownerToken: String,
@@ -568,6 +612,7 @@ class AbandonedRecordingStateTest {
                 cursor.moveToFirst()
                 cursor.getLong(0)
             }
+        seededSessionIds += sessionId
         sqlite.execSQL(
             "INSERT INTO track_segments(" +
                 "session_id, sequence, started_at, ended_at, start_reason, end_reason, open_slot" +
@@ -590,6 +635,7 @@ class AbandonedRecordingStateTest {
             cursor.moveToFirst()
             cursor.getLong(0)
         }
+        seededSessionIds += sessionId
         sqlite.execSQL(
             "INSERT INTO track_segments(" +
                 "session_id, sequence, started_at, ended_at, start_reason, end_reason, open_slot" +
@@ -619,15 +665,43 @@ class AbandonedRecordingStateTest {
     }
 
     /**
-     * An id no row holds yet, so it can be claimed on the container before the row exists. Claiming
-     * afterwards would race the route, which reacts to the insert on its own.
+     * An id no row holds yet **and no row ever held**, so it can be claimed on the container before
+     * the row exists. Claiming afterwards would race the route, which reacts to the insert on its
+     * own.
+     *
+     * `MAX(id)` alone is not that id. It falls back whenever rows are deleted - by this class's own
+     * `finally`, and by any purge of fixture residue - so a later run re-selects an id an earlier
+     * run already used and inherits every session-keyed row that outlived that run's session.
+     * `recording_sessions` is `AUTOINCREMENT`, so SQLite keeps a high-water mark that deletes never
+     * lower and an explicit insert raises; reading it makes the reservation monotone across runs.
+     * The two session-keyed tables that have no foreign key are read as well, because a row in
+     * either of them at the reserved id is what makes the repair inherit a stale pending Stop.
      */
-    private fun nextSessionId(sqlite: SupportSQLiteDatabase): Long = sqlite
-        .query("SELECT COALESCE(MAX(id), 0) FROM recording_sessions")
-        .use { cursor ->
+    private fun nextSessionId(sqlite: SupportSQLiteDatabase): Long {
+        fun scalar(sql: String): Long = sqlite.query(sql).use { cursor ->
             cursor.moveToFirst()
-            cursor.getLong(0) + ID_GAP
+            cursor.getLong(0)
         }
+        val reserved = maxOf(
+            scalar("SELECT COALESCE(MAX(id), 0) FROM recording_sessions"),
+            scalar(
+                "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'recording_sessions'), 0)",
+            ),
+            scalar("SELECT COALESCE(MAX(session_id), 0) FROM recording_operation_receipts"),
+            scalar(
+                "SELECT COALESCE(MAX(session_id), 0) FROM recording_location_receipt_retention_states",
+            ),
+        ) + ID_GAP
+        // Proved, not assumed. The derivation above already makes this impossible, so the guard can
+        // only fire if someone breaks it - and it names the consequence rather than the symptom.
+        assertEquals(
+            "the reserved id $reserved still carries durable operation receipts, so the repair " +
+                "would inherit an earlier run's pending Stop and close this row COMPLETED",
+            0L,
+            scalar("SELECT COUNT(*) FROM recording_operation_receipts WHERE session_id = $reserved"),
+        )
+        return reserved
+    }
 
     private fun sessionColumn(
         sqlite: SupportSQLiteDatabase,
@@ -683,7 +757,12 @@ class AbandonedRecordingStateTest {
         const val A_QUARTER_HOUR = 900_000L
         const val THREE_HOURS = 3 * AN_HOUR
 
-        /** Wide enough that a session inserted concurrently cannot land on the reserved id. */
+        /**
+         * Wide enough that a session inserted concurrently cannot land on the reserved id. That is
+         * only half the requirement: the id must also never have been used, which is what the
+         * high-water mark in `nextSessionId` provides. A gap above a value that falls back still
+         * falls back.
+         */
         const val ID_GAP = 1_000L
     }
 }

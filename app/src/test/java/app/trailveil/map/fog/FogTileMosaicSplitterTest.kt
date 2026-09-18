@@ -24,7 +24,7 @@ class FogTileMosaicSplitterTest {
             request = FogViewportRequest(GeoPoint(0.0, 180.0), mapZoom = 2.0),
             keys = keys,
             queryBounds = null,
-            mosaic = FogTileMosaic(
+            presentation = FogTileMosaic(
                 mask = FogPixelMask(512, 512, alpha),
                 bounds = FogTileBounds(-180.0, -66.5, 180.0, 66.5),
                 tileCount = keys.size,
@@ -50,7 +50,7 @@ class FogTileMosaicSplitterTest {
                 request = FogViewportRequest(GeoPoint(0.0, 0.0), 2.0),
                 keys = listOf(key),
                 queryBounds = null,
-                mosaic = FogTileMosaic(
+                presentation = FogTileMosaic(
                     mask = FogPixelMask(255, 256, ByteArray(255 * 256)),
                     bounds = FogTileBounds(-90.0, -45.0, 0.0, 45.0),
                     tileCount = 1,
@@ -73,7 +73,7 @@ class FogTileMosaicSplitterTest {
                 request = FogViewportRequest(GeoPoint(0.0, 180.0), 2.0),
                 keys = keys,
                 queryBounds = null,
-                mosaic = FogTileMosaic(
+                presentation = FogTileMosaic(
                     mask = FogPixelMask(512, 512, ByteArray(512 * 512)),
                     bounds = FogTileBounds(-180.0, -66.5, 180.0, 66.5),
                     tileCount = keys.size,

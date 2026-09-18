@@ -112,7 +112,9 @@ class GoogleGestureExposureTest {
         originalPermissionHistory = runBlocking { permissionHistory.current() }
         runBlocking {
             permissionHistory.replaceForTesting(
-                requireNotNull(originalPermissionHistory).copy(hasSeenIntroduction = true),
+                PermissionHistory(hasSeenIntroduction = true, hasRequestedLocation = true,
+                    hasRetriedLocation = true, hasRequestedPreciseUpgrade = true,
+                    hasRequestedNotifications = false),
             )
         }
     }

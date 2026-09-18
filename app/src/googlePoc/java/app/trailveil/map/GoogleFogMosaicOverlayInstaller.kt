@@ -12,6 +12,7 @@ import app.trailveil.map.fog.FogTilePngCodec
 import app.trailveil.map.fog.FogViewportCoverageRequest
 import app.trailveil.map.fog.GeoPoint
 import app.trailveil.map.fog.WebMercator
+import app.trailveil.map.fog.anchoredNear
 import com.google.android.gms.maps.GoogleMap
 import com.google.android.gms.maps.model.BitmapDescriptorFactory
 import com.google.android.gms.maps.model.GroundOverlay
@@ -46,10 +47,9 @@ import com.google.android.gms.maps.model.PolygonOptions
  *    which is what these builds exist for. See [reveal] for what bounds the exposure now. The
  *    vector installer deliberately does NOT follow: it never had the defect, and hiding there
  *    loses the map.
- * 2. **A mosaic that crosses the antimeridian is refused.** `FogPocMosaic` deliberately leaves its
- *    longitude bounds unwrapped so a dateline mosaic is continuous; `LatLng` normalises longitude
- *    into [-180, 180), which would silently anchor such an image the long way round the world.
- *    Refusing fails the generation, which raises the cover - correct, and loud.
+ * 2. **A dateline mosaic uses wrapped LatLngBounds.** The SDK's bounds explicitly support a
+ *    southwest longitude greater than northeast. Full-world/degenerate spans are still refused,
+ *    because equal normalized endpoints cannot describe a whole world in one GroundOverlay.
  * 3. **The raster is capped, not tile-resolution.** See [targetSizeFor].
  * 4. **The surround it reports is the IMAGE, not the tile path's backdrop.** See [imageExtent] -
  *    the one place this class first got wrong, and the reason the spike has a zoom-out control.
@@ -103,7 +103,7 @@ internal class GoogleFogMosaicOverlayInstaller(
         tiles: List<FogMosaicTile>,
     ): Boolean {
         val mosaic = try {
-            FogPocMosaic.compose(tiles)
+            FogPocMosaic.compose(tiles).anchoredNear(coverage.center.longitude)
         } catch (failure: IllegalArgumentException) {
             return refuse("compose:" + failure.javaClass.simpleName)
         }
@@ -233,9 +233,7 @@ internal class GoogleFogMosaicOverlayInstaller(
         // complementary half of the world, which contains the image. That is a second coat over
         // every pixel the proof samples, and it is what generations 2, 3 and 4 died of.
         val rectangles = try {
-            surroundComplementOfImage(mosaic)
-                .map(FogBackdropGeometry::anchoredInsideWorld)
-                .flatMap { bounds -> bounds.splitForGooglePolygon() }
+            GoogleFogPolygonGeometry.backdropRectangles(mosaic)
         } catch (_: IllegalArgumentException) {
             refuse("guardGeometry")
             return emptyList()
@@ -298,44 +296,8 @@ internal class GoogleFogMosaicOverlayInstaller(
      * Four strips, each clipped to the surround, and any that comes out degenerate is dropped
      * rather than emitted as a zero-area ring.
      */
-    private fun surroundComplementOfImage(mosaic: FogTileMosaic): List<FogTileBounds> {
-        val surround = FogBackdropGeometry.extent(mosaic)
-        val image = mosaic.bounds
-        val north = WebMercator.latitudeAtNormalizedY(surround.northNormalizedY)
-        val south = WebMercator.latitudeAtNormalizedY(surround.southNormalizedY)
-        val halfDegrees = surround.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
-        // A surround that reaches all the way round has no east or west edge to complement; its
-        // north and south strips still span only the latitudes the surround owns.
-        val west = if (surround.wrapsWorld) {
-            -FogBackdropGeometry.WORLD_LONGITUDE_SPAN / 2.0
-        } else {
-            surround.centerLongitude - halfDegrees
-        }
-        val east = if (surround.wrapsWorld) {
-            FogBackdropGeometry.WORLD_LONGITUDE_SPAN / 2.0
-        } else {
-            surround.centerLongitude + halfDegrees
-        }
-        val strips = mutableListOf<FogTileBounds>()
-        fun add(westLongitude: Double, southLatitude: Double, eastLongitude: Double, northLatitude: Double) {
-            if (eastLongitude - westLongitude <= 0.0 || northLatitude - southLatitude <= 0.0) return
-            if (!westLongitude.isFinite() || !eastLongitude.isFinite()) return
-            if (!southLatitude.isFinite() || !northLatitude.isFinite()) return
-            strips += FogTileBounds(
-                westLongitude = westLongitude,
-                southLatitude = southLatitude,
-                eastLongitude = eastLongitude,
-                northLatitude = northLatitude,
-            )
-        }
-        // North and south own the full width, so the corners belong to them and the side strips
-        // only span the image's own latitudes. Same division of labour as extentGuard.
-        add(west, image.northLatitude, east, north)
-        add(west, south, east, image.southLatitude)
-        add(west, image.southLatitude, image.westLongitude, image.northLatitude)
-        add(image.eastLongitude, image.southLatitude, east, image.northLatitude)
-        return strips
-    }
+    private fun surroundComplementOfImage(mosaic: FogTileMosaic): List<FogTileBounds> =
+        GoogleFogPolygonGeometry.surroundComplementOf(mosaic)
 
     /**
      * Halves a guard rectangle until no ring spans enough longitude to be read the long way round.
@@ -437,6 +399,11 @@ internal class GoogleFogMosaicOverlayInstaller(
         entry.backdrop.forEach { polygon -> runCatching { polygon.isVisible = false } }
     }
 
+    /** Every generation, the same way a predecessor is hidden; `reveal` shows the successor again. */
+    override fun hideBeneathCover() {
+        installed.keys.toList().forEach(::hideGeneration)
+    }
+
     override fun remove(generationId: Long): Boolean {
         val entry = installed[generationId] ?: return true
         val removed = try {
@@ -488,15 +455,6 @@ internal class GoogleFogMosaicOverlayInstaller(
     }
 
     /**
-     * A dateline mosaic is refused rather than anchored the long way round.
-     *
-     * `FogPocMosaic` leaves its longitude bounds unwrapped on purpose, so a mosaic that crosses the
-     * antimeridian reports an east longitude above 180 (or a west below -180). `LatLng` normalises
-     * into [-180, 180), so handing those straight to `LatLngBounds` would produce a quad spanning
-     * almost the whole world in the wrong direction - a silently misplaced fog image rather than a
-     * failure. Refusing fails the generation and raises the cover.
-     */
-    /**
      * What this surface actually fogs: the anchored image, and nothing outside it.
      *
      * **Measured, after this returned the wrong answer.** The first version handed back
@@ -533,14 +491,15 @@ internal class GoogleFogMosaicOverlayInstaller(
 
     private fun boundsOrNull(mosaic: FogTileMosaic): LatLngBounds? {
         val bounds = mosaic.bounds
-        if (bounds.westLongitude < -MAX_LONGITUDE || bounds.eastLongitude > MAX_LONGITUDE) {
+        val span = bounds.eastLongitude - bounds.westLongitude
+        if (!span.isFinite() || span <= 0.0 || span >= 360.0) {
             return null
         }
         if (bounds.southLatitude > bounds.northLatitude) return null
         return try {
             LatLngBounds(
-                LatLng(bounds.southLatitude, bounds.westLongitude),
-                LatLng(bounds.northLatitude, bounds.eastLongitude),
+                LatLng(bounds.southLatitude, WebMercator.wrapLongitude(bounds.westLongitude)),
+                LatLng(bounds.northLatitude, WebMercator.wrapLongitude(bounds.eastLongitude)),
             )
         } catch (_: IllegalArgumentException) {
             null

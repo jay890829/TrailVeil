@@ -1,16 +1,21 @@
 package app.trailveil.map
 
+import android.os.SystemClock
+
 import app.trailveil.map.fog.FogBackdropGeometry
 import app.trailveil.map.fog.anchoredNear
 import app.trailveil.map.fog.FogMaskContours
 import app.trailveil.map.fog.FogMaskRect
 import app.trailveil.map.fog.FogMosaicTile
+import app.trailveil.map.fog.FogNativeGeometry
+import app.trailveil.map.fog.FogNativePresentation
 import app.trailveil.map.fog.FogPocMosaic
 import app.trailveil.map.fog.FogSurroundExtent
 import app.trailveil.map.fog.FogTileBounds
 import app.trailveil.map.fog.FogTileMosaic
 import app.trailveil.map.fog.FogTilePngCodec
 import app.trailveil.map.fog.FogViewportCoverageRequest
+import app.trailveil.map.fog.FogViewportPresentation
 import app.trailveil.map.fog.GeoPoint
 import app.trailveil.map.fog.WebMercator
 import com.google.android.gms.maps.GoogleMap
@@ -49,9 +54,21 @@ internal class GoogleFogVectorOverlayInstaller(
         val extent: FogSurroundExtent,
         val rings: Int,
         val truncated: Boolean,
-    )
+        val nativeVertices: Int,
+    ) {
+        /** Set by [reveal]; only revealed polygons are on screen and only those leave for a cover. */
+        var revealed = false
+        var snapshotNotBeforeMillis = 0L
+    }
 
     private val installed = LinkedHashMap<Long, Installed>()
+
+    /**
+     * Generations whose polygons refused to leave in [hideBeneathCover]. [remove] has already
+     * dropped their record, so a later removal would report success over polygons still on the
+     * map; these are reported as failed instead, which is the coordinator's terminal path.
+     */
+    private val strays = HashSet<Long>()
     private var refusals = 0
     private var lastRefusal: String? = null
     private var lastRings: Int = 0
@@ -74,34 +91,58 @@ internal class GoogleFogVectorOverlayInstaller(
         generationId: Long,
         coverage: FogViewportCoverageRequest,
         tiles: List<FogMosaicTile>,
+    ): Boolean = attachGeometry(generationId, coverage, tiles, null)
+
+    fun attachNative(
+        generationId: Long,
+        coverage: FogViewportCoverageRequest,
+        tiles: List<FogMosaicTile>,
+        geometry: FogNativeGeometry,
+    ): Boolean = attachGeometry(generationId, coverage, tiles, geometry)
+
+    private fun attachGeometry(
+        generationId: Long,
+        coverage: FogViewportCoverageRequest,
+        tiles: List<FogMosaicTile>,
+        native: FogNativeGeometry?,
     ): Boolean {
         if (tiles.isEmpty()) return refuse("noTiles")
+        // Native geometry only needs the exact layout; contours still need the raster pixels.
         val mosaic = try {
-            FogPocMosaic.compose(tiles).anchoredNear(coverage.center.longitude)
+            if (native == null) FogPocMosaic.compose(tiles).anchoredNear(coverage.center.longitude) else null
         } catch (_: IllegalArgumentException) {
             return refuse("composeFailed")
         }
+        val layout = try {
+            if (native != null) FogPocMosaic.layout(tiles).anchoredNear(coverage.center.longitude) else null
+        } catch (_: IllegalArgumentException) {
+            return refuse("composeFailed")
+        }
+        val bounds = mosaic?.bounds ?: checkNotNull(layout).bounds
 
         // A holed polygon cannot be halved the way a solid guard rectangle can - a hole would have
         // to be cut at the seam and reattached to whichever half owns it - so a rendered rectangle
         // wide enough to need splitting is refused rather than drawn wrong. A viewport is never
         // this wide; the check is here because "never" is what section 15n also assumed.
-        val imageWidth = mosaic.bounds.eastLongitude - mosaic.bounds.westLongitude
+        val imageWidth = bounds.eastLongitude - bounds.westLongitude
         if (!imageWidth.isFinite() ||
             imageWidth > GoogleFogPolygonGeometry.MAX_POLYGON_RING_DEGREES
         ) {
             return refuse("imageTooWide")
         }
 
+        if (native != null && native.bounds != bounds) return refuse("nativeBoundsMismatch")
+        val presentation: FogViewportPresentation = if (native == null) checkNotNull(mosaic)
+            else FogNativePresentation(native, checkNotNull(layout))
         val decomposed = try {
-            FogMaskContours.decompose(mosaic.mask, step = step)
+            if (native == null) FogMaskContours.decompose(checkNotNull(mosaic).mask, step = step) else null
         } catch (_: IllegalArgumentException) {
             return refuse("decomposeFailed")
         }
-        lastRings = decomposed.rects.size
-        lastTruncated = decomposed.truncated
+        lastRings = native?.polygons?.sumOf { it.holes.size + 1 } ?: checkNotNull(decomposed).rects.size
+        lastTruncated = decomposed?.truncated ?: false
 
-        val holes = decomposed.rects.mapNotNull { rect -> holeRing(mosaic, rect) }
+        val holes = decomposed?.rects?.mapNotNull { rect -> holeRing(checkNotNull(mosaic), rect) }.orEmpty()
         val signature = FogTilePngCodec.colorForGeneration(generationId)
         val fill = GoogleFogPolygonGeometry.argb(
             GoogleFogPolygonGeometry.VISIBLE_FOG_ALPHA,
@@ -111,25 +152,36 @@ internal class GoogleFogVectorOverlayInstaller(
         )
 
         val attached = mutableListOf<Polygon>()
-        val image = addPolygon(
-            ring = GoogleFogPolygonGeometry.ring(mosaic.bounds),
+        val image = if (native == null) addPolygon(
+            ring = GoogleFogPolygonGeometry.ring(bounds),
             holes = holes,
             fill = fill,
             zIndex = NEW_POLYGON_Z,
-        )
-        if (image == null) {
+        ) else null
+        if (image == null && native == null) {
             return refuse("addImagePolygon")
         }
-        attached += image
+        image?.let(attached::add)
+        native?.polygons?.forEach { polygon ->
+            val added = addPolygon(
+                ring = polygon.shell.map { LatLng(it.latitude, it.longitude) },
+                holes = polygon.holes.map { ring -> ring.map { LatLng(it.latitude, it.longitude) } },
+                fill = fill,
+                zIndex = NEW_POLYGON_Z,
+            )
+            if (added == null) {
+                attached.forEach { runCatching { it.remove() } }
+                return refuse("nativePolygonAttach")
+            }
+            attached += added
+        }
 
         // The backdrop, and the 15k rule with it: the extent this generation claims is the one it
         // DREW. If the surround fails to attach, the claim shrinks to the rendered rectangle rather
         // than staying at the tile path's reach - a smaller claim raises the cover sooner, which is
         // the safe direction, where the reverse put 89.344% of unexplored ground on screen.
         val strips = try {
-            GoogleFogPolygonGeometry.surroundComplementOf(mosaic)
-                .map(FogBackdropGeometry::anchoredInsideWorld)
-                .flatMap { bounds -> GoogleFogPolygonGeometry.splitForGooglePolygon(bounds) }
+            GoogleFogPolygonGeometry.backdropRectangles(presentation)
         } catch (_: IllegalArgumentException) {
             emptyList()
         }
@@ -167,9 +219,12 @@ internal class GoogleFogVectorOverlayInstaller(
         // raises the cover and forces a rebuild. That is exactly the churn the tile arms already
         // pay, and paying it is what makes this arm comparable to them rather than flattered by a
         // blindfold.
-            extent = imageExtent(mosaic),
-            rings = decomposed.rects.size,
-            truncated = decomposed.truncated,
+            extent = imageExtent(bounds),
+            rings = lastRings,
+            truncated = lastTruncated,
+            nativeVertices = native?.polygons?.sumOf { polygon ->
+                polygon.shell.size + polygon.holes.sumOf { it.size }
+            } ?: 0,
         )
         return true
     }
@@ -183,6 +238,10 @@ internal class GoogleFogVectorOverlayInstaller(
      */
     override fun reveal(generationId: Long, previousGenerationId: Long?): Boolean {
         val entry = installed[generationId] ?: return false
+        val firstReveal = !entry.revealed
+        // Marked before the first polygon shows: a reveal that fails part-way has put some of
+        // them on screen, and a later cover must take those too.
+        entry.revealed = true
         val revealed = entry.polygons.all { polygon ->
             try {
                 polygon.zIndex = NEW_POLYGON_Z
@@ -195,6 +254,12 @@ internal class GoogleFogVectorOverlayInstaller(
             }
         }
         if (!revealed) return false
+        // J1 candidate: b26's 10k-vertex native reveal first snapshots bare basemap, whereas
+        // 4.4k/6.6k reveals pass once. This bounded scheduling heuristic is not a renderer fence.
+        // Let planning overlap the warmup; only a still-early snapshot request waits afterwards.
+        if (firstReveal && entry.nativeVertices >= 8_192) {
+            entry.snapshotNotBeforeMillis = SystemClock.elapsedRealtime() + 300L
+        }
         // **This arm deliberately does NOT hide its predecessor, unlike the mosaic arm.**
         //
         // The owner's 2026-09-08 decision - hide immediately rather than wait for the verdict -
@@ -214,7 +279,26 @@ internal class GoogleFogVectorOverlayInstaller(
         return true
     }
 
+    override fun snapshotNotBeforeMillis(generationId: Long): Long =
+        installed[generationId]?.snapshotNotBeforeMillis ?: 0L
+
+    /**
+     * This installer cannot hide (see [reveal]: `isVisible = false` and a transparent fill both
+     * crashed the SDK on a holed polygon), so a revealed generation is REMOVED for the cover. The
+     * unrevealed ones - attached for a proof that has not run - stay, invisible as attached. What
+     * is lost is only what the raised cover has already replaced: `covers` now answers false for
+     * the generation and the rebuild the cover implies proceeds; the coordinator's later `remove`
+     * finds nothing and reports success. A polygon that refuses to leave makes its generation a
+     * stray, and [remove] keeps reporting it as failed: terminal, not a proof loop beneath it.
+     */
+    override fun hideBeneathCover() {
+        installed.filterValues { entry -> entry.revealed }.keys.toList().forEach { generationId ->
+            if (!remove(generationId)) strays.add(generationId)
+        }
+    }
+
     override fun remove(generationId: Long): Boolean {
+        if (generationId in strays) return false
         val entry = installed.remove(generationId) ?: return true
         var removed = true
         entry.polygons.forEach { polygon ->
@@ -235,6 +319,7 @@ internal class GoogleFogVectorOverlayInstaller(
     }
 
     override fun release() {
+        strays.clear()
         installed.values.forEach { entry ->
             entry.polygons.forEach { polygon ->
                 try {
@@ -252,7 +337,8 @@ internal class GoogleFogVectorOverlayInstaller(
     /** Ring count is the measurement this arm exists for, so it leads. */
     override fun describe(): String =
         "vector=[rings=$lastRings truncated=$lastTruncated step=$step " +
-            "generations=${installed.keys} refusals=$refusals last=$lastRefusal]"
+            "generations=${installed.keys} refusals=$refusals last=$lastRefusal" +
+            (if (strays.isEmpty()) "" else " strays=${strays.size}") + "]"
 
     private fun addPolygon(
         ring: List<LatLng>,
@@ -318,8 +404,7 @@ internal class GoogleFogVectorOverlayInstaller(
         )
     }
 
-    private fun imageExtent(mosaic: FogTileMosaic): FogSurroundExtent {
-        val bounds = mosaic.bounds
+    private fun imageExtent(bounds: FogTileBounds): FogSurroundExtent {
         return FogSurroundExtent(
             centerLongitude = (bounds.westLongitude + bounds.eastLongitude) / 2.0,
             halfWorlds = (bounds.eastLongitude - bounds.westLongitude) / 2.0 /

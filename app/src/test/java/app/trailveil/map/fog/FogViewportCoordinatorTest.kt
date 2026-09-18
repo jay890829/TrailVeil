@@ -117,7 +117,7 @@ class FogViewportCoordinatorTest {
         coordinator.clearDerivedCache()
         val rebuilt = coordinator.render(request)
 
-        assertEquals(first.mosaic.mask, rebuilt.mosaic.mask)
+        assertEquals((first.presentation as FogTileMosaic).mask, (rebuilt.presentation as FogTileMosaic).mask)
         assertEquals(first.keys, rebuilt.keys)
         assertEquals(2, reads)
     }
@@ -248,7 +248,7 @@ class FogViewportCoordinatorTest {
         assertTrue(originKey in merge.missingKeys)
         assertEquals(null, pipeline.loadCached(originKey))
         val rebuilt = coordinator.render(FogViewportRequest(origin, mapZoom = 14.0))
-        assertTrue(rebuilt.mosaic.mask.copyAlpha().any { alpha -> (alpha.toInt() and 0xff) == 0 })
+        assertTrue((rebuilt.presentation as FogTileMosaic).mask.copyAlpha().any { alpha -> (alpha.toInt() and 0xff) == 0 })
     }
 
     /**

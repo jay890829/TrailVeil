@@ -1,7 +1,10 @@
 package app.trailveil.data.map
 
+import androidx.collection.MutableLongSet
 import app.trailveil.map.fog.GeoPoint
 import app.trailveil.map.fog.TrackSegment
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 
 /** A non-wrapping longitude predicate suitable for a database query. */
 data class LongitudeInterval(
@@ -153,6 +156,54 @@ class ViewportTrackDataSource(
     }
 
     /**
+     * Reads the exact union of one latitude band's longitude predicates, then reconstructs each
+     * original window from raw point identities/sequences. Filtering already-built segments would
+     * join across points omitted by a narrower window. Different bands retain independent reads.
+     * Bounded batches also bound the amount of speculative input held by a native preparation.
+     */
+    suspend fun readBatch(bounds: List<ViewportBounds>): List<ViewportTrackReadModel> {
+        if (bounds.isEmpty()) return emptyList()
+        return bounds.chunked(4).flatMap { group ->
+            currentCoroutineContext().ensureActive()
+            val first = group.first()
+            if (group.size == 1 || group.any { it.south != first.south || it.north != first.north }) {
+                group.map { currentCoroutineContext().ensureActive(); readPoints(it) }
+            } else {
+                val intervals = group.flatMap { it.longitudeIntervals() }.sortedBy { it.west }
+                val union = ArrayList<LongitudeInterval>()
+                intervals.forEach { interval ->
+                    val previous = union.lastOrNull()
+                    if (previous == null || interval.west > previous.east) union += interval
+                    else union[union.lastIndex] = LongitudeInterval(previous.west, maxOf(previous.east, interval.east))
+                }
+                val raw = union.flatMap { interval ->
+                    currentCoroutineContext().ensureActive()
+                    reader.read(first.south, first.north, interval)
+                }
+                currentCoroutineContext().ensureActive()
+                val ordered = orderPoints(raw)
+                // A point belongs to several overlapping windows, but its immutable geographic
+                // value only needs to be constructed once within this bounded (<=4 windows) batch.
+                val projected = arrayOfNulls<GeoPoint>(ordered.size)
+                group.map { window ->
+                    currentCoroutineContext().ensureActive()
+                    val members = window.longitudeIntervals()
+                    val indices = IntArray(ordered.size)
+                    var size = 0
+                    ordered.forEachIndexed { index, point ->
+                        if (index % 256 == 0) currentCoroutineContext().ensureActive()
+                        if (point.latitude >= window.south && point.latitude <= window.north &&
+                            members.any { point.longitude >= it.west && point.longitude <= it.east }) {
+                            indices[size++] = index
+                        }
+                    }
+                    readIndexedModel(ordered, indices, size, projected)
+                }
+            }
+        }
+    }
+
+    /**
      * One single-point segment per cell.
      *
      * Never a [ViewportTrackPoint]: that type requires a positive `pointId`, `sessionId` and
@@ -178,35 +229,91 @@ class ViewportTrackDataSource(
         )
 
     private suspend fun readPoints(bounds: ViewportBounds): ViewportTrackReadModel {
-        val merged = bounds.longitudeIntervals()
-            .flatMap { interval -> reader.read(bounds.south, bounds.north, interval) }
-            .distinctBy(ViewportTrackPoint::pointId)
-            .sortedWith(
-                compareBy<ViewportTrackPoint>(ViewportTrackPoint::sessionId)
-                    .thenBy(ViewportTrackPoint::segmentSequence)
-                    .thenBy(ViewportTrackPoint::segmentId)
-                    .thenBy(ViewportTrackPoint::pointSequence),
-            )
+        val merged = orderPoints(bounds.longitudeIntervals()
+            .flatMap { interval -> reader.read(bounds.south, bounds.north, interval) })
+        return readModel(merged)
+    }
 
-        return ViewportTrackReadModel(
-            segments = merged
-                .groupBy { point -> SegmentKey(point.sessionId, point.segmentId, point.segmentSequence) }
-                .flatMap { (key, points) ->
-                    points.contiguousSequenceRuns().map { run ->
-                        ViewportTrackSegment(
-                            sessionId = key.sessionId,
-                            segmentId = key.segmentId,
-                            segmentSequence = key.segmentSequence,
-                            points = run.map { point ->
-                                GeoPoint(latitude = point.latitude, longitude = point.longitude)
-                            },
-                        )
-                    }
-                },
-        )
+    private fun orderPoints(points: List<ViewportTrackPoint>): List<ViewportTrackPoint> {
+        val seen = MutableLongSet()
+        val unique = ArrayList<ViewportTrackPoint>()
+        for (point in points) if (seen.add(point.pointId)) unique += point
+        unique.sortWith(POINT_ORDER)
+        return unique
+    }
+
+    /**
+     * Both callers use orderPoints first; a batch window only filters that ordered list. Thus each
+     * (session, segment sequence, segment id) group is contiguous already. Find sequence runs in
+     * that order and allocate only their final point lists, avoiding per-point keys and temporary
+     * grouping/run lists. Duplicate sequences, gaps and Long.MAX_VALUE still end a run.
+     */
+    private fun readModel(merged: List<ViewportTrackPoint>): ViewportTrackReadModel {
+        val segments = ArrayList<ViewportTrackSegment>()
+        var start = 0
+        while (start < merged.size) {
+            val first = merged[start]
+            var end = start + 1
+            while (end < merged.size) {
+                val previous = merged[end - 1]
+                val next = merged[end]
+                if (next.sessionId != first.sessionId || next.segmentSequence != first.segmentSequence ||
+                    next.segmentId != first.segmentId || previous.pointSequence == Long.MAX_VALUE ||
+                    next.pointSequence != previous.pointSequence + 1
+                ) break
+                end++
+            }
+            val points = ArrayList<GeoPoint>(end - start)
+            for (index in start until end) {
+                val point = merged[index]
+                points += GeoPoint(point.latitude, point.longitude)
+            }
+            segments += ViewportTrackSegment(first.sessionId, first.segmentId, first.segmentSequence, points)
+            start = end
+        }
+        return ViewportTrackReadModel(segments)
+    }
+
+    /** Same run boundaries as readModel; ordered indices preserve filtering without row-list copies. */
+    private fun readIndexedModel(ordered: List<ViewportTrackPoint>, indices: IntArray, size: Int,
+        projected: Array<GeoPoint?>): ViewportTrackReadModel {
+        val segments = ArrayList<ViewportTrackSegment>()
+        var start = 0
+        while (start < size) {
+            val first = ordered[indices[start]]
+            var end = start + 1
+            while (end < size) {
+                val previous = ordered[indices[end - 1]]
+                val next = ordered[indices[end]]
+                if (next.sessionId != first.sessionId || next.segmentSequence != first.segmentSequence ||
+                    next.segmentId != first.segmentId || previous.pointSequence == Long.MAX_VALUE ||
+                    next.pointSequence != previous.pointSequence + 1
+                ) break
+                end++
+            }
+            val points = ArrayList<GeoPoint>(end - start)
+            for (position in start until end) {
+                val index = indices[position]
+                val point = projected[index] ?: ordered[index].let { raw ->
+                    GeoPoint(raw.latitude, raw.longitude).also { projected[index] = it }
+                }
+                points += point
+            }
+            segments += ViewportTrackSegment(first.sessionId, first.segmentId, first.segmentSequence, points)
+            start = end
+        }
+        return ViewportTrackReadModel(segments)
     }
 
     private companion object {
+        // Compare primitive longs, preserving the former stable four-field ordering and ties.
+        val POINT_ORDER = Comparator<ViewportTrackPoint> { left, right ->
+            var result = left.sessionId.compareTo(right.sessionId)
+            if (result == 0) result = left.segmentSequence.compareTo(right.segmentSequence)
+            if (result == 0) result = left.segmentId.compareTo(right.segmentId)
+            if (result == 0) result = left.pointSequence.compareTo(right.pointSequence)
+            result
+        }
         /**
          * A cell belongs to no recording, and nothing reads these back: `toFogTrackSegments()`
          * assigns render-local ids by position and ignores both fields. They are named rather than
@@ -216,27 +323,4 @@ class ViewportTrackDataSource(
         const val COARSE_CELL_NO_SEGMENT = 0L
     }
 
-    /** A bbox can omit middle points from one persisted segment; never draw across that gap. */
-    private fun List<ViewportTrackPoint>.contiguousSequenceRuns(): List<List<ViewportTrackPoint>> {
-        val runs = mutableListOf<MutableList<ViewportTrackPoint>>()
-        forEach { point ->
-            val previous = runs.lastOrNull()?.lastOrNull()
-            if (
-                previous != null &&
-                previous.pointSequence != Long.MAX_VALUE &&
-                point.pointSequence == previous.pointSequence + 1
-            ) {
-                runs.last().add(point)
-            } else {
-                runs += mutableListOf(point)
-            }
-        }
-        return runs
-    }
-
-    private data class SegmentKey(
-        val sessionId: Long,
-        val segmentId: Long,
-        val segmentSequence: Long,
-    )
 }

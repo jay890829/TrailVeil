@@ -23,9 +23,32 @@ import app.trailveil.map.fog.GeoPoint
  * null-by-default hook out of `src/google` because it was scaffolding in a public artifact all the
  * same.
  *
- * Every method runs on the main thread, like the binding that calls it.
+ * Methods run on Main except [prepare] and [hasPreparedNativeGeometry], both on the render worker.
  */
 internal interface GoogleFogOverlayInstaller {
+    /** This preparer reads raw canonical points after the same attempt's raster read. */
+    val reusesCanonicalPoints: Boolean get() = false
+
+    /** Opt-in only: preparation can decide whether the unused padded raster is needed. */
+    val canPrepareFromRequiredMasks: Boolean get() = false
+
+    /** Worker-side answer after prepare; unknown or raster payloads retain the full raster. */
+    fun hasPreparedNativeGeometry(generationId: Long): Boolean = false
+
+    /** The installed representation needs the existing cover/retirement path before replacement. */
+    fun requiresCoverForHandover(installedGenerationId: Long): Boolean = false
+
+    /** Optional elapsed-realtime deadline for a newly revealed surface's first snapshot request.
+     * Scheduling hint only: reaching it never counts as proof. Already settled/tile surfaces use 0.
+     */
+    fun snapshotNotBeforeMillis(generationId: Long): Long = 0L
+
+    /** Optional background preparation, inside the generation's render/cancellation budget. */
+    suspend fun prepare(
+        generationId: Long,
+        coverage: FogViewportCoverageRequest,
+        tiles: List<FogMosaicTile>,
+    ) = Unit
 
     /**
      * Pushes every already-installed layer behind the one about to be attached.
@@ -66,6 +89,32 @@ internal interface GoogleFogOverlayInstaller {
     fun remove(generationId: Long): Boolean
 
     /**
+     * The safety cover has just risen, or a refuted generation stays installed beneath it: take
+     * every layer this installer has revealed off the screen, so the interval reads as ONE coat
+     * of fog - the cover, at the fog's own colour and alpha, over bare basemap - and not fog
+     * stacked on fog. The binding hides the tile path's overlays on the same edge (V02-012
+     * design 2); this is the installer's half of that rule.
+     *
+     * Measured on the API 36 AVD (2026-09-10, same viewport and fixture): with the mosaic image
+     * or the native polygons left beneath the cover the screen read (41,52,58) against the fog's
+     * own (68,88,97); the tile path read (68,88,97) under its cover. The owner read the first as
+     * "the cover is darker than the fog" - it is not the cover, it is the second coat.
+     *
+     * Best effort and never fail-open: a layer that stays is a second coat of fog, and the cover
+     * itself is what keeps unproven ground no clearer than fog. An installer that cannot hide a
+     * layer (hiding a holed polygon crashes the SDK; recorded in the vector installer) removes it
+     * instead. The coordinator's later `remove` of such a generation then finds nothing and
+     * reports success - unless the removal itself failed, in which case the installer keeps
+     * reporting that generation as a failed removal, the same fail-closed contract as [remove]
+     * (a stray layer above later generations would otherwise fail every proof until the cover
+     * deadline). `covers` answers false for a removed generation, which only asks for the
+     * rebuild the raised cover already implies; a host-start re-proof of it cannot lower the
+     * cover, and the rebuild comes from the pending generation or the next idle, with the cover
+     * up throughout.
+     */
+    fun hideBeneathCover()
+
+    /**
      * Whether [generationId]'s published fog still covers [visibleCorners].
      *
      * This is the surround term the tile path answers with `published >= predicted` over tile keys.
@@ -74,6 +123,20 @@ internal interface GoogleFogOverlayInstaller {
      * genuinely takes away. False for an unknown or null generation.
      */
     fun covers(generationId: Long?, visibleCorners: List<GeoPoint>): Boolean
+
+    /** False only for an installed geometry payload whose detail is independent of tile zoom. */
+    fun requiresRasterResolution(generationId: Long?): Boolean = true
+
+    /**
+     * False for an installer that never reads the published PNG tiles. Its masks still arrive
+     * through [prepare] and [attach] and the proof still samples them; only the provider-facing
+     * encode is dead weight, so the binding publishes an empty key set and keeps the adapter's
+     * currency gate alone. Deliberately, the adapter's per-key budget rejections (render version,
+     * entry and byte caps) then no longer apply to this installer either: nothing of its output is
+     * held by the adapter, and the render itself is still bounded by the coverage profile's key
+     * ceiling. True by default: the tile path draws through the provider.
+     */
+    val publishesMaskTiles: Boolean get() = true
 
     /** Releases every layer and any bitmap it holds. */
     fun release()

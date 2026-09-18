@@ -122,6 +122,27 @@ class GoogleFogBoundarySharpnessSpikeTest {
 
     // ---- the scene -------------------------------------------------------------------------------
 
+    @Test
+    fun trackDerivedBoundaryIsMeasuredWithoutRasterMagnification() {
+        SpikeScenarioSupport.assumeKeyConfigured()
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val baseline = measureArm(FogContinuityArm.BASELINE)
+        val native = measureArm(FogContinuityArm.TRACK_NATIVE)
+        for ((arm, readings) in listOf("baseline" to baseline, "trackNative" to native)) {
+            readings.forEach { (stage, reading) ->
+                SpikeEvidence.emit(context, "v03-013-track-boundary.txt",
+                    "V03-013-BOUNDARY arm=$arm stage=$stage ${reading.describe()}")
+            }
+        }
+        assertTrue("native trial must not silently use raster fallback",
+            native.all { (_, reading) -> reading.installer?.startsWith("trackNative[") == true })
+        assertTrue("native zoom unexpectedly rebuilt its geometry",
+            native.first().second.generation == native.last().second.generation)
+        assertTrue("no visible explored boundary was measured", native.all { (_, reading) ->
+            reading.rows > 0 && reading.revealedPct > 0.0 && reading.fogPct > 0.0
+        })
+    }
+
     private fun measureArm(arm: FogContinuityArm): List<Pair<String, BoundaryReading>> {
         val database = inMemoryDatabase()
         val readings = mutableListOf<Pair<String, BoundaryReading>>()

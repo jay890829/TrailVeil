@@ -5,10 +5,42 @@ data class FogMosaicTile(
     val mask: FogPixelMask,
 )
 
+/** Geometry shared by the backdrop/extent policy; only the raster representation has pixels. */
+sealed interface FogViewportPresentation {
+    val bounds: FogTileBounds
+    val tileCount: Int
+    val samplingGridWidth: Int
+    val samplingGridHeight: Int
+}
+
 data class FogTileMosaic(
     val mask: FogPixelMask,
+    override val bounds: FogTileBounds,
+    override val tileCount: Int,
+) : FogViewportPresentation {
+    override val samplingGridWidth: Int get() = mask.width
+    override val samplingGridHeight: Int get() = mask.height
+}
+
+data class FogNativePresentation(
+    val geometry: FogNativeGeometry,
+    val layout: FogMosaicLayout,
+) : FogViewportPresentation {
+    init { require(geometry.bounds == layout.bounds) { "native geometry must cover its layout" } }
+    override val bounds: FogTileBounds get() = layout.bounds
+    override val tileCount: Int get() = layout.tileCount
+    override val samplingGridWidth: Int get() = layout.samplingGridWidth
+    override val samplingGridHeight: Int get() = layout.samplingGridHeight
+}
+
+/** The exact compose footprint, calculated without allocating a mask. */
+data class FogMosaicLayout(
     val bounds: FogTileBounds,
     val tileCount: Int,
+    val columns: Int,
+    val rows: Int,
+    val samplingGridWidth: Int,
+    val samplingGridHeight: Int,
 )
 
 object FogPocMosaic {
@@ -20,24 +52,50 @@ object FogPocMosaic {
      * long way around the world.
      */
     fun compose(tiles: List<FogMosaicTile>): FogTileMosaic {
+        val layout = layout(tiles)
+        val tileWidth = tiles.first().mask.width
+        val tileHeight = tiles.first().mask.height
+        val mosaicWidth = layout.samplingGridWidth
+        val mosaicHeight = layout.samplingGridHeight
+        val alpha = ByteArray(Math.multiplyExact(mosaicWidth, mosaicHeight))
+        tiles.forEachIndexed { index, tile ->
+            val rowIndex = index / layout.columns
+            val columnIndex = index % layout.columns
+            val source = tile.mask.copyAlpha()
+            repeat(tileHeight) { sourceY ->
+                val sourceOffset = sourceY * tileWidth
+                val targetOffset = (rowIndex * tileHeight + sourceY) * mosaicWidth + columnIndex * tileWidth
+                source.copyInto(alpha, targetOffset, sourceOffset, sourceOffset + tileWidth)
+            }
+        }
+        return FogTileMosaic(FogPixelMask(mosaicWidth, mosaicHeight, alpha), layout.bounds, layout.tileCount)
+    }
+
+    /** Validates the same tile batch as [compose], without copying or allocating pixel arrays. */
+    fun layout(tiles: List<FogMosaicTile>): FogMosaicLayout {
         require(tiles.isNotEmpty()) { "tiles must not be empty" }
         val first = tiles.first()
-        val zoom = first.key.zoom
-        val renderVersion = first.key.renderVersion
         val tileWidth = first.mask.width
         val tileHeight = first.mask.height
-        require(tileWidth > 0 && tileHeight > 0) { "tile masks must not be empty" }
-        require(tiles.all { it.key.zoom == zoom }) { "all tiles must use the same zoom" }
-        require(tiles.all { it.key.renderVersion == renderVersion }) {
-            "all tiles must use the same render version"
-        }
         require(tiles.all { it.mask.width == tileWidth && it.mask.height == tileHeight }) {
             "all tile masks must have the same dimensions"
         }
+        val layout = layout(tiles.map(FogMosaicTile::key), tileWidth, tileHeight)
+        tiles.forEach { it.mask.requireCompleteRasterData() }
+        return layout
+    }
 
-        val rows = tiles.fold(mutableListOf<MutableList<FogMosaicTile>>()) { result, tile ->
+    fun layout(keys: List<FogTileKey>, tileWidth: Int, tileHeight: Int = tileWidth): FogMosaicLayout {
+        require(keys.isNotEmpty()) { "tiles must not be empty" }
+        require(tileWidth > 0 && tileHeight > 0) { "tile masks must not be empty" }
+        val zoom = keys.first().zoom
+        val renderVersion = keys.first().renderVersion
+        require(keys.all { it.zoom == zoom }) { "all tiles must use the same zoom" }
+        require(keys.all { it.renderVersion == renderVersion }) { "all tiles must use the same render version" }
+
+        val rows = keys.fold(mutableListOf<MutableList<FogTileKey>>()) { result, tile ->
             val current = result.lastOrNull()
-            if (current == null || current.first().key.y != tile.key.y) {
+            if (current == null || current.first().y != tile.y) {
                 result += mutableListOf(tile)
             } else {
                 current += tile
@@ -49,54 +107,39 @@ object FogPocMosaic {
             "tiles must form a complete row-major rectangle"
         }
         rows.zipWithNext().forEach { (prior, next) ->
-            require(next.first().key.y == prior.first().key.y + 1) {
+            require(next.first().y == prior.first().y + 1) {
                 "tile rows must be vertically consecutive"
             }
         }
         val tileCountAtZoom = 1 shl zoom
-        val expectedX = rows.first().map { it.key.x }
+        val expectedX = rows.first().map { it.x }
         expectedX.zipWithNext().forEach { (prior, next) ->
             require(next == Math.floorMod(prior + 1, tileCountAtZoom)) {
                 "tile columns must be horizontally consecutive with dateline wrapping"
             }
         }
-        require(rows.all { row -> row.map { it.key.x } == expectedX }) {
+        require(rows.all { row -> row.map { it.x } == expectedX }) {
             "every tile row must use the same horizontal order"
         }
 
         val mosaicWidth = Math.multiplyExact(tileWidth, columnCount)
         val mosaicHeight = Math.multiplyExact(tileHeight, rows.size)
-        val alpha = ByteArray(Math.multiplyExact(mosaicWidth, mosaicHeight))
-        rows.forEachIndexed { rowIndex, row ->
-            row.forEachIndexed { columnIndex, tile ->
-                val source = tile.mask.copyAlpha()
-                repeat(tileHeight) { sourceY ->
-                    val sourceOffset = sourceY * tileWidth
-                    val targetOffset =
-                        (rowIndex * tileHeight + sourceY) * mosaicWidth +
-                            columnIndex * tileWidth
-                    source.copyInto(
-                        destination = alpha,
-                        destinationOffset = targetOffset,
-                        startIndex = sourceOffset,
-                        endIndex = sourceOffset + tileWidth,
-                    )
-                }
-            }
-        }
-
-        val firstBounds = FogPocTileGrid.bounds(rows.first().first().key)
-        val lastBounds = FogPocTileGrid.bounds(rows.last().last().key)
+        Math.multiplyExact(mosaicWidth, mosaicHeight)
+        val firstBounds = FogPocTileGrid.bounds(rows.first().first())
+        val lastBounds = FogPocTileGrid.bounds(rows.last().last())
         val longitudeSpan = 360.0 / tileCountAtZoom
-        return FogTileMosaic(
-            mask = FogPixelMask(mosaicWidth, mosaicHeight, alpha),
+        return FogMosaicLayout(
             bounds = FogTileBounds(
                 westLongitude = firstBounds.westLongitude,
                 southLatitude = lastBounds.southLatitude,
                 eastLongitude = firstBounds.westLongitude + columnCount * longitudeSpan,
                 northLatitude = firstBounds.northLatitude,
             ),
-            tileCount = tiles.size,
+            tileCount = keys.size,
+            columns = columnCount,
+            rows = rows.size,
+            samplingGridWidth = mosaicWidth,
+            samplingGridHeight = mosaicHeight,
         )
     }
 }

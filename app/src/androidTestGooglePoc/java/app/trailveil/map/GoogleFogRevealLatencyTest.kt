@@ -25,6 +25,7 @@ import app.trailveil.data.map.RoomViewportTrackPointReader
 import app.trailveil.data.map.ViewportTrackDataSource
 import app.trailveil.map.fog.FogMemoryTileCache
 import app.trailveil.map.fog.FogRenderStyle
+import app.trailveil.harness.TrackRegionGeometryEngine
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogTilePipeline
 import app.trailveil.map.fog.FogTileRenderer
@@ -87,6 +88,7 @@ class GoogleFogRevealLatencyTest {
     @Before
     fun setUp() {
         GoogleMapSurfaceTestHooks.reset()
+        GoogleFogArm.DEFAULT.apply()
         // The harness activity composes its own surface in onCreate from these hooks, before this
         // test can install a runtime. A terminal startup decision keeps that first composition
         // from building a second MapView that would compete for the SDK renderer.
@@ -96,7 +98,10 @@ class GoogleFogRevealLatencyTest {
     }
 
     @After
-    fun tearDown() = GoogleMapSurfaceTestHooks.reset()
+    fun tearDown() {
+        GoogleMapSurfaceTestHooks.reset()
+        GoogleFogArm.DEFAULT.apply()
+    }
 
     @Test
     fun persistedPointToInstalledFogP95StaysWithinTwoSeconds() {
@@ -120,6 +125,7 @@ class GoogleFogRevealLatencyTest {
                         renderMask = FogTileRenderer(style)::render,
                     ),
                     style = style,
+                    nativeGeometryEngine = TrackRegionGeometryEngine(),
                 ),
                 pointChanges = observedFeed,
             )
@@ -184,7 +190,20 @@ class GoogleFogRevealLatencyTest {
                 // The generation standing before any sample was persisted. The closing assertion
                 // compares against this, so a proven generation that predates the loop entirely -
                 // the one the initial render installed - can no longer discharge it.
-                val generationAtLoopStart = readCanonicalGeneration(mapViewRef.get())
+                // Mask publication is not proof of a presented generation. Settle the startup
+                // (including empty-history raster fallback) before starting the unchanged budget.
+                composeRule.waitUntil(FIRST_RENDER_TIMEOUT_MILLIS) {
+                    val view = mapViewRef.get()
+                    val presented = AtomicReference(false)
+                    if (view != null) InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                        presented.set((view.getTag(R.id.map_fog_canonical_generation) as? String)?.toLongOrNull() != null &&
+                            view.getTag(R.id.map_fog_cover_up) == false &&
+                            view.getTag(R.id.map_fog_synchronous_cover_up) == false)
+                    }
+                    presented.get()
+                }
+                rendered.clear()
+                val generationAtLoopStart = checkNotNull(readCanonicalGeneration(mapViewRef.get()))
 
                 val samplesMillis = buildList {
                     repeat(SAMPLE_COUNT) { index ->

@@ -12,12 +12,17 @@ import android.content.Context
  * hope about it.
  */
 internal object MapLibreVectorFogState {
+    /** The final scheme the process-scoped runtime was constructed with. */
+    @Volatile
+    var activeArm: MapLibreFogArm? = null
     @Volatile
     var enabled: Boolean = false
+    @Volatile
+    var trackEnabled: Boolean = false
 }
 
 /**
- * The harness twin: the mosaic this build's fog runtime is constructed with.
+ * The harness twin: the final native 5x5 scheme this build's fog runtime is constructed with.
  *
  * Lives in `src/debug` rather than `src/mapLibre` because that tree is compiled by `release` too,
  * and a published artifact must not carry a selectable fog size. `internal` and `release` declare
@@ -27,6 +32,8 @@ internal object MapLibreVectorFogState {
  */
 internal fun fogMosaicPaddingTiles(context: Context): Int {
     val arm = MapLibreFogArm.stored(context)
-    MapLibreVectorFogState.enabled = arm.vectorFog
+    MapLibreVectorFogState.enabled = false
+    MapLibreVectorFogState.trackEnabled = arm.trackVector
+    MapLibreVectorFogState.activeArm = arm
     return arm.mosaicPaddingTiles
 }

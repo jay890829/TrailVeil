@@ -104,6 +104,7 @@ class GoogleFogFailureStatusTest {
     @Before
     fun setUp() {
         GoogleMapSurfaceTestHooks.reset()
+        GoogleFogArm.DEFAULT.apply()
         // The harness activity composes its own surface from these hooks in onCreate, before a
         // test can install a runtime. A terminal startup decision makes that first composition
         // inert, so the only MapView in the window is the one hosted by [hostFogSurface].
@@ -113,7 +114,10 @@ class GoogleFogFailureStatusTest {
     }
 
     @After
-    fun tearDown() = GoogleMapSurfaceTestHooks.reset()
+    fun tearDown() {
+        GoogleMapSurfaceTestHooks.reset()
+        GoogleFogArm.DEFAULT.apply()
+    }
 
     /**
      * A canonical change feed that starts refusing stops fog tracking new points at all, so the

@@ -150,6 +150,7 @@ private fun fogRuntimeWith(
                 renderMask = renderMask,
             ),
             style = style,
+            nativeGeometryEngine = fogNativeGeometryEngine(),
         ),
         pointChanges = pointChanges,
     )

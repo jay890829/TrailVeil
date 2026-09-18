@@ -4,6 +4,11 @@ import app.trailveil.data.map.PersistedPointCursor
 import app.trailveil.data.map.PersistedTrackPointChange
 import app.trailveil.data.map.PersistedTrackPointChangeFeed
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -12,6 +17,7 @@ internal data class FogSynchronization(
     val bootstrapped: Boolean,
     val mergedPages: Int,
     val mergedChanges: Int,
+    val superseded: Boolean = false,
 )
 
 /**
@@ -29,6 +35,40 @@ internal class FogChangeSynchronizer(
 ) {
     private val mutex = Mutex()
     private var cursor: PersistedPointCursor? = null
+    private val replacementEpoch = MutableStateFlow(0L)
+    /** Odd while a replacement is running; even after its cache invalidation has finished. */
+    val canonicalEpoch: StateFlow<Long> = replacementEpoch.asStateFlow()
+
+    /**
+     * Existing harness data replacement is not an append. Serialize it with cursor draining;
+     * afterward fence old workers, clear BOTH derived representations and restart subscribers.
+     * A cancelled/failed multi-transaction fixture may already have committed some rows, so its
+     * finally must run too. This is process-local, not V03-008's future durable mutation epoch.
+     */
+    suspend fun <T> replaceCanonicalData(mutation: suspend () -> T): T = mutex.withLock {
+        // Fence in-flight renders before the first transaction can change canonical rows.
+        // A second publication in finally restarts subscribers after partial failure as well.
+        replacementEpoch.value += 1L
+        var mutationFailure: Throwable? = null
+        try {
+            mutation()
+        } catch (failure: Throwable) {
+            mutationFailure = failure
+            throw failure
+        } finally {
+            withContext(NonCancellable) {
+                cursor = null
+                try {
+                    clearDerivedCache()
+                } catch (failure: Throwable) {
+                    val original = mutationFailure
+                    if (original == null) throw failure else original.addSuppressed(failure)
+                } finally {
+                    replacementEpoch.value += 1L
+                }
+            }
+        }
+    }
 
     /** See [FogViewportCoordinator.isLockedForTesting]; the same question for this lock. */
     internal val isLockedForTesting: Boolean get() = mutex.isLocked
@@ -39,7 +79,14 @@ internal class FogChangeSynchronizer(
 
     suspend fun synchronizeTo(
         targetCursor: PersistedPointCursor? = null,
+        expectedCanonicalEpoch: Long? = null,
     ): FogSynchronization = mutex.withLock {
+        // A queued point notification from before a replacement cannot advance the new cursor
+        // back to a deleted id, nor merge an old page into a newly cleared cache.
+        if (expectedCanonicalEpoch != null && expectedCanonicalEpoch != replacementEpoch.value) {
+            return@withLock FogSynchronization(cursor ?: PersistedPointCursor(0L), false, 0, 0,
+                superseded = true)
+        }
         val needsBootstrap = cursor == null
         try {
             var current = cursor ?: run {

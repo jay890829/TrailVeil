@@ -18,6 +18,8 @@ internal fun GoogleFogArmBadge(
     modifier: Modifier = Modifier,
     lastCoverMillis: Long? = null,
     maximumCoverMillis: Long? = null,
+    surfaceDescription: String? = null,
+    stageSummary: String? = null,
 ) {
     // Intentionally empty; see above. The cover timings are accepted and dropped rather than left
     // out of the signature, so the shared call site stays one call rather than a per-build-type

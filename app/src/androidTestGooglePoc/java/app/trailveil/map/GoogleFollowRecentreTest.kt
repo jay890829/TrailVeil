@@ -151,6 +151,13 @@ class GoogleFollowRecentreTest {
         val proofAccepted = CountDownLatch(1)
         val ready = CountDownLatch(1)
         val mapViewRef = AtomicReference<MapView>()
+        // One interleaved log of both events, because the ordering is the claim. Both callbacks
+        // run on the main thread inside the same chain - onProofObserved fires in
+        // GoogleFogSnapshotProver before the passed verdict reaches
+        // GoogleCanonicalFogSurfaceBinding.revealOverlaysForGeneration - so append order here is a
+        // real happens-before order rather than a sample the test thread happened to take.
+        val order = CopyOnWriteArrayList<Pair<String, Long?>>()
+        val fogState = AtomicReference<GoogleCanonicalFogState?>(null)
 
         GoogleMapSurfaceTestHooks.decision.set(ProviderStartupDecision(true, null))
         GoogleMapSurfaceTestHooks.fogRequired = true
@@ -158,15 +165,28 @@ class GoogleFollowRecentreTest {
         GoogleMapSurfaceTestHooks.currentLocation = initial
         GoogleMapSurfaceTestHooks.onMapReady.set { ready.countDown() }
         GoogleMapSurfaceTestHooks.onMapViewCreated.set { mapViewRef.set(it) }
+        GoogleMapSurfaceTestHooks.onFogState.set { state -> fogState.set(state) }
         GoogleMapSurfaceTestHooks.onFogProof.set { observation ->
             if (observation.passed) {
+                order += "proof" to observation.generation
                 passedProofs.incrementAndGet()
                 proofAccepted.countDown()
             }
         }
         GoogleMapSurfaceTestHooks.onOverlayVisibility.set { visible ->
+            if (visible) order += "reveal" to fogState.get()?.installedGeneration
             visibilityEvents += visible
         }
+
+        // Arranged, not assumed. `GoogleMapSurfaceTestHooks` is process-global and `reset()` runs in
+        // both @Before and @After, so the only way a proof is already counted here is a callback
+        // arriving between the hook installation above and this launch - a leaked surface from an
+        // earlier case feeding the same hook. That would silently corrupt every count below.
+        assertEquals(
+            "GoogleMapSurfaceTestHooks.onFogProof counted a proof before this surface existed",
+            0,
+            passedProofs.get(),
+        )
 
         ActivityScenario.launch(GoogleMapSurfaceTestActivity::class.java).use { scenario ->
             assertTrue("Google map did not become ready", ready.await(30, TimeUnit.SECONDS))
@@ -178,7 +198,6 @@ class GoogleFollowRecentreTest {
                 "marker/track became visible before a production fog proof",
                 visibilityEvents.first(),
             )
-            val proofsBeforeAcceptance = passedProofs.get()
             assertTrue(
                 "production fog proof did not pass",
                 proofAccepted.await(30, TimeUnit.SECONDS),
@@ -187,7 +206,32 @@ class GoogleFollowRecentreTest {
                 "matching proof did not reveal the overlay",
                 awaitUntil { visibilityEvents.any { visible -> visible } },
             )
-            assertTrue("proof callback did not precede reveal", passedProofs.get() > proofsBeforeAcceptance)
+            // Read the order that was logged, rather than a delta across a sample point. The
+            // previous form took `passedProofs` after `onMapReady` and required it to grow
+            // afterwards; `onMapReady` is deliberately the last step of binding construction, so a
+            // proof that had already passed made the delta zero and the case failed having
+            // asserted nothing about the invariant. Measured on the owner's phone, where the
+            // surface builds faster than the emulator.
+            val revealIndex = order.indexOfFirst { (kind, _) -> kind == "reveal" }
+            assertTrue("overlay was never revealed; order: $order", revealIndex >= 0)
+            val proofsBeforeReveal = order.take(revealIndex).filter { (kind, _) -> kind == "proof" }
+            assertTrue(
+                "the overlay was revealed with no passing proof before it; order: $order",
+                proofsBeforeReveal.isNotEmpty(),
+            )
+            // And it was THIS generation's proof, where the binding published one by the time the
+            // reveal was observed. Conditional because the two callbacks are independent
+            // publications: a null here means the state had not been republished yet, which is a
+            // missing observation rather than a violated ordering, and failing on it would trade
+            // one sampling race for another.
+            val revealedGeneration = order[revealIndex].second
+            if (revealedGeneration != null) {
+                assertTrue(
+                    "the overlay was revealed for generation $revealedGeneration, which no proof " +
+                        "before it had passed; order: $order",
+                    proofsBeforeReveal.any { (_, generation) -> generation == revealedGeneration },
+                )
+            }
 
             // A raw active-session fix is a geometry update, not a canonical fog generation. It
             // must keep the proven overlay visible and must not start a new proof per GPS tick.
@@ -278,7 +322,12 @@ class GoogleFollowRecentreTest {
                 },
             )
             val stableGeneration = requireNotNull(latestHealthyState(states).installedGeneration)
-            assertEquals(false, mapView.getTag(app.trailveil.R.id.map_fog_synchronous_cover_up))
+            // V03-013: the cover's lowering settles (50 ms + an animation frame) after the state
+            // that lowered it is published, so the tag is polled, not read on the same tick.
+            assertTrue(
+                "the anchor's cover did not come down after its proof",
+                awaitUntil { mapView.getTag(app.trailveil.R.id.map_fog_synchronous_cover_up) == false },
+            )
 
             // A centered fix is HOLD: it must not jitter the camera or raise the cover.
             val center = readCameraOnMain(

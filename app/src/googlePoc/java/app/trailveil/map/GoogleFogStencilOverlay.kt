@@ -1,5 +1,7 @@
 package app.trailveil.map
 
+import app.trailveil.harness.screenSegmentOutside
+
 import androidx.compose.foundation.Canvas
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -215,7 +217,10 @@ internal fun GoogleFogStencilOverlay(
                 // apart than the radius. Measured against the tile path on the same seeded track,
                 // the point-only version was missing 118,023 of 256,293 revealed pixels - 46% of
                 // the explored ground - because a walk's points are not always close together.
-                if (start != null && !(offscreen && isOffscreen(start, size, feathered))) {
+                if (start != null && !screenSegmentOutside(
+                        start.x, start.y, centre.x, centre.y, size.width, size.height, feathered,
+                    )
+                ) {
                     drawLine(
                         color = Color.Black,
                         start = start,
@@ -245,11 +250,6 @@ internal fun GoogleFogStencilOverlay(
         }
     }
 }
-
-/** Both ends off-screen on the same side means the capsule cannot cross the viewport. */
-private fun isOffscreen(point: Offset, size: Size, margin: Float): Boolean =
-    point.x < -margin || point.y < -margin || point.x > size.width + margin ||
-        point.y > size.height + margin
 
 /**
  * The reveal radius in screen pixels, measured through the SDK rather than recomputed.

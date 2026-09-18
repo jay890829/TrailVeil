@@ -31,6 +31,41 @@ class ViewportTrackDataSourceTest {
         assertEquals(listOf(121.0, 121.1, 121.2), result.segments.single().points.map { it.longitude })
     }
 
+    /**
+     * `V03-013`: the DAO's fog reads dropped their `ORDER BY` (0.94 s of a 1.78 s whole-table read
+     * on the AVD) on the strength of this sort. A reader answering in the reverse of the old DAO
+     * order must therefore produce the identical model - segments, their order, their runs.
+     */
+    @Test
+    fun theModelDoesNotDependOnTheReadersRowOrder() = runTest {
+        val interval = LongitudeInterval(120.0, 122.0)
+        val bounds = ViewportBounds(south = 24.0, north = 26.0, west = 120.0, east = 122.0)
+        val inDaoOrder = listOf(
+            point(pointId = 1, sessionId = 3, segmentId = 30, segmentSequence = 0, pointSequence = 0, latitude = 25.0, longitude = 121.0),
+            point(pointId = 2, sessionId = 3, segmentId = 30, segmentSequence = 0, pointSequence = 1, latitude = 25.1, longitude = 121.1),
+            point(pointId = 9, sessionId = 3, segmentId = 31, segmentSequence = 1, pointSequence = 0, latitude = 25.2, longitude = 121.2),
+            point(pointId = 4, sessionId = 3, segmentId = 31, segmentSequence = 1, pointSequence = 2, latitude = 25.3, longitude = 121.3),
+            point(pointId = 5, sessionId = 8, segmentId = 80, segmentSequence = 0, pointSequence = 0, latitude = 24.5, longitude = 120.5),
+            point(pointId = 6, sessionId = 8, segmentId = 80, segmentSequence = 0, pointSequence = 1, latitude = 24.6, longitude = 120.6),
+            point(pointId = 7, sessionId = 8, segmentId = 80, segmentSequence = 0, pointSequence = 2, latitude = 24.7, longitude = 120.7),
+        )
+
+        val ordered = ViewportTrackDataSource(RecordingReader(mapOf(interval to inDaoOrder))).read(bounds)
+        val reversed = ViewportTrackDataSource(RecordingReader(mapOf(interval to inDaoOrder.reversed()))).read(bounds)
+        val interleaved = ViewportTrackDataSource(
+            RecordingReader(mapOf(interval to listOf(inDaoOrder[4], inDaoOrder[2], inDaoOrder[6], inDaoOrder[0], inDaoOrder[3], inDaoOrder[5], inDaoOrder[1]))),
+        ).read(bounds)
+
+        assertEquals(ordered, reversed)
+        assertEquals(ordered, interleaved)
+        // And the model is the one the old order produced: two sessions, the second session's
+        // segments in sequence order, and the sequence gap (0 -> 2) split into two runs.
+        assertEquals(listOf(3L, 3L, 3L, 8L), ordered.segments.map { it.sessionId })
+        assertEquals(listOf(30L, 31L, 31L, 80L), ordered.segments.map { it.segmentId })
+        assertEquals(listOf(2, 1, 1, 3), ordered.segments.map { it.points.size })
+        assertEquals(listOf(120.5, 120.6, 120.7), ordered.segments.last().points.map { it.longitude })
+    }
+
     @Test
     fun datelineViewportSplitsQueriesDedupesAndDoesNotBridgeSegments() = runTest {
         val east = LongitudeInterval(170.0, 180.0)

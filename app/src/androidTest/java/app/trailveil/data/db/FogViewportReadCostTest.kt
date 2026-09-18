@@ -201,12 +201,15 @@ class FogViewportReadCostTest {
         // cost a measured +13.1% on every write, and dropping it paid for the new one exactly. The
         // fallback only runs for a band taller than about 1.28 degrees.
         //
-        // It is NOT an unindexed table scan, and calling it one was wrong twice — in this comment
-        // and in the assertion message below. The `ORDER BY` leads with `p.session_id`, so SQLite
-        // walks `index_track_points_session_id_id` end to end with a rowid lookup per row: a
-        // non-covering full index scan, generally MORE I/O than reading the table. `SCAN p` is what
-        // the plan says either way, which is why the wrong description survived a correction that
-        // only reached the ledger.
+        // It was NOT an unindexed table scan, and calling it one was wrong twice — in this comment
+        // and in the assertion message below. While the query carried an `ORDER BY` leading with
+        // `p.session_id`, SQLite walked `index_track_points_session_id_id` end to end with a rowid
+        // lookup per row: a non-covering full index scan, generally MORE I/O than reading the
+        // table. `SCAN p` is what the plan says either way, which is why the wrong description
+        // survived a correction that only reached the ledger. `V03-013` then dropped the order
+        // (the data source sorts the merged rows itself; the walk plus its temp b-tree cost 0.94 s
+        // of a 1.78 s whole-table read on the AVD), so today the plan is the plain rowid-order
+        // `SCAN p` with the segment lookup - which this assertion accepts exactly as it did the walk.
         val fallback = fallbackRead()
         val fallbackPlan = planOf(fallback)
         assertTrue(

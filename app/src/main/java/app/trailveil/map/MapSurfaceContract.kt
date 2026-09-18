@@ -108,13 +108,13 @@ internal data class MapTrackOverlay(
     }
 }
 
-internal suspend fun renderCanonicalFogWithRetry(
+internal suspend fun <T : Any> renderCanonicalFogWithRetry(
     request: FogViewportRequest,
     retryDelayMillis: Long,
-    render: suspend (FogViewportRequest) -> FogViewportRender,
-    installAndAwait: suspend (FogViewportRender) -> Unit,
+    render: suspend (FogViewportRequest) -> T,
+    installAndAwait: suspend (T) -> Unit,
     onFailure: (Exception) -> Unit,
-): FogViewportRender = retryFogOperation(retryDelayMillis, onFailure) {
+): T = retryFogOperation(retryDelayMillis, onFailure) {
     render(request).also { rendered -> installAndAwait(rendered) }
 }
 

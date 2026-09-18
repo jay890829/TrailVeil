@@ -200,7 +200,7 @@ object FogBackdropGeometry {
      * At exploration zooms it extends farther than the required four-level pinch. Through render
      * zoom six it is the whole world, where no gesture can outrun it at all.
      */
-    fun surround(mosaic: FogTileMosaic): FogTileBounds {
+    fun surround(mosaic: FogViewportPresentation): FogTileBounds {
         val bounds = mosaic.bounds
         val center = (bounds.westLongitude + bounds.eastLongitude) / 2.0
         val halfWorlds = surroundHalfWorlds(mosaic)
@@ -224,7 +224,7 @@ object FogBackdropGeometry {
      * to MapLibre's own southern limit reaches 56%. Sliding keeps the whole budgeted height and
      * costs nothing, because past the pole there is no map to cover.
      */
-    private fun verticalSpan(mosaic: FogTileMosaic, halfWorlds: Double): Pair<Double, Double> {
+    private fun verticalSpan(mosaic: FogViewportPresentation, halfWorlds: Double): Pair<Double, Double> {
         val bounds = mosaic.bounds
         val centerY = (
             WebMercator.normalizedY(bounds.northLatitude) +
@@ -249,7 +249,7 @@ object FogBackdropGeometry {
      *
      * One rule: the world, or the largest square the renderer will draw, whichever is smaller.
      */
-    fun surroundHalfWorlds(mosaic: FogTileMosaic): Double {
+    fun surroundHalfWorlds(mosaic: FogViewportPresentation): Double {
         val worldPixels = worldPixels(mosaic)
         if (worldPixels <= 0.0) return 0.5
         return min(0.5, MAX_SURROUND_WORLD_PIXELS / 2.0 / worldPixels)
@@ -262,17 +262,17 @@ object FogBackdropGeometry {
      * much of the world it spans, and how many tiles wide it is. One divided by the other is the
      * world.
      */
-    fun worldPixels(mosaic: FogTileMosaic): Double {
+    fun worldPixels(mosaic: FogViewportPresentation): Double {
         val bounds = mosaic.bounds
         val mosaicWorlds = (bounds.eastLongitude - bounds.westLongitude) / WORLD_LONGITUDE_SPAN
         if (mosaicWorlds <= 0.0) return 0.0
-        val aspect = mosaic.mask.width.toDouble() / mosaic.mask.height.toDouble()
+        val aspect = mosaic.samplingGridWidth.toDouble() / mosaic.samplingGridHeight.toDouble()
         val columns = max(1.0, kotlin.math.sqrt(mosaic.tileCount.toDouble() * aspect))
         return columns * RENDER_TILE_SIZE_PIXELS / mosaicWorlds
     }
 
     /** Where the installed surround is and how far it reaches, for checking a live camera. */
-    fun extent(mosaic: FogTileMosaic): FogSurroundExtent {
+    fun extent(mosaic: FogViewportPresentation): FogSurroundExtent {
         val bounds = mosaic.bounds
         val halfWorlds = surroundHalfWorlds(mosaic)
         val vertical = verticalSpan(mosaic, halfWorlds)
@@ -408,7 +408,7 @@ object FogBackdropGeometry {
      * mosaic's east edge round to its west cannot have a far side, tiles the world exactly once
      * with the mosaic, and is repeated into every copy by the renderer at no cost.
      */
-    fun wrappedSideBand(mosaic: FogTileMosaic): FogTileBounds? {
+    fun wrappedSideBand(mosaic: FogViewportPresentation): FogTileBounds? {
         if (spansWorld(mosaic) || !surroundSpansWorld(mosaic)) return null
         val bounds = mosaic.bounds
         val overlap = longitudeOverlap(mosaic)
@@ -423,23 +423,23 @@ object FogBackdropGeometry {
         )
     }
 
-    private fun longitudeOverlap(mosaic: FogTileMosaic): Double {
+    private fun longitudeOverlap(mosaic: FogViewportPresentation): Double {
         val bounds = mosaic.bounds
-        return (bounds.eastLongitude - bounds.westLongitude) / mosaic.mask.width *
+        return (bounds.eastLongitude - bounds.westLongitude) / mosaic.samplingGridWidth *
             MOSAIC_OVERLAP_PIXELS
     }
 
     /** The mosaic's north and south edges pulled half a mosaic pixel inwards, north first. */
-    private fun innerLatitudes(mosaic: FogTileMosaic): Pair<Double, Double> {
+    private fun innerLatitudes(mosaic: FogViewportPresentation): Pair<Double, Double> {
         val bounds = mosaic.bounds
         val northY = WebMercator.normalizedY(bounds.northLatitude)
         val southY = WebMercator.normalizedY(bounds.southLatitude)
-        val overlapY = (southY - northY) / mosaic.mask.height * MOSAIC_OVERLAP_PIXELS
+        val overlapY = (southY - northY) / mosaic.samplingGridHeight * MOSAIC_OVERLAP_PIXELS
         return WebMercator.latitudeAtNormalizedY(northY + overlapY) to
             WebMercator.latitudeAtNormalizedY(southY - overlapY)
     }
 
-    fun bands(mosaic: FogTileMosaic): FogBackdropBands {
+    fun bands(mosaic: FogViewportPresentation): FogBackdropBands {
         val bounds = mosaic.bounds
         val longitudeOverlap = longitudeOverlap(mosaic)
         val inner = innerLatitudes(mosaic)
@@ -488,7 +488,7 @@ object FogBackdropGeometry {
      * no quad this code installs is ever larger than the largest one the renderer is known to
      * draw: the whole-world mosaic it already builds at render zoom 0.
      */
-    fun worldRepeats(mosaic: FogTileMosaic): List<FogTileBounds> {
+    fun worldRepeats(mosaic: FogViewportPresentation): List<FogTileBounds> {
         val surround = surround(mosaic)
         return listOf(
             surround.copy(
@@ -510,7 +510,7 @@ object FogBackdropGeometry {
      * When it does it is repeated a world either side instead, because those copies still have to
      * show what the user explored rather than flat fog.
      */
-    fun spansWorld(mosaic: FogTileMosaic): Boolean =
+    fun spansWorld(mosaic: FogViewportPresentation): Boolean =
         mosaic.bounds.eastLongitude - mosaic.bounds.westLongitude >= WORLD_LONGITUDE_SPAN
 
     /**
@@ -518,7 +518,7 @@ object FogBackdropGeometry {
      * beside it can be seen — and the only case where one may be installed, since a world-wide quad
      * is only within [MAX_SURROUND_WORLD_PIXELS] at the zooms where the world itself is.
      */
-    fun surroundSpansWorld(mosaic: FogTileMosaic): Boolean = surroundHalfWorlds(mosaic) >= 0.5
+    fun surroundSpansWorld(mosaic: FogViewportPresentation): Boolean = surroundHalfWorlds(mosaic) >= 0.5
 
     private const val GUARD_EDGE_EPSILON = 1e-12
     private const val MAX_GUARD_RECTANGLE_DEGREES = 180.0

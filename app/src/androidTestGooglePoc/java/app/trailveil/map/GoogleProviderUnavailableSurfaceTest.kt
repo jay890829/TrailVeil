@@ -13,9 +13,15 @@ import app.trailveil.BuildConfig
 import app.trailveil.R
 import com.google.android.gms.maps.MapView
 import java.io.FileInputStream
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.After
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -28,6 +34,30 @@ import org.junit.runner.RunWith
 class GoogleProviderUnavailableSurfaceTest {
     @Before fun setUp() = GoogleMapSurfaceTestHooks.reset()
     @After fun tearDown() = GoogleMapSurfaceTestHooks.reset()
+
+    private companion object {
+        const val UNSET_MILLIS = -1L
+
+        /**
+         * The cover deadline this case arms, short so the whole case stays bounded. It is a
+         * measurement parameter, not the shipped 20 s default.
+         */
+        const val COVER_TIMEOUT_MILLIS = 750L
+
+        /** Liveness only. Every assertion below is reached by a callback, not by this expiring. */
+        const val POLL_DEADLINE_MILLIS = 4_000L
+
+        /** About one frame, so the bounded window yields tens of samples rather than a handful. */
+        const val SAMPLE_INTERVAL_MILLIS = 16L
+
+        /**
+         * The deadline is counted with `delay` inside a `LaunchedEffect`, so it can report a few
+         * milliseconds early relative to `elapsedRealtime`. Wide enough to absorb that and far
+         * narrower than the gap to an immediate `getMapAsync` throw, which is what this separates
+         * the deadline from.
+         */
+        const val TERMINAL_STAMP_TOLERANCE_MILLIS = 250L
+    }
 
     @Test
     fun everyTerminalReasonBuildsNoMapViewAndTheNextCompositionRetries() {
@@ -74,42 +104,169 @@ class GoogleProviderUnavailableSurfaceTest {
     @Test
     fun fogRuntimeMissingHasBoundedTerminalCover() {
         val created = CountDownLatch(1)
+        val terminal = CountDownLatch(1)
+        val mapViewRef = AtomicReference<MapView?>(null)
+        val createdAt = AtomicLong(UNSET_MILLIS)
+        val terminalAfterCreationMillis = AtomicLong(UNSET_MILLIS)
+        // Whether the construction stamp existed at the instant the FIRST terminal was reported.
+        // It has to be captured there rather than read back after the run: the terminal and the
+        // stamp are written from two different phases of the same Compose apply pass, and the later
+        // one still lands within milliseconds - long before these assertions execute - so by then
+        // `createdAt` is set on both paths and the ordering that tells them apart is gone.
+        val mapBuiltBeforeTerminal = AtomicBoolean(false)
+        val terminalReasons = CopyOnWriteArrayList<String>()
+        // Written by the main-thread sampler below, read by this thread after the terminal latch.
+        val opaqueCoverSeen = AtomicBoolean(false)
+        val polls = AtomicInteger(0)
+        val coverDownPolls = AtomicInteger(0)
         GoogleMapSurfaceTestHooks.decision.set(ProviderStartupDecision(true, null))
         GoogleMapSurfaceTestHooks.fogRequired = true
-        GoogleMapSurfaceTestHooks.fogCoverTimeoutMillis = 750L
-        GoogleMapSurfaceTestHooks.onMapViewCreated.set { created.countDown() }
+        // Left at 750 ms deliberately. An earlier repair proposal widened this to 3 s and that was
+        // its only load-bearing step - the case would have gone green by being given more room to
+        // win the same race. The race is removed below instead, so the armed deadline is still the
+        // thing under measurement.
+        GoogleMapSurfaceTestHooks.fogCoverTimeoutMillis = COVER_TIMEOUT_MILLIS
+        // Arm the witness from inside the process, at the seam, and let it sample on the main
+        // thread for the whole window. The case used to read the tag through
+        // `scenario.onActivity` from the instrumentation thread, and on the owner's phone that
+        // dispatch did not get through even once before the surface terminated - the run failed
+        // claiming the cover was never raised when what actually happened is that nothing ever
+        // looked. Posting is not the same as reading the tag inside the hook: this Runnable
+        // executes in later main-thread messages, after the `SideEffect` that raises the cover has
+        // returned, so it can still observe the cover going DOWN and is not tautological.
+        GoogleMapSurfaceTestHooks.onMapViewCreated.set { view ->
+            mapViewRef.set(view)
+            createdAt.compareAndSet(UNSET_MILLIS, SystemClock.elapsedRealtime())
+            view.post(
+                object : Runnable {
+                    override fun run() {
+                        // Instants strictly before the terminal report are the only ones that are
+                        // evidence about the cover; the teardown itself may clear the tag. The
+                        // elapsed bound is what stops this chain re-posting onto the main looper
+                        // for the life of the process if no terminal surface ever arrives.
+                        if (terminal.count == 0L) return
+                        if (SystemClock.elapsedRealtime() - createdAt.get() > POLL_DEADLINE_MILLIS) {
+                            return
+                        }
+                        // A sample taken while the view is off the window says nothing about what
+                        // the SDK was showing, so it is skipped rather than counted - but the chain
+                        // stays alive, because `View.post` before attachment defers to the run
+                        // queue and an early detach must not silently end the measurement.
+                        if (view.isAttachedToWindow) {
+                            polls.incrementAndGet()
+                            if (view.getTag(R.id.map_fog_synchronous_cover_up) == true) {
+                                opaqueCoverSeen.set(true)
+                            } else {
+                                coverDownPolls.incrementAndGet()
+                            }
+                        }
+                        view.postDelayed(this, SAMPLE_INTERVAL_MILLIS)
+                    }
+                },
+            )
+            created.countDown()
+        }
+        // The seam the whole case now hangs on. `TrailVeilMapSurface` cannot tear the guarded
+        // MapView down without reporting a terminal reason first, so this callback is guaranteed to
+        // PRECEDE the disappearance the case used to poll for - and unlike that poll it cannot be
+        // missed by arriving late. Stamped relative to construction, because when it arrives is what
+        // separates the armed cover deadline from a getMapAsync throw, which reports the same reason
+        // immediately.
+        GoogleMapSurfaceTestHooks.onTerminalFailure.set { reason ->
+            terminalReasons += reason.name
+            val createdStamp = createdAt.get()
+            // The compareAndSet returns true exactly on the first terminal, which is the one the
+            // elapsed figure describes, so the ordering witness is written under the same guard and
+            // by the same single writer - no second atomic to keep in step with it.
+            if (
+                terminalAfterCreationMillis.compareAndSet(
+                    UNSET_MILLIS,
+                    SystemClock.elapsedRealtime() - createdStamp,
+                )
+            ) {
+                mapBuiltBeforeTerminal.set(createdStamp != UNSET_MILLIS)
+            }
+            terminal.countDown()
+        }
 
         ActivityScenario.launch(GoogleMapSurfaceTestActivity::class.java).use { scenario ->
             assertTrue(
                 "fog-required composition never constructed its guarded map",
                 created.await(2, TimeUnit.SECONDS),
             )
-            val deadline = SystemClock.elapsedRealtime() + 4_000L
-            var mapStillPresent = true
             // `V02-007`: watching only for the map to disappear would be satisfied just as well by
             // a guard that composed NOTHING over the unknown ground, which is the half MapLibre's
-            // `requiredFogKeepsUnknownAreaCoveredUntilRuntimeIsReady` owns. Witness it from the
-            // same poll, through the view tag the surface publishes for the synchronous opaque
-            // ViewOverlay drawable - the thing that actually hides SDK pixels within a frame.
-            // Sampling it here costs nothing; an out-of-band Compose query before this loop is
-            // what an earlier attempt did, and it consumed the bounded window it was measuring.
-            var opaqueCoverSeen = false
-            do {
-                scenario.onActivity { activity ->
-                    val mapView = activity.window.decorView.findMapView()
-                    mapStillPresent = mapView != null
-                    if (mapView?.getTag(R.id.map_fog_synchronous_cover_up) == true) {
-                        opaqueCoverSeen = true
-                    }
-                }
-                if (!mapStillPresent) break
-                SystemClock.sleep(50L)
-            } while (SystemClock.elapsedRealtime() < deadline)
-            assertFalse("missing FogRuntime left the safety cover unbounded", mapStillPresent)
+            // `requiredFogKeepsUnknownAreaCoveredUntilRuntimeIsReady` owns. The witness is the view
+            // tag the surface publishes for the synchronous opaque ViewOverlay drawable - the thing
+            // that actually hides SDK pixels within a frame - and it is sampled by the Runnable the
+            // creation hook armed, not from here.
+            assertTrue(
+                "missing FogRuntime left the safety cover unbounded: no terminal surface was " +
+                    "reported within " + POLL_DEADLINE_MILLIS + " ms of the guarded map being built",
+                terminal.await(POLL_DEADLINE_MILLIS, TimeUnit.MILLISECONDS),
+            )
+            assertEquals(
+                "the surface terminated for a reason other than its own cover deadline",
+                listOf(ProviderFallbackReason.INITIALIZATION_FAILURE.name),
+                terminalReasons.distinct(),
+            )
+            // Which deadline ended it. A getMapAsync throw reports INITIALIZATION_FAILURE too, and
+            // arrives at once; without this the case cannot tell the two apart and a throwing SDK
+            // would pass it silently.
+            // That discrimination is only possible if there was a construction stamp to measure
+            // from when the terminal arrived. On the earliest throw path there was not:
+            // `onMapViewCreated` stamps `createdAt` from the `SideEffect` this surface opens, while
+            // a synchronous `getMapAsync` throw reports its terminal failure from the body of a
+            // `DisposableEffect`, and Compose dispatches remember observers before side effects
+            // within a single apply pass. So on a first composition the terminal is reported while
+            // `createdAt` is still `UNSET_MILLIS`, the stamp above subtracts `-1`, and the deadline
+            // assertion below reads an elapsed time in the millions of ms - passing trivially, for
+            // the one throw it exists to catch. Reading `createdAt` here would not catch it either,
+            // because the `SideEffect` stamps it immediately afterwards and `created` has already
+            // been awaited by this point; only the witness taken at the report distinguishes them.
+            assertTrue(
+                "the surface reported terminal before its map was constructed, so the elapsed " +
+                    "time below was measured against an unset stamp rather than being a late " +
+                    "terminal - a synchronous getMapAsync throw, not the armed cover deadline",
+                mapBuiltBeforeTerminal.get(),
+            )
+            val terminalAt = terminalAfterCreationMillis.get()
+            assertTrue(
+                "the surface terminated " + terminalAt + " ms after its map was built, far short of the " +
+                    "armed " + COVER_TIMEOUT_MILLIS + " ms cover deadline, so something other than that " +
+                    "deadline ended it",
+                terminalAt >= COVER_TIMEOUT_MILLIS - TERMINAL_STAMP_TOLERANCE_MILLIS,
+            )
+            assertTrue(
+                "the fixture never sampled the guarded map before the surface terminated, so " +
+                    "this run measured nothing about the cover",
+                polls.get() > 0,
+            )
             assertTrue(
                 "the guarded map was torn down without the opaque cover ever being raised over " +
                     "the unknown ground it was hiding",
-                opaqueCoverSeen,
+                opaqueCoverSeen.get(),
+            )
+            assertEquals(
+                "the opaque cover was down at " + coverDownPolls.get() + " of " +
+                    polls.get() + " sampled instants while the guarded map was still on screen",
+                0,
+                coverDownPolls.get(),
+            )
+            // Now a consequence being confirmed rather than a race being run: the terminal report
+            // above already happened, so the removal it causes is merely awaited.
+            var mapStillPresent = true
+            val goneBy = SystemClock.elapsedRealtime() + POLL_DEADLINE_MILLIS
+            while (mapStillPresent && SystemClock.elapsedRealtime() < goneBy) {
+                scenario.onActivity { activity ->
+                    mapStillPresent = activity.window.decorView.findMapView() != null
+                }
+                if (!mapStillPresent) break
+                SystemClock.sleep(50L)
+            }
+            assertFalse(
+                "the surface reported its terminal reason but never removed the guarded map",
+                mapStillPresent,
             )
         }
     }

@@ -29,6 +29,7 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -47,11 +48,12 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.savedstate.compose.LocalSavedStateRegistryOwner
 import app.trailveil.R
 import app.trailveil.map.fog.FogBackdropGeometry
-import app.trailveil.map.fog.FogPixelMask
 import app.trailveil.map.fog.FogRuntime
 import app.trailveil.map.fog.FogSurroundExtent
 import app.trailveil.map.fog.FogTileBounds
 import app.trailveil.map.fog.FogTileMosaic
+import app.trailveil.map.fog.FogViewportPresentation
+import app.trailveil.map.fog.FogNativePresentation
 import app.trailveil.map.fog.FogViewportRequest
 import app.trailveil.map.fog.FogViewportRender
 import app.trailveil.map.fog.GeoPoint
@@ -59,10 +61,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withTimeoutOrNull
 import org.maplibre.android.MapLibre
 import org.maplibre.android.camera.CameraUpdateFactory
@@ -262,16 +268,19 @@ internal enum class FogViewportRequestTrigger {
     INSTALLED_NOT_HOLDING,
     /** `canonicalViewportRequestForTesting` published a request directly. */
     TESTING_REQUEST,
+    /** The completed canonical generation already represents this idle viewport. */
+    CAMERA_IDLE_REUSED,
 }
 
 /**
- * One viewport request or generation bump. Deliberately carries no position: a zoom and a
- * generation are enough to line the surface's decisions up against a harness's holds, and the
+ * One viewport request, generation bump, or completed-generation reuse. Deliberately carries no
+ * position: a zoom and a generation are enough to line the surface's decisions up against a
+ * harness's holds, and the
  * hosted logs this feeds are public.
  */
 internal data class FogViewportRequestTrace(
     val trigger: FogViewportRequestTrigger,
-    /** `fogViewportGeneration` after the bump. */
+    /** Current `fogViewportGeneration`; unchanged for CAMERA_IDLE_REUSED. */
     val generation: Long,
     /** The camera zoom at the time, when a map was ready. */
     val mapZoom: Double?,
@@ -281,7 +290,7 @@ internal data class FogViewportRequestTrace(
 )
 
 private data class PreparedFogGeneration(
-    val mosaic: FogTileMosaic,
+    val mosaic: FogViewportPresentation,
     val previousSlot: FogGenerationSlot?,
     val installedSlot: FogGenerationSlot,
 )
@@ -330,6 +339,13 @@ internal data class CanonicalFogInstallDecision(
  * painting over whatever screen comes next until the view is finally detached. Drawing into the
  * window costs a copy per frame and buys a map that disappears exactly when its screen does.
  */
+/** One retry attempt carries its own prepared payload; no mutable cross-generation preparation slot. */
+private data class PreparedFogRender(
+    val render: FogViewportRender,
+    val native: PreparedNativeFog?,
+    val raster: PreparedRasterFog?,
+)
+
 @Composable
 internal fun TrailVeilMapSurface(
     modifier: Modifier = Modifier,
@@ -472,10 +488,16 @@ internal fun TrailVeilMapSurface(
     var activeFogSlot by remember(mapView, fogRuntime, readyStyle) {
         mutableStateOf<FogGenerationSlot?>(null)
     }
+    // Keep the holder stable for the MapView's lifecycle observer. The certificate itself fences
+    // runtime and style identities, and every new request or pass invalidates it immediately.
+    var idleCertificate by remember(mapView) {
+        mutableStateOf<MapLibreFogIdleCertificate?>(null)
+    }
     var canonicalFogLoaded by remember(mapView, fogRuntime, fogRequired) {
         mutableStateOf(!fogRequired)
     }
     var fogRenderFailed by remember(mapView, fogRuntime) { mutableStateOf(false) }
+    var nativeFogDescription by remember(mapView, fogRuntime) { mutableStateOf<String?>(null) }
     var fogSyncFailed by remember(mapView, fogRuntime) { mutableStateOf(false) }
     var fogBaselineReady by remember(mapView, fogRuntime) {
         mutableStateOf(fogRuntime == null)
@@ -542,12 +564,14 @@ internal fun TrailVeilMapSurface(
 
         val lifecycleBinding = MapViewLifecycleBinding(mapView)
         val lifecycleObserver = LifecycleEventObserver { _, event ->
+            idleCertificate = null
             lifecycleBinding.onEvent(event)
         }
         lifecycle.addObserver(lifecycleObserver)
         lifecycleBinding.synchronize(lifecycle.currentState)
 
         onDispose {
+            idleCertificate = null
             compositionActive.set(false)
             lifecycle.removeObserver(lifecycleObserver)
             savedStateRegistry.unregisterSavedStateProvider(savedStateKey)
@@ -683,8 +707,8 @@ internal fun TrailVeilMapSurface(
     // installed is not the same as coverage being enough: a re-render can land while a gesture has
     // already carried the camera past what the installed surround holds, and lowering the cover on
     // the strength of a successful install alone would uncover a map that is leaking.
-    // `V02-011`: every generation bump reports itself to the test seam, with the trigger that
-    // asked for it. A no-op in production, where the seam is null.
+    // `V02-011`: every generation bump reports its trigger; CAMERA_IDLE_REUSED instead reports
+    // the unchanged generation. A no-op in production, where the seam is null.
     fun traceViewportGeneration(trigger: FogViewportRequestTrigger) {
         currentOnFogViewportRequestedForTesting?.invoke(
             FogViewportRequestTrace(
@@ -698,6 +722,7 @@ internal fun TrailVeilMapSurface(
     }
 
     fun publishViewportRequest(request: FogViewportRequest, trigger: FogViewportRequestTrigger) {
+        idleCertificate = null
         followingCameraMove.set(false)
         canonicalFogLoaded = false
         fogRenderFailed = false
@@ -760,11 +785,43 @@ internal fun TrailVeilMapSurface(
      * jump can outrun on-demand guard tile extraction.
      */
     fun retainCommittedGenerationOrRaiseCover() {
+        idleCertificate = null
         canonicalFogLoaded = false
         if (activeFogSlot == null || installedSurround == null) {
             fogCoverageInstalled = false
             installedSurround = null
         }
+    }
+
+    fun reuseCompletedFogAtIdle(): Boolean {
+        val certificate = idleCertificate ?: return false
+        val map = readyMap ?: return false
+        val style = readyStyle ?: return false
+        val runtime = fogRuntime ?: return false
+        val slot = activeFogSlot ?: return false
+        if (currentCanonicalViewportRequestForTesting != null || !fogRequired ||
+            !compositionActive.get() || !styleGenerationActive.get() ||
+            !lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) ||
+            mapView.width <= 0 || mapView.height <= 0 || map.style !== style || !style.isFullyLoaded ||
+            !fogBaselineReady || fogSyncFailed || fogRenderFailed ||
+            !canonicalFogLoaded || !fogCoverageInstalled || installedSurround == null ||
+            fogPlaceholderReadyGeneration != fogViewportGeneration
+        ) return false
+        val current = MapLibreFogIdleCertificate(
+            mapInstance = map,
+            styleIdentity = style,
+            runtimeIdentity = runtime,
+            generation = fogViewportGeneration,
+            revision = fogRevision,
+            canonicalEpoch = runtime.canonicalEpoch.value,
+            slot = slot,
+            footprint = runtime.viewportCoordinator.footprint(map.fogViewportRequest()),
+            mode = currentMapLibreFogRenderMode(),
+        )
+        if (!certificate.matches(current) || !surroundHoldsForCamera()) return false
+        followingCameraMove.set(false)
+        traceViewportGeneration(FogViewportRequestTrigger.CAMERA_IDLE_REUSED)
+        return true
     }
 
     // `V02-006`: the full-bleed MapView reaches under the system navigation bar, so the SDK's logo
@@ -855,22 +912,39 @@ internal fun TrailVeilMapSurface(
     LaunchedEffect(fogRuntime) {
         val runtime = fogRuntime ?: return@LaunchedEffect
         fogBaselineReady = false
+        var appliedCanonicalEpoch = runtime.canonicalEpoch.value
         while (true) {
             try {
-                val baseline = withContext(Dispatchers.Default) {
-                    runtime.changeSynchronizer.synchronizeTo()
-                }
-                fogBaselineReady = true
-                fogRenderFailed = false
-                fogSyncFailed = false
-                fogRevision += 1L
-                runtime.pointChanges.revisionsAfter(baseline.cursor).collect { revision ->
-                    val synchronization = withContext(Dispatchers.Default) {
-                        runtime.changeSynchronizer.synchronizeTo(revision.latestCursor)
+                runtime.canonicalEpoch.collectLatest { epoch ->
+                    if (epoch != appliedCanonicalEpoch) {
+                        idleCertificate = null
+                        appliedCanonicalEpoch = epoch
+                        fogBaselineReady = false
+                        fogCoverageInstalled = false
+                        canonicalFogLoaded = false
+                        installedSurround = null
+                        fogPlaceholderReadyGeneration = -1L
+                        fogViewportGeneration += 1L
+                        fogViewportRequest = readyMap?.fogViewportRequest()
                     }
+                    if (epoch % 2L != 0L) return@collectLatest
+                    val baseline = withContext(Dispatchers.Default) {
+                        runtime.changeSynchronizer.synchronizeTo(expectedCanonicalEpoch = epoch)
+                    }
+                    if (baseline.superseded || epoch != runtime.canonicalEpoch.value) return@collectLatest
+                    fogBaselineReady = true
+                    fogRenderFailed = false
                     fogSyncFailed = false
-                    if (synchronization.mergedChanges > 0) {
-                        fogRevision += 1L
+                    fogRevision += 1L
+                    runtime.pointChanges.revisionsAfter(baseline.cursor).collect { revision ->
+                        val synchronization = withContext(Dispatchers.Default) {
+                            runtime.changeSynchronizer.synchronizeTo(revision.latestCursor, epoch)
+                        }
+                        fogSyncFailed = false
+                        if (!synchronization.superseded && epoch == runtime.canonicalEpoch.value &&
+                            synchronization.mergedChanges > 0) {
+                            fogRevision += 1L
+                        }
                     }
                 }
             } catch (cancelled: CancellationException) {
@@ -907,7 +981,7 @@ internal fun TrailVeilMapSurface(
             // the backdrop bands keep everything around it fogged in the same rendered frame.
             val idleListener = MapLibreMap.OnCameraIdleListener {
                 if (!suppressFogCameraReactionsForTesting) {
-                    requestViewport(FogViewportRequestTrigger.CAMERA_IDLE)
+                    if (!reuseCompletedFogAtIdle()) requestViewport(FogViewportRequestTrigger.CAMERA_IDLE)
                 }
             }
             // A programmed move differs from a gesture in one way that matters here: it can cross
@@ -971,6 +1045,7 @@ internal fun TrailVeilMapSurface(
             map.addOnCameraMoveCancelListener(moveCanceledListener)
             requestViewport(FogViewportRequestTrigger.ATTACH)
             onDispose {
+                idleCertificate = null
                 map.removeOnCameraIdleListener(idleListener)
                 map.removeOnCameraMoveStartedListener(moveStartedListener)
                 map.removeOnCameraMoveListener(moveListener)
@@ -1008,17 +1083,29 @@ internal fun TrailVeilMapSurface(
                     }
                 },
             ) {
-                val placeholder = runtime.viewportCoordinator.placeholder(request)
+                val (placeholder, raster) = withContext(Dispatchers.Default) {
+                    currentCoroutineContext().ensureActive()
+                    RasterFogPreparationTestProbe.onPlaceholderStart?.invoke(currentCoroutineContext()[Job])
+                    currentCoroutineContext().ensureActive()
+                    val placeholder = runtime.viewportCoordinator.placeholder(request)
+                    placeholder to prepareRasterFog(placeholder.presentation as FogTileMosaic)
+                }
+                currentCoroutineContext().ensureActive()
+                if (generation != fogViewportGeneration || request != fogViewportRequest ||
+                    style !== readyStyle || map !== readyMap ||
+                    !compositionActive.get() || !styleGenerationActive.get()
+                ) throw StaleCanonicalFogInstallException
                 val previousSlot = activeFogSlot
                 val installedSlot = mapView.installFogGenerationAndAwait(
                     map = map,
                     style = style,
-                    mosaic = placeholder.mosaic,
+                    mosaic = placeholder.presentation,
+                    rasterPrepared = raster,
                     fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
                     activeSlot = previousSlot,
                 )
                 PreparedFogGeneration(
-                    mosaic = placeholder.mosaic,
+                    mosaic = placeholder.presentation,
                     previousSlot = previousSlot,
                     installedSlot = installedSlot,
                 )
@@ -1081,6 +1168,12 @@ internal fun TrailVeilMapSurface(
             revisions = snapshotFlow { fogRevision },
             currentRevision = { fogRevision },
         ) canonicalPass@{
+            idleCertificate = null
+            val passRevision = fogRevision
+            val renderMode = currentMapLibreFogRenderMode()
+            val passMap = readyMap
+            val canonicalEpoch = runtime.canonicalEpoch.value
+            if (canonicalEpoch % 2L != 0L) return@canonicalPass CanonicalFogPassOutcome.STOP
             if (
                 generation != fogViewportGeneration ||
                 request != fogViewportRequest ||
@@ -1103,11 +1196,20 @@ internal fun TrailVeilMapSurface(
                     retryDelayMillis = FOG_RETRY_DELAY_MILLIS,
                     render = { viewport ->
                         withContext(Dispatchers.Default) {
-                            runtime.viewportCoordinator.render(viewport)
+                            val rendered = runtime.viewportCoordinator.render(viewport, nativeGeometry = renderMode.nativeRequested)
+                            val native = (rendered.presentation as? FogNativePresentation)?.let { prepareNativeFog(it.geometry) }
+                            val raster = (rendered.presentation as? FogTileMosaic)?.let { prepareRasterFog(it) }
+                            PreparedFogRender(rendered, native, raster)
                         }
                     },
-                    installAndAwait = { viewport ->
-                        val incomingExtent = FogBackdropGeometry.extent(viewport.mosaic)
+                    installAndAwait = { prepared ->
+                        val viewport = prepared.render
+                        currentCoroutineContext().ensureActive()
+                        if (canonicalEpoch != runtime.canonicalEpoch.value || generation != fogViewportGeneration ||
+                            request != fogViewportRequest || style !== readyStyle || passMap !== readyMap ||
+                            !compositionActive.get() || !styleGenerationActive.get()
+                        ) throw StaleCanonicalFogInstallException
+                        val incomingExtent = FogBackdropGeometry.extent(viewport.presentation)
                         val cameraAlreadyOutsideIncoming = !surroundHoldsForCamera(incomingExtent)
                         if (cameraAlreadyOutsideIncoming && !followingCameraMove.get()) {
                             // Keep the older globally guarded renderer generation in place. Rejecting a
@@ -1142,7 +1244,10 @@ internal fun TrailVeilMapSurface(
                         preparedSlot = mapView.installFogGenerationAndAwait(
                             map = checkNotNull(readyMap) { "Map disappeared during canonical fog install" },
                             style = style,
-                            mosaic = viewport.mosaic,
+                            mosaic = viewport.presentation,
+                            nativePrepared = prepared.native,
+                            rasterPrepared = prepared.raster,
+                            renderMode = renderMode,
                             fogAlpha = runtime.viewportCoordinator.style.fogAlpha,
                             activeSlot = previousSlot,
                             installFaultForTesting = fogInstallFaultForTesting,
@@ -1162,25 +1267,25 @@ internal fun TrailVeilMapSurface(
                             currentOnFogFailure(failure)
                         }
                     },
-                )
+                ).render
                 currentCanonicalFogInstallCheckpointForTesting?.invoke(
                     CanonicalFogInstallCheckpoint(
                         phase = CanonicalFogInstallCheckpointPhase.AFTER_STYLE_INSTALL_BEFORE_RECONCILE,
                         generation = generation,
                         fogRevision = fogRevision,
                         render = rendered,
-                        installedExtent = FogBackdropGeometry.extent(rendered.mosaic),
+                        installedExtent = FogBackdropGeometry.extent(rendered.presentation),
                         installedSlot = preparedSlot,
                     ),
                 )
                 if (
                     generation != fogViewportGeneration ||
                     request != fogViewportRequest ||
-                    style !== readyStyle
+                    style !== readyStyle || canonicalEpoch != runtime.canonicalEpoch.value
                 ) {
                     return@canonicalPass CanonicalFogPassOutcome.STOP
                 }
-                val installedExtent = FogBackdropGeometry.extent(rendered.mosaic)
+                val installedExtent = FogBackdropGeometry.extent(rendered.presentation)
                 val installedSlot = checkNotNull(preparedSlot) {
                     "Canonical fog rendered without a prepared renderer generation"
                 }
@@ -1238,7 +1343,30 @@ internal fun TrailVeilMapSurface(
                         slot = installedSlot,
                     ),
                 )
+                nativeFogDescription = rendered.nativeGeometryStatus
                 currentOnFogRendered?.invoke(rendered)
+                // Retirement and both callbacks must finish before an idle can reuse this pass.
+                // A native fallback remains retryable even when its raster footprint is identical.
+                val footprint = runtime.viewportCoordinator.footprint(request)
+                if (passMap != null && passMap === readyMap && passMap.style === style &&
+                    style === readyStyle && style.isFullyLoaded &&
+                    generation == fogViewportGeneration && request == fogViewportRequest &&
+                    passRevision == fogRevision && canonicalEpoch == runtime.canonicalEpoch.value &&
+                    canonicalEpoch % 2L == 0L && renderMode == currentMapLibreFogRenderMode() &&
+                    fogPlaceholderReadyGeneration == generation && fogBaselineReady &&
+                    !fogSyncFailed && !fogRenderFailed && canonicalFogLoaded && fogCoverageInstalled &&
+                    activeFogSlot == installedSlot && installedSurround == installedExtent &&
+                    compositionActive.get() && styleGenerationActive.get() &&
+                    lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED) &&
+                    mapView.width > 0 && mapView.height > 0 && surroundHoldsForCamera() &&
+                    footprint.matches(rendered) &&
+                    (!renderMode.nativeRequested || rendered.presentation is FogNativePresentation)
+                ) {
+                    idleCertificate = MapLibreFogIdleCertificate(
+                        passMap, style, runtime, generation, passRevision, canonicalEpoch,
+                        installedSlot, footprint, renderMode,
+                    )
+                }
                 CanonicalFogPassOutcome.AWAIT_NEXT_REVISION
             } finally {
                 if (styleMayHaveChanged && !installedStateReconciled) {
@@ -1285,7 +1413,7 @@ internal fun TrailVeilMapSurface(
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.Black.copy(alpha = 0.72f))
+                    .background(Color(MAPLIBRE_FOG_COLOR).copy(alpha = 0.72f))
                     .testTag(MapSurfaceTestTags.FogSafetyCover),
             )
         }
@@ -1298,6 +1426,10 @@ internal fun TrailVeilMapSurface(
             else -> null
         }
         statusText?.let { text -> MapStatusBadge(text) }
+        if (fogRequired) MapLibreFogArmBadge(
+            modifier = Modifier.align(Alignment.BottomStart),
+            nativeDescription = nativeFogDescription,
+        )
     }
 }
 
@@ -1319,7 +1451,7 @@ private fun Style.Builder.withInitialFogGuard(fogRequired: Boolean): Style.Build
 
 private fun newFogInstallGuard(visibility: String): BackgroundLayer =
     BackgroundLayer(FogOverlayIds.InstallGuardLayer).withProperties(
-        PropertyFactory.backgroundColor("#000000"),
+        PropertyFactory.backgroundColor(MAPLIBRE_FOG_COLOR),
         PropertyFactory.backgroundOpacity(1.0f),
         PropertyFactory.visibility(visibility),
     )
@@ -1331,11 +1463,14 @@ private fun newFogInstallGuard(visibility: String): BackgroundLayer =
  * target can only add fog over the globally fail-closed old generation.
  */
 private fun Style.installFogGeneration(
-    mosaic: FogTileMosaic,
+    mosaic: FogViewportPresentation,
     fogAlpha: Int,
     slot: FogGenerationSlot,
     keepInstallGuardVisible: Boolean,
     installFaultForTesting: (() -> Unit)? = null,
+    nativePrepared: PreparedNativeFog? = null,
+    rasterPrepared: PreparedRasterFog?,
+    renderMode: MapLibreFogRenderMode,
 ) {
     val installGuard = ensureFogInstallGuard(initiallyVisible = true)
     if (keepInstallGuardVisible) {
@@ -1345,7 +1480,7 @@ private fun Style.installFogGeneration(
     // The copies are always installed when there is a world to copy. A camera-zoom opacity step is
     // attached before each layer enters the style, so the renderer — not a Handler-dispatched
     // camera callback — decides which mutually exclusive arrangement is drawn for the frame.
-    installFogMosaic(mosaic, spansWorld, slot)
+    installFogMosaic(mosaic, spansWorld, slot, nativePrepared, rasterPrepared, renderMode)
     installFaultForTesting?.invoke()
     installFogBackdrop(
         mosaic,
@@ -1371,7 +1506,7 @@ private fun Style.installFogGeneration(
  * immutable generation is active.
  */
 private fun Style.installFogSeamAndExtentGuard(
-    mosaic: FogTileMosaic,
+    mosaic: FogViewportPresentation,
     fogAlpha: Int,
     slot: FogGenerationSlot,
 ) {
@@ -1439,7 +1574,7 @@ private fun Style.installFogSeamAndExtentGuard(
         ),
     )
     val seamLayer = LineLayer(FogSeamGuardIds.layer(slot), seamSourceId).withProperties(
-        PropertyFactory.lineColor("#000000"),
+        PropertyFactory.lineColor(MAPLIBRE_FOG_COLOR),
         PropertyFactory.lineWidth(FOG_SEAM_GUARD_WIDTH_PIXELS),
         PropertyFactory.lineOpacity(fogAlpha / 255.0f),
         PropertyFactory.visibility(if (seamLines.isEmpty()) Property.NONE else Property.VISIBLE),
@@ -1448,7 +1583,7 @@ private fun Style.installFogSeamAndExtentGuard(
         FogSeamGuardIds.extentFillLayer(slot),
         extentSourceId,
     ).withProperties(
-        PropertyFactory.fillColor("#000000"),
+        PropertyFactory.fillColor(MAPLIBRE_FOG_COLOR),
         PropertyFactory.fillOpacity(fogAlpha / 255.0f),
         PropertyFactory.fillAntialias(false),
     ).withFilter(
@@ -1461,7 +1596,7 @@ private fun Style.installFogSeamAndExtentGuard(
         FogSeamGuardIds.extentBoundaryLayer(slot),
         extentSourceId,
     ).withProperties(
-        PropertyFactory.lineColor("#000000"),
+        PropertyFactory.lineColor(MAPLIBRE_FOG_COLOR),
         PropertyFactory.lineWidth(FOG_EXTENT_GUARD_BOUNDARY_WIDTH_PIXELS),
         PropertyFactory.lineOpacity(fogAlpha / 255.0f),
     ).withFilter(
@@ -1498,16 +1633,46 @@ private fun Style.ensureFogInstallGuard(initiallyVisible: Boolean): BackgroundLa
 }
 
 private fun Style.installFogMosaic(
+    mosaic: FogViewportPresentation,
+    spansWorld: Boolean,
+    slot: FogGenerationSlot,
+    nativePrepared: PreparedNativeFog?,
+    rasterPrepared: PreparedRasterFog?,
+    renderMode: MapLibreFogRenderMode,
+) {
+    when (mosaic) {
+        is FogNativePresentation -> {
+            check(!spansWorld) { "native presentation cannot span the world" }
+            val sourceId = FogOverlayIds.source(slot)
+            val layerId = FogOverlayIds.layer(slot)
+            check(getSource(sourceId) == null) { "$sourceId was not retired before slot reuse" }
+            check(getLayer(layerId) == null) { "$layerId was not retired before slot reuse" }
+            // This generation's immutable result decides the representation. A later picker
+            // change must not demand raster pixels that a successful native render never made.
+            installNativeFog(this, sourceId, layerId, mosaic.geometry,
+                checkNotNull(nativePrepared) { "native generation was not prepared" }, fogInteriorBelowLayer())
+        }
+        is FogTileMosaic -> installRasterFogMosaic(mosaic, spansWorld, slot,
+            checkNotNull(rasterPrepared) { "raster generation was not prepared" }, renderMode)
+    }
+}
+
+private fun Style.installRasterFogMosaic(
     mosaic: FogTileMosaic,
     spansWorld: Boolean,
     slot: FogGenerationSlot,
+    prepared: PreparedRasterFog,
+    renderMode: MapLibreFogRenderMode,
 ) {
-    val bitmap = mosaic.mask.toBitmap()
+    check(prepared.mosaic === mosaic) { "raster generation does not match its payload" }
+    val rasterBitmap by lazy(LazyThreadSafetyMode.NONE) { prepared.createBitmapFor(mosaic) }
+    val bitmap = { rasterBitmap }
     installFogMosaicQuad(
         FogOverlayIds.source(slot),
         FogOverlayIds.layer(slot),
         mosaic.bounds,
         bitmap,
+        maskVectorEnabled = renderMode.maskVectorRequested,
     )
     if (spansWorld) {
         installFogMosaicQuad(
@@ -1516,6 +1681,7 @@ private fun Style.installFogMosaic(
             mosaic.bounds.shiftedByWorlds(-1),
             bitmap,
             zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
+            maskVectorEnabled = renderMode.maskVectorRequested,
         )
         installFogMosaicQuad(
             FogOverlayIds.eastRepeatSource(slot),
@@ -1523,6 +1689,7 @@ private fun Style.installFogMosaic(
             mosaic.bounds.shiftedByWorlds(1),
             bitmap,
             zoomOpacity = visibleAtAndAboveWorldCopyZoom(),
+            maskVectorEnabled = renderMode.maskVectorRequested,
         )
     }
 }
@@ -1531,24 +1698,21 @@ private fun Style.installFogMosaicQuad(
     sourceId: String,
     layerId: String,
     bounds: FogTileBounds,
-    bitmap: Bitmap,
+    bitmap: () -> Bitmap,
     zoomOpacity: Expression? = null,
+    maskVectorEnabled: Boolean,
 ) {
     val coordinates = bounds.toQuad()
     check(getSource(sourceId) == null) { "$sourceId was not retired before slot reuse" }
     check(getLayer(layerId) == null) { "$layerId was not retired before slot reuse" }
-    val below = if (getLayer(CurrentLocationOverlayIds.Layer) == null) {
-        FogOverlayIds.InstallGuardLayer
-    } else {
-        CurrentLocationOverlayIds.Layer
-    }
+    val below = fogInteriorBelowLayer()
     // `V03-013` arm `vector`: the same generation drawn as tessellated geometry instead of a
     // raster quad, under the same id in the same slot so every retire and reuse path already
     // written applies unchanged. The published twin of this seam answers false unconditionally and
     // cannot name what it would have installed, so nothing below can be reached outside the
     // harness build type.
-    if (installVectorFogIfArmed(this, sourceId, layerId, bounds, bitmap, below)) return
-    addSource(ImageSource(sourceId, coordinates, bitmap))
+    if (installVectorFogIfArmed(this, sourceId, layerId, bounds, bitmap, below, enabled = maskVectorEnabled)) return
+    addSource(ImageSource(sourceId, coordinates, bitmap()))
     val layer = RasterLayer(layerId, sourceId).withProperties(
         PropertyFactory.rasterFadeDuration(0f),
         PropertyFactory.rasterResampling(Property.RASTER_RESAMPLING_NEAREST),
@@ -1562,6 +1726,9 @@ private fun Style.installFogMosaicQuad(
     )
     addLayerBelow(layer, below)
 }
+
+private fun Style.fogInteriorBelowLayer(): String =
+    if (getLayer(CurrentLocationOverlayIds.Layer) == null) FogOverlayIds.InstallGuardLayer else CurrentLocationOverlayIds.Layer
 
 private fun Style.removeFogGenerationInterior(slot: FogGenerationSlot): Boolean {
     var changed = false
@@ -1635,7 +1802,7 @@ private fun FogTileBounds.shiftedByWorlds(worlds: Int): FogTileBounds = copy(
 )
 
 private fun Style.installFogBackdrop(
-    mosaic: FogTileMosaic,
+    mosaic: FogViewportPresentation,
     fogAlpha: Int,
     slot: FogGenerationSlot,
     repeatWorlds: Boolean,
@@ -1739,7 +1906,7 @@ private fun FogTileBounds.toQuad(): LatLngQuad = LatLngQuad(
 
 /** One texel of the renderer's own fog, stretched over a band by the raster layer. */
 private fun fogBandBitmap(fogAlpha: Int): Bitmap =
-    Bitmap.createBitmap(intArrayOf((fogAlpha and 0xff) shl 24), 1, 1, Bitmap.Config.ARGB_8888)
+    Bitmap.createBitmap(intArrayOf(mapLibreFogPixel(fogAlpha)), 1, 1, Bitmap.Config.ARGB_8888)
 
 private fun Style.installCurrentLocation(point: GeoPoint?) {
     val collection = point?.let {
@@ -1826,21 +1993,16 @@ private fun Style.installGeoJsonSource(id: String, collection: FeatureCollection
     }
 }
 
-private fun FogPixelMask.toBitmap(): Bitmap {
-    val alpha = copyAlpha()
-    val pixels = IntArray(alpha.size) { index ->
-        (alpha[index].toInt() and 0xff) shl 24
-    }
-    return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
-}
-
 private suspend fun MapView.installFogGenerationAndAwait(
     map: MapLibreMap,
     style: Style,
-    mosaic: FogTileMosaic,
+    mosaic: FogViewportPresentation,
     fogAlpha: Int,
     activeSlot: FogGenerationSlot?,
     installFaultForTesting: (() -> Unit)? = null,
+    nativePrepared: PreparedNativeFog? = null,
+    rasterPrepared: PreparedRasterFog? = null,
+    renderMode: MapLibreFogRenderMode = currentMapLibreFogRenderMode(),
 ): FogGenerationSlot {
     val targetSlot = FogGenerationSlot.next(activeSlot)
     check(targetSlot != activeSlot) { "A fog generation cannot replace itself in place" }
@@ -1857,6 +2019,9 @@ private suspend fun MapView.installFogGenerationAndAwait(
                 slot = targetSlot,
                 keepInstallGuardVisible = activeSlot == null,
                 installFaultForTesting = installFaultForTesting,
+                nativePrepared = nativePrepared,
+                rasterPrepared = rasterPrepared,
+                renderMode = renderMode,
             )
         }
         true

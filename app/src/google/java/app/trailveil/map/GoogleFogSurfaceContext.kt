@@ -35,6 +35,7 @@ internal data class GoogleFogSurfaceContext(
     val onUnprovableProofPlan: () -> Boolean,
     val onProofAccepted: (Long) -> Unit,
     val installFaultForTesting: (() -> Unit)?,
+    val awaitCoverCommitted: suspend () -> Boolean,
 )
 
 /** The shipped surface, built from the same inputs any alternative would have been built from. */
@@ -51,6 +52,7 @@ internal fun GoogleFogSurfaceContext.canonicalBinding(): GoogleCanonicalFogSurfa
         onUnprovableProofPlan = onUnprovableProofPlan,
         onProofAccepted = onProofAccepted,
         installFaultForTesting = installFaultForTesting,
+        awaitCoverCommitted = awaitCoverCommitted,
         // Null in every shipped build, and the release seam cannot name an alternative.
         overlayInstaller = googleFogOverlayInstaller(this),
     )

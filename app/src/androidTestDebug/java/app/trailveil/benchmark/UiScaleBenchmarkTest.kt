@@ -14,6 +14,10 @@ import androidx.test.platform.app.InstrumentationRegistry
 import app.trailveil.MainActivity
 import app.trailveil.R
 import app.trailveil.data.db.TrailVeilDatabase
+import app.trailveil.map.MapLibreFogArm
+import app.trailveil.map.MapLibreVectorFogState
+import org.maplibre.android.style.layers.FillLayer
+import org.maplibre.android.style.sources.GeoJsonSource
 import app.trailveil.map.BasemapLoadState
 import app.trailveil.map.FogGenerationSlot
 import app.trailveil.map.FogOverlayIds
@@ -42,6 +46,10 @@ import org.maplibre.android.style.sources.ImageSource
  */
 @RunWith(AndroidJUnit4::class)
 class UiScaleBenchmarkTest {
+    private val existingDataMode get() = InstrumentationRegistry.getArguments()
+        .getString(ExistingDemoFrameFixture.ARGUMENT) == "true"
+    private var existingFixture: ExistingDemoFrameFixture? = null
+
     @Test
     fun mainMapPanZoomAndLifecycleRecoveryAtCanonicalScale() {
         assumeTrue(
@@ -53,99 +61,103 @@ class UiScaleBenchmarkTest {
         if (enforcePhysicalGate) {
             assertTrue("The designated mid-range gate cannot run on an emulator", !isEmulator())
         }
-        populateEmptyProductionDatabase()
+        existingFixture = if (existingDataMode) ExistingDemoFrameFixture() else null
+        if (!existingDataMode) populateEmptyProductionDatabase()
 
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
-            val activity = scenario.requireActivity()
-            // Exclude provider fallback and the initial canonical rebuild from the fixed operation
-            // histogram. Readiness itself remains a hard precondition for collecting samples.
-            awaitMapState(scenario)
-            // The activity window is kept only as context. It cannot see this map - see
-            // [SurfaceFlingerPresentIntervals] - and the gate below is judged on the map's own
-            // SurfaceFlinger layer instead. Reporting both is what makes the difference legible
-            // rather than something a later reader has to rediscover.
-            val frameMetrics = FrameMetricsAggregator(FrameMetricsAggregator.TOTAL_DURATION)
-            frameMetrics.add(activity)
-            try {
-                SurfaceFlingerPresentIntervals.arm()
-                val presented = performDeterministicPanAndZoom(scenario)
-                val windowSummary = summarize(
-                    frameMetrics.remove(activity)?.getOrNull(FrameMetricsAggregator.TOTAL_INDEX),
-                )
-                val summary = summarize(presented.histogram)
-                // Blindness first, and on its own terms. A camera animation that produced no
-                // interval for the map's layer did not measure a slow map - nothing observed the
-                // map at all - and that is a different failure from a slow one, so it is asserted
-                // apart from any threshold on speed. See [MAP_SURFACE_LAYER].
-                assertTrue(
-                    "The map's SurfaceFlinger layer presented during only " +
-                        "${presented.presentingWindows} of $PAN_ZOOM_ITERATIONS camera " +
-                        "animations, so this run did not observe the map for the rest, and " +
-                        "frameP95=${summary.p95Millis}ms is not a measurement of it. First thing " +
-                        "to check: that TimeStats is tracking a layer whose name contains " +
-                        "\"$MAP_SURFACE_LAYER\". For contrast, the activity window - which does " +
-                        "NOT contain this map - reported ${windowSummary.total} frames across " +
-                        "the same animations.",
-                    presented.presentingWindows == PAN_ZOOM_ITERATIONS,
-                )
-                // Then the worst single animation, which the pooled histogram cannot express.
-                // A stalled window contributes ONE interval where a healthy one contributes
-                // fourteen, so pooling lets the windows that behaved outvote the ones that did
-                // not. See [MIN_INTERVALS_PER_WINDOW].
-                assertTrue(
-                    "The worst camera animation produced only ${presented.leanestWindow} " +
-                        "presentation intervals, below the $MIN_INTERVALS_PER_WINDOW per-window " +
-                        "floor. The map stalled during at least one animation, and a pooled " +
-                        "frameP95=${summary.p95Millis}ms cannot show that, because a stalled " +
-                        "window contributes fewer samples than a healthy one and is outvoted by " +
-                        "them.",
-                    presented.leanestWindow >= MIN_INTERVALS_PER_WINDOW,
-                )
-                // Then whether there are enough of them for a p95 to mean anything.
-                assertTrue(
-                    "Only ${summary.total} presentation intervals were recorded, below the " +
-                        "$MIN_PRESENT_INTERVALS floor, so frameP95=${summary.p95Millis}ms and " +
-                        "frozenRatio=${summary.frozenRatio} are too thinly sampled to quote.",
-                    summary.total >= MIN_PRESENT_INTERVALS,
-                )
-                assertTrue("p95 frame time was invalid: ${summary.p95Millis}", summary.p95Millis >= 0)
-                assertTrue(
-                    "Frozen-frame ratio was invalid: ${summary.frozenRatio}",
-                    summary.frozenRatio in 0.0..1.0,
-                )
-                if (enforcePhysicalGate) {
-                    assertTrue(
-                        "Pan/zoom p95 exceeded ${MAX_FRAME_P95_MILLIS}ms: " +
-                            "${summary.p95Millis}ms",
-                        summary.p95Millis <= MAX_FRAME_P95_MILLIS,
+        existingFixture.use {
+            ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+                val activity = scenario.requireActivity()
+                // Exclude provider fallback and the initial canonical rebuild from the fixed operation
+                // histogram. Readiness itself remains a hard precondition for collecting samples.
+                awaitMapState(scenario)
+                // The activity window is kept only as context. It cannot see this map - see
+                // [SurfaceFlingerPresentIntervals] - and the gate below is judged on the map's own
+                // SurfaceFlinger layer instead. Reporting both is what makes the difference legible
+                // rather than something a later reader has to rediscover.
+                val frameMetrics = FrameMetricsAggregator(FrameMetricsAggregator.TOTAL_DURATION)
+                frameMetrics.add(activity)
+                try {
+                    SurfaceFlingerPresentIntervals.arm()
+                    val presented = performDeterministicPanAndZoom(scenario)
+                    val windowSummary = summarize(
+                        frameMetrics.remove(activity)?.getOrNull(FrameMetricsAggregator.TOTAL_INDEX),
                     )
+                    val summary = summarize(presented.histogram)
+                    // Blindness first, and on its own terms. A camera animation that produced no
+                    // interval for the map's layer did not measure a slow map - nothing observed the
+                    // map at all - and that is a different failure from a slow one, so it is asserted
+                    // apart from any threshold on speed. See [MAP_SURFACE_LAYER].
                     assertTrue(
-                        "Frozen-frame ratio must be below $MAX_FROZEN_RATIO: " +
-                            "${summary.frozenRatio}",
-                        summary.frozenRatio < MAX_FROZEN_RATIO,
+                        "The map's SurfaceFlinger layer presented during only " +
+                            "${presented.presentingWindows} of $PAN_ZOOM_ITERATIONS camera " +
+                            "animations, so this run did not observe the map for the rest, and " +
+                            "frameP95=${summary.p95Millis}ms is not a measurement of it. First thing " +
+                            "to check: that TimeStats is tracking a layer whose name contains " +
+                            "\"$MAP_SURFACE_LAYER\". For contrast, the activity window - which does " +
+                            "NOT contain this map - reported ${windowSummary.total} frames across " +
+                            "the same animations.",
+                        presented.presentingWindows == PAN_ZOOM_ITERATIONS,
                     )
-                }
-                val expectedCamera = readCamera(scenario)
-                val expectedFogGeneration = readFogGeneration(scenario)
+                    // Then the worst single animation, which the pooled histogram cannot express.
+                    // A stalled window contributes ONE interval where a healthy one contributes
+                    // fourteen, so pooling lets the windows that behaved outvote the ones that did
+                    // not. See [MIN_INTERVALS_PER_WINDOW].
+                    assertTrue(
+                        "The worst camera animation produced only ${presented.leanestWindow} " +
+                            "presentation intervals, below the $MIN_INTERVALS_PER_WINDOW per-window " +
+                            "floor. The map stalled during at least one animation, and a pooled " +
+                            "frameP95=${summary.p95Millis}ms cannot show that, because a stalled " +
+                            "window contributes fewer samples than a healthy one and is outvoted by " +
+                            "them.",
+                        presented.leanestWindow >= MIN_INTERVALS_PER_WINDOW,
+                    )
+                    // Then whether there are enough of them for a p95 to mean anything.
+                    assertTrue(
+                        "Only ${summary.total} presentation intervals were recorded, below the " +
+                            "$MIN_PRESENT_INTERVALS floor, so frameP95=${summary.p95Millis}ms and " +
+                            "frozenRatio=${summary.frozenRatio} are too thinly sampled to quote.",
+                        summary.total >= MIN_PRESENT_INTERVALS,
+                    )
+                    assertTrue("p95 frame time was invalid: ${summary.p95Millis}", summary.p95Millis >= 0)
+                    assertTrue(
+                        "Frozen-frame ratio was invalid: ${summary.frozenRatio}",
+                        summary.frozenRatio in 0.0..1.0,
+                    )
+                    if (enforcePhysicalGate) {
+                        assertTrue(
+                            "Pan/zoom p95 exceeded ${MAX_FRAME_P95_MILLIS}ms: " +
+                                "${summary.p95Millis}ms",
+                            summary.p95Millis <= MAX_FRAME_P95_MILLIS,
+                        )
+                        assertTrue(
+                            "Frozen-frame ratio must be below $MAX_FROZEN_RATIO: " +
+                                "${summary.frozenRatio}",
+                            summary.frozenRatio < MAX_FROZEN_RATIO,
+                        )
+                    }
+                    existingFixture?.assertUnchanged("after-pan-zoom")
+                    val expectedCamera = readCamera(scenario)
+                    val expectedFogGeneration = readFogGeneration(scenario)
 
-                repeat(LIFECYCLE_RECOVERY_COUNT) { recoveryIndex ->
-                    scenario.moveToState(Lifecycle.State.CREATED)
-                    scenario.moveToState(Lifecycle.State.RESUMED)
-                    awaitMapState(
-                        scenario = scenario,
-                        expectedCamera = expectedCamera,
-                        minimumFogGeneration = expectedFogGeneration,
-                        recoveryNumber = recoveryIndex + 1,
-                    )
+                    repeat(LIFECYCLE_RECOVERY_COUNT) { recoveryIndex ->
+                        scenario.moveToState(Lifecycle.State.CREATED)
+                        scenario.moveToState(Lifecycle.State.RESUMED)
+                        awaitMapState(
+                            scenario = scenario,
+                            expectedCamera = expectedCamera,
+                            minimumFogGeneration = expectedFogGeneration,
+                            recoveryNumber = recoveryIndex + 1,
+                        )
+                    }
+                    report(summary, windowSummary, presented.leanestWindow, enforcePhysicalGate)
+                } finally {
+                    // A crash or ANR prevents a lifecycle transition or map-ready callback from
+                    // completing, and therefore fails this instrumentation test.
+                    frameMetrics.stop()
+                    // TimeStats is global to SurfaceFlinger and off by default. Leaving it enabled
+                    // would change how the device behaves for everything measured after this test.
+                    SurfaceFlingerPresentIntervals.disable()
                 }
-                report(summary, windowSummary, presented.leanestWindow, enforcePhysicalGate)
-            } finally {
-                // A crash or ANR prevents a lifecycle transition or map-ready callback from
-                // completing, and therefore fails this instrumentation test.
-                frameMetrics.stop()
-                // TimeStats is global to SurfaceFlinger and off by default. Leaving it enabled
-                // would change how the device behaves for everything measured after this test.
-                SurfaceFlingerPresentIntervals.disable()
             }
         }
     }
@@ -278,13 +290,21 @@ class UiScaleBenchmarkTest {
                     MapState(
                         mapVisible = mapView.isShown,
                         camera = camera,
-                        fogInstalled = slot != null &&
+                        fogInstalled = slot != null && if (existingDataMode) {
+                            MapLibreFogArm.DEFAULT == MapLibreFogArm.TRACK_VECTOR_RING &&
+                                MapLibreVectorFogState.activeArm == MapLibreFogArm.TRACK_VECTOR_RING &&
+                                MapLibreVectorFogState.trackEnabled && !MapLibreVectorFogState.enabled &&
+                                style?.getSource(FogOverlayIds.source(slot)) is GeoJsonSource &&
+                                style.getLayer(FogOverlayIds.layer(slot)) is FillLayer &&
+                                ExistingDemoFrameFixture.noNoticeCards(mapView)
+                        } else {
                             style?.getSourceAs<ImageSource>(FogOverlayIds.source(slot)) != null &&
-                            style.getLayerAs<RasterLayer>(FogOverlayIds.layer(slot)) != null,
+                                style.getLayerAs<RasterLayer>(FogOverlayIds.layer(slot)) != null
+                        },
                         fogGeneration = mapView.getTag(R.id.map_fog_canonical_generation) as? Long,
                         localFallback =
                             mapView.getTag(R.id.map_basemap_load_state) ==
-                                BasemapLoadState.LOCAL_FALLBACK.name,
+                                (if (existingDataMode) BasemapLoadState.ONLINE else BasemapLoadState.LOCAL_FALLBACK).name,
                     ),
                 )
             }
@@ -389,7 +409,7 @@ class UiScaleBenchmarkTest {
         enforcePhysicalGate: Boolean,
     ) {
         val deviceClass = when {
-            enforcePhysicalGate -> "designated mid-range physical device"
+            enforcePhysicalGate -> if (existingDataMode) "designated physical device" else "designated mid-range physical device"
             isEmulator() -> "emulator; engineering evidence only"
             else -> "physical device not designated as mid-range; engineering evidence only"
         }
@@ -398,17 +418,18 @@ class UiScaleBenchmarkTest {
             Bundle().apply {
                 putString(
                     "stream",
-                    "TrailVeil UI scale benchmark seed=${ScaleBenchmarkFixture.SEED} " +
-                        "points=$CANONICAL_POINT_COUNT panZoom=$PAN_ZOOM_ITERATIONS " +
+                    "TrailVeil UI scale benchmark " +
+                        (existingFixture?.description ?: "seed=${ScaleBenchmarkFixture.SEED} points=$CANONICAL_POINT_COUNT") +
+                        " panZoom=$PAN_ZOOM_ITERATIONS " +
                         "lifecycleRecoveries=$LIFECYCLE_RECOVERY_COUNT " +
                         "frameP95=${summary.p95Millis}ms " +
                         "frozenRatio=${"%.4f".format(java.util.Locale.US, summary.frozenRatio)} " +
                         "frames=${summary.total} leanestWindow=$leanestWindow " +
                         "surface=mapSurfaceViewPresentIntervals " +
                         "activityWindowFrames=${windowSummary.total}; " +
-                        "basemap=local-fallback; $deviceClass; " +
+                        "basemap=${if (existingDataMode) "maplibre-live" else "local-fallback"}; $deviceClass; " +
                         if (enforcePhysicalGate) {
-                            "mid-range performance gate enforced\n"
+                            if (existingDataMode) "designated-device frame gate enforced\n" else "mid-range performance gate enforced\n"
                         } else {
                             "no device performance gate applied\n"
                         },

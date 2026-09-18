@@ -13,7 +13,10 @@ import app.trailveil.TrailVeilApplication
 import app.trailveil.data.db.LatitudeBuckets
 import app.trailveil.data.db.TrackPointCells
 import app.trailveil.data.db.TrailVeilDatabase
+import app.trailveil.map.fog.FogRuntime
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 
 /**
@@ -55,10 +58,10 @@ import kotlinx.coroutines.withContext
  * must never fail in.
  *
  * The transaction is Room's own, not the helper's, because ending a Room transaction is what
- * refreshes the invalidation tracker - and that is what makes the fog rebuild while you watch
- * instead of on the next launch. The world fixture takes one transaction PER SESSION rather than one
- * for all of them: it bounds how much is lost if something goes wrong, it lets progress be reported
- * truthfully, and it lets the map fill in as it goes.
+ * refreshes the invalidation tracker. The replacement epoch also invalidates non-append changes
+ * for a warm runtime. The world fixture takes one transaction PER SESSION: it bounds partial work
+ * and reports progress truthfully. Canonical fog resumes after the whole replacement finishes or
+ * is cancelled, when the final committed rows and the derived caches have been reconciled.
  */
 internal object DemoExplorationSeeder {
 
@@ -142,19 +145,24 @@ internal object DemoExplorationSeeder {
 
     /** The comparison fixture: one session, here, at the density the arms are judged at. */
     suspend fun seedHere(context: Context, anchor: Anchor): Outcome = withContext(Dispatchers.IO) {
-        val database = database(context)
-        clearInternal(database)
-        val components = DemoExplorationTrack.componentsAround(anchor.latitude, anchor.longitude)
-        database.runInTransaction {
-            writeSession(
-                helper = database.openHelper.writableDatabase,
-                components = components,
-                distanceMetres = DemoExplorationTrack.lengthMetres(),
-                endedAt = System.currentTimeMillis(),
-            )
-        }
-        Outcome(sessions = 1, points = components.sumOf { it.size }, anchor = anchor)
+        seedHere(database(context), runtime(context), anchor)
     }
+
+    /** Same SQL and invalidation route, with an isolated database available to instrumentation. */
+    internal suspend fun seedHere(database: TrailVeilDatabase, runtime: FogRuntime, anchor: Anchor): Outcome =
+        runtime.replaceCanonicalData {
+            clearInternal(database)
+            val components = DemoExplorationTrack.componentsAround(anchor.latitude, anchor.longitude)
+            database.runInTransaction {
+                writeSession(
+                    helper = database.openHelper.writableDatabase,
+                    components = components,
+                    distanceMetres = DemoExplorationTrack.lengthMetres(),
+                    endedAt = System.currentTimeMillis(),
+                )
+            }
+            Outcome(sessions = 1, points = components.sumOf { it.size }, anchor = anchor)
+        }
 
     /**
      * The load fixture: many sessions, scattered across [DemoTaiwanAnchors]'s box, dense.
@@ -168,12 +176,22 @@ internal object DemoExplorationSeeder {
         pointsPerSession: Int = DemoTaiwanAnchors.DEFAULT_POINTS_PER_SESSION,
         onProgress: suspend (Int, Int) -> Unit = { _, _ -> },
     ): Outcome = withContext(Dispatchers.IO) {
-        val database = database(context)
+        seedRegion(database(context), runtime(context), sessions, pointsPerSession, onProgress)
+    }
+
+    internal suspend fun seedRegion(
+        database: TrailVeilDatabase,
+        runtime: FogRuntime,
+        sessions: Int,
+        pointsPerSession: Int,
+        onProgress: suspend (Int, Int) -> Unit = { _, _ -> },
+    ): Outcome = runtime.replaceCanonicalData {
         clearInternal(database)
         val distance = DemoExplorationTrack.lengthMetres(pointsPerSession)
         val now = System.currentTimeMillis()
         var written = 0
         DemoTaiwanAnchors.anchors(sessions).forEachIndexed { index, anchor ->
+            currentCoroutineContext().ensureActive()
             val components = DemoExplorationTrack.componentsAround(
                 anchor.latitude,
                 anchor.longitude,
@@ -197,8 +215,14 @@ internal object DemoExplorationSeeder {
 
     /** Removes seeded data and nothing else, leaving any real exploration untouched. */
     suspend fun clear(context: Context): Int = withContext(Dispatchers.IO) {
-        clearInternal(database(context))
+        clear(database(context), runtime(context))
     }
+
+    internal suspend fun clear(database: TrailVeilDatabase, runtime: FogRuntime): Int =
+        runtime.replaceCanonicalData { clearInternal(database) }
+
+    private fun runtime(context: Context): FogRuntime =
+        (context.applicationContext as TrailVeilApplication).appContainer.fogRuntime()
 
     /** How many seeded points are currently stored, so the UI can state a fact rather than a hope. */
     suspend fun seededPointCount(context: Context): Int = withContext(Dispatchers.IO) {

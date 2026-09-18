@@ -13,6 +13,34 @@ import org.junit.Assert.assertSame
 import org.junit.Test
 
 class FogCanonicalRetryTest {
+    @Test fun aRetriedPreparedPayloadCannotReuseThePriorAttemptsValue() = runTest {
+        data class Payload(val attempt: Int)
+        var attempts = 0
+        val installs = mutableListOf<Payload>()
+        val result = renderCanonicalFogWithRetry(
+            FogViewportRequest(GeoPoint(0.0, 0.0), 16.0), 1L,
+            render = { Payload(++attempts) },
+            installAndAwait = { payload -> installs += payload; if (payload.attempt == 1) error("install failed") },
+            onFailure = {},
+        )
+        assertEquals(listOf(1, 2), installs.map { it.attempt })
+        assertSame(installs.last(), result)
+    }
+
+    @Test fun cancellationDuringPreparationDoesNotInstallOrRetry() = runTest {
+        var installed = false
+        var failures = 0
+        try {
+            renderCanonicalFogWithRetry<Unit>(
+                FogViewportRequest(GeoPoint(0.0, 0.0), 16.0), 1L,
+                render = { throw kotlinx.coroutines.CancellationException("cancelled") },
+                installAndAwait = { installed = true }, onFailure = { failures++ },
+            )
+            org.junit.Assert.fail("expected cancellation")
+        } catch (_: kotlinx.coroutines.CancellationException) { /* expected */ }
+        assertEquals(false, installed)
+        assertEquals(0, failures)
+    }
     @Test
     fun transientRenderAndInstallFailuresRetryUntilCanonicalFrameSucceeds() = runTest {
         val request = FogViewportRequest(
@@ -28,7 +56,7 @@ class FogCanonicalRetryTest {
                 west = 121.5,
                 east = 121.6,
             ),
-            mosaic = FogTileMosaic(
+            presentation = FogTileMosaic(
                 mask = FogPixelMask(1, 1, byteArrayOf(184.toByte())),
                 bounds = FogTileBounds(
                     westLongitude = 121.5,

@@ -90,9 +90,11 @@ class GoogleFogStage6SourceTest {
         // planning from planning once in prove() and threading it through — the exact regression
         // this case is named for.
         val attemptBody = functionBody(prover, "private fun attempt(")
+        val planBody = functionBody(prover, "private suspend fun planAndSnapshot(")
         assertTrue(
-            "the plan must be obtained inside attempt(), once per pass",
-            attemptBody.contains("planForAttempt(run.generation)"),
+            "each attempt must launch its own plan, once per pass",
+            attemptBody.contains("scope.launch { planAndSnapshot(run, attemptToken) }") &&
+                planBody.contains("planForAttempt(run.generation, attemptToken.number)"),
         )
         assertFalse(
             "prove() must not hoist the plan; that restores the stale-plan defect F2 closes",
@@ -100,10 +102,97 @@ class GoogleFogStage6SourceTest {
         )
         assertTrue(
             "each snapshot callback must be bound to its lifecycle/camera attempt token",
-            attemptBody.contains("isLive(run, attemptToken)") &&
-                attemptBody.contains("retrySameAttempt(run, attemptToken)"),
+            planBody.contains("isLive(run, attemptToken)") &&
+                planBody.contains("retrySameAttempt(run, attemptToken)"),
         )
+        assertTrue("a stale worker result must be rejected before preparing overlays or snapshotting",
+            planBody.indexOf("if (!isLive(run, attemptToken))") in
+                0 until planBody.indexOf("prepareFogProofPlan(plan, onUnprovablePlan)"))
+        assertTrue("warmup must yield and its captured plan must still pass the post-wait fence",
+            planBody.indexOf("delay(warmupRemaining)") in
+                0 until planBody.indexOf("if (!isLive(run, attemptToken))"))
+        assertTrue(planBody.contains("catch (cancelled: CancellationException)"))
+        listOf("fun prove(", "fun release(", "fun onHostStopped(").forEach { declaration ->
+            assertTrue(functionBody(prover, declaration).contains("planningJob?.cancel()"))
+        }
+        val binding = googleSource("GoogleCanonicalFogSurfaceBinding.kt")
+        val freshPlan = functionBody(binding, "private suspend fun freshProofPlan(")
+        assertTrue(freshPlan.contains("FogProbeCandidateBank.forAttempt(attempt)"))
+        assertTrue(freshPlan.indexOf("recentRequestedKeysOrNull()") < freshPlan.indexOf("proofPlanMemo.find("))
+        assertTrue(freshPlan.indexOf("exclusionZonesForProof()") < freshPlan.indexOf("proofPlanMemo.find("))
+        assertTrue(freshPlan.contains("withContext(Dispatchers.Default)"))
+        assertTrue("worker planning must observe its coroutine cancellation",
+            freshPlan.contains("checkActive = { workerJob.ensureActive() }"))
+        listOf("fun onCameraMoveStarted(", "fun onCameraMoveFrame(", "fun onCameraIdle(",
+            "fun onOverlayDataChanged(").forEach { declaration ->
+            assertTrue("changed SDK inputs must cancel in-flight planning: $declaration",
+                functionBody(binding, declaration).contains("snapshotProver.onInputsChanged()"))
+        }
+        listOf("override fun removeOverlay(", "override fun cancelRebuild(").forEach { declaration ->
+            assertTrue("discarded generation must cancel only its own proof",
+                functionBody(binding, declaration).contains("snapshotProver.cancelGeneration(generationId)"))
+        }
+        listOf("private fun applyCanonicalEpoch(", "private fun failSynchronization(").forEach { declaration ->
+            val body = functionBody(binding, declaration)
+            assertTrue(body.contains("proofPlanMemo.clear()"))
+            val next = if (declaration.contains("applyCanonicalEpoch"))
+                "coordinator.onCanonicalResetRequired()" else "failRuntime(failure)"
+            assertTrue("reset/failure cancels obsolete proof before its coordinator transition",
+                body.indexOf("snapshotProver.release()") in 0 until body.indexOf(next))
+        }
+        val failedSync = functionBody(binding, "private fun failSynchronization(")
+        assertFalse("transient read errors must not revoke a proven generation",
+            failedSync.contains("coordinator.onCanonicalResetRequired()"))
+        assertFalse(failedSync.contains("hideOverlaysBeneathCover()"))
+        val reveal = functionBody(binding, "override fun revealOverlay(")
+        assertEquals("both posted reveal failures must cancel their generation's now-useless proof", 2,
+            Regex("""snapshotProver\.cancelGeneration\(generationId\)\s+coordinator\.onRevealFailed\(generationId\)""")
+                .findAll(reveal).count())
+        val terminal = functionBody(binding, "private fun afterCoordinatorMutation(")
+            .substringAfter("val publishTerminal = coordinator.terminal && !terminalPublished")
+            .substringBefore("if (coordinator.retryScheduled")
+        assertTrue(terminal.contains("proofPlanMemo.clear()"))
+        assertTrue("every terminal path must stop planning before notifying the host",
+            terminal.indexOf("snapshotProver.release()") in 0 until terminal.indexOf("onStateChanged(state())"))
+        assertTrue(terminal.indexOf("onStateChanged(state())") < terminal.indexOf("onTerminalFailure()"))
+        assertTrue(freshPlan.indexOf("currentCoverageRequest()") < freshPlan.indexOf("withContext(Dispatchers.Default)"))
+        assertTrue(freshPlan.indexOf("exclusionZonesForProof()") < freshPlan.indexOf("withContext(Dispatchers.Default)"))
+        listOf("!allMasks.keys.containsAll(requiredFloorKeys)", "!allMasks.keys.containsAll(actual)",
+            "exclusionZonesForProof()").forEach { check ->
+            assertTrue("memo lookup must follow fresh coverage and exclusion checks",
+                freshPlan.indexOf(check) in 0 until freshPlan.indexOf("proofPlanMemo.find("))
+        }
         assertTrue(prover.contains("FogSnapshotProofBudget(MAX_ATTEMPTS)"))
+        // V03-013: prove() posts the FIRST attempt after a settle so the main thread yields before
+        // the plan and snapshot run. It must reach attempt(run) exactly once and only through that
+        // post: an inline call in any spelling, or an immediate handler.post beside the settled
+        // one, restores the b20 first attempt and leaves the settled post to `begin:null` - a
+        // regression the earlier "no bare attempt(run) line" pin could not see. The settle is a
+        // real interval that attempt() does not re-apply, and retries keep their own pacing.
+        val proveBody = functionBody(prover, "fun prove(")
+        assertTrue(
+            "prove() must post the first attempt after FIRST_SNAPSHOT_SETTLE_MILLIS",
+            proveBody.contains("handler.postDelayed({ attempt(run) }, FIRST_SNAPSHOT_SETTLE_MILLIS)"),
+        )
+        assertEquals(
+            "prove() must reach attempt(run) exactly once, inside the settled post",
+            1,
+            Regex("attempt\\(run\\)").findAll(proveBody).count(),
+        )
+        assertFalse(
+            "prove() must not post an immediate attempt beside the settled one",
+            proveBody.contains("handler.post {") || proveBody.contains("handler.post("),
+        )
+        assertTrue(prover.contains("const val FIRST_SNAPSHOT_SETTLE_MILLIS = 50L"))
+        assertFalse(
+            "the settle belongs to prove(), not to every attempt",
+            attemptBody.contains("FIRST_SNAPSHOT_SETTLE_MILLIS") || attemptBody.contains("50L"),
+        )
+        assertTrue(
+            "retries keep their RETRY_MILLIS pacing; the settle is not a retry interval",
+            functionBody(prover, "private fun retryOrFinish(")
+                .contains("handler.postDelayed({ attempt(run) }, RETRY_MILLIS)"),
+        )
         assertTrue(prover.contains("run.budget.recordSuccess(attemptToken)"))
         assertTrue(prover.contains("catch (_: Exception)"))
         assertTrue(prover.contains("catch (_: LinkageError)"))
@@ -118,12 +207,55 @@ class GoogleFogStage6SourceTest {
             "the prover must not compute its own passed flag from raw tile counts",
             prover.contains("passed = verifiedTiles =="),
         )
+        // One coat of fog beneath the cover: the tile overlays AND the installer arms' layers
+        // are hidden on the cover's rising edge (the owner read the second coat as a darker cover).
+        val coverHide = functionBody(googleSource("GoogleCanonicalFogSurfaceBinding.kt"), "private fun hideOverlaysBeneathCover()")
+        assertTrue(
+            "the installer's layers must be hidden beneath the cover with the tile overlays",
+            coverHide.contains("overlayInstaller?.hideBeneathCover()"),
+        )
         assertTrue(hosted.contains("if (fogRequired && fogCoverUp)"))
         assertFalse(hosted.contains("pointerInput"))
         assertTrue(gestureView.contains("requestDisallowInterceptTouchEvent(true)"))
         assertTrue(synchronousCover.contains("mapView.overlay.add(drawable)"))
         assertTrue(synchronousCover.contains("map_fog_synchronous_cover_up"))
         assertFalse(synchronousCover.contains("setOnTouchListener"))
+        // V03-013: raising is synchronous, lowering settles. The drawable may only leave through
+        // the settled path (a delay, then an animation frame), never straight from setVisible(false),
+        // and the raise path must cancel a pending lowering before it adds the drawable.
+        val setVisibleBody = functionBody(synchronousCover, "fun setVisible(show: Boolean)")
+        assertFalse(
+            "setVisible(false) must not remove the cover synchronously; the SDK's next frame may not carry the successor yet",
+            setVisibleBody.contains("overlay.remove(drawable)"),
+        )
+        // The verifier's counter-example: `else if (visible) lowerNow()` kept every pin above
+        // green. The false branch must go through the settle and nowhere else.
+        assertTrue(
+            "setVisible(false) must schedule the settled lowering",
+            setVisibleBody.contains("scheduleLower()"),
+        )
+        assertFalse(
+            "setVisible must never lower directly",
+            setVisibleBody.contains("lowerNow()"),
+        )
+        assertTrue(
+            "the settle must be a real interval, not a named zero",
+            synchronousCover.contains("const val LOWER_SETTLE_MILLIS = 50L"),
+        )
+        assertTrue(
+            "the raise path must cancel a pending lowering",
+            setVisibleBody.indexOf("cancelPendingLower()") in 0 until setVisibleBody.indexOf("raiseNow()"),
+        )
+        val scheduleBody = functionBody(synchronousCover, "private fun scheduleLower()")
+        assertTrue(
+            "lowering must settle for LOWER_SETTLE_MILLIS and then align with an animation frame",
+            scheduleBody.contains("mapView.postDelayed(lower, LOWER_SETTLE_MILLIS)") &&
+                scheduleBody.contains("mapView.postOnAnimation(this)"),
+        )
+        assertTrue(
+            "release must lower at once, not through the settle",
+            functionBody(synchronousCover, "fun release()").contains("lowerNow()"),
+        )
         // Stage 8 attempted to keep the Google attribution legible by clipping a 220x220 px hole in
         // this cover. That hole exposed unproven raw basemap and was rejected; the remedy moves the
         // SDK's own ImageView instead. Nothing pinned it, so the regression could return silently.
@@ -186,10 +318,49 @@ class GoogleFogStage6SourceTest {
         // `fogRuntime` still must NOT be a deadline key — a runtime arriving near the deadline may
         // not be granted another full window. `lifecycle` was added so the wait can be suspended
         // while the host is stopped; see boundedDeadlinesDoNotRunWhileTheHostIsStopped.
+        // `fogGestureSettleClock` and `fogGestureHeld` (owner decision 2026-09-10) make this effect
+        // the binding's net: it restarts only when a gesture's settling idle re-arms the binding's
+        // deadline - never on the binding's first arm, which is what keeps the late-runtime bound
+        // above - and waits longer while a person's gesture holds the camera, where the binding's
+        // clock is deliberately stopped. An explicit harness canonical replacement also pauses
+        // the window; its completion resumes rendering without extending a renderer timeout.
         assertTrue(
             hosted.contains(
-                "LaunchedEffect(mapView, fogRequired, fogCoverUp, fogCoverTimeoutMillis, lifecycle)",
+                "LaunchedEffect(mapView, fogRequired, fogCoverUp, fogCoverTimeoutMillis, lifecycle, " +
+                    "fogGestureSettleClock, fogGestureHeld, canonicalReplacementInProgress)",
             ),
+        )
+        // The settle clock is bumped in exactly one place, the settling idle. The binding's first
+        // arm happens inside its own construction, so a clock bumped by every arm restarted the
+        // host's window when a runtime arrived at 19 s - the defect these pins exist for.
+        val bindingSource = googleSource("GoogleCanonicalFogSurfaceBinding.kt")
+        assertEquals(
+            "the settle clock must be bumped in exactly one place",
+            1,
+            Regex("""gestureSettleClock \+= 1L""").findAll(bindingSource).count(),
+        )
+        assertTrue(
+            "and that place is the settling idle",
+            functionBody(bindingSource, "fun onCameraIdle()").contains("gestureSettleClock += 1L"),
+        )
+        assertFalse(
+            "armCoverDeadline must not touch the settle clock",
+            functionBody(bindingSource, "private fun armCoverDeadline()").contains("gestureSettleClock"),
+        )
+        assertTrue(
+            "the host's gesture restart must use the binding's settle clock",
+            hosted.contains("val fogGestureSettleClock = fogState?.gestureSettleClock ?: 0L"),
+        )
+        assertTrue(
+            "only an explicitly published canonical replacement may pause the host net",
+            hosted.contains("val canonicalReplacementInProgress = fogState?.canonicalReplacementInProgress == true") &&
+                hosted.contains("if (!fogRequired || !fogCoverUp || canonicalReplacementInProgress) return@LaunchedEffect"),
+        )
+        assertTrue(
+            "the gesture rule must wait for the first cover to lower on a passed proof; the " +
+                "installed-generation id is set at reveal, before the proof, and cannot be the gate",
+            functionBody(bindingSource, "fun onCameraMoveStarted(reason: Int)")
+                .contains("fogReason == FogCameraMoveReason.GESTURE && firstCoverLowered"),
         )
         assertFalse(
             "fogRuntime must never key the cover deadline",
@@ -327,8 +498,9 @@ class GoogleFogStage6SourceTest {
                 binding.contains("budget.resume(paused)"),
         )
         assertTrue(
-            "the cover deadline must not be armed while the host is stopped",
-            binding.contains("if (!hostStopped) armCoverDeadline()"),
+            "the cover deadline must not be armed while the host is stopped, nor on a cover that " +
+                "rises under a held gesture (the settling idle arms it; owner decision 2026-09-10)",
+            binding.contains("if (!hostStopped && !gestureHeld) armCoverDeadline()"),
         )
         assertTrue(
             "the install timeout must not be armed while the host is stopped either; cancelling an " +
@@ -557,7 +729,7 @@ class GoogleFogStage6SourceTest {
         )
         assertTrue(
             "...and only while what it guards is actually expensive",
-            binding.contains("mosaic = FogPocMosaic.compose(tiles)"),
+            binding.contains("presentation = FogPocMosaic.compose(tiles)"),
         )
     }
 

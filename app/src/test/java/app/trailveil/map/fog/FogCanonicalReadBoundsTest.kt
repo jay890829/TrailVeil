@@ -336,8 +336,8 @@ class FogCanonicalReadBoundsTest {
             cold.keys,
             partiallyCached.keys,
         )
-        val reference = cold.mosaic.mask
-        val measured = partiallyCached.mosaic.mask
+        val reference = (cold.presentation as FogTileMosaic).mask
+        val measured = (partiallyCached.presentation as FogTileMosaic).mask
         assertEquals(reference.width, measured.width)
         assertEquals(reference.height, measured.height)
         var firstDifference: String? = null
@@ -407,8 +407,8 @@ class FogCanonicalReadBoundsTest {
                 queryMarginMeters = DISCRIMINATING_QUERY_MARGIN_METERS,
             ).render(warmRequest)
 
-            val reference = cold.mosaic.mask
-            val measured = partiallyCached.mosaic.mask
+            val reference = (cold.presentation as FogTileMosaic).mask
+            val measured = (partiallyCached.presentation as FogTileMosaic).mask
             var differing = 0
             var firstDifference: String? = null
             for (y in 0 until reference.height) {

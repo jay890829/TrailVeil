@@ -22,7 +22,9 @@ import org.maplibre.android.camera.CameraUpdateFactory
 import org.maplibre.android.geometry.LatLng
 import org.maplibre.android.maps.MapLibreMap
 import org.maplibre.android.maps.MapView
+import org.maplibre.android.style.layers.FillLayer
 import org.maplibre.android.style.layers.RasterLayer
+import org.maplibre.android.style.sources.GeoJsonSource
 import org.maplibre.android.style.sources.ImageSource
 
 @RunWith(AndroidJUnit4::class)
@@ -76,8 +78,18 @@ class MapSurfaceLifecycleTest {
         }
     }
 
+    /**
+     * Production fog has two installs behind one pair of ids, and which one lands is decided per
+     * generation: the native arm adds a `GeoJsonSource` under a `FillLayer`, the raster arm an
+     * `ImageSource` under a `RasterLayer`. Asserting the raster pair alone made this case depend on
+     * a process-global that the neighbouring MapLibre classes toggle and restore, so it threw
+     * `ClassCastException` whenever the generation in effect had captured the native arm - a
+     * failure that says nothing about fog. What is worth pinning is that the active slot carries a
+     * *matched* pair, so both arms are accepted and a crossed pair still fails.
+     */
     private fun assertProductionFogInstalled(scenario: ActivityScenario<MainActivity>) {
         val installed = AtomicBoolean(false)
+        val seen = AtomicReference("no fog source or layer for the active slot")
         repeat(100) {
             scenario.onActivity { activity ->
                 val mapView = activity.window.decorView.findMapView()
@@ -85,17 +97,24 @@ class MapSurfaceLifecycleTest {
                     val style = map.style
                     val slot = (mapView.getTag(R.id.map_fog_active_slot) as? String)
                         ?.let(FogGenerationSlot::valueOf)
+                    val source = slot?.let { style?.getSource(FogOverlayIds.source(it)) }
+                    val layer = slot?.let { style?.getLayer(FogOverlayIds.layer(it)) }
+                    if (source != null || layer != null) {
+                        seen.set(
+                            "slot=$slot source=${source?.javaClass?.simpleName} " +
+                                "layer=${layer?.javaClass?.simpleName}",
+                        )
+                    }
                     installed.set(
-                        slot != null &&
-                            style?.getSourceAs<ImageSource>(FogOverlayIds.source(slot)) != null &&
-                            style.getLayerAs<RasterLayer>(FogOverlayIds.layer(slot)) != null,
+                        (source is ImageSource && layer is RasterLayer) ||
+                            (source is GeoJsonSource && layer is FillLayer),
                     )
                 }
             }
             if (installed.get()) return
             Thread.sleep(100L)
         }
-        assertTrue("Production fog source/layer were not installed", installed.get())
+        assertTrue("Production fog source/layer were not installed: ${seen.get()}", installed.get())
     }
 
     private fun withMap(

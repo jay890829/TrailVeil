@@ -8,6 +8,10 @@ import androidx.room.OnConflictStrategy
 import androidx.room.Query
 import androidx.room.Relation
 import androidx.room.Transaction
+import androidx.room.useReaderConnection
+import android.database.Cursor
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import app.trailveil.data.recording.ExpiredLocationOperationException
 import app.trailveil.data.recording.LOCATION_RECEIPT_PRUNE_INTERVAL
 import app.trailveil.data.recording.LOCATION_RECEIPT_RETAIN_COUNT
@@ -154,7 +158,7 @@ internal object RecordingReceiptOutcome {
     fun stopRequested(reason: String): String = STOP_REQUESTED_PREFIX + reason
 }
 @Dao
-internal abstract class RecordingDao {
+internal abstract class RecordingDao(private val database: TrailVeilDatabase) {
     @Insert(onConflict = OnConflictStrategy.ABORT) protected abstract suspend fun insertSessionRow(session: RecordingSessionEntity): Long
     @Insert(onConflict = OnConflictStrategy.ABORT) protected abstract suspend fun insertSegmentRow(segment: TrackSegmentEntity): Long
     @Insert(onConflict = OnConflictStrategy.ABORT) protected abstract suspend fun insertPointRowUnbucketed(point: TrackPointEntity): Long
@@ -544,24 +548,20 @@ internal abstract class RecordingDao {
     abstract suspend fun recordingState(sessionId: Long): RecordingStateProjection?
     @Query("SELECT * FROM track_points WHERE segment_id = :segmentId ORDER BY sequence ASC") abstract suspend fun pointsForSegment(segmentId: Long): List<TrackPointEntity>
     @Query("SELECT * FROM track_points WHERE session_id = :sessionId AND latitude BETWEEN :south AND :north AND longitude BETWEEN :west AND :east ORDER BY timestamp ASC, id ASC") abstract suspend fun pointsInBoundingBox(sessionId: Long, south: Double, west: Double, north: Double, east: Double): List<TrackPointEntity>
-    @Query(
-        """
-        SELECT
-            p.id AS point_id,
-            p.session_id AS session_id,
-            p.segment_id AS segment_id,
-            s.sequence AS segment_sequence,
-            p.sequence AS point_sequence,
-            p.latitude AS latitude,
-            p.longitude AS longitude
-        FROM track_points p
-        INNER JOIN track_segments s
-            ON s.id = p.segment_id AND s.session_id = p.session_id
-        WHERE p.latitude BETWEEN :south AND :north
-            AND p.longitude BETWEEN :west AND :east
-        ORDER BY p.session_id ASC, s.sequence ASC, p.sequence ASC, p.id ASC
-        """,
-    )
+    /**
+     * The fog viewport read for a band too tall for [fogPointsInBucketedBox]: the same predicates,
+     * with nothing to narrow the scan.
+     *
+     * Unordered on purpose, both here and in the bucketed twin. The only consumer,
+     * `ViewportTrackDataSource.readPoints`, merges the dateline's two intervals, drops duplicate
+     * point ids and then sorts by session, segment sequence, segment id and point sequence itself,
+     * so an `ORDER BY` here was work the caller redid - and not cheap work: `V03-013` measured the
+     * whole-table case (204,800 rows, API 36 AVD) at 1.78 s with the order and 0.84 s without it.
+     * The order made SQLite walk `index_track_points_session_id_id` end to end with a rowid lookup
+     * per row and sort the rest in a temp b-tree; without it the plan is `SCAN p` in rowid order
+     * with the segment lookup, which is the read the table's size actually costs.
+     */
+    @Query(FOG_POINTS_IN_LONGITUDE_INTERVAL)
     abstract suspend fun fogPointsInLongitudeInterval(
         south: Double,
         west: Double,
@@ -577,27 +577,10 @@ internal abstract class RecordingDao {
      * The exact `latitude BETWEEN` predicate is kept and still decides membership: the bucket is
      * coarse (about 223 m), so it admits at most two extra bucket heights of span and never changes
      * the answer. Callers that cannot express the band within [LatitudeBuckets.MAX_BUCKETS] use
-     * [fogPointsInLongitudeInterval] instead, which is the same query without the narrowing.
+     * [fogPointsInLongitudeInterval] instead, which is the same query without the narrowing - and,
+     * like it, without an `ORDER BY`: the data source sorts the merged rows itself (see there).
      */
-    @Query(
-        """
-        SELECT
-            p.id AS point_id,
-            p.session_id AS session_id,
-            p.segment_id AS segment_id,
-            s.sequence AS segment_sequence,
-            p.sequence AS point_sequence,
-            p.latitude AS latitude,
-            p.longitude AS longitude
-        FROM track_points p
-        INNER JOIN track_segments s
-            ON s.id = p.segment_id AND s.session_id = p.session_id
-        WHERE p.lat_bucket IN (:latitudeBuckets)
-            AND p.longitude BETWEEN :west AND :east
-            AND p.latitude BETWEEN :south AND :north
-        ORDER BY p.session_id ASC, s.sequence ASC, p.sequence ASC, p.id ASC
-        """,
-    )
+    @Query(FOG_POINTS_IN_BUCKETED_BOX)
     abstract suspend fun fogPointsInBucketedBox(
         latitudeBuckets: IntArray,
         south: Double,
@@ -605,6 +588,35 @@ internal abstract class RecordingDao {
         north: Double,
         east: Double,
     ): List<ViewportTrackPointRow>
+
+    /**
+     * Consume the same query without Room's per-field SQLiteStatement-to-Cursor bridge. Room owns
+     * the read context (including a caller's suspending transaction); this does not start a writer
+     * transaction. The cursor never escapes its owner and is closed on success, failure or cancel.
+     * This path intentionally uses our current SupportSQLiteOpenHelper backend, not a SQLiteDriver.
+     */
+    suspend fun <T> withFogPointCursor(
+        south: Double,
+        north: Double,
+        west: Double,
+        east: Double,
+        consume: (Cursor) -> T,
+    ): T = database.useReaderConnection {
+        currentCoroutineContext().ensureActive()
+        val buckets = LatitudeBuckets.covering(south, north)
+        val cursor = if (buckets == null) fogPointsInLongitudeIntervalCursor(south, west, north, east)
+            else fogPointsInBucketedBoxCursor(buckets, south, west, north, east)
+        cursor.use {
+            currentCoroutineContext().ensureActive()
+            consume(it).also { currentCoroutineContext().ensureActive() }
+        }
+    }
+
+    @Query(FOG_POINTS_IN_LONGITUDE_INTERVAL)
+    protected abstract fun fogPointsInLongitudeIntervalCursor(south: Double, west: Double, north: Double, east: Double): Cursor
+
+    @Query(FOG_POINTS_IN_BUCKETED_BOX)
+    protected abstract fun fogPointsInBucketedBoxCursor(latitudeBuckets: IntArray, south: Double, west: Double, north: Double, east: Double): Cursor
     /** Room observes only `track_points`; lifecycle changes cannot emit a revision. */
     @Query("SELECT COALESCE(MAX(id), 0) FROM track_points")
     abstract fun observeLatestPersistedPointId(): Flow<Long>
@@ -1172,3 +1184,36 @@ internal abstract class RecordingDao {
     protected abstract suspend fun openSegmentForSession(sessionId: Long): TrackSegmentEntity?
 
 }
+
+internal const val FOG_POINTS_IN_LONGITUDE_INTERVAL = """
+        SELECT
+            p.id AS point_id,
+            p.session_id AS session_id,
+            p.segment_id AS segment_id,
+            s.sequence AS segment_sequence,
+            p.sequence AS point_sequence,
+            p.latitude AS latitude,
+            p.longitude AS longitude
+        FROM track_points p
+        INNER JOIN track_segments s
+            ON s.id = p.segment_id AND s.session_id = p.session_id
+        WHERE p.latitude BETWEEN :south AND :north
+            AND p.longitude BETWEEN :west AND :east
+        """
+
+private const val FOG_POINTS_IN_BUCKETED_BOX = """
+        SELECT
+            p.id AS point_id,
+            p.session_id AS session_id,
+            p.segment_id AS segment_id,
+            s.sequence AS segment_sequence,
+            p.sequence AS point_sequence,
+            p.latitude AS latitude,
+            p.longitude AS longitude
+        FROM track_points p
+        INNER JOIN track_segments s
+            ON s.id = p.segment_id AND s.session_id = p.session_id
+        WHERE p.lat_bucket IN (:latitudeBuckets)
+            AND p.longitude BETWEEN :west AND :east
+            AND p.latitude BETWEEN :south AND :north
+        """

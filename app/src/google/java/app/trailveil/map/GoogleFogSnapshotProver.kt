@@ -9,7 +9,6 @@ import app.trailveil.map.fog.FogProofBlockSample
 import app.trailveil.map.fog.FogSnapshotProofBudget
 import app.trailveil.map.fog.FogSnapshotVisualProbe
 import app.trailveil.map.fog.FogSnapshotVisualProbePlan
-import app.trailveil.map.fog.FogTileColor
 import app.trailveil.map.fog.FogTilePngCodec
 import app.trailveil.map.fog.prepareFogProofPlan
 import app.trailveil.map.fog.reduceFogProofBlocks
@@ -17,11 +16,17 @@ import app.trailveil.map.fog.tallyFogProof
 import com.google.android.gms.maps.GoogleMap
 import com.google.android.gms.maps.Projection
 import com.google.android.gms.maps.model.LatLng
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 
 /** Final screen-pixel proof for the production surface; every retry obtains a fresh plan. */
 internal class GoogleFogSnapshotProver(
     private val map: GoogleMap,
-    private val planForAttempt: (Long) -> FogSnapshotVisualProbePlan?,
+    private val scope: CoroutineScope,
+    private val planForAttempt: suspend (Long, Int) -> FogSnapshotVisualProbePlan?,
     private val cameraEpoch: () -> Long,
     private val onProofObserved: (GoogleFogProofObservation) -> Unit = {},
     private val hostStopped: () -> Boolean = { false },
@@ -37,10 +42,12 @@ internal class GoogleFogSnapshotProver(
         val generation: Long,
         val proofEpoch: Long,
         val budget: FogSnapshotProofBudget,
+        val snapshotNotBeforeMillis: Long,
         val onResult: (Boolean) -> Unit,
     )
 
     private var activeRun: ProofRun? = null
+    private var planningJob: Job? = null
     private var resumeAfterStop = false
 
     /** Bounded event history (names, numbers, booleans) for device failure messages. */
@@ -52,29 +59,72 @@ internal class GoogleFogSnapshotProver(
         events.addLast("$event@${nowMillis()}")
     }
 
-    fun prove(generation: Long, onResult: (Boolean) -> Unit) {
+    fun prove(generation: Long, snapshotNotBeforeMillis: Long = 0L, onResult: (Boolean) -> Unit) {
+        planningJob?.cancel()
         val proofEpoch = ++epoch
         note("prove:$generation")
         val run = ProofRun(
             generation = generation,
             proofEpoch = proofEpoch,
             budget = FogSnapshotProofBudget(MAX_ATTEMPTS),
+            snapshotNotBeforeMillis = snapshotNotBeforeMillis,
             onResult = onResult,
         )
         activeRun = run
         resumeAfterStop = hostStopped()
-        attempt(run)
+        // V03-013: the coordinator reveals the generation and calls this in one main-thread turn,
+        // and the SDK applies that reveal only once the thread returns to its looper. A first
+        // attempt taken inline asked for a frame the polygons could not be in yet: on the API 36
+        // AVD every native generation read attempt,snapshot,eval:false,attempt,snapshot,eval:true
+        // (a 250 ms retry plus a wasted snapshot and plan per cover), and waiting INSIDE the turn
+        // did not help - plans of 60-210 ms before the snapshot still read false (b21). So the
+        // first attempt is posted after a settle; its own planning then runs inside the window
+        // the SDK is given. Later attempts, retries and the restart path are unchanged. A stale
+        // post no-ops on the epoch/run guards at the top of attempt(); release() and a host stop
+        // clear it exactly as they clear a stopped poll. Fail-closed: what moves later is a
+        // verdict, never a lowering on weaker evidence - a held cover stays held until a passed
+        // verdict; a PASS that would have come inline (the ON_START re-proof, a tile swap the
+        // renderer had already applied) lowers its cover [FIRST_SNAPSHOT_SETTLE_MILLIS] later,
+        // and a visible-at-rest reveal learns a FAILING verdict that much later. Every caller of
+        // prove() pays it, not only the reveal it was measured for; see the constant.
+        note("settle:$FIRST_SNAPSHOT_SETTLE_MILLIS")
+        handler.postDelayed({ attempt(run) }, FIRST_SNAPSHOT_SETTLE_MILLIS)
     }
 
     fun release() {
+        planningJob?.cancel()
         epoch += 1L
         activeRun = null
         resumeAfterStop = false
         handler.removeCallbacksAndMessages(null)
     }
 
+    /** The coordinator discarded this generation; do not cancel a newer run or synthesize a verdict. */
+    fun cancelGeneration(generation: Long) {
+        if (activeRun?.generation != generation) return
+        note("cancel:$generation")
+        release()
+    }
+
+    /** Camera/overlay inputs changed while CPU planning or its warmup was still in flight. */
+    fun onInputsChanged() {
+        val run = activeRun ?: return
+        val job = planningJob?.takeIf { it.isActive } ?: return
+        job.cancel()
+        run.budget.abandonActive()
+        handler.removeCallbacksAndMessages(null)
+        note("inputs:cancelPlan")
+        if (hostStopped()) {
+            resumeAfterStop = true
+        } else {
+            // Keep one paced retry; a late callback from the abandoned attempt cannot add another.
+            handler.postDelayed({ attempt(run) }, RETRY_MILLIS)
+        }
+    }
+
     /** Invalidates any snapshot callback captured before the host stopped. */
     fun onHostStopped() {
+        planningJob?.cancel()
         lifecycleEpoch += 1L
         if (activeRun != null) {
             // Remove delayed retries as well as abandoning a callback in flight. The foreground
@@ -131,18 +181,42 @@ internal class GoogleFogSnapshotProver(
             return
         }
         note("attempt:${attemptToken.number}")
+        planningJob = scope.launch { planAndSnapshot(run, attemptToken) }
+    }
+
+    private suspend fun planAndSnapshot(
+        run: ProofRun,
+        attemptToken: FogSnapshotProofBudget.Attempt,
+    ) {
         // Re-plan on every pass. A plan captured before a tilt/pan can demand probes that are no
         // longer on screen and can never become true (F0/F2).
         val plan = try {
-            planForAttempt(run.generation)
+            planForAttempt(run.generation, attemptToken.number)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
         } catch (_: Exception) {
             null
+        } catch (_: LinkageError) {
+            null
+        }
+        val warmupRemaining = run.snapshotNotBeforeMillis - android.os.SystemClock.elapsedRealtime()
+        if (warmupRemaining > 0L) {
+            note("warmup:$warmupRemaining")
+            delay(warmupRemaining)
+        }
+        // Planning yields the main thread. Never prepare overlays or ask for a snapshot using
+        // geometry captured before a camera move, host stop or replacement proof.
+        if (!isLive(run, attemptToken)) {
+            note("plan:notLive")
+            retrySameAttempt(run, attemptToken)
+            return
         }
         if (plan == null) {
             note("plan:null")
             retryOrFinish(run, attemptToken)
             return
         }
+        note("bank:${plan.candidateBank.name}")
         val preparation = try {
             prepareFogProofPlan(plan, onUnprovablePlan)
         } catch (_: Exception) {
@@ -198,7 +272,7 @@ internal class GoogleFogSnapshotProver(
                     note(
                         "eval:${observation.passed}:" +
                             "${observation.verifiedTileCount}/${observation.requiredTileCount}" +
-                            "/off${observation.offScreenTileCount}",
+                            "/off${observation.offScreenTileCount}/bank=${plan.candidateBank.name}",
                     )
                     try {
                         onProofObserved(observation)
@@ -293,6 +367,7 @@ internal class GoogleFogSnapshotProver(
             )
         }
         val projection = map.projection
+        val pixels = ProofPixels(generation)
         val tileNotes = StringBuilder()
         val samples = plan.probesByKey.keys.mapIndexed { index, key ->
             var firstMismatch: String? = null
@@ -300,11 +375,13 @@ internal class GoogleFogSnapshotProver(
             // candidates are interchangeable. Stopping at the first match keeps the unoccluded case
             // at exactly one projection per block, the cost before the fallbacks existed; only a
             // block whose leading candidate is hidden pays for the rest.
-            val blocks = plan.probeBlocks(key).map { candidates ->
+            val blocks = ArrayList<FogProofBlockSample>()
+            var matchingBlocks = 0
+            for (candidates in plan.probeBlocks(key)) {
                 var anyOnScreen = false
                 var anyMatched = false
                 for (candidate in candidates) {
-                    when (observe(snapshot, projection, candidate, generation)) {
+                    when (observe(snapshot, projection, candidate, pixels)) {
                         ProbeObservation.MATCH -> {
                             anyOnScreen = true
                             anyMatched = true
@@ -317,7 +394,11 @@ internal class GoogleFogSnapshotProver(
                     }
                     if (anyMatched) break
                 }
-                FogProofBlockSample(anyOnScreen = anyOnScreen, anyMatched = anyMatched)
+                blocks += FogProofBlockSample(anyOnScreen = anyOnScreen, anyMatched = anyMatched)
+                // After three matching blocks, onScreen >= 3 and min(3, onScreen) is satisfied.
+                // Further blocks cannot change this tile's verdict. Tiles below quorum still
+                // scan every block, preserving both the off-screen exemption and failure rule.
+                if (anyMatched && ++matchingBlocks >= MINIMUM_MATCHING_BLOCKS_PER_TILE) break
             }
             val sample = reduceFogProofBlocks(blocks)
             val required = minOf(MINIMUM_MATCHING_BLOCKS_PER_TILE, sample.onScreenBlocks)
@@ -374,7 +455,7 @@ internal class GoogleFogSnapshotProver(
         snapshot: Bitmap,
         projection: Projection,
         probe: FogSnapshotVisualProbe,
-        generation: Long,
+        pixels: ProofPixels,
     ): ProbeObservation {
         val point = try {
             projection.toScreenLocation(LatLng(probe.latitude, probe.longitude))
@@ -392,18 +473,17 @@ internal class GoogleFogSnapshotProver(
         ) {
             return ProbeObservation.OFF_SCREEN
         }
-        var matches = 0
-        var samples = 0
-        for (offsetY in -radius..radius) {
-            for (offsetX in -radius..radius) {
-                samples += 1
-                if (matchesGeneration(snapshot[point.x + offsetX, point.y + offsetY], generation)) {
-                    matches += 1
-                }
-            }
+        if (radius == 0) {
+            return if (pixels.matches(snapshot[point.x, point.y])) ProbeObservation.MATCH else ProbeObservation.MISMATCH
         }
-        val passed = if (probe.strongNeighbourhood) matches >= STRONG_MATCHES else matches == samples
-        return if (passed) ProbeObservation.MATCH else ProbeObservation.MISMATCH
+        snapshot.getPixels(pixels.neighbourhood, 0, 3, point.x - 1, point.y - 1, 3, 3)
+        var matches = 0
+        for (index in 0 until 9) {
+            if (pixels.matches(pixels.neighbourhood[index])) matches++
+            if (matches >= STRONG_MATCHES) return ProbeObservation.MATCH
+            if (matches + 8 - index < STRONG_MATCHES) return ProbeObservation.MISMATCH
+        }
+        return ProbeObservation.MISMATCH
     }
 
     /**
@@ -413,15 +493,23 @@ internal class GoogleFogSnapshotProver(
      * the light default style everywhere except labels and icons, which the SDK draws above
      * the overlay and which the probe plan's exclusion zones and the 5-of-9 rule tolerate.
      */
-    private fun matchesGeneration(pixel: Int, generation: Long): Boolean =
-        FogTilePngCodec.matchesRevealedFog(
-            actual = FogTileColor(
-                red = Color.red(pixel),
-                green = Color.green(pixel),
-                blue = Color.blue(pixel),
-            ),
-            generation = generation,
-        )
+    private class ProofPixels(private val generation: Long) {
+        val neighbourhood = IntArray(9)
+        // Lazy keeps an off-screen-only attempt from evaluating a colour it never samples.
+        private val windows: IntArray by lazy(LazyThreadSafetyMode.NONE) {
+            val colour = FogTilePngCodec.colorForGeneration(generation)
+            val red = FogTilePngCodec.revealedFogChannelRange(colour.red)
+            val green = FogTilePngCodec.revealedFogChannelRange(colour.green)
+            val blue = FogTilePngCodec.revealedFogChannelRange(colour.blue)
+            intArrayOf(red.first, red.last, green.first, green.last, blue.first, blue.last)
+        }
+        fun matches(pixel: Int): Boolean {
+            val range = windows
+            val red = Color.red(pixel); val green = Color.green(pixel); val blue = Color.blue(pixel)
+            return red >= range[0] && red <= range[1] && green >= range[2] && green <= range[3] &&
+                blue >= range[4] && blue <= range[5]
+        }
+    }
 
     private enum class ProbeObservation { MATCH, MISMATCH, OFF_SCREEN }
 
@@ -429,6 +517,29 @@ internal class GoogleFogSnapshotProver(
         const val MAX_ATTEMPTS = 10
         const val EVENT_TRACE_LIMIT = 40
         const val RETRY_MILLIS = 250L
+
+        /**
+         * How long `prove()` lets the main thread return to its looper before the FIRST attempt
+         * of a proof plans and snapshots.
+         *
+         * The NEED is measured: with the attempt inline (b20), and with it delayed inside the same
+         * turn by its own 60-210 ms plan (b21), the first snapshot never carried the just-revealed
+         * polygons on the API 36 AVD - every native generation read
+         * `attempt,snapshot,eval:false,attempt,snapshot,eval:true`, a wasted 250 ms retry, snapshot
+         * and plan per cover. The VALUE is not measured: it matches the safety cover's lowering
+         * settle (`GoogleFogSafetyOverlay.LOWER_SETTLE_MILLIS`) against the same renderer, and is
+         * accepted by the ledger's digests rather than by argument - b22 read
+         * `prove,settle,attempt,snapshot,eval:true`, one attempt, on native generations up to four
+         * partitions and on raster fallbacks, while reveals attaching 12-16 partitions (6.7-9.2k
+         * vertices, attach 56-70 ms) still read `eval:false` once first. So it is a floor for small
+         * reveals, not a bound for large ones (V03-013 track-native evidence, E round).
+         *
+         * Every caller of `prove()` pays it - the reveal it was measured for, the ON_START re-proof
+         * whose turn revealed nothing, and the tile path - and the badge's `proof=` clock, which
+         * starts at `prove()`, contains it while `plan=` does not; the `settle` event in the digest
+         * is what names it.
+         */
+        const val FIRST_SNAPSHOT_SETTLE_MILLIS = 50L
 
         /** Slower than [RETRY_MILLIS]: while stopped there is nothing to observe, only to wait for. */
         const val STOPPED_POLL_MILLIS = 1_000L

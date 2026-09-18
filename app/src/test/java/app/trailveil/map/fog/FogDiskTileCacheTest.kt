@@ -137,6 +137,26 @@ class FogDiskTileCacheTest {
     }
 
     @Test
+    fun trimmingAWriteCleansOwnedOrphansAndPreservesUnrelatedFilesAndLru() {
+        val root = temporaryFolder.newFolder("write-trim")
+        val clock = AtomicLong(1_000)
+        val cache = FogDiskTileCache(root, 96, nowMillis = clock::incrementAndGet)
+        assertTrue(cache.put(key(0), mask(1)))
+        assertTrue(cache.put(key(1), mask(2)))
+        val directory = File(root, "v0/z2/x0").apply { mkdirs() }
+        val orphan = File(directory, ".y1.mask.interrupted.tmp").apply { writeBytes(ByteArray(200)) }
+        val unrelated = File(directory, "notes.tmp").apply { writeText("keep") }
+        assertEquals(mask(1), cache.get(key(0)))
+        assertTrue(cache.put(key(2), mask(3)))
+        assertFalse(orphan.exists())
+        assertTrue(unrelated.isFile)
+        assertNull(cache.get(key(1)))
+        assertEquals(mask(1), cache.get(key(0)))
+        assertEquals(mask(3), cache.get(key(2)))
+        assertEquals(FogDiskTileCacheStats(2, 96), cache.stats())
+    }
+
+    @Test
     fun failedDeletionIsReportedAsAnIncompleteMutation() {
         val root = temporaryFolder.newFolder("failed-mutation")
         val key = key(x = 0)

@@ -76,6 +76,7 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -655,7 +656,7 @@ class MapSurfaceTest {
                 // read can finish under a live stream.
                 composeRule.waitUntil(timeoutMillis = STREAMING_CANONICAL_TIMEOUT_MILLIS) {
                     synchronized(renders) { renders.toList() }.any { render ->
-                        val bounds = render.mosaic.bounds
+                        val bounds = render.presentation.bounds
                         bounds.eastLongitude - bounds.westLongitude < LOCAL_MOSAIC_MAX_SPAN_DEGREES
                     }
                 }
@@ -856,6 +857,273 @@ class MapSurfaceTest {
         requireOnlineStyle = true,
     )
 
+    @Test
+    fun trackNativeGeometryRevealsWalksAndItsZoomOutControlStaysFogged() =
+        trackNativeGeometryControl(MapLibreFogArm.TRACK_VECTOR_FLOOR.mosaicPaddingTiles)
+
+    @Test
+    fun nativeAndRasterFallbackHaveTheSameSettledFogColour() {
+        val previousNative = MapLibreVectorFogState.trackEnabled
+        val previousVector = MapLibreVectorFogState.enabled
+        MapLibreVectorFogState.trackEnabled = true
+        MapLibreVectorFogState.enabled = false
+        val database = inMemoryDatabase()
+        try {
+            val point = GeoPoint(-25.5, -130.5)
+            val rendered = AtomicReference<FogViewportRender?>(null)
+            val request = mutableStateOf(MapCameraRequest(1L, point, zoom = 16.0))
+            val runtime = fogRuntime(database, RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                nativeGeometry = true)
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration("fog-colour-control", "https://tiles.invalid/colour"),
+                    fallbackTimeoutMillis = 100L, fogRuntime = runtime, fogRequired = true,
+                    cameraRequest = request.value, onFogRendered = rendered::set,
+                )
+            }
+            composeRule.waitUntil(45_000L) { rendered.get() != null }
+            val map = checkNotNull(awaitMap())
+            composeRule.runOnUiThread {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+            fun sample(native: Boolean): IntArray {
+                composeRule.waitUntil(45_000L) { rendered.get()?.request?.matches(map.cameraAuditState()) == true }
+                composeRule.waitUntil(30_000L) {
+                    runCatching { map.hasOnlyPublishedFogGeneration(publishedFogSlot()) }.getOrDefault(false)
+                }
+                composeRule.waitUntil(20_000L) {
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover).fetchSemanticsNodes().isEmpty()
+                }
+                composeRule.waitUntil(20_000L) {
+                    map.fogLayerVisibility(FogOverlayIds.InstallGuardLayer) == Property.NONE
+                }
+                assertEquals("wrong geometry path", native, rendered.get()?.presentation is app.trailveil.map.fog.FogNativePresentation)
+                val settledSlot = publishedFogSlot()
+                composeRule.runOnUiThread {
+                    val layer = map.style?.getLayer(FogOverlayIds.layer(settledSlot))
+                    val source = map.style?.getSource(FogOverlayIds.source(settledSlot))
+                    assertTrue(if (native) layer is org.maplibre.android.style.layers.FillLayer
+                        else layer is org.maplibre.android.style.layers.RasterLayer)
+                    assertTrue(if (native) source is org.maplibre.android.style.sources.GeoJsonSource
+                        else source is org.maplibre.android.style.sources.ImageSource)
+                }
+                val pixels = map.snapshotStablePixels(if (native) "native colour" else "fallback colour")
+                val width = snapshotWidth()
+                val height = pixels.size / width
+                val samples = (1..3).flatMap { y -> (1..3).map { x -> pixels[(height * y / 4) * width + width * x / 4] } }.toIntArray()
+                // Independent specification: #1F262B at alpha 184 over packaged #D6DBD2.
+                // This rejects equal-but-bare, opaque-install-guard and double-coat false passes.
+                // It does not use the older black-fog luminance coverage comparator.
+                val expected = intArrayOf(82, 88, 90)
+                samples.forEachIndexed { index, pixel ->
+                    listOf(16, 8, 0).forEachIndexed { channel, shift ->
+                        val actual = (pixel ushr shift) and 255
+                        assertTrue("wrong single fog coat: native=$native sample=$index channel=$shift actual=$actual expected=${expected[channel]}",
+                            kotlin.math.abs(actual - expected[channel]) <= 2)
+                    }
+                }
+                return samples
+            }
+            val native = sample(true)
+            composeRule.runOnUiThread { request.value = MapCameraRequest(2L, point, zoom = 2.0) }
+            val fallback = sample(false)
+            for (i in native.indices) {
+                for (shift in listOf(16, 8, 0)) {
+                    val difference = kotlin.math.abs(((native[i] ushr shift) and 255) - ((fallback[i] ushr shift) and 255))
+                    assertTrue("native/fallback colour differs: sample=$i channel=$shift delta=$difference", difference <= 2)
+                }
+            }
+            composeRule.runOnUiThread { request.value = MapCameraRequest(3L, point, zoom = 16.0) }
+            assertArrayEquals("return to native changed its colour", native, sample(true))
+        } finally {
+            MapLibreVectorFogState.trackEnabled = previousNative
+            MapLibreVectorFogState.enabled = previousVector
+            database.close()
+        }
+    }
+
+    @Test
+    fun trackNativeRingGeometryRevealsWalksAndItsZoomOutControlStaysFogged() =
+        trackNativeGeometryControl(MapLibreFogArm.TRACK_VECTOR_RING.mosaicPaddingTiles)
+
+    private fun trackNativeGeometryControl(paddingTiles: Int) {
+        val previousNative = MapLibreVectorFogState.trackEnabled
+        val previousVector = MapLibreVectorFogState.enabled
+        MapLibreVectorFogState.trackEnabled = true
+        MapLibreVectorFogState.enabled = false
+        val database = inMemoryDatabase()
+        val pinchRequests = java.util.concurrent.CopyOnWriteArrayList<FogViewportRequestTrace>()
+        check(activePinchViewportTrace.compareAndSet(null, pinchRequests))
+        try {
+            val revealed = GeoPoint(25.0330, 121.5654)
+            revealTrack(database, revealed)
+            val rendered = AtomicReference<FogViewportRender?>(null)
+            val request = mutableStateOf(MapCameraRequest(1L, revealed, zoom = 16.0))
+            val runtime = fogRuntime(database, RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                nativeGeometry = true, paddingTiles = paddingTiles)
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration("native-geometry-control", "https://tiles.invalid/native"),
+                    fallbackTimeoutMillis = 100L, fogRuntime = runtime, fogRequired = true,
+                    cameraRequest = request.value, onFogRendered = rendered::set,
+                    onFogViewportRequestedForTesting = { pinchRequests += it },
+                )
+            }
+            composeRule.waitUntil(45_000L) { rendered.get() != null }
+            val map = checkNotNull(awaitMap())
+            // Match the existing coverage sweep: SDK decorations are not ground and would be
+            // counted as exposed pixels by this ground-only oracle.
+            composeRule.runOnUiThread {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+            fun settled() {
+                composeRule.waitUntil(45_000L) { rendered.get()?.request?.matches(map.cameraAuditState()) == true }
+                composeRule.waitUntil(30_000L) {
+                    val slot = runCatching { publishedFogSlot() }.getOrNull()
+                    slot != null && map.hasOnlyPublishedFogGeneration(slot)
+                }
+                composeRule.waitUntil(20_000L) {
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover).fetchSemanticsNodes().isEmpty()
+                }
+                Thread.sleep(ZOOM_SETTLE_MILLIS)
+            }
+            settled()
+            assertTrue("new arm silently fell back at exploration zoom", rendered.get()?.presentation is app.trailveil.map.fog.FogNativePresentation)
+            assertEquals("fixture did not render the selected comparison extent",
+                (paddingTiles * 2 + 1) * (paddingTiles * 2 + 1), rendered.get()?.keys?.size)
+            val nativeSlot = publishedFogSlot()
+            composeRule.runOnUiThread {
+                val style = checkNotNull(map.style)
+                assertTrue("native payload was not installed as GeoJSON",
+                    style.getSource(FogOverlayIds.source(nativeSlot)) is org.maplibre.android.style.sources.GeoJsonSource)
+                assertTrue("native payload was not installed as a fill layer",
+                    style.getLayer(FogOverlayIds.layer(nativeSlot)) is org.maplibre.android.style.layers.FillLayer)
+            }
+            val walk = map.auditFogCoverage()
+            assertTrue("native geometry did not reveal the seeded walk: ${walk.report()}",
+                walk.uncoveredFraction > MINIMUM_STREAMED_REVEALED_FRACTION)
+
+            // Move away from all fixture tracks. The same rendering path must paint unexplored ground.
+            composeRule.runOnUiThread {
+                request.value = MapCameraRequest(2L, GeoPoint(-25.5, -130.5), zoom = 16.0)
+            }
+            settled()
+            assertTrue("negative control never installed native geometry", rendered.get()?.presentation is app.trailveil.map.fog.FogNativePresentation)
+            val calibration = map.auditWithFogRemoved()
+            assertTrue("oracle cannot see a deliberately bare map: ${calibration.report()}",
+                calibration.drawnFraction >= MINIMUM_DRAWN_FRACTION &&
+                    calibration.uncoveredFraction >= MINIMUM_CALIBRATION_UNCOVERED_FRACTION)
+            var holds = 0
+            pinchOutInSteps(map) {
+                val coverage = map.auditFogCoverage()
+                assertTrue("zoom-out exposed unexplored ground: ${coverage.report()}",
+                    coverage.revealedOrUndecidableFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION)
+                holds++
+            }
+            assertTrue("no gesture holds were measured", holds > 0)
+
+            composeRule.runOnUiThread {
+                request.value = MapCameraRequest(3L, GeoPoint(-25.5, -130.5), zoom = 2.0)
+            }
+            settled()
+            assertTrue("wide-area control should report raster fallback", rendered.get()?.presentation is app.trailveil.map.fog.FogTileMosaic)
+            assertTrue("fallback was not labelled", rendered.get()?.nativeGeometryStatus
+                ?.startsWith("raster-fallback:") == true)
+            val fallbackSlot = publishedFogSlot()
+            composeRule.runOnUiThread {
+                val style = checkNotNull(map.style)
+                assertTrue("fallback source was not the existing image path",
+                    style.getSource(FogOverlayIds.source(fallbackSlot)) is org.maplibre.android.style.sources.ImageSource)
+                assertTrue("fallback layer was not raster",
+                    style.getLayer(FogOverlayIds.layer(fallbackSlot)) is org.maplibre.android.style.layers.RasterLayer)
+            }
+            val broad = map.auditFogCoverage()
+            assertTrue("wide-area fallback exposed unexplored ground: ${broad.report()}",
+                broad.revealedOrUndecidableFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION)
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString("stream", "V03-013 MapLibre native walk/control/fallback PASS holds=$holds\n")
+            })
+        } finally {
+            check(activePinchViewportTrace.compareAndSet(pinchRequests, null))
+            MapLibreVectorFogState.trackEnabled = previousNative
+            MapLibreVectorFogState.enabled = previousVector
+            database.close()
+        }
+    }
+
+    @Test
+    fun canonicalClearReplacesTheInstalledNativeSurfaceWithoutRecreatingTheMap() =
+        canonicalClearReplacesInstalledSurface(native = true)
+
+    @Test
+    fun canonicalClearReplacesTheInstalledRasterSurfaceWithoutRecreatingTheMap() =
+        canonicalClearReplacesInstalledSurface(native = false)
+
+    private fun canonicalClearReplacesInstalledSurface(native: Boolean) {
+        val previousNative = MapLibreVectorFogState.trackEnabled
+        val previousVector = MapLibreVectorFogState.enabled
+        MapLibreVectorFogState.trackEnabled = native
+        MapLibreVectorFogState.enabled = false
+        val database = inMemoryDatabase()
+        try {
+            val point = GeoPoint(25.0330, 121.5654)
+            revealTrack(database, point)
+            val sequence = AtomicInteger(0)
+            val runtime = fogRuntime(database, RoomPersistedTrackPointChangeFeed(database.recordingDao()),
+                nativeGeometry = native)
+            composeRule.setContent {
+                TrailVeilMapSurface(
+                    modifier = Modifier.fillMaxSize(),
+                    provider = MapProviderConfiguration("canonical-clear-control", "https://tiles.invalid/reset"),
+                    fallbackTimeoutMillis = 100L, fogRuntime = runtime, fogRequired = true,
+                    cameraRequest = MapCameraRequest(1L, point, zoom = 16.0),
+                    onFogRendered = { sequence.incrementAndGet() },
+                )
+            }
+            composeRule.waitUntil(45_000L) { sequence.get() > 0 }
+            val map = checkNotNull(awaitMap())
+            composeRule.runOnUiThread {
+                map.uiSettings.isLogoEnabled = false
+                map.uiSettings.isAttributionEnabled = false
+                map.uiSettings.isCompassEnabled = false
+            }
+            fun settled() {
+                composeRule.waitUntil(30_000L) {
+                    val slot = runCatching { publishedFogSlot() }.getOrNull()
+                    slot != null && map.hasOnlyPublishedFogGeneration(slot)
+                }
+                composeRule.waitUntil(20_000L) {
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover).fetchSemanticsNodes().isEmpty()
+                }
+                Thread.sleep(ZOOM_SETTLE_MILLIS)
+            }
+            settled()
+            assertTrue("sensitivity control did not show the old walk",
+                map.auditFogCoverage().uncoveredFraction > MINIMUM_STREAMED_REVEALED_FRACTION)
+            val before = sequence.get()
+            runBlocking(Dispatchers.IO) { runtime.replaceCanonicalData { database.clearAllTables() } }
+            composeRule.waitUntil(45_000L) { sequence.get() > before }
+            settled()
+            assertTrue("clear recreated the map", map === awaitMap())
+            val cleared = map.auditFogCoverage()
+            assertTrue("cleared walk remains visible: ${cleared.report()}",
+                cleared.revealedOrUndecidableFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION)
+            val bare = map.auditWithFogRemoved()
+            assertTrue("oracle cannot detect a deliberately missing fog surface: ${bare.report()}",
+                bare.uncoveredFraction >= MINIMUM_CALIBRATION_UNCOVERED_FRACTION)
+        } finally {
+            MapLibreVectorFogState.trackEnabled = previousNative
+            MapLibreVectorFogState.enabled = previousVector
+            database.close()
+        }
+    }
+
     private fun sweepSettledCameras(
         provider: MapProviderConfiguration,
         requireOnlineStyle: Boolean,
@@ -1038,8 +1306,8 @@ class MapSurfaceTest {
                         settledZoom,
                         ZOOM_TOLERANCE,
                     )
-                    if (coverage.uncoveredFraction > worstFraction) {
-                        worstFraction = coverage.uncoveredFraction
+                    if (coverage.revealedOrUndecidableFraction > worstFraction) {
+                        worstFraction = coverage.revealedOrUndecidableFraction
                         // With the bounds, not just the size. A strip along one edge, a seam
                         // through the middle and a corner are three different defects, and a bare
                         // percentage cannot tell them apart — localising one costs a run each time.
@@ -1240,6 +1508,114 @@ class MapSurfaceTest {
             },
         )
 
+        assertTrue(
+            "The forced post-idle canonical-install delay seam was never reached",
+            delayHit.get(),
+        )
+        val liftGeneration = checkNotNull(baselineGeneration.get()) {
+            "The forced engaged rejection never armed its lift baseline"
+        }
+        val delayed = checkNotNull(delayedGeneration.get()) {
+            "The forced post-idle canonical generation was never delayed"
+        }
+        assertTrue(
+            "The delayed canonical install did not follow the forced rejected lift",
+            delayed > liftGeneration,
+        )
+    }
+
+    /** Pinch retries obey the same delayed-install boundary as quick zoom. */
+    @Test
+    fun aPinchRetryWaitsForCanonicalFogBeforeReopening() {
+        val forceRejectEngagedAttempt = AtomicBoolean(true)
+        val delayArmed = AtomicBoolean(false)
+        val delayHit = AtomicBoolean(false)
+        val baselineGeneration = AtomicReference<Long?>(null)
+        val delayedGeneration = AtomicReference<Long?>(null)
+        val installInFlight = AtomicBoolean(false)
+        val checkpointEntered = CountDownLatch(1)
+        val releaseNegativeControl = CountDownLatch(1)
+        val retryObserved = AtomicBoolean(false)
+        val reproduce = InstrumentationRegistry.getArguments().getString("zReproducePinchRetryRace") == "true"
+
+        sweepGesture(
+            provider = MapProviderConfiguration(
+                providerName = "fog-pinch-retry-test-provider",
+                styleUri = "https://tiles.invalid/styles/fog-pinch-retry",
+            ),
+            requireOnlineStyle = false,
+            savedStateKey = "trailveil.map.fog-pinch-retry-test",
+            gesture = { map, onHold ->
+                checkNotNull(fogGeneration() as? Long) {
+                    "No canonical generation was published before the forced retry"
+                }
+                val slot = publishedFogSlot()
+                assertTrue(
+                    "The forced retry did not start from a sole published fog generation",
+                    map.hasOnlyPublishedFogGeneration(slot),
+                )
+                pinchInSteps(
+                    map = map,
+                    onHold = {
+                        assertFalse("A measured hold began before the delayed install finished", installInFlight.get())
+                        onHold()
+                    },
+                    beforeAttempt = {
+                        if (baselineGeneration.get() != null) {
+                            // Pump the Compose scheduler while waiting for the pending install;
+                            // blocking this test thread can itself prevent the checkpoint entry.
+                            composeRule.waitUntil(15_000L) { checkpointEntered.count == 0L }
+                            val premature = installInFlight.get()
+                            retryObserved.set(true)
+                            // Reproduction holds the install until this exact attempted reopen.
+                            // Release it even when the assertion fails so cleanup cannot deadlock.
+                            releaseNegativeControl.countDown()
+                            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                                putString("stream", "Z_PINCH_RETRY openedWhileInstalling=$premature reproduce=$reproduce\n")
+                            })
+                            assertFalse("PINCH_RETRY_OPENED_BEFORE_INSTALL_RELEASE", premature)
+                        }
+                    },
+                    zoomIn = false,
+                    auditEveryMove = true,
+                    forceRejectEngagedAttempt = forceRejectEngagedAttempt,
+                    onForcedRejectBeforeLift = { baseline ->
+                        baselineGeneration.set(baseline)
+                        delayArmed.set(true)
+                    },
+                )
+                assertFalse(
+                    "The deterministic retry driver never forced an engaged rejection",
+                    forceRejectEngagedAttempt.get(),
+                )
+            },
+            canonicalFogInstallCheckpointForTesting = { checkpoint ->
+                val baseline = baselineGeneration.get()
+                if (
+                    delayArmed.get() &&
+                    checkpoint.phase == CanonicalFogInstallCheckpointPhase.BEFORE_STYLE_INSTALL &&
+                    baseline != null &&
+                    checkpoint.generation > baseline &&
+                    delayedGeneration.compareAndSet(null, checkpoint.generation) &&
+                    delayArmed.compareAndSet(true, false)
+                ) {
+                    delayHit.set(true)
+                    installInFlight.set(true)
+                    checkpointEntered.countDown()
+                    try {
+                        withContext(Dispatchers.Default) {
+                            if (reproduce) {
+                                check(releaseNegativeControl.await(15, TimeUnit.SECONDS)) {
+                                    "Negative control never attempted to reopen the pinch"
+                                }
+                            } else Thread.sleep(QUICK_ZOOM_RETRY_FORCED_DELAY_MILLIS)
+                        }
+                    } finally { installInFlight.set(false) }
+                }
+            },
+        )
+
+        assertTrue("No retry reached the direct install-release oracle", retryObserved.get())
         assertTrue(
             "The forced post-idle canonical-install delay seam was never reached",
             delayHit.get(),
@@ -1493,7 +1869,7 @@ class MapSurfaceTest {
                 )
             }
             val incoming = runBlocking { beforeInstallEntered.await() }
-            val s2Extent = FogBackdropGeometry.extent(incoming.render.mosaic)
+            val s2Extent = FogBackdropGeometry.extent(incoming.render.presentation)
             assertEquals(s2Request, incoming.render.request)
             assertTrue(
                 "The gated S2 was not narrower than installed S1: S1=${s1.extent} S2=$s2Extent",
@@ -2223,7 +2599,7 @@ class MapSurfaceTest {
             } catch (failure: AssertionError) {
                 if (failure.message?.contains("never engaged") == true) {
                     throw org.junit.AssumptionViolatedException(
-                        "The environment rejected the ${'$'}{path.name} gesture stream: " +
+                        "The environment rejected the ${path.name} gesture stream: " +
                             failure.message,
                     )
                 }
@@ -2237,9 +2613,21 @@ class MapSurfaceTest {
                     tilt = 60.0,
                     bearing = 0.0,
                     retreatFraction = 0.003,
+                    insideBearingDelta = FINITE_EXTENT_ROTATE_INSIDE_DEGREES,
+                    crossingBearingLadder = FINITE_EXTENT_ROTATE_CROSSING_LADDER,
                 )
             } else {
                 map.positionFrozenCameraNearNorthExtent(
+                    insideTiltDelta = if (path == FiniteExtentPath.TILT) {
+                        FINITE_EXTENT_SHOVE_INSIDE_DEGREES
+                    } else {
+                        null
+                    },
+                    crossingTiltLadder = if (path == FiniteExtentPath.TILT) {
+                        FINITE_EXTENT_SHOVE_CROSSING_LADDER
+                    } else {
+                        null
+                    },
                     extent = installed.extent,
                     tilt = 0.0,
                     bearing = 0.0,
@@ -2462,13 +2850,14 @@ class MapSurfaceTest {
                         val settled = map.auditFogCoverage()
                         assertTrue(
                             "The settled camera after the " + name + " presented unexplored map " +
-                                "as revealed: " + settled.report(),
-                            settled.uncoveredFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
+                                "as revealed or undecidable: " + settled.report(),
+                            settled.revealedOrUndecidableFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
                         )
                         assertTrue(
-                            "The settled camera after the " + name + " drew more than one coat: " +
+                            "The settled camera after the " + name + " drew more than one coat, " +
+                                "or ground on which one coat cannot be told from two: " +
                                 settled.report(),
-                            settled.overFoggedFraction <= MAXIMUM_OVER_FOGGED_FRACTION,
+                            settled.overFoggedOrUnjudgeableFraction <= MAXIMUM_OVER_FOGGED_FRACTION,
                         )
                         InstrumentationRegistry.getInstrumentation().sendStatus(
                             0,
@@ -2599,7 +2988,7 @@ class MapSurfaceTest {
                 // reading per hold: it compares the fogged capture against the bare one, so it goes
                 // to zero exactly when there is nothing to compare. No brightness threshold is
                 // involved, which is why it works where the absolute-luminance guards cannot.
-                if (audit.uncoveredFraction > worst) worst = audit.uncoveredFraction
+                if (audit.revealedOrUndecidableFraction > worst) worst = audit.revealedOrUndecidableFraction
                 report.append(
                     " z=${"%.2f".format(java.util.Locale.US, zoom)}:" +
                         "${"%.4f".format(java.util.Locale.US, audit.uncoveredFraction * 100)}%",
@@ -3525,12 +3914,13 @@ class MapSurfaceTest {
                 assertTrue(
                     "At zoom $settled the map was left bare past the world edge: " +
                         "slot=$activeSlot $styleReport ${audit.report()}",
-                    audit.uncoveredFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
+                    audit.revealedOrUndecidableFraction <= MAXIMUM_SETTLED_REVEALED_FRACTION,
                 )
                 assertTrue(
-                    "At zoom $settled part of the map was under more than one coat of fog: " +
+                    "At zoom $settled part of the map was under more than one coat of fog, or on " +
+                        "ground where one coat cannot be told from two: " +
                         "slot=$activeSlot $styleReport ${audit.report()}",
-                    audit.overFoggedFraction <= MAXIMUM_OVER_FOGGED_FRACTION,
+                    audit.overFoggedOrUnjudgeableFraction <= MAXIMUM_OVER_FOGGED_FRACTION,
                 )
             }
             InstrumentationRegistry.getInstrumentation().sendStatus(
@@ -3649,14 +4039,14 @@ class MapSurfaceTest {
         auditRendererTransitionsFromGestureStart: Boolean = false,
     ) {
         val database = inMemoryDatabase()
+        val viewportRequests = java.util.concurrent.CopyOnWriteArrayList<FogViewportRequestTrace>()
+        check(activePinchViewportTrace.compareAndSet(null, viewportRequests))
         try {
             val fogRendered = AtomicBoolean(false)
             val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
             // `V02-011`: the surface's own account of every canonical request, so a geometry
             // assertion can say which path re-installed the fog instead of leaving the reader
             // to infer it from a dispatcher dump. Recorded from the main thread, read on failure.
-            val viewportRequests =
-                java.util.concurrent.CopyOnWriteArrayList<FogViewportRequestTrace>()
             val fogCameraReactionsSuppressed = mutableStateOf(false)
             revealTrack(database, REVEALED_CENTER)
 
@@ -3783,6 +4173,7 @@ class MapSurfaceTest {
             Thread.sleep(ZOOM_SETTLE_MILLIS)
             configureFogLayers?.invoke(map)
             fogLayerMutationForRetries.set(configureFogLayers)
+            fogCameraReactionsFrozenForRetries.set(suppressFogCameraReactionsForTesting)
 
             // Same calibration the settled sweep runs, for the same reason: a detector that cannot
             // see a leak here would report every audit of the gesture as covered.
@@ -3853,6 +4244,9 @@ class MapSurfaceTest {
             var worstOverFogged = 0.0
             var worstOverFoggedReport = "none"
             var worstZoom = startCameraZoom
+            var worstRevealedOrUndecidable = -1.0
+            var worstRevealedOrUndecidableReport = "none"
+            var worstRevealedOrUndecidableZoom = startCameraZoom
             var holds = 0
             val generations = mutableListOf<Any?>()
             var measuredCoverage: InstalledFogCoverageSnapshot? = null
@@ -4007,14 +4401,24 @@ class MapSurfaceTest {
                                     audit.overFoggedFraction * 100.0,
                                 )}% ",
                             )
-                        if (audit.overFoggedFraction > worstOverFogged) {
-                            worstOverFogged = audit.overFoggedFraction
+                        if (audit.overFoggedOrUnjudgeableFraction > worstOverFogged) {
+                            worstOverFogged = audit.overFoggedOrUnjudgeableFraction
                             worstOverFoggedReport = audit.report()
                         }
                         if (audit.uncoveredFraction > worstFraction) {
                             worstFraction = audit.uncoveredFraction
                             worstReport = audit.report()
                             worstZoom = zoom
+                        }
+                        // Tracked separately from `worstFraction` on purpose. The coverage
+                        // gate must spend budget on pixels nobody can judge, but the A/B
+                        // branch below asserts that a mutation REPRODUCED a leak - and
+                        // letting undecidable pixels count toward that would make the
+                        // negative control easier to satisfy, which is backwards.
+                        if (audit.revealedOrUndecidableFraction > worstRevealedOrUndecidable) {
+                            worstRevealedOrUndecidable = audit.revealedOrUndecidableFraction
+                            worstRevealedOrUndecidableReport = audit.report()
+                            worstRevealedOrUndecidableZoom = zoom
                         }
                     }
                 }
@@ -4032,10 +4436,43 @@ class MapSurfaceTest {
                     "The finite-extent gate had no in-extent control hold",
                     insideExtentHolds > 0,
                 )
+                // Name a rotation shortfall as one. The generic bearing floor
+                // (`MINIMUM_ACCEPTED_ROTATE_DEGREES`) sits below every rung of the crossing ladder
+                // and is checked far below this point, so without this a sweep that simply did not
+                // turn far enough arrives as "never crossed" - a geometry verdict for an injection
+                // problem. Only the already-failing path is judged here, so a start pose with
+                // margin that crosses before the calibrated bearing is never failed by it.
+                if (outsideExtentHolds == 0) {
+                    calibratedCrossingBearing.get()?.let { calibrated ->
+                        val turned = kotlin.math.abs(
+                            WebMercator.wrapLongitude(map.cameraPosition.bearing - startBearing),
+                        )
+                        assertTrue(
+                            "The rotate delivered $turned degrees of bearing, short of the " +
+                                "${kotlin.math.abs(calibrated)} the start pose was calibrated to " +
+                                "cross at, so the crossing below measured a short sweep rather " +
+                                "than the guard (bearing $startBearing -> " +
+                                "${map.cameraPosition.bearing})",
+                            turned >= kotlin.math.abs(calibrated),
+                        )
+                    }
+                    calibratedCrossingTilt.get()?.let { calibrated ->
+                        val pitched = kotlin.math.abs(map.cameraPosition.tilt - startTilt)
+                        assertTrue(
+                            "The shove delivered $pitched degrees of tilt, short of the " +
+                                "${kotlin.math.abs(calibrated)} the start pose was calibrated to " +
+                                "cross at, so the crossing below measured a short shove rather " +
+                                "than the guard (tilt $startTilt -> ${map.cameraPosition.tilt})",
+                            pitched >= kotlin.math.abs(calibrated),
+                        )
+                    }
+                }
                 assertTrue(
                     "The gesture never crossed the exact installed finite extent: " +
                         "startZoom=$startCameraZoom endZoom=$endZoom " +
-                        "tilt=${map.cameraPosition.tilt} extent=${measuredCoverage?.extent} " +
+                        "tilt=${map.cameraPosition.tilt} bearing=${map.cameraPosition.bearing} " +
+                        "calibratedCrossingBearing=${calibratedCrossingBearing.get()} " +
+                        "holds=$holds extent=${measuredCoverage?.extent} " +
                         "corners=${map.visibleRegionCorners()}",
                     outsideExtentHolds > 0,
                 )
@@ -4216,9 +4653,9 @@ class MapSurfaceTest {
             }
             if (minimumUncoveredFraction == null) {
                 assertTrue(
-                    "A zoom-out gesture presented unexplored map as revealed at zoom $worstZoom: " +
-                        worstReport,
-                    worstFraction <= maximumUncoveredFraction,
+                    "A zoom-out gesture presented unexplored map as revealed or undecidable at " +
+                        "zoom $worstRevealedOrUndecidableZoom: $worstRevealedOrUndecidableReport",
+                    worstRevealedOrUndecidable <= maximumUncoveredFraction,
                 )
             } else {
                 assertTrue(
@@ -4249,6 +4686,11 @@ class MapSurfaceTest {
                 )
             }
         } finally {
+            check(activePinchViewportTrace.compareAndSet(viewportRequests, null))
+            fogLayerMutationForRetries.set(null)
+            fogCameraReactionsFrozenForRetries.set(false)
+            calibratedCrossingBearing.set(null)
+            calibratedCrossingTilt.set(null)
             database.close()
         }
     }
@@ -4298,6 +4740,44 @@ class MapSurfaceTest {
      */
     private val fogLayerMutationForRetries =
         AtomicReference<((MapLibreMap) -> Unit)?>(null)
+    private val fogCameraReactionsFrozenForRetries = AtomicBoolean(false)
+
+    /**
+     * The bearing the BEARING gate's start pose was calibrated to cross at, or null when the plain
+     * fixed retreat was used. Read only to name the number in a failure message: if the sweep ever
+     * delivers less rotation than this, "never crossed" is a rotation shortfall rather than a guard
+     * result, and the reader should not have to guess which.
+     */
+    private val calibratedCrossingBearing = AtomicReference<Double?>(null)
+
+    /** The shove gate's counterpart of [calibratedCrossingBearing], in degrees of tilt. */
+    private val calibratedCrossingTilt = AtomicReference<Double?>(null)
+    private val activePinchViewportTrace =
+        AtomicReference<java.util.concurrent.CopyOnWriteArrayList<FogViewportRequestTrace>?>(null)
+
+    private fun hasFreshPinchReuse(
+        requests: List<FogViewportRequestTrace>?, startIndex: Int, liftUptime: Long,
+        baseline: Long, idleAdvanced: Boolean,
+    ): Boolean = requests != null && idleAdvanced && requests.drop(startIndex).any {
+        it.trigger == FogViewportRequestTrigger.CAMERA_IDLE_REUSED &&
+            it.generation == baseline && it.uptimeMillis >= liftUptime
+    }
+
+    @Test
+    fun pinchReuseRequiresFreshMatchingTraceAndPostLiftIdle() {
+        val fresh = FogViewportRequestTrace(FogViewportRequestTrigger.CAMERA_IDLE_REUSED,
+            7L, 16.0, true, 100L)
+        fun accepts(events: List<FogViewportRequestTrace>?, index: Int = 0,
+            idle: Boolean = true) = hasFreshPinchReuse(events, index, 100L, 7L, idle)
+        assertTrue(accepts(listOf(fresh)))
+        assertFalse(accepts(null))
+        assertFalse(accepts(listOf(fresh), index = 1))
+        assertFalse(accepts(listOf(fresh.copy(uptimeMillis = 99L))))
+        assertFalse(accepts(listOf(fresh.copy(generation = 6L))))
+        assertFalse(accepts(listOf(fresh.copy(generation = 8L))))
+        assertFalse(accepts(listOf(fresh.copy(trigger = FogViewportRequestTrigger.CAMERA_IDLE))))
+        assertFalse(accepts(listOf(fresh), idle = false))
+    }
 
     /** Re-applies [fogLayerMutationForRetries] after an abandoned gesture attempt. */
     private fun reapplyFogLayerMutation(map: MapLibreMap) {
@@ -4314,9 +4794,48 @@ class MapSurfaceTest {
         auditEveryMove: Boolean = false,
         attemptLimit: Int = PINCH_ATTEMPTS,
         onEngaged: (() -> Unit)? = null,
+        beforeAttempt: (() -> Unit)? = null,
+        forceRejectEngagedAttempt: AtomicBoolean? = null,
+        onForcedRejectBeforeLift: ((Long) -> Unit)? = null,
     ) {
         require(attemptLimit > 0) { "attemptLimit must be positive" }
+        val originalCamera = composeRule.runOnIdle {
+            val current = map.cameraPosition
+            val target = checkNotNull(current.target)
+            CameraPosition.Builder(current).target(LatLng(target.latitude, target.longitude, target.altitude)).build()
+        }
+        fun atOriginalCamera(): Boolean = composeRule.runOnIdle {
+            val actual = map.cameraPosition
+            val target = actual.target ?: return@runOnIdle false
+            val originalTarget = checkNotNull(originalCamera.target)
+            abs(target.latitude - originalTarget.latitude) <= SETTLED_CAMERA_EPSILON &&
+                abs(WebMercator.wrapLongitude(target.longitude - originalTarget.longitude)) <= SETTLED_CAMERA_EPSILON &&
+                abs(actual.zoom - originalCamera.zoom) <= SETTLED_CAMERA_EPSILON &&
+                kotlin.math.floor(actual.zoom) == kotlin.math.floor(originalCamera.zoom) &&
+                abs(actual.tilt - originalCamera.tilt) <= SETTLED_CAMERA_TILT_EPSILON &&
+                abs(WebMercator.wrapLongitude(actual.bearing - originalCamera.bearing)) <= SETTLED_CAMERA_TILT_EPSILON
+        }
         repeat(attemptLimit) { attempt ->
+            // The direct negative oracle must observe premature retry BEFORE any restore can
+            // cancel/release its held install or hide the original race.
+            beforeAttempt?.invoke()
+            if (attempt > 0 && !atOriginalCamera()) {
+                val baseline = awaitPinchPublishedReadiness(map, allowIntentionalIncomplete = true)
+                composeRule.runOnUiThread { map.moveCamera(CameraUpdateFactory.newCameraPosition(originalCamera)) }
+                composeRule.waitUntil(GESTURE_RETRY_CANONICAL_TIMEOUT_MILLIS) { atOriginalCamera() }
+                if (fogCameraReactionsFrozenForRetries.get()) {
+                    val restored = awaitPinchPublishedReadiness(map, allowIntentionalIncomplete = true)
+                    assertEquals("Frozen fixture rebuilt while restoring the retry camera", baseline, restored)
+                } else {
+                    awaitPinchPublishedReadiness(map, minimumExclusive = baseline)
+                }
+                reapplyFogLayerMutation(map)
+            }
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString("stream", "Z_PINCH_START attempt=$attempt intendedZoom=${originalCamera.zoom} " +
+                    "actualZoom=${map.cameraPosition.zoom} renderFloor=${kotlin.math.floor(map.cameraPosition.zoom).toInt()} " +
+                    "generation=${fogGeneration()}\n")
+            })
             if (
                 pinchOnce(
                     map,
@@ -4332,9 +4851,10 @@ class MapSurfaceTest {
                     // "never engaged" at a caller that has no attempt left - which is exactly what
                     // the single-attempt composite case would have done.
                     retrySlippedBegin = attempt < attemptLimit - 1,
+                    forceRejectEngagedAttempt = forceRejectEngagedAttempt,
+                    onForcedRejectBeforeLift = onForcedRejectBeforeLift,
                 )
             ) return
-            reapplyFogLayerMutation(map)
         }
         // Every assertion downstream would still be sound, but reporting nothing measured is more
         // useful than reporting a clean gesture that never happened.
@@ -4350,11 +4870,16 @@ class MapSurfaceTest {
         auditEveryMove: Boolean = false,
         onEngaged: (() -> Unit)? = null,
         retrySlippedBegin: Boolean = false,
+        forceRejectEngagedAttempt: AtomicBoolean? = null,
+        onForcedRejectBeforeLift: ((Long) -> Unit)? = null,
     ): Boolean {
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         // A stuck injected-pointer state from any earlier crashed stream would reject this
         // stream's opening DOWN; clear it rather than inherit it.
         bestEffortClearStuckInjectedPointers()
+        val attemptStartGeneration = awaitPinchPublishedReadiness(map, allowIntentionalIncomplete = true)
+        // CANCEL can trigger an idle rebuild into the other slot; retain the control's mutation.
+        reapplyFogLayerMutation(map)
         val centerX = view.width / 2f
         val centerY = view.height / 2f
         val downTime = SystemClock.uptimeMillis()
@@ -4447,7 +4972,15 @@ class MapSurfaceTest {
             override fun onScale(detector: StandardScaleGestureDetector) = Unit
             override fun onScaleEnd(detector: StandardScaleGestureDetector) = Unit
         }
-        composeRule.runOnUiThread { map.addOnScaleListener(beginListener) }
+        val idleEventCount = AtomicInteger(0)
+        val moveStartedEventCount = AtomicInteger(0)
+        val idleListener = MapLibreMap.OnCameraIdleListener { idleEventCount.incrementAndGet() }
+        val moveListener = MapLibreMap.OnCameraMoveStartedListener { moveStartedEventCount.incrementAndGet() }
+        composeRule.runOnUiThread {
+            map.addOnScaleListener(beginListener)
+            map.addOnCameraIdleListener(idleListener)
+            map.addOnCameraMoveStartedListener(moveListener)
+        }
 
         var currentSpan = startSpan
         var streamEnded = false
@@ -4467,6 +5000,57 @@ class MapSurfaceTest {
                 SystemClock.uptimeMillis(),
             )
             send(MotionEvent.ACTION_UP, 1, span, SystemClock.uptimeMillis())
+        }
+
+        fun rejectAndAwaitCanonical(forceReject: Boolean = false) {
+            val generationBeforeLift = fogGeneration() as? Long
+            val alreadyPending = generationBeforeLift == null
+            val baseline = generationBeforeLift ?: attemptStartGeneration
+            check(baseline >= attemptStartGeneration) { "Pinch canonical generation moved backwards" }
+            val idleBeforeLift = idleEventCount.get()
+            if (forceReject) onForcedRejectBeforeLift?.invoke(baseline)
+            val pinchRequests = activePinchViewportTrace.get()
+            val traceIndexBeforeLift = pinchRequests?.size ?: 0
+            val liftStartedUptime = SystemClock.uptimeMillis()
+            lift(currentSpan)
+            streamEnded = true
+            Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+            // The explicit negative control replays only the historical forced-rejection race.
+            if (forceReject && InstrumentationRegistry.getArguments()
+                    .getString("zReproducePinchRetryRace") == "true") return
+            if (fogCameraReactionsFrozenForRetries.get()) {
+                // Finite-extent negative controls explicitly disable camera-triggered rebuilds.
+                // They must retain this same complete (then deliberately mutated) generation.
+                check(!alreadyPending) { "A frozen fog control unexpectedly withdrew its generation" }
+                val settled = awaitPinchPublishedReadiness(map, allowIntentionalIncomplete = true)
+                assertEquals("Frozen fog control rebuilt during a rejected pinch", baseline, settled)
+                return
+            }
+            val published = fogGeneration() as? Long
+            val requested = moveStartedEventCount.get() > 0 ||
+                (idleEventCount.get() > idleBeforeLift && (published == null || published > baseline))
+            if (alreadyPending) {
+                // The null tag before lift already witnesses an in-flight canonical request.
+                // Require its strictly newer completed generation, not another SDK idle event.
+                awaitPinchPublishedReadiness(map, minimumExclusive = attemptStartGeneration)
+            } else if (requested) {
+                awaitPinchPublishedReadiness(map, minimumExclusive = baseline,
+                    idleEventCount = idleEventCount, idleEventsBeforeLift = idleBeforeLift,
+                    sameGenerationReuseWitness = {
+                        pinchRequests != null && activePinchViewportTrace.get() === pinchRequests &&
+                            hasFreshPinchReuse(pinchRequests, traceIndexBeforeLift, liftStartedUptime,
+                                baseline, idleEventCount.get() > idleBeforeLift)
+                    })
+                if (fogGeneration() == baseline) auditLog(
+                    "pinch-retry reuseSameGeneration=true baseline=$baseline " +
+                        "idleDelta=${idleEventCount.get() - idleBeforeLift} " +
+                        "freshTraceDelta=${(pinchRequests?.size ?: 0) - traceIndexBeforeLift}",
+                )
+            } else {
+                val settled = awaitPinchPublishedReadiness(map, allowIntentionalIncomplete = true)
+                assertEquals("No-move pinch rejection changed generation without an idle", baseline, settled)
+            }
+            auditLog("pinch-retry-ready generation=${fogGeneration()} idleEvents=${idleEventCount.get()}")
         }
 
         // Engagement first, with nothing measured. An attempt that never reaches MapLibre's scale
@@ -4500,12 +5084,11 @@ class MapSurfaceTest {
         } else {
             zoomAtTouchDown - map.cameraPosition.zoom
         }
-        if (engagement < MINIMUM_PINCH_ENGAGEMENT) {
-            lift(engageSpan)
-            streamEnded = true
-            // Lifting ends in a camera idle, which rebuilds the fog. Let that finish, so the next
-            // attempt starts from a settled overlay rather than racing one.
-            Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+        currentSpan = engageSpan
+        val forceReject = engagement >= MINIMUM_PINCH_ENGAGEMENT &&
+            forceRejectEngagedAttempt?.compareAndSet(true, false) == true
+        if (engagement < MINIMUM_PINCH_ENGAGEMENT || forceReject) {
+            rejectAndAwaitCanonical(forceReject)
             return false
         }
         if (retrySlippedBegin && spanEdge == PinchSpanEdge.TALLEST) {
@@ -4521,9 +5104,7 @@ class MapSurfaceTest {
             val earliestBeginSpan = startSpan + (engageSpan - startSpan) * 2 / PINCH_ENGAGE_MOVES
             val began = beginSpan.get()?.div(DETECTOR_SPAN_PER_POINTER_DISTANCE)
             if (began == null || began < earliestBeginSpan - BEGIN_SPAN_TOLERANCE_PX) {
-                lift(engageSpan)
-                streamEnded = true
-                Thread.sleep(PINCH_RETRY_SETTLE_MILLIS)
+                rejectAndAwaitCanonical()
                 return false
             }
         }
@@ -4566,7 +5147,11 @@ class MapSurfaceTest {
             streamEnded = true
             return true
         } finally {
-            composeRule.runOnUiThread { map.removeOnScaleListener(beginListener) }
+            composeRule.runOnUiThread {
+                map.removeOnScaleListener(beginListener)
+                map.removeOnCameraIdleListener(idleListener)
+                map.removeOnCameraMoveStartedListener(moveListener)
+            }
             if (!streamEnded) {
                 // A failure can occur before POINTER_DOWN or after POINTER_UP. Probe both legal
                 // stuck states instead of assuming that two pointers are still down.
@@ -5202,12 +5787,29 @@ class MapSurfaceTest {
      * indistinguishable from a map that ignored it. Injecting through the automation interface
      * instead returns whether the event was actually dispatched.
      */
+    private var injectedMapOrigin: IntArray? = null
+
     private fun injectTouch(event: MotionEvent) {
-        val injected = InstrumentationRegistry.getInstrumentation()
-            .uiAutomation
-            .injectInputEvent(event, true)
-        event.recycle()
-        assertTrue("The input event was rejected: $event", injected)
+        val terminal = event.actionMasked == MotionEvent.ACTION_UP || event.actionMasked == MotionEvent.ACTION_CANCEL
+        var delivered = false
+        try {
+            // Callers build MapView-local points. API 34 may inset its test Activity below
+            // the status bar. Capture once per stream; MOVE needs no extra Main round trip.
+            if (event.actionMasked == MotionEvent.ACTION_DOWN) {
+                injectedMapOrigin = composeRule.runOnIdle {
+                    val view = checkNotNull(attachedMapView())
+                    check(view.hasWindowFocus()) { "The map does not own input focus before DOWN" }
+                    IntArray(2).also(view::getLocationOnScreen)
+                }
+            }
+            val origin = checkNotNull(injectedMapOrigin) { "Touch stream has no map origin" }
+            event.offsetLocation(origin[0].toFloat(), origin[1].toFloat())
+            delivered = InstrumentationRegistry.getInstrumentation().uiAutomation.injectInputEvent(event, true)
+            assertTrue("The input event was rejected: $event", delivered)
+        } finally {
+            event.recycle()
+            if (terminal || !delivered) injectedMapOrigin = null
+        }
     }
 
     /**
@@ -5520,6 +6122,54 @@ class MapSurfaceTest {
      * generation. The generation and slot are read from Compose publication, while layer presence
      * proves the renderer has retired the other slot before another pointer stream opens.
      */
+    /** Published identity and renderer retirement must remain stable before opening a pinch. */
+    private fun awaitPinchPublishedReadiness(
+        map: MapLibreMap,
+        minimumExclusive: Long? = null,
+        idleEventCount: AtomicInteger? = null,
+        idleEventsBeforeLift: Int = 0,
+        allowIntentionalIncomplete: Boolean = false,
+        sameGenerationReuseWitness: (() -> Boolean)? = null,
+    ): Long {
+        val deadline = SystemClock.uptimeMillis() + GESTURE_RETRY_CANONICAL_TIMEOUT_MILLIS
+        val intentionalMutation = allowIntentionalIncomplete && fogLayerMutationForRetries.get() != null
+        fun rendererReady(slot: FogGenerationSlot): Boolean =
+            map.hasRetiredGeneration(slot.other()) &&
+                (intentionalMutation || map.hasCompletePublishedGeneration(slot))
+        fun generationReady(generation: Long): Boolean = minimumExclusive == null ||
+            generation > minimumExclusive ||
+            (generation == minimumExclusive && sameGenerationReuseWitness?.invoke() == true)
+        while (SystemClock.uptimeMillis() < deadline) {
+            val generation = fogGeneration() as? Long
+            val slot = runCatching { publishedFogSlot() }.getOrNull()
+            if (generation == null || slot == null ||
+                !generationReady(generation) ||
+                (idleEventCount != null && idleEventCount.get() <= idleEventsBeforeLift) ||
+                !rendererReady(slot)) {
+                SystemClock.sleep(GESTURE_RETRY_READINESS_POLL_MILLIS)
+                continue
+            }
+            val idleAtStart = idleEventCount?.get()
+            val stableUntil = SystemClock.uptimeMillis() + GESTURE_RETRY_CANONICAL_STABILITY_MILLIS
+            if (stableUntil > deadline) break
+            var stable = true
+            while (SystemClock.uptimeMillis() < stableUntil) {
+                SystemClock.sleep(GESTURE_RETRY_READINESS_POLL_MILLIS)
+                if (fogGeneration() != generation ||
+                    !generationReady(generation) ||
+                    runCatching { publishedFogSlot() }.getOrNull() != slot ||
+                    idleEventCount?.get() != idleAtStart || !rendererReady(slot)) {
+                    stable = false
+                    break
+                }
+            }
+            if (stable) return generation
+        }
+        throw AssertionError("Pinch setup never reached stable published fog: " +
+            "minimumExclusive=$minimumExclusive generation=${fogGeneration()} " +
+            "slot=${runCatching { publishedFogSlot() }.getOrNull()}")
+    }
+
     private fun awaitQuickZoomRetryFogReadiness(
         map: MapLibreMap,
         baselineGeneration: Long,
@@ -7114,7 +7764,10 @@ class MapSurfaceTest {
             referenceFramesAreStable(painted, painted.copyOf()),
         )
 
-        val fogged = intArrayOf(gray(5), gray(6), painted[2], gray(8))
+        // One coat of #1F262B at alpha 184/255 over 18/22/28, not 0.278 of them: a coat adds the
+        // fog's own light as well as transmitting the ground's. The leak stays at index 2, bare 26,
+        // which is dark ocean - the case this test's own KDoc promises to keep visible.
+        val fogged = intArrayOf(gray(31), gray(32), painted[2], gray(33))
         val audit = compareFogCoverage(fogged, painted, width = 2)
         assertEquals(
             "The stable-reference rule blinded the detector to an actual missing-fog pixel",
@@ -7123,6 +7776,230 @@ class MapSurfaceTest {
             0.0,
         )
         assertEquals(1.0, audit.drawnFraction, 0.0)
+    }
+
+    /**
+     * `V03-013` Z8: the properties the corrected comparator must have, on fabricated frames, so
+     * they are settled by arithmetic rather than by whatever a device happened to render.
+     *
+     * Every arm is an objection raised against the correction. A leak over dark ocean must stay
+     * visible, because that is the product. A leak over near-black must BECOME visible: the
+     * replaced rule was inverted there, calling a correct coat bare ground and bare ground covered.
+     * A correct coat must be silent at every lightness, which the replaced rule was not below
+     * bare 99. Fog that has gone thin must still be caught even though it sits nowhere near the
+     * bare value - a rule that only asked "is this the ground" would ship an opacity regression.
+     * And the band where a coat and the ground are the same colour must be declared, not guessed.
+     */
+    @Test
+    fun theComparatorSeesLeaksOverDarkGroundAndStaysSilentOnCorrectFog() {
+        val width = 16
+        fun frame(luminanceValue: Int) = IntArray(width * width) { gray(luminanceValue) }
+        fun coveredLuminance(bare: Int): Int =
+            (FOG_TRANSMISSION * bare + FOG_COVER_LUMINANCE_OFFSET).toInt()
+
+        // Hand-computed, not derived from the constants under test: one coat over ocean at 22 is
+        // 0.2784*22 + 26 = 32, and over near-black it is 26. Both must read as covered.
+        assertEquals(
+            "One coat over ocean was reported as revealed map",
+            0.0,
+            compareFogCoverage(frame(32), frame(22), width).uncoveredFraction,
+            0.0,
+        )
+        assertEquals(
+            "One coat over near-black was reported as revealed map",
+            0.0,
+            compareFogCoverage(frame(26), frame(1), width).uncoveredFraction,
+            0.0,
+        )
+
+        // Ocean sits at 18-28 and near-black is where the replaced rule was inverted, so both are
+        // carried explicitly rather than left to a bright-basemap average.
+        listOf(1, 12, 18, 22, 28, 65, 120, 216).forEach { bare ->
+            assertEquals(
+                "One correct coat over bare $bare was reported as revealed map",
+                0.0,
+                compareFogCoverage(frame(coveredLuminance(bare)), frame(bare), width)
+                    .uncoveredFraction,
+                0.0,
+            )
+            assertEquals(
+                "A total leak over bare $bare was not seen",
+                1.0,
+                compareFogCoverage(frame(bare), frame(bare), width).uncoveredFraction,
+                0.0,
+            )
+        }
+
+        // An opacity regression is not a leak and is nowhere near the bare value, but it stops
+        // hiding the ground: at half the installed alpha over land the screen reads 148 where a
+        // coat reads 86.
+        val halfAlpha = 96.0 / 255.0
+        val thin = (216 * (1.0 - halfAlpha) + halfAlpha * 36.0).toInt()
+        assertEquals(
+            "Fog installed at half its opacity was accepted as a coat",
+            1.0,
+            compareFogCoverage(frame(thin), frame(216), width).uncoveredFraction,
+            0.0,
+        )
+
+        // A grey frame at 36 over grey ground at 36 used to be declared undecidable here, and
+        // that arm was wrong: it encoded the comparator's blind spot as if it were correct.
+        // Nothing ever gated the declaration, so a full leak over ground at this brightness
+        // reported zero and passed. Brightness genuinely cannot separate them - colour can, and
+        // now does. A grey frame carries none of this fog's blue, so it is not a coat of it.
+        val greyOverGrey = compareFogCoverage(frame(36), frame(36), width)
+        assertEquals(
+            "A leak over ground at the coat's own brightness was declared instead of seen",
+            1.0,
+            greyOverGrey.uncoveredFraction,
+            0.0,
+        )
+        assertEquals(
+            "The comparator still declared a band it can now judge",
+            0.0,
+            greyOverGrey.leakUnjudgeableFraction,
+            0.0,
+        )
+    }
+
+    /**
+     * The brightness rule is blind wherever one coat lands on the same value as the ground under
+     * it, which is a whole band of grounds around bare 36 and not a single tone. Declaring that
+     * band undecidable was honest but unenforced, so a full leak inside it reported `0 %` and
+     * passed every coverage gate - the one hole the independent review found in the repaired
+     * comparator.
+     *
+     * This fog is blue-grey, not grey. A coat moves blue away from red by the same amount however
+     * bright the ground is, so that axis does not collapse where brightness does. The two are
+     * blind in different places and only a ground caught by both is genuinely undecidable.
+     *
+     * Every number below is computed by hand from alpha `184/255` and `0x1F262B`, never from the
+     * constants under test, so this case fails if the product's fog changes and the comparator
+     * quietly follows it.
+     */
+    @Test
+    fun theComparatorSeparatesFogFromGroundWhereBrightnessCannot() {
+        val width = 16
+        fun frame(red: Int, green: Int, blue: Int) =
+            IntArray(width * width) { (0xff shl 24) or (red shl 16) or (green shl 8) or blue }
+
+        // Ground at 36 grey is the worst case for brightness: one coat lands at 36 as well. By
+        // hand, 0.2784*(36,36,36) + 0.7216*(31,38,43) = (32,37,41) - same brightness, blue now
+        // nine above red where the ground had none.
+        val ground = frame(36, 36, 36)
+        val coat = frame(32, 37, 41)
+
+        assertEquals(
+            "A total leak over ground at the coat's own brightness was not seen",
+            1.0,
+            compareFogCoverage(ground, ground, width).uncoveredFraction,
+            0.0,
+        )
+        val covered = compareFogCoverage(coat, ground, width)
+        assertEquals(
+            "One correct coat over ground at its own brightness was reported as revealed map",
+            0.0,
+            covered.uncoveredFraction,
+            0.0,
+        )
+        assertEquals(
+            "A coat this comparator can judge was declared undecidable instead",
+            0.0,
+            covered.leakUnjudgeableFraction,
+            0.0,
+        )
+
+        // Half the installed alpha over the same ground: 0.6235*(36,36,36) + 0.3765*(31,38,43)
+        // = (34,36,38). Its spread of four is neither the ground's nought nor a full coat's
+        // nine, so thin fog is caught here too rather than only on the brightness axis.
+        assertEquals(
+            "Fog at half its opacity over this ground was accepted as a coat",
+            1.0,
+            compareFogCoverage(frame(34, 36, 38), ground, width).uncoveredFraction,
+            0.0,
+        )
+
+        // The one ground that defeats both axes at once. (30,36,42) sits in the blind brightness
+        // band AND already carries this fog's own blue-red spread of twelve, so a coat over it is
+        // (30,37,42) and nothing separates the two. That pixel must be DECLARED in both
+        // directions - never silently counted as covered, which is how a leak would ship.
+        // The rim that caught this comparator's own defect. Ground (20,40,35) is brightness-blind
+        // at luminance 33, and its ideal colour separation is |12.83 - 15| = 2.17 - just outside a
+        // tolerance of two, so a guard built on the IDEAL coat declined to declare it and handed it
+        // to an arm comparing the RENDERED coat, which lands at spread 13 against the ground's 15
+        // and was read as the ground itself. A perfectly fogged frame came back fully revealed.
+        // Judging both questions on the rendered spread fixes it without losing the leak here.
+        // Hand-computed from alpha 184/255 and 0x1F262B; no constant under test is reused.
+        val rimGround = frame(20, 40, 35)
+        val rimCoat = compareFogCoverage(frame(28, 39, 41), rimGround, width)
+        assertEquals(
+            "A correct coat over the guard rim was reported as revealed map",
+            0.0,
+            rimCoat.uncoveredFraction,
+            0.0,
+        )
+        // Said exactly: here the coat is DECLARED, not judged covered. At spread 13 it is within
+        // tolerance of this fog's coat and of the ground at once, so the frame cannot separate
+        // them. Declaring it is the honest verdict; the leak below is still caught.
+        assertEquals(
+            "The guard rim was judged covered when nothing in the frame could tell",
+            1.0,
+            rimCoat.leakUnjudgeableFraction,
+            0.0,
+        )
+        assertEquals(
+            "A total leak over the guard rim was not seen",
+            1.0,
+            compareFogCoverage(rimGround, rimGround, width).uncoveredFraction,
+            0.0,
+        )
+
+        val degenerate = frame(30, 36, 42)
+        listOf(frame(30, 37, 42) to "A coat", degenerate to "A leak").forEach { (fogged, what) ->
+            val audit = compareFogCoverage(fogged, degenerate, width)
+            assertEquals(
+                "$what over the doubly-degenerate ground was judged rather than declared",
+                0.0,
+                audit.uncoveredFraction,
+                0.0,
+            )
+            assertEquals(
+                "$what over the doubly-degenerate ground was not declared undecidable",
+                1.0,
+                audit.leakUnjudgeableFraction,
+                0.0,
+            )
+            // The declaration is worth nothing if no gate spends budget on it. A whole frame
+            // nobody can judge reports 0 % revealed, so before this the settled gates passed it;
+            // the conservative reading is what makes an undecidable frame cost the same as a bare
+            // one. Asserted here because an unbound rule is exactly how this hole appeared.
+            assertEquals(
+                "$what over the doubly-degenerate ground did not spend the settled budget",
+                1.0,
+                audit.revealedOrUndecidableFraction,
+                0.0,
+            )
+            assertTrue(
+                "a wholly undecidable frame passed the settled coverage gate: ${audit.report()}",
+                audit.revealedOrUndecidableFraction > MAXIMUM_SETTLED_REVEALED_FRACTION,
+            )
+        }
+        // And the other direction, so the gate cannot be satisfied by making everything
+        // undecidable OR by a sum that quietly drops one of its terms: a correctly fogged frame
+        // over ordinary ground spends nothing at all.
+        val ordinaryGround = frame(90, 110, 130)
+        val ordinaryCoat = compareFogCoverage(
+            frame(47, 58, 67),
+            ordinaryGround,
+            width,
+        )
+        assertEquals(
+            "a correct coat over ordinary ground was charged to the settled budget: " +
+                ordinaryCoat.report(),
+            0.0,
+            ordinaryCoat.revealedOrUndecidableFraction,
+            0.0,
+        )
     }
 
     /**
@@ -7314,7 +8191,8 @@ class MapSurfaceTest {
         // from. The sibling calibration test caught that; this pins it here too, next to the guard
         // it belongs to.
         val tinyDarkBare = intArrayOf(gray(18), gray(22), gray(26), gray(28))
-        val tinyFogged = intArrayOf(gray(5), gray(6), tinyDarkBare[2], gray(8))
+        // Covered values are one real coat over 18/22/28; see the sibling fixture above.
+        val tinyFogged = intArrayOf(gray(31), gray(32), tinyDarkBare[2], gray(33))
         assertEquals(
             "The dead-capture guard fired on a tiny all-dark fixture with no bright bare pixel",
             0.25,
@@ -7336,27 +8214,55 @@ class MapSurfaceTest {
     fun theOverFogDetectorFiresOnADoubleCoatIncludingOverDarkOcean() {
         val width = 16
         val height = 16
-        // One coat transmits FOG_TRANSMISSION; a second coat squares it.
-        fun coats(bare: Int, count: Int): Int {
+        // A coat of THIS fog is an alpha composite, not a transmission. An earlier version of
+        // this test built its double coat as `bare * FOG_TRANSMISSION^2` - a BLACK fog - and so
+        // it passed while the arm it certifies could not detect any real double coat at any
+        // brightness (0 of 16,540,459 judgeable colours). Every literal below is computed by
+        // hand from alpha 184/255 over #1F262B, never from the constants under test:
+        //   grey 120 -> (56,61,64) luminance 59 -> (38,44,49) luminance 42 -> luminance 38
+        // and one coat is predicted at 0.278*120 + 26 = 59.36, so a correct coat sits 0.36
+        // levels away and a double coat 17.36 levels past it, toward the fog's own 36.
+        fun frameOf(red: Int, green: Int, blue: Int) =
+            IntArray(width * height) { (0xff shl 24) or (red shl 16) or (green shl 8) or blue }
+        // Kept, because the block measure below is still a darkening detector and this is what
+        // a genuinely darkened frame looks like. It is NOT a coat of this fog.
+        fun blackFogCoats(bare: Int, count: Int): Int {
             var value = bare.toDouble()
             repeat(count) { value *= FOG_TRANSMISSION }
             return gray(value.toInt())
         }
 
         val brightBare = IntArray(width * height) { gray(120) }
-        val brightOneCoat = IntArray(width * height) { coats(120, 1) }
-        val brightTwoCoats = IntArray(width * height) { coats(120, 2) }
+        val brightOneCoat = frameOf(56, 61, 64)
+        val brightTwoCoats = frameOf(38, 44, 49)
         assertEquals(
-            "A single coat was reported as over-fog on a bright basemap",
+            "A correct single coat of this fog was reported as over-fog on a bright basemap",
             0.0,
             compareFogCoverage(brightOneCoat, brightBare, width).overFoggedFraction,
             0.0,
         )
+        // The other direction, and the one that matters most: bare ground is a LEAK, and must
+        // never be bucketed as an extra coat.
+        assertEquals(
+            "Bare ground was reported as over-fog, which is the wrong defect entirely",
+            0.0,
+            compareFogCoverage(brightBare, brightBare, width).overFoggedFraction,
+            0.0,
+        )
         val doubled = compareFogCoverage(brightTwoCoats, brightBare, width)
         assertEquals(
-            "The strict ratio did not fire on a full-frame double coat",
+            "The over-fog arm did not fire on a REAL full-frame double coat of this fog",
             1.0,
             doubled.overFoggedFraction,
+            0.0,
+        )
+        // Indifference to how many coats did it. Three coats of this fog land at luminance 38,
+        // still past one coat toward the fog, and a rule tuned to `exactly two` would lose them.
+        assertEquals(
+            "The over-fog arm lost a triple coat, so it is tuned to exactly two rather than to " +
+                "more than one",
+            1.0,
+            compareFogCoverage(frameOf(34, 41, 46), brightBare, width).overFoggedFraction,
             0.0,
         )
         assertEquals("A bright basemap was not fully judgeable", 1.0, doubled.judgeableFraction, 0.0)
@@ -7365,7 +8271,7 @@ class MapSurfaceTest {
         // reported defect lived. The strict ratio must stay silent there and the block measure must
         // not.
         val oceanBare = IntArray(width * height) { gray(22) }
-        val oceanTwoCoats = IntArray(width * height) { coats(22, 2) }
+        val oceanTwoCoats = IntArray(width * height) { blackFogCoats(22, 2) }
         val ocean = compareFogCoverage(oceanTwoCoats, oceanBare, width)
         assertEquals(
             "Dark ocean became judgeable by the strict ratio, which rounding cannot support",
@@ -7374,9 +8280,24 @@ class MapSurfaceTest {
             0.0,
         )
         assertEquals(
-            "The floor-free block measure missed a double coat over dark ocean",
+            "The floor-free block measure missed a DARKENED frame over dark ocean",
             1.0,
             ocean.darkBlockOverFoggedFraction,
+            0.0,
+        )
+        // And the limit of that measure, asserted rather than left in a comment to be
+        // rediscovered. The block measure is a darkening detector and still carries the
+        // transmission-only model: over dark ocean a real double coat of THIS fog lands at
+        // luminance 35 against one coat's 32 - BRIGHTER, not darker - so it does not fire and
+        // cannot. Deliberately not changed here: it has caught real defects (the v15 dark band),
+        // and re-modelling a measure that is reported rather than bounded needs its own
+        // calibration against real frames, not a same-session swap.
+        assertEquals(
+            "The block measure now claims to see a real double coat over dark ocean; if that is " +
+                "intended it needs its own calibration, and this assertion should be the thing " +
+                "that was reconsidered",
+            0.0,
+            compareFogCoverage(frameOf(30, 37, 41), oceanBare, width).darkBlockOverFoggedFraction,
             0.0,
         )
         assertEquals(
@@ -7388,7 +8309,11 @@ class MapSurfaceTest {
         // Thickness: a three-pixel line and a filled block can carry the same pixel count and the
         // same bounding box. Only thickness tells them apart.
         val lineFogged = brightOneCoat.copyOf()
-        repeat(height) { y -> (0 until 3).forEach { dx -> lineFogged[y * width + dx] = coats(120, 2) } }
+        repeat(height) { y ->
+            (0 until 3).forEach { dx ->
+                lineFogged[y * width + dx] = (0xff shl 24) or (38 shl 16) or (44 shl 8) or 49
+            }
+        }
         assertEquals(
             "A three-pixel seam did not measure as three pixels thick",
             3,
@@ -7396,7 +8321,9 @@ class MapSurfaceTest {
         )
         val blockFogged = brightOneCoat.copyOf()
         for (y in 0 until 7) {
-            for (x in 0 until 7) blockFogged[y * width + x] = coats(120, 2)
+            for (x in 0 until 7) {
+                blockFogged[y * width + x] = (0xff shl 24) or (38 shl 16) or (44 shl 8) or 49
+            }
         }
         assertEquals(
             "A filled 7x7 region did not measure as seven pixels thick",
@@ -7751,6 +8678,9 @@ class MapSurfaceTest {
         var maxY = Int.MIN_VALUE
         var overFogged = 0L
         var judgeable = 0L
+        var leakUnjudgeable = 0L
+        var overFogUnjudgeable = 0L
+        val overFoggedMask = BooleanArray(bare.size)
         var darkMinX = Int.MAX_VALUE
         var darkMinY = Int.MAX_VALUE
         var darkMaxX = Int.MIN_VALUE
@@ -7768,7 +8698,29 @@ class MapSurfaceTest {
             // something.
             if (bareLuminance >= MINIMUM_BARE_FOR_OVER_FOG) {
                 judgeable += 1L
-                if (fogLuminance < FOG_TRANSMISSION * bareLuminance * OVER_FOG_RATIO) {
+                // Every extra coat moves the pixel TOWARD the fog's own colour and stops there,
+                // so the question is not "is it dark" - that was a black-fog model, and it fired
+                // on 0 of 16,540,459 judgeable colours for a real double coat of this fog,
+                // because two coats carry an additive floor near 33.2 and are never darker than
+                // one. The question is whether the rendered pixel has travelled PAST one coat in
+                // the fog's direction. That is indifferent to how many coats did it, which the
+                // "looks like exactly two coats" alternative is not: measured, this rule catches
+                // two, three and five coats alike at 99.40 %, where the exactly-two rule falls to
+                // 7.74 % on three and 2.68 % on five.
+                // An axis can only separate where one coat does not already sit on top of the
+                // fog's own value: over dark ground a single coat IS nearly the fog colour, and
+                // a second coat has nowhere left to move. Where neither axis has room the pixel
+                // is declared rather than guessed, for the same reason the leak arm declares its
+                // own blind set: calling it covered is how a real double coat there would ship.
+                val movedPastOneCoat =
+                    movementPastOneCoat(bareLuminance, bare[index], fogLuminance, fogged[index])
+                if (movedPastOneCoat.isNaN()) overFogUnjudgeable += 1L
+                // The shape mask is filled here rather than in a second pass over the frame.
+                // Sharing one function between the count and the mask was the right repair; doing
+                // it by walking every pixel twice was not, and it cost 233 s per API35 suite.
+                // NaN compares false, so an undecidable pixel is not drawn into the shape either.
+                overFoggedMask[index] = movedPastOneCoat > OVER_FOG_TOLERANCE
+                if (movedPastOneCoat > OVER_FOG_TOLERANCE) {
                     overFogged += 1L
                     val x = index % width
                     val y = index / width
@@ -7778,7 +8730,59 @@ class MapSurfaceTest {
                     if (y > darkMaxY) darkMaxY = y
                 }
             }
-            if (fogLuminance > FOG_TRANSMISSION_CEILING * bareLuminance + FOG_LUMINANCE_TOLERANCE) {
+            // One correct coat lands at [FOG_COVER_LUMINANCE_OFFSET] plus what it transmits; a
+            // leak lands at the bare value itself. The two separate by `|expectedCover - bare|`,
+            // which passes through zero at bare 36 - there, a coat of this fog and the ground
+            // under it are the same BRIGHTNESS and no luminance test can separate them.
+            val expectedCover = FOG_TRANSMISSION * bareLuminance + FOG_COVER_LUMINANCE_OFFSET
+            val revealed: Boolean
+            if (kotlin.math.abs(expectedCover - bareLuminance) <= FOG_LEAK_TOLERANCE) {
+                // Same brightness is not the same colour. This fog is blue-grey, so a coat pushes
+                // blue away from red by [FOG_COVER_SPREAD_OFFSET] regardless of how bright the
+                // ground is, and that axis does NOT collapse where brightness does. Reading it
+                // here is what stops a full leak over ground at exactly this brightness from
+                // reporting zero and shipping - which is what an earlier version of this rule did,
+                // because it declared the whole band unjudgeable and nothing ever gated that.
+                // The two tests are blind in different places: brightness over bare 31-41, colour
+                // over a ground whose own blue-red spread is already this fog's. Only a pixel in
+                // BOTH is genuinely undecidable, and only that pixel is declared.
+                // Both questions are asked of the pixel that was actually RENDERED, never of the
+                // ideal coat. An earlier version guarded with the ideal and judged with the
+                // rendered one at the same tolerance; a rendered spread sits up to a level off the
+                // ideal, so a rim of grounds passed the guard and was then handed to an arm that
+                // could not tell this fog's coat from the ground beneath it - 3,049 correctly
+                // fogged colours reported as revealed map, which is a red on good fog rather than
+                // a leak shipping, but wrong either way.
+                val bareSpread = blueMinusRed(bare[index])
+                val expectedCoverSpread = FOG_TRANSMISSION * bareSpread + FOG_COVER_SPREAD_OFFSET
+                val fogSpread = blueMinusRed(fogged[index])
+                val looksLikeGround =
+                    kotlin.math.abs(fogSpread - bareSpread) <= FOG_SPREAD_TOLERANCE
+                val looksLikeOneCoat =
+                    kotlin.math.abs(fogSpread - expectedCoverSpread) <= FOG_SPREAD_COAT_TOLERANCE
+                if (looksLikeOneCoat && looksLikeGround) {
+                    // This fog's coat and this ground are the same colour here as well as the same
+                    // brightness. Nothing in the frame separates them, so it is declared rather
+                    // than guessed - calling it covered is how a leak over exactly this ground
+                    // would ship.
+                    leakUnjudgeable += 1L
+                    revealed = false
+                } else {
+                    // Anything that is not one coat of THIS fog is revealed: the ground itself, a
+                    // coat gone thin, or some other colour entirely.
+                    revealed = !looksLikeOneCoat
+                }
+            } else {
+                revealed =
+                    // Too bright for one coat: no fog at all, or fog that has gone thin. The
+                    // second is why this side is not merely "does it equal the bare value" - an
+                    // opacity regression hides nothing and sits nowhere near bare.
+                    fogLuminance > expectedCover + FOG_LEAK_TOLERANCE ||
+                    // Or it simply IS the ground. Over anything darker than bare 9 the replaced
+                    // rule could not see this at all, which is what this product exists to prevent.
+                    kotlin.math.abs(fogLuminance - bareLuminance) <= FOG_LEAK_TOLERANCE
+            }
+            if (revealed) {
                 uncovered += 1L
                 val x = index % width
                 val y = index / width
@@ -7793,17 +8797,11 @@ class MapSurfaceTest {
                 }
             }
         }
-        val overFoggedMask = BooleanArray(bare.size)
-        bare.indices.forEach { index ->
-            val bareLuminance = luminance(bare[index])
-            if (bareLuminance >= MINIMUM_BARE_FOR_OVER_FOG) {
-                overFoggedMask[index] =
-                    luminance(fogged[index]) < FOG_TRANSMISSION * bareLuminance * OVER_FOG_RATIO
-            }
-        }
         val blockCoats = blockOverFog(fogged, bare, width)
         return FogAudit(
             uncoveredFraction = uncovered.toDouble() / bare.size.toDouble(),
+            leakUnjudgeableFraction = leakUnjudgeable.toDouble() / bare.size.toDouble(),
+            overFogUnjudgeableFraction = overFogUnjudgeable.toDouble() / bare.size.toDouble(),
             drawnFraction = drawn.toDouble() / bare.size.toDouble(),
             worstRatio = worstRatio,
             worstBareLuminance = worstBare,
@@ -8037,19 +9035,31 @@ class MapSurfaceTest {
      * bearing. No viewport arithmetic guesses where the horizon or rotated corners land. The final
      * retreat leaves a small in-extent acquisition margin; the real gesture must consume it and
      * produce both inside and outside audited states.
+     *
+     * [insideTiltDelta] and [crossingTiltLadder] calibrate that margin for the shove gate, whose
+     * crossing is driven by tilt: supplying neither keeps the plain fixed retreat, which is what
+     * the pan and zoom gates use.
      */
     private fun MapLibreMap.positionFrozenCameraNearNorthExtent(
         extent: app.trailveil.map.fog.FogSurroundExtent,
         tilt: Double,
         bearing: Double,
         retreatFraction: Double,
+        insideTiltDelta: Double? = null,
+        crossingTiltLadder: List<Double>? = null,
     ) {
         require(retreatFraction in 0.0..0.25)
+        require((insideTiltDelta == null) == (crossingTiltLadder == null)) {
+            "Calibrating the crossing needs both the inside tilt and the ladder, or neither"
+        }
+        require(crossingTiltLadder == null || crossingTiltLadder.isNotEmpty()) {
+            "An empty crossing ladder cannot calibrate anything"
+        }
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         val centerY = (extent.northNormalizedY + extent.southNormalizedY) / 2.0
         val verticalSpan = extent.southNormalizedY - extent.northNormalizedY
 
-        fun moveTo(normalizedY: Double) {
+        fun moveTo(normalizedY: Double, tiltOverride: Double = tilt) {
             val latitude = WebMercator.latitudeAtNormalizedY(normalizedY.coerceIn(0.0, 1.0))
             // P4-044: the requested position is kept so the readiness wait can PROVE the screen is
             // showing it, instead of waiting for a drawn-frame callback that a sub-pixel step of
@@ -8057,7 +9067,7 @@ class MapSurfaceTest {
             val requested = CameraPosition.Builder()
                 .target(LatLng(latitude, extent.centerLongitude))
                 .zoom(EXPLORATION_GESTURE_ZOOM)
-                .tilt(tilt)
+                .tilt(tiltOverride)
                 .bearing(bearing)
                 .build()
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
@@ -8089,36 +9099,131 @@ class MapSurfaceTest {
                 outsideY = middle
             }
         }
-        val retreatY = insideY + (centerY - insideY) * retreatFraction
+        fun northAt(fraction: Double): Double = insideY + (centerY - insideY) * fraction
+        fun leavesExtentAt(fraction: Double, tiltDelta: Double): Boolean {
+            moveTo(northAt(fraction), tilt + tiltDelta)
+            return !extent.covers(visibleRegionCorners())
+        }
+
+        // P5-002, the same defect the bearing gate had: a fixed retreat cannot promise that the
+        // gesture leaves the extent. The shove's crossing comes from the far edge reaching north as
+        // the tilt grows, which depends on the viewport, and on API34 this gate has never crossed -
+        // an assumption skip under the v5 binary and a real non-vacuity failure under v13, whose
+        // far corner stopped about 356 render pixels short. Calibrate the start pose against a tilt
+        // the shove actually passes through instead.
+        var calibration = "not calibrated"
+        val retreat = if (insideTiltDelta == null || crossingTiltLadder == null) {
+            retreatFraction
+        } else {
+            fun ladderReport(ladder: List<Double>): String = ladder.joinToString(", ") { delta ->
+                "$delta=${if (leavesExtentAt(0.0, delta)) "outside" else "inside"}"
+            }
+            val crossesAt = crossingTiltLadder.firstOrNull { delta ->
+                leavesExtentAt(0.0, delta)
+            } ?: throw AssertionError(
+                "No start pose inside this extent can cross it at any tilt on the ladder, so the " +
+                    "shove gate cannot be made non-vacuous here. At retreat 0: " +
+                    ladderReport(crossingTiltLadder) + " (extent=$extent verticalSpan=$verticalSpan)",
+            )
+            calibratedCrossingTilt.set(crossesAt)
+            if (leavesExtentAt(retreatFraction, crossesAt)) {
+                calibration = "retreat=$retreatFraction (requested, unchanged) crossesAt=$crossesAt"
+                retreatFraction
+            } else {
+                // Both ends of the viable interval are zero-margin on one side, so bound it from
+                // both and sit in the middle; retreating south is monotonically further inside.
+                var crossing = 0.0
+                var tooFarSouth = retreatFraction
+                repeat(FINITE_EXTENT_CROSSING_SEARCH_STEPS) {
+                    val middle = (crossing + tooFarSouth) / 2.0
+                    if (leavesExtentAt(middle, crossesAt)) crossing = middle else tooFarSouth = middle
+                }
+                var inside = retreatFraction
+                var tooFarNorth = 0.0
+                if (!leavesExtentAt(0.0, insideTiltDelta)) {
+                    inside = 0.0
+                } else {
+                    repeat(FINITE_EXTENT_CROSSING_SEARCH_STEPS) {
+                        val middle = (tooFarNorth + inside) / 2.0
+                        if (leavesExtentAt(middle, insideTiltDelta)) tooFarNorth = middle
+                        else inside = middle
+                    }
+                }
+                assertTrue(
+                    "No start pose both holds an in-extent frame at $insideTiltDelta degrees of " +
+                        "tilt and still crosses at $crossesAt: the inside constraint needs a " +
+                        "retreat of at least $inside and the crossing allows at most $crossing " +
+                        "(extent=$extent verticalSpan=$verticalSpan)",
+                    inside <= crossing,
+                )
+                val chosen = (inside + crossing) / 2.0
+                assertTrue(
+                    "The only usable start poses sit within $chosen of the boundary, below the " +
+                        "${retreatFraction / FINITE_EXTENT_MIN_RETREAT_DIVISOR} floor: this gate " +
+                        "has no start pose with a real in-extent margin that still crosses " +
+                        "(extent=$extent verticalSpan=$verticalSpan)",
+                    chosen >= retreatFraction / FINITE_EXTENT_MIN_RETREAT_DIVISOR,
+                )
+                assertTrue(
+                    "The chosen start pose does not cross at $crossesAt degrees of tilt " +
+                        "(retreat=$chosen inside=$inside crossing=$crossing extent=$extent)",
+                    leavesExtentAt(chosen, crossesAt),
+                )
+                assertTrue(
+                    "The chosen start pose is already outside the extent at $insideTiltDelta " +
+                        "degrees of tilt, so the gate would never hold an in-extent frame " +
+                        "(retreat=$chosen inside=$inside crossing=$crossing extent=$extent)",
+                    !leavesExtentAt(chosen, insideTiltDelta),
+                )
+                calibration = "retreat=$chosen (requested $retreatFraction) crossesAt=$crossesAt " +
+                    "insideAt=$insideTiltDelta window=[$inside, $crossing]"
+                chosen
+            }
+        }
+        val retreatY = northAt(retreat)
         moveTo(retreatY)
         assertTrue(
             "The finite-boundary setup did not retreat to the safe side",
             extent.covers(visibleRegionCorners()),
         )
+        auditLog("finite-extent north start calibrated: $calibration normalizedY=$retreatY")
     }
 
-    /** East-edge counterpart used by the real bearing gesture. */
+    /**
+     * East-edge counterpart used by the real bearing gesture.
+     *
+     * [insideBearingDelta] and [crossingBearingLadder] calibrate the start pose so the rotation
+     * can actually leave the extent. Supplying neither keeps the plain fixed retreat.
+     */
     private fun MapLibreMap.positionFrozenCameraNearEastExtent(
         extent: app.trailveil.map.fog.FogSurroundExtent,
         tilt: Double,
         bearing: Double,
         retreatFraction: Double,
+        insideBearingDelta: Double? = null,
+        crossingBearingLadder: List<Double>? = null,
     ) {
         require(!extent.wrapsWorld) { "A wrapping extent has no east edge" }
         require(retreatFraction in 0.0..0.25)
+        require((insideBearingDelta == null) == (crossingBearingLadder == null)) {
+            "Calibrating the crossing needs both the inside bearing and the ladder, or neither"
+        }
+        require(crossingBearingLadder == null || crossingBearingLadder.isNotEmpty()) {
+            "An empty crossing ladder cannot calibrate anything"
+        }
         val view = requireNotNull(composeRule.runOnIdle { attachedMapView() })
         val centerY = (extent.northNormalizedY + extent.southNormalizedY) / 2.0
         val centerLatitude = WebMercator.latitudeAtNormalizedY(centerY)
         val halfDegrees = extent.halfWorlds * FogBackdropGeometry.WORLD_LONGITUDE_SPAN
 
-        fun moveTo(longitude: Double) {
+        fun moveTo(longitude: Double, bearingOverride: Double = bearing) {
             // P4-044, same reason as the north-edge helper: an eighteen-step binary search ends in
             // steps too small to change a pixel.
             val requested = CameraPosition.Builder()
                 .target(LatLng(centerLatitude, longitude))
                 .zoom(EXPLORATION_GESTURE_ZOOM)
                 .tilt(tilt)
-                .bearing(bearing)
+                .bearing(bearingOverride)
                 .build()
             InstrumentationRegistry.getInstrumentation().runOnMainSync {
                 moveCamera(CameraUpdateFactory.newCameraPosition(requested))
@@ -8148,13 +9253,109 @@ class MapSurfaceTest {
                 outsideLongitude = middle
             }
         }
-        val retreatedLongitude = insideLongitude -
-            (insideLongitude - extent.centerLongitude) * retreatFraction
+        fun longitudeAt(fraction: Double): Double =
+            insideLongitude - (insideLongitude - extent.centerLongitude) * fraction
+        fun leavesExtentAt(fraction: Double, bearingDelta: Double): Boolean {
+            moveTo(longitudeAt(fraction), bearing + bearingDelta)
+            return !extent.covers(visibleRegionCorners())
+        }
+
+        // P5-002: a fixed retreat cannot promise that the rotation leaves the extent, and a fixed
+        // crossing bearing cannot either. Rotation first swings the WIDE far edge away from the
+        // east edge, so the eastward reach shrinks before it grows and the crossing only arrives
+        // late in the sweep - measured directly here, where even a start pose ON the boundary is
+        // still covered at -32 degrees. A gate whose gesture never crosses has measured nothing,
+        // which is what the same frozen b78 app did on API34 under the v8 and v10 test binaries
+        // after crossing under v4 and v5 with identical rotate bytecode. So probe for the bearing
+        // that does cross, then calibrate the start pose against THAT bearing.
+        var calibration = "not calibrated"
+        val retreat = if (insideBearingDelta == null || crossingBearingLadder == null) {
+            retreatFraction
+        } else {
+            fun ladderReport(ladder: List<Double>): String = ladder.joinToString(", ") { delta ->
+                "$delta=${if (leavesExtentAt(0.0, delta)) "outside" else "inside"}"
+            }
+            // Only the failing path pays for the diagnostic ladder: this file has already been
+            // caught once by assertTrue evaluating its message BEFORE its condition, and every
+            // probe in that message moves the camera.
+            val crossesAt = crossingBearingLadder.firstOrNull { delta ->
+                leavesExtentAt(0.0, delta)
+            } ?: throw AssertionError(
+                "No start pose inside this extent can cross it at any bearing on the ladder, so " +
+                    "the rotation gate cannot be made non-vacuous here. At retreat 0: " +
+                    ladderReport(crossingBearingLadder) + "; opposite sign: " +
+                    ladderReport(crossingBearingLadder.map { -it }) +
+                    " (extent=$extent halfDegrees=$halfDegrees)",
+            )
+            calibratedCrossingBearing.set(crossesAt)
+            if (leavesExtentAt(retreatFraction, crossesAt)) {
+                // The healthy case: the requested retreat already crosses, so keep the historical
+                // start pose exactly rather than inventing a new one.
+                calibration = "retreat=$retreatFraction (requested, unchanged) crossesAt=$crossesAt"
+                retreatFraction
+            } else {
+                // Both ends of the viable interval are zero-margin on one side: the largest retreat
+                // that still crosses has no crossing margin left, and the smallest retreat that
+                // still holds an in-extent frame has no inside margin. Bound it from both ends and
+                // sit in the middle. Retreating further west is monotonically further inside, so
+                // each bounded bisection is exact enough; its last step is far under one pixel.
+                var crossing = 0.0
+                var tooFarWest = retreatFraction
+                repeat(FINITE_EXTENT_CROSSING_SEARCH_STEPS) {
+                    val middle = (crossing + tooFarWest) / 2.0
+                    if (leavesExtentAt(middle, crossesAt)) crossing = middle else tooFarWest = middle
+                }
+                var inside = retreatFraction
+                var tooFarEast = 0.0
+                if (!leavesExtentAt(0.0, insideBearingDelta)) {
+                    inside = 0.0
+                } else {
+                    repeat(FINITE_EXTENT_CROSSING_SEARCH_STEPS) {
+                        val middle = (tooFarEast + inside) / 2.0
+                        if (leavesExtentAt(middle, insideBearingDelta)) tooFarEast = middle
+                        else inside = middle
+                    }
+                }
+                assertTrue(
+                    "No start pose both holds an in-extent frame at $insideBearingDelta degrees " +
+                        "and still crosses at $crossesAt: the inside constraint needs a retreat of " +
+                        "at least $inside and the crossing allows at most $crossing " +
+                        "(extent=$extent halfDegrees=$halfDegrees)",
+                    inside <= crossing,
+                )
+                val chosen = (inside + crossing) / 2.0
+                assertTrue(
+                    "The only usable start poses sit within $chosen of the boundary, below the " +
+                        "${retreatFraction / FINITE_EXTENT_MIN_RETREAT_DIVISOR} floor: this gate " +
+                        "has no start pose with a real in-extent margin that still crosses " +
+                        "(extent=$extent halfDegrees=$halfDegrees)",
+                    chosen >= retreatFraction / FINITE_EXTENT_MIN_RETREAT_DIVISOR,
+                )
+                // Both properties are re-measured at the pose actually chosen, so the calibration
+                // never rests on the monotonicity argument alone.
+                assertTrue(
+                    "The chosen start pose does not cross at $crossesAt degrees " +
+                        "(retreat=$chosen inside=$inside crossing=$crossing extent=$extent)",
+                    leavesExtentAt(chosen, crossesAt),
+                )
+                assertTrue(
+                    "The chosen start pose is already outside the extent at $insideBearingDelta " +
+                        "degrees, so the gate would never hold an in-extent frame " +
+                        "(retreat=$chosen inside=$inside crossing=$crossing extent=$extent)",
+                    !leavesExtentAt(chosen, insideBearingDelta),
+                )
+                calibration = "retreat=$chosen (requested $retreatFraction) crossesAt=$crossesAt " +
+                    "insideAt=$insideBearingDelta window=[$inside, $crossing]"
+                chosen
+            }
+        }
+        val retreatedLongitude = longitudeAt(retreat)
         moveTo(retreatedLongitude)
         assertTrue(
             "The finite-boundary setup did not retreat to the safe side",
             extent.covers(visibleRegionCorners()),
         )
+        auditLog("finite-extent bearing start calibrated: $calibration longitude=$retreatedLongitude")
     }
 
     /**
@@ -8664,11 +9865,64 @@ class MapSurfaceTest {
             29 * (pixel and 0xff)
         ) shr 8
 
+    /**
+     * How far a pixel's blue sits from its red. A neutral ground reads zero whatever its
+     * brightness, and one coat of this fog adds [FOG_COVER_SPREAD_OFFSET] to it, so this is the
+     * axis that still separates fog from ground where brightness alone cannot.
+     */
+    private fun blueMinusRed(pixel: Int): Int = (pixel and 0xff) - ((pixel shr 16) and 0xff)
+
+    /**
+     * How far past one coat of this fog the rendered pixel has travelled, in the fog's own
+     * direction, on whichever axis has room to say - or `NaN` where neither has.
+     *
+     * One function because there were two. The per-pixel count and the thickness mask each
+     * carried their own copy of this decision, so updating the count alone left the mask on the
+     * old black-fog model and a real three-pixel seam measured **zero** pixels thick. The
+     * arithmetic control caught it before any matrix ran; the durable fix is that there is now
+     * one place to change.
+     */
+    private fun movementPastOneCoat(
+        bareLuminance: Int,
+        barePixel: Int,
+        foggedLuminance: Int,
+        foggedPixel: Int,
+    ): Double {
+        val oneCoatLuminance = FOG_TRANSMISSION * bareLuminance + FOG_COVER_LUMINANCE_OFFSET
+        if (kotlin.math.abs(oneCoatLuminance - FOG_OWN_LUMINANCE) > OVER_FOG_SEPARATION) {
+            return (foggedLuminance - oneCoatLuminance) *
+                (if (FOG_OWN_LUMINANCE < oneCoatLuminance) -1.0 else 1.0)
+        }
+        // Only reached where brightness cannot separate, which is 0.60 % of the colour space -
+        // so the multiply and the two channel extractions below are paid on that fraction of
+        // pixels rather than on all of them.
+        val oneCoatSpread = FOG_TRANSMISSION * blueMinusRed(barePixel) + FOG_COVER_SPREAD_OFFSET
+        if (kotlin.math.abs(oneCoatSpread - FOG_OWN_SPREAD) > OVER_FOG_SEPARATION) {
+            return (blueMinusRed(foggedPixel) - oneCoatSpread) *
+                (if (FOG_OWN_SPREAD < oneCoatSpread) -1.0 else 1.0)
+        }
+        return Double.NaN
+    }
+
     private fun gray(value: Int): Int =
         (0xff shl 24) or (value shl 16) or (value shl 8) or value
 
     private data class FogAudit(
         val uncoveredFraction: Double,
+        /**
+         * The share of pixels where a coat of fog and the ground under it are the same colour, so
+         * neither verdict is available. Reported rather than folded into either count: "0 % bare"
+         * over a frame that was mostly undecidable is not a coverage claim, and this is the number
+         * that says so.
+         */
+        val leakUnjudgeableFraction: Double = 0.0,
+        /**
+         * The share of pixels that passed the brightness floor but where one coat of this fog
+         * already sits on top of the fog's own value on both axes, so an extra coat has nowhere
+         * to move and the over-fog arm cannot see it. Declared for the same reason the leak arm
+         * declares its own blind set.
+         */
+        val overFogUnjudgeableFraction: Double = 0.0,
         val drawnFraction: Double,
         val worstRatio: Double,
         val worstBareLuminance: Int,
@@ -8707,6 +9961,38 @@ class MapSurfaceTest {
          */
         val darkBlockOverFoggedThickness: Int = 0,
     ) {
+        /**
+         * What the frame fails to establish is covered: revealed plus undecidable.
+         *
+         * The undecidable share was reported and never bounded, which left a hole the size of the
+         * band: a total leak over ground this comparator cannot judge reports `uncovered=0.0000%`
+         * and passes every settled gate, while the *replaced* luminance-only rule would have caught
+         * it. Gating on this sum closes that without inventing a certification constant - a pixel
+         * nobody can call covered is not evidence of coverage, so it spends the same budget as a
+         * pixel that is visibly bare.
+         *
+         * It costs nothing today and would have cost something before: over every recorded v18 and
+         * v19 reading at all three API levels the worst sum is 0.0671 %, against a 0.1 % budget,
+         * and `leakUnjudgeableFraction` is 0.0000 % on all 176 non-calibration readings - so no
+         * current verdict moves. On v17, six or seven readings per level exceeded it.
+         *
+         * Calibration frames are deliberately not gated this way: they assert
+         * `uncoveredFraction >= MINIMUM_CALIBRATION_UNCOVERED_FRACTION`, the opposite direction.
+         */
+        val revealedOrUndecidableFraction: Double
+            get() = uncoveredFraction + leakUnjudgeableFraction
+
+        /**
+         * The over-fog arm's equivalent, and it exists because the fifth review noticed that
+         * v21a re-opened on this arm precisely the hole v20 had just closed on the other one:
+         * `overFogUnjudgeableFraction` was reported and bounded by nothing, which is the same
+         * exemption, argued the same way, that this file rejected one build earlier. A pixel
+         * where one coat already sits on the fog's own value on both axes cannot be shown to
+         * carry only one coat, so it spends the over-fog budget rather than passing free.
+         */
+        val overFoggedOrUnjudgeableFraction: Double
+            get() = overFoggedFraction + overFogUnjudgeableFraction
+
         fun report(): String = "[uncovered=" +
             "${"%.4f".format(java.util.Locale.US, uncoveredFraction * 100.0)}% " +
             "drawn=${"%.2f".format(java.util.Locale.US, drawnFraction * 100.0)}% " +
@@ -8715,6 +10001,10 @@ class MapSurfaceTest {
             (uncoveredBounds?.let { " at=(${it[0]},${it[1]})-(${it[2]},${it[3]})" } ?: "") +
             " overFogged=${"%.4f".format(java.util.Locale.US, overFoggedFraction * 100.0)}%" +
             " judgeable=${"%.2f".format(java.util.Locale.US, judgeableFraction * 100.0)}%" +
+            " leakUnjudgeable=" +
+            "${"%.4f".format(java.util.Locale.US, leakUnjudgeableFraction * 100.0)}%" +
+            " overFogUnjudgeable=" +
+            "${"%.4f".format(java.util.Locale.US, overFogUnjudgeableFraction * 100.0)}%" +
             " thickness=$overFoggedThickness" +
             " darkBlockOverFogged=" +
             "${"%.4f".format(java.util.Locale.US, darkBlockOverFoggedFraction * 100.0)}%" +
@@ -8941,6 +10231,8 @@ class MapSurfaceTest {
     private fun fogRuntime(
         database: TrailVeilDatabase,
         pointChanges: PersistedTrackPointChangeFeed,
+        nativeGeometry: Boolean = false,
+        paddingTiles: Int = FogViewportCoordinator.DEFAULT_MOSAIC_PADDING_TILES,
     ): FogRuntime {
         val dao = database.recordingDao()
         val style = FogRenderStyle()
@@ -8953,6 +10245,8 @@ class MapSurfaceTest {
                     renderMask = FogTileRenderer(style)::render,
                 ),
                 style = style,
+                nativeGeometryEngine = if (nativeGeometry) fogNativeGeometryEngine() else null,
+                mosaicPaddingTiles = paddingTiles,
             ),
             pointChanges = pointChanges,
         )
@@ -9116,13 +10410,89 @@ class MapSurfaceTest {
         const val MAXIMUM_SETTLED_REVEALED_FRACTION = 0.001
 
         /**
-         * Fog transmits `(255 - fogAlpha) / 255` = 0.278 of what is under it, so a covered pixel
-         * lands near 0.28 of its bare value and an uncovered one at 1.0. Half-way between is a
-         * wide margin either side; the flat tolerance absorbs rounding where the map is nearly
-         * black and the ratio stops being meaningful.
+         * What one coat of fog ADDS, in luminance, on top of what it transmits.
+         *
+         * `V03-013` Z8 correction. The rule here used to widen `0.278 * bare` to
+         * `0.5 * bare + 4`, on the stated reasoning that "a covered pixel lands near 0.28 of its
+         * bare value". That is true only of BLACK fog. This fog is `MAPLIBRE_FOG_COLOR` #1F262B at
+         * `FogRenderStyle.fogAlpha` 184/255, so a covered pixel is an alpha composite and carries
+         * the fog's own light as well: `0.2784 * bare + 26`. The product says so itself for the
+         * Google arm - "a fog pixel on screen is `a * fog + (1 - a) * basemap`",
+         * `FogTilePngCodec.revealedFogChannelRange` - and [FOG_TRANSMISSION] here is already
+         * `1 - 184/255`, the transmitted half of that same composite. Only the added half was
+         * missing, and without it the rule was constant-true for correctly fogged ground below
+         * bare 99, and inverted below bare 9: true for a correct coat, false for a real leak.
+         * Measured on API35/36, 0.2285-1.4842 % of low-zoom frames against a 0.1 % gate, always
+         * with `bareAtWorst=1 worstRatio=25.00` - and 25 is the arithmetic value of one correct
+         * coat over black, `(22,27,31)` premultiplied, not of bare ground.
+         *
+         * This is a HAND CONVERSION and is deliberately not derived from the product's own colour
+         * or alpha. An oracle that reads its expectation out of the thing it certifies cannot fail
+         * when that thing regresses, and a fog silently installed at half opacity must still be
+         * caught here. Changing the fog colour or `fogAlpha` is therefore expected to fail this
+         * file; the number below must then be re-converted by hand and the change justified.
          */
-        const val FOG_TRANSMISSION_CEILING = 0.5
-        const val FOG_LUMINANCE_TOLERANCE = 4
+        const val FOG_COVER_LUMINANCE_OFFSET = 26.0
+
+        /**
+         * How far a pixel may sit from either model before it is called. It absorbs rounding on
+         * both sides: a coat that reads a level light, and a leak that reads a level dark.
+         */
+        const val FOG_LEAK_TOLERANCE = 4
+
+        /**
+         * What one coat does to blue-minus-red, by hand from the same two published numbers and
+         * deliberately not read from the product: alpha `184/255 = 0.7216` of the fog's own
+         * `0x1F262B`, whose blue exceeds its red by `43 - 31 = 12`, so a coat moves the spread by
+         * `0.7216 * 12 =` **8.66** whatever lies underneath. The ground's own spread is carried
+         * through at [FOG_TRANSMISSION], exactly as brightness is.
+         */
+        const val FOG_COVER_SPREAD_OFFSET = 8.66
+
+        /**
+         * How close a rendered spread must sit to a reference to be called that reference. Each
+         * channel of a rendered coat lands within half a level of the ideal, so their difference -
+         * a spread - lands within one; two is that bound with a level of slack, and it is not
+         * fitted to any measurement.
+         *
+         * Both tolerances are deliberately equal, and both are applied to the RENDERED spread.
+         * Asking one question of the ideal coat and the other of the rendered one is precisely the
+         * defect this replaced. Checked by arithmetic over every colour whose brightness lands in
+         * the blind band (359,479 of them), for a renderer that rounds and one that truncates:
+         *
+         * - these values: **0** correctly fogged colours called revealed, 8,079 leaks undetectable;
+         * - judging the leak arm against the ideal coat instead: 3,049 (rounding) or 3,070
+         *   (truncating) correct coats called revealed - the defect;
+         * - widening only the undecidable guard to 3, which also removes those: 14,542 leaks
+         *   undetectable, nearly twice as blind for the same zero.
+         *
+         * `theComparatorSeparatesFogFromGroundWhereBrightnessCannot` pins the rim case that
+         * separates the three.
+         */
+        const val FOG_SPREAD_TOLERANCE = 2
+        const val FOG_SPREAD_COAT_TOLERANCE = 2
+
+        /**
+         * The fog's own luminance and blue-minus-red, by hand from `#1F262B`: `(77*31 + 150*38
+         * + 29*43) shr 8` = 36, and `43 - 31` = 12. These are where an infinite stack of coats
+         * converges, so they are what "the direction of more fog" means on each axis.
+         */
+        const val FOG_OWN_LUMINANCE = 36
+        const val FOG_OWN_SPREAD = 12
+
+        /**
+         * How far past one coat a pixel must travel before the extra coat is called, and how
+         * much room one coat must have left on an axis for that axis to be asked at all.
+         *
+         * The separation is two tolerances, so the fired and not-fired windows cannot overlap -
+         * the mistake this round already made once, guarding with an ideal value and judging
+         * with a rendered one at the same tolerance. Measured over all 2^24 colours against real
+         * alpha composites: zero false positives on a correct single coat and zero on bare
+         * ground, under both a rounding and a truncating renderer, with 99.40 % of real double,
+         * triple and quintuple coats caught and 0.60 % declared undecidable.
+         */
+        const val OVER_FOG_TOLERANCE = 2.0
+        const val OVER_FOG_SEPARATION = 4.0
 
         /**
          * What one coat of fog leaves: `(255 - fogAlpha) / 255`. A second coat squares it, to
@@ -9202,9 +10572,19 @@ class MapSurfaceTest {
          *
          * What this must never stop catching is the defect it was built for: a user reported half
          * the map going black past the antimeridian, which measures 50.39% settled and 50.08%
-         * during a gesture. This bound sits twenty times under that.
+         * during a gesture. This bound sits more than eleven times under that.
+         *
+         * **Calibrated, and coupled to the boundary line width.** 0.05 was chosen for an arm that
+         * fired on nothing; it now governs an arm that fires on almost every real double coat, so it
+         * was re-derived from measurement rather than left at its original guess. Worst measured
+         * `overFogged` at today's 4 dp extent-guard boundary line: API34 1.5805%, API35 and API36
+         * 1.3232%, unchanged across v22-v26 because it is geometry, not build or load. 0.045 leaves
+         * 2.85x headroom over the worst of those. The readings scale with the line width - at 8 dp
+         * they roughly double to ~3.16% and nothing below about 8% would hold 2.5x - so if
+         * `TrailVeilMapSurface.kt`'s boundary width changes, this constant must be re-derived with
+         * it rather than discovered later as a red suite.
          */
-        const val MAXIMUM_OVER_FOGGED_FRACTION = 0.05
+        const val MAXIMUM_OVER_FOGGED_FRACTION = 0.045
         const val MAXIMUM_HIGH_LATITUDE_OVER_FOGGED_FRACTION = 0.02
         const val MINIMUM_REPRODUCED_HIGH_LATITUDE_SEAM_FRACTION = 0.0001
         const val MINIMUM_FINITE_EXTENT_CONTROL_LEAK_FRACTION = 0.01
@@ -9581,6 +10961,53 @@ class MapSurfaceTest {
         const val ROTATE_RADIUS_FRACTION = 0.35f
         const val ROTATE_TOTAL_DEGREES = 75.0
         const val MINIMUM_ROTATE_ENGAGEMENT_DEGREES = 2.0
+
+        /**
+         * Where the bearing gate's start pose is calibrated, as a bearing change from the start.
+         *
+         * The injected two-finger rotation DECREASES the camera bearing, so these are negative:
+         * measured 0 -> 296.2 degrees end bearing in `z8-maplibre-rotation-repro-v1`, derived from
+         * the far/near edge midpoints the failure message printed. The first held frame arrives
+         * only after the engage travel (`PINCH_ENGAGE_TRAVEL` of `ROTATE_TOTAL_DEGREES`, so about
+         * 22 degrees), which is why the start must still be inside there.
+         *
+         * The crossing is a LADDER, not one bearing, because rotation swings the wide far edge away
+         * from the east edge first: the eastward reach shrinks before it grows, so a start pose on
+         * the boundary is still covered at -32 degrees (measured in
+         * `z8-maplibre-rotation-v11-api34-v1`). The first rung that actually leaves the extent is
+         * the one the start pose is then calibrated against; the last rung stays inside the sweep
+         * the gesture delivers (about -64 degrees measured), so the gate keeps held frames on both
+         * sides of the edge.
+         */
+        const val FINITE_EXTENT_ROTATE_INSIDE_DEGREES = -22.0
+        val FINITE_EXTENT_ROTATE_CROSSING_LADDER = listOf(-40.0, -48.0, -56.0, -60.0)
+
+        /**
+         * Where the shove gate's start pose is calibrated, in degrees of tilt from the start.
+         *
+         * The shove drives tilt from 0 to MapLibre's 60-degree cap (the failing run finished at
+         * 59.99999999999999), and the far edge reaches further north as it goes, so unlike the
+         * bearing gate the reach grows monotonically and the ladder only has to stay under the cap.
+         * The inside probe is low enough to sit before the first held frame.
+         */
+        const val FINITE_EXTENT_SHOVE_INSIDE_DEGREES = 10.0
+        val FINITE_EXTENT_SHOVE_CROSSING_LADDER = listOf(30.0, 40.0, 50.0, 57.0)
+
+        /** Bisection depth for the calibrated retreat; the last step is far under one pixel. */
+        const val FINITE_EXTENT_CROSSING_SEARCH_STEPS = 8
+
+        /**
+         * How much of the requested retreat the calibrated one may give up before the gate is
+         * treated as having no usable start pose at all.
+         *
+         * Two limits of the calibration belong here rather than in a comment nobody reads. The
+         * probes rotate about the camera TARGET, while the real gesture pivots at the screen
+         * centre, so they bound the crossing under a model of the gesture rather than reproducing
+         * it; and `FogSurroundExtent.covers` only sorts held frames into inside and outside - the
+         * pixel audit, not this predicate, decides whether the guard actually covered anything.
+         * A model error therefore costs a red with a named bearing, never a false green.
+         */
+        const val FINITE_EXTENT_MIN_RETREAT_DIVISOR = 64.0
         const val MINIMUM_ACCEPTED_ROTATE_DEGREES = 20.0
         const val EXPLORATION_GESTURE_ZOOM = 16.0
         const val INSTALL_GATE_WIDE_ZOOM = 12.0

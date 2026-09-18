@@ -1,6 +1,11 @@
 package app.trailveil.data.map
 
 import androidx.room.Room
+import androidx.room.withTransaction
+import android.database.Cursor
+import android.database.CursorWrapper
+import android.database.MatrixCursor
+import android.os.Looper
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import app.trailveil.data.db.RecordingDao
@@ -11,6 +16,15 @@ import app.trailveil.data.db.TrackPointEntity
 import app.trailveil.data.db.TrackSegmentEntity
 import app.trailveil.data.db.TrailVeilDatabase
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.launch
+import org.junit.Assert.assertTrue
+import org.junit.Assert.assertFalse
+import org.junit.Assert.fail
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Before
@@ -22,6 +36,7 @@ class RoomViewportTrackDataSourceTest {
     private lateinit var database: TrailVeilDatabase
     private lateinit var dao: RecordingDao
     private lateinit var dataSource: ViewportTrackDataSource
+    private val executedSql = java.util.concurrent.CopyOnWriteArrayList<String>()
 
     @Before
     fun createDatabase() {
@@ -31,6 +46,7 @@ class RoomViewportTrackDataSourceTest {
         )
             .allowMainThreadQueries()
             .addCallback(TrailVeilDatabase.invariantCallback)
+            .setQueryCallback({ sql, _ -> executedSql += sql }, Runnable::run)
             .build()
         dao = database.recordingDao()
         dataSource = ViewportTrackDataSource(RoomViewportTrackPointReader(dao))
@@ -175,6 +191,106 @@ class RoomViewportTrackDataSourceTest {
             listOf(listOf(1.0, 2.0), listOf(5.0, 6.0)),
             result.segments.map { segment -> segment.points.map { it.latitude } },
         )
+    }
+
+    @Test
+    fun cursorReaderPreservesEveryTypedFieldOnBothQueryRoutesAndOffMain() = runBlocking {
+        val recording = startRecording(100)
+        append(recording, 0, -0.002, -180.0)
+        append(recording, 1, 0.0, 180.0)
+        append(recording, 2, 0.002, 121.1234567890123)
+        append(recording, 3, 0.0020000000001, 121.0)
+        stop(recording, 150)
+        for ((south, north) in listOf(-0.002 to 0.002, -80.0 to 80.0, 10.0 to 10.1)) {
+            val buckets = app.trailveil.data.db.LatitudeBuckets.covering(south, north)
+            val expected = (if (buckets == null) dao.fogPointsInLongitudeInterval(south, -180.0, north, 180.0)
+                else dao.fogPointsInBucketedBox(buckets, south, -180.0, north, 180.0)).map {
+                ViewportTrackPoint(it.pointId, it.sessionId, it.segmentId, it.segmentSequence, it.pointSequence, it.latitude, it.longitude)
+            }
+            val actual = withContext(Dispatchers.Main) {
+                dao.withFogPointCursor(south, north, -180.0, 180.0) {
+                    assertFalse("cursor access must leave Main", Looper.myLooper() == Looper.getMainLooper())
+                }
+                RoomViewportTrackPointReader(dao).read(south, north, LongitudeInterval(-180.0, 180.0))
+            }
+            assertEquals(expected, actual)
+            assertEquals(expected.map { it.latitude.toBits() to it.longitude.toBits() }, actual.map { it.latitude.toBits() to it.longitude.toBits() })
+        }
+    }
+
+    @Test
+    fun cursorReaderSeesUncommittedRowsInsideRoomTransactionAfterDispatcherHop() = runBlocking {
+        val recording = startRecording(100)
+        val rollback = IllegalStateException("rollback-control")
+        try {
+            database.withTransaction {
+                append(recording, 0, 25.0, 121.0)
+                val reader = RoomViewportTrackPointReader(dao)
+                val direct = reader.read(24.9, 25.1, LongitudeInterval(120.9, 121.1))
+                val hopped = withContext(Dispatchers.Default) { reader.read(24.9, 25.1, LongitudeInterval(120.9, 121.1)) }
+                assertEquals(1, direct.size)
+                assertEquals(direct, hopped)
+                throw rollback
+            }
+        } catch (failure: IllegalStateException) { assertTrue(failure === rollback) }
+        assertTrue(RoomViewportTrackPointReader(dao).read(24.9, 25.1, LongitudeInterval(120.9, 121.1)).isEmpty())
+    }
+
+    @Test
+    fun cursorScopeClosesOnSuccessConsumerFailureAndCancellation() = runBlocking {
+        var observed: Cursor? = null
+        dao.withFogPointCursor(-1.0, 1.0, -1.0, 1.0) { observed = it }
+        assertTrue(checkNotNull(observed).isClosed)
+        assertTrue(dao.fogPointsInLongitudeInterval(-1.0, -1.0, 1.0, 1.0).isEmpty())
+        val failure = IllegalArgumentException("consumer-control")
+        try {
+            dao.withFogPointCursor(-1.0, 1.0, -1.0, 1.0) { observed = it; throw failure }
+            fail("consumer failure was swallowed")
+        } catch (actual: IllegalArgumentException) { assertTrue(actual === failure) }
+        assertTrue(checkNotNull(observed).isClosed)
+        assertTrue(dao.fogPointsInLongitudeInterval(-1.0, -1.0, 1.0, 1.0).isEmpty())
+        val job = launch {
+            val ownJob = checkNotNull(currentCoroutineContext()[Job])
+            dao.withFogPointCursor(-1.0, 1.0, -1.0, 1.0) { observed = it; ownJob.cancel() }
+            fail("cancelled read returned normally")
+        }
+        job.join()
+        assertTrue(job.isCancelled)
+        assertTrue(checkNotNull(observed).isClosed)
+        assertTrue(dao.fogPointsInLongitudeInterval(-1.0, -1.0, 1.0, 1.0).isEmpty())
+    }
+
+    @Test
+    fun preCancelledCursorReaderIssuesNoPointQuery() = runBlocking {
+        val before = executedSql.count { it.contains("FROM track_points p") }
+        val job = launch {
+            checkNotNull(currentCoroutineContext()[Job]).cancel()
+            RoomViewportTrackPointReader(dao).read(-1.0, 1.0, LongitudeInterval(-1.0, 1.0))
+            fail("pre-cancelled read returned normally")
+        }
+        job.join()
+        assertTrue(job.isCancelled)
+        assertEquals(before, executedSql.count { it.contains("FROM track_points p") })
+    }
+
+    @Test
+    fun cursorDecoderStopsWithinOneChunkAfterMidReadCancellation() {
+        val job = Job()
+        val matrix = MatrixCursor(arrayOf("point_id", "session_id", "segment_id", "segment_sequence", "point_sequence", "latitude", "longitude"))
+        repeat(1025) { matrix.addRow(arrayOf<Any?>(it + 1L, 1L, 1L, 0L, it.toLong(), 25.0, 121.0)) }
+        var rows = 0
+        val observed = object : CursorWrapper(matrix) {
+            override fun getLong(columnIndex: Int): Long {
+                if (columnIndex == 0 && ++rows == 257) job.cancel()
+                return super.getLong(columnIndex)
+            }
+        }
+        try {
+            observed.use { readViewportPoints(it, job) }
+            fail("cancelled decoder returned rows")
+        } catch (_: CancellationException) { /* expected */ }
+        assertTrue("decoder read $rows rows after cancellation", rows in 257..512)
+        assertTrue(matrix.isClosed)
     }
 
     private suspend fun startRecording(startedAt: Long): StartedRecording =

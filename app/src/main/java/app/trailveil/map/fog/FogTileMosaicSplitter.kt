@@ -11,9 +11,11 @@ import java.util.LinkedHashMap
  */
 object FogTileMosaicSplitter {
     fun split(render: FogViewportRender): Map<FogTileKey, FogPixelMask> {
+        val mosaic = render.presentation as? FogTileMosaic
+            ?: throw IllegalArgumentException("native presentation has no raster tiles to split")
         val keys = render.keys
         require(keys.isNotEmpty()) { "viewport render must contain tiles" }
-        require(render.mosaic.tileCount == keys.size) {
+        require(mosaic.tileCount == keys.size) {
             "mosaic tile count must match viewport keys"
         }
 
@@ -50,7 +52,7 @@ object FogTileMosaicSplitter {
             }
         }
 
-        val mosaicMask = render.mosaic.mask
+        val mosaicMask = mosaic.mask
         require(mosaicMask.width % columnCount == 0 && mosaicMask.height % rowCount == 0) {
             "mosaic dimensions must divide evenly into tile dimensions"
         }

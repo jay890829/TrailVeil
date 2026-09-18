@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import app.trailveil.map.fog.FogMaskContours
 import app.trailveil.map.fog.FogPixelMask
 import app.trailveil.map.fog.FogTileBounds
+import app.trailveil.map.fog.FogNativeGeometry
 import org.maplibre.android.style.layers.FillLayer
 import org.maplibre.android.style.layers.PropertyFactory
 import org.maplibre.android.style.sources.GeoJsonSource
@@ -11,6 +12,16 @@ import org.maplibre.geojson.Feature
 import org.maplibre.geojson.LineString
 import org.maplibre.geojson.Point
 import org.maplibre.geojson.Polygon
+import org.maplibre.geojson.FeatureCollection
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+
+internal fun nativeTrackFogEnabled(): Boolean = MapLibreVectorFogState.trackEnabled
+
+internal fun currentMapLibreFogRenderMode(): MapLibreFogRenderMode = MapLibreFogRenderMode(
+    nativeRequested = MapLibreVectorFogState.trackEnabled,
+    maskVectorRequested = MapLibreVectorFogState.enabled,
+)
 
 /**
  * `V03-013` arm `vector` on this provider: the fog as geometry the renderer tessellates itself.
@@ -40,11 +51,12 @@ internal fun installVectorFogIfArmed(
     sourceId: String,
     layerId: String,
     bounds: FogTileBounds,
-    bitmap: Bitmap,
+    bitmap: () -> Bitmap,
     belowLayerId: String,
+    enabled: Boolean = MapLibreVectorFogState.enabled,
 ): Boolean {
-    if (!MapLibreVectorFogState.enabled) return false
-    val mask = maskOf(bitmap) ?: return false
+    if (!enabled) return false
+    val mask = maskOf(bitmap()) ?: return false
     val decomposed = FogMaskContours.decompose(mask, step = VECTOR_STEP)
 
     val outer = ring(
@@ -74,12 +86,68 @@ internal fun installVectorFogIfArmed(
     val polygon = Polygon.fromOuterInner(outer, holes)
     style.addSource(GeoJsonSource(sourceId, Feature.fromGeometry(polygon)))
     val layer = FillLayer(layerId, sourceId).withProperties(
-        PropertyFactory.fillColor(VECTOR_FOG_COLOR),
+        PropertyFactory.fillColor(MAPLIBRE_FOG_COLOR),
         PropertyFactory.fillOpacity(VECTOR_FOG_OPACITY),
         PropertyFactory.fillAntialias(true),
     )
     style.addLayerBelow(layer, belowLayerId)
     return true
+}
+
+/** Detached Java data only; no Source/Layer/Style object is created on the preparation worker. */
+internal class PreparedNativeFog internal constructor(
+    val geometry: FogNativeGeometry,
+    internal val features: FeatureCollection,
+)
+
+internal suspend fun prepareNativeFog(geometry: FogNativeGeometry): PreparedNativeFog {
+    val context = currentCoroutineContext()
+    context.ensureActive()
+    val features = geometry.polygons.map { polygon ->
+        context.ensureActive()
+        fun nativeRing(points: List<app.trailveil.map.fog.GeoPoint>): List<Point> {
+            val converted = ArrayList<Point>(points.size)
+            points.forEachIndexed { index, point ->
+                if (index % 256 == 0) context.ensureActive()
+                converted += Point.fromLngLat(point.longitude, point.latitude)
+            }
+            return converted
+        }
+        val shell = nativeRing(polygon.shell)
+        val rings = ArrayList<List<Point>>(polygon.holes.size + 1)
+        rings += shell
+        polygon.holes.forEach { rings += nativeRing(it) }
+        // GeoJSON 6.0.1 fromOuterInner checks these two conditions after converting every ring.
+        // The direct coordinate overload avoids LineString wrappers but does not perform them.
+        val converted = if (rings.all { it.size >= 4 && it.first() == it.last() }) {
+            Polygon.fromLngLats(rings)
+        } else {
+            // Let the same SDK method reject invalid input in its original shell/hole order.
+            // Reuse converted points, so failure handling never rereads source geometry.
+            Polygon.fromOuterInner(LineString.fromLngLats(shell), rings.drop(1).map { LineString.fromLngLats(it) })
+        }
+        Feature.fromGeometry(converted)
+    }
+    context.ensureActive()
+    return PreparedNativeFog(geometry, FeatureCollection.fromFeatures(features))
+}
+
+/** Installs this generation's prepared payload; it cannot be replaced by mutable picker state. */
+internal fun installNativeFog(
+    style: org.maplibre.android.maps.Style,
+    sourceId: String,
+    layerId: String,
+    geometry: FogNativeGeometry,
+    prepared: PreparedNativeFog,
+    belowLayerId: String,
+) {
+    check(prepared.geometry === geometry) { "native payload belongs to another geometry generation" }
+    style.addSource(GeoJsonSource(sourceId, prepared.features))
+    style.addLayerBelow(FillLayer(layerId, sourceId).withProperties(
+        PropertyFactory.fillColor(MAPLIBRE_FOG_COLOR),
+        PropertyFactory.fillOpacity(VECTOR_FOG_OPACITY),
+        PropertyFactory.fillAntialias(true),
+    ), belowLayerId)
 }
 
 private fun ring(west: Double, south: Double, east: Double, north: Double): LineString =
@@ -119,7 +187,6 @@ private fun maskOf(bitmap: Bitmap): FogPixelMask? {
 }
 
 /** Matches the raster fog's own colour and alpha, so the arms differ in geometry and nothing else. */
-private const val VECTOR_FOG_COLOR = 0xFF1F262B.toInt()
 private const val VECTOR_FOG_OPACITY = 184f / 255f
 
 /**

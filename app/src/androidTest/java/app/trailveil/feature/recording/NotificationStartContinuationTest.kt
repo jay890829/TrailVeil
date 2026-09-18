@@ -28,6 +28,11 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -64,12 +69,14 @@ class NotificationStartContinuationTest {
 
     /** Non-zero means the wedge described on [boundedProbe] actually happened in this run. */
     private val probeExpiries = AtomicInteger(0)
+    private var processPoisoned = false
 
     @Test
     fun recreationWhileThePromptIsVisibleContinuesOneDeniedStartExactlyOnce() {
         val historyStore = PermissionHistoryStore(context)
         val originalHistory = runBlocking { historyStore.current() }
         var sessionIdsBeforeStart: Set<Long>? = null
+        var bodyFailure: Throwable? = null
 
         // P4-046: this guard is OUTSIDE the try on purpose. Revoking a granted runtime permission
         // from in here does not fail this test, it ENDS THE RUN - Android kills a process when a
@@ -136,6 +143,7 @@ class NotificationStartContinuationTest {
             composeRule.onNodeWithTag(RecordingEntryTestTags.Start).performClick()
             composeRule.waitForIdle()
 
+            stage("body-prompt1")
             val firstRequestedAt = SystemClock.uptimeMillis()
             val firstDeny = awaitDenyButton(PROMPT_APPEARANCE_TIMEOUT_MILLIS)
             val firstPromptMillis = SystemClock.uptimeMillis() - firstRequestedAt
@@ -176,6 +184,7 @@ class NotificationStartContinuationTest {
                 AWAITING_RESULT,
                 currentContinuation(),
             )
+            stage("body-recreate")
             val activityBeforePromptRecreation = composeRule.activity
             instrumentation.runOnMainSync { activityBeforePromptRecreation.recreate() }
             val recreationDeadline = SystemClock.uptimeMillis() + UI_TIMEOUT_MILLIS
@@ -189,6 +198,7 @@ class NotificationStartContinuationTest {
                 "The Activity behind the runtime notification prompt was not recreated",
                 activityBeforePromptRecreation.isDestroyed,
             )
+            stage("body-prompt2")
             val recreatedRequestedAt = SystemClock.uptimeMillis()
             val recreatedDeny = awaitDenyButton(PROMPT_APPEARANCE_TIMEOUT_MILLIS)
             val recreatedPromptMillis = SystemClock.uptimeMillis() - recreatedRequestedAt
@@ -208,7 +218,7 @@ class NotificationStartContinuationTest {
                 beginReceiptsBeforeStart,
                 beginReceiptsWhilePromptVisible,
             )
-            val stateWhilePromptVisible = runBlocking { repository.state() }
+            val stateWhilePromptVisible = awaitIo("body-pre-result-state") { repository.state() }
             assertTrue(
                 "Recording became active before the permission result was observed",
                 stateWhilePromptVisible.lifecycle != RecordingLifecycle.STARTING &&
@@ -224,7 +234,8 @@ class NotificationStartContinuationTest {
             )
             composeRule.waitForIdle()
 
-            val sessionId = runBlocking {
+            stage("body-denied")
+            val sessionId = awaitIo("body-active") {
                 withTimeout(SERVICE_TIMEOUT_MILLIS) {
                     while (true) {
                         val state = repository.state()
@@ -255,7 +266,8 @@ class NotificationStartContinuationTest {
             composeRule.onNodeWithTag(RecordingEntryTestTags.Menu).performClick()
             composeRule.onNodeWithTag(RecordingEntryTestTags.Stop).assertIsEnabled()
             composeRule.onNodeWithTag(RecordingEntryTestTags.Stop).performClick()
-            runBlocking {
+            stage("body-stop-click")
+            awaitIo("body-stopped") {
                 withTimeout(SERVICE_TIMEOUT_MILLIS) {
                     while (repository.state().lifecycle != RecordingLifecycle.STOPPED) {
                         delay(POLL_MILLIS)
@@ -263,6 +275,7 @@ class NotificationStartContinuationTest {
                 }
             }
 
+            stage("body-pass")
             // Recorded so a future hosted regression can be compared against real appearance
             // latency instead of being re-diagnosed from scratch.
             instrumentation.sendStatus(
@@ -278,59 +291,124 @@ class NotificationStartContinuationTest {
                     )
                 },
             )
+        } catch (failure: Throwable) {
+            bodyFailure = failure
+            throw failure
         } finally {
+            val cleanupFailures = mutableListOf<Throwable>()
+            fun cleanupStage(name: String, work: suspend () -> Unit) {
+                if (processPoisoned) {
+                    cleanupFailures += AssertionError("PROCESS_POISONED: refusing further cleanup $name")
+                    return
+                }
+                runCatching { awaitIo("cleanup-$name", work) }
+                    .exceptionOrNull()?.let(cleanupFailures::add)
+            }
             val application = context.applicationContext as TrailVeilApplication
             val database = application.appContainer.databaseForTesting()
-            val createdSessionIds = sessionIdsBeforeStart
-                ?.let { before -> database.sessionIds() - before }
-                .orEmpty()
-            runBlocking {
-                val current = runCatching {
-                    application.appContainer.recordingRepository.state()
-                }.getOrNull()
-                current?.sessionId
-                    ?.takeIf { it in createdSessionIds }
-                    ?.let { sessionId ->
-                        runCatching {
-                            context.startService(
-                                Intent(context, RecordingForegroundService::class.java).apply {
-                                    action = RecordingForegroundService.ACTION_STOP
-                                    putExtra(
-                                        RecordingForegroundService.EXTRA_SESSION_ID,
-                                        sessionId,
-                                    )
-                                },
-                            )
-                        }
-                        runCatching {
-                            withTimeout(SERVICE_TIMEOUT_MILLIS) {
-                                while (
-                                    application.appContainer.recordingRepository.state().lifecycle ==
-                                    RecordingLifecycle.STARTING ||
-                                    application.appContainer.recordingRepository.state().lifecycle ==
-                                    RecordingLifecycle.ACTIVE
-                                ) {
-                                    delay(POLL_MILLIS)
-                                }
+            var createdSessionIds = emptySet<Long>()
+            var terminalConfirmed = false
+            cleanupStage("discover") {
+                createdSessionIds = sessionIdsBeforeStart
+                    ?.let { before -> database.sessionIds() - before }.orEmpty()
+            }
+            cleanupStage("terminal") {
+                if (createdSessionIds.isNotEmpty()) {
+                    val repository = application.appContainer.recordingRepository
+                    stage("cleanup-state-before")
+                    val current = repository.state()
+                    if (current.sessionId in createdSessionIds &&
+                        current.lifecycle in setOf(RecordingLifecycle.STARTING, RecordingLifecycle.ACTIVE)) {
+                        context.startService(Intent(context, RecordingForegroundService::class.java).apply {
+                            action = RecordingForegroundService.ACTION_STOP
+                            putExtra(RecordingForegroundService.EXTRA_SESSION_ID, requireNotNull(current.sessionId))
+                        })
+                        stage("cleanup-stop-sent")
+                        withTimeout(SERVICE_TIMEOUT_MILLIS) {
+                            while (true) {
+                                val state = repository.state()
+                                if (state.sessionId !in createdSessionIds ||
+                                    state.lifecycle !in setOf(RecordingLifecycle.STARTING, RecordingLifecycle.ACTIVE)) break
+                                delay(POLL_MILLIS)
                             }
                         }
                     }
-                database.withTransaction {
-                    createdSessionIds.forEach { sessionId ->
-                        database.openHelper.writableDatabase.execSQL(
-                            "DELETE FROM recording_operation_receipts WHERE session_id = ?",
-                            arrayOf(sessionId),
-                        )
-                        database.recordingDao().deleteSession(sessionId)
+                    stage("cleanup-terminal")
+                }
+                terminalConfirmed = true
+            }
+            cleanupStage("activity-close") { composeRule.activityRule.scenario.close() }
+            cleanupStage("deletion") {
+                check(terminalConfirmed) { "Cannot delete before terminal state was confirmed" }
+                if (createdSessionIds.isNotEmpty()) {
+                    val runtime = application.appContainer.fogRuntime()
+                    runtime.replaceCanonicalData {
+                        database.withTransaction {
+                            createdSessionIds.forEach { sessionId ->
+                                database.openHelper.writableDatabase.execSQL(
+                                    "DELETE FROM recording_operation_receipts WHERE session_id = ?",
+                                    arrayOf(sessionId),
+                                )
+                                database.recordingDao().deleteSession(sessionId)
+                            }
+                        }
                     }
+                    assertTrue(database.sessionIds().intersect(createdSessionIds).isEmpty())
+                    assertEquals(0L, runtime.canonicalEpoch.value % 2L)
+                    stage("cleanup-deletion")
                 }
             }
-            runBlocking { historyStore.replaceForTesting(originalHistory) }
-            // Deliberately NOT restoring a grant. `notificationWasGranted` can only be false to
-            // reach here (the assume above), and re-granting would arm the same abort for the next
-            // run - which is exactly how this defect stayed invisible for two occurrences.
-            prepareFreshNotificationRequest()
+            cleanupStage("history") {
+                historyStore.replaceForTesting(originalHistory)
+                assertEquals(originalHistory, historyStore.current())
+            }
+            // This test entered with DENIED. Never revoke a grant inside instrumentation.
+            cleanupStage("permission") {
+                assertEquals(PackageManager.PERMISSION_DENIED,
+                    context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS))
+                prepareFreshNotificationRequest()
+            }
+            accessibilityProbe.shutdownNow()
+            if (cleanupFailures.isNotEmpty()) {
+                val first = cleanupFailures.first()
+                cleanupFailures.drop(1).forEach(first::addSuppressed)
+                val primary = bodyFailure
+                if (primary == null) throw first
+                // A skipped body cannot hide a failed cleanup and contaminate the next test.
+                if (primary is org.junit.internal.AssumptionViolatedException) {
+                    first.addSuppressed(primary)
+                    throw first
+                }
+                primary.addSuppressed(first)
+            }
         }
+    }
+
+    /** Keep IO off the test thread while Compose's test scheduler continues to advance. */
+    private fun <T> awaitIo(name: String, work: suspend () -> T): T {
+        stage("$name-before")
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val result = scope.async { withTimeout(CLEANUP_TIMEOUT_MILLIS) { work() } }
+        try {
+            composeRule.waitUntil(CLEANUP_TIMEOUT_MILLIS + 1_000L) { result.isCompleted }
+            return runBlocking { result.await() }.also { stage("$name-after") }
+        } catch (failure: Throwable) {
+            scope.cancel()
+            try {
+                composeRule.waitUntil(CANCELLATION_DRAIN_MILLIS) { result.isCompleted }
+            } catch (drainFailure: Throwable) {
+                processPoisoned = true
+                stage("PROCESS_POISONED-$name")
+                failure.addSuppressed(drainFailure)
+            }
+            throw failure
+        } finally { scope.cancel() }
+    }
+
+    private fun stage(name: String) {
+        instrumentation.sendStatus(0, Bundle().apply {
+            putString("stream", "Z_NOTIFICATION stage=$name uptime=${SystemClock.uptimeMillis()}\n")
+        })
     }
 
     private fun prepareFreshNotificationRequest() {
@@ -528,6 +606,8 @@ class NotificationStartContinuationTest {
          */
         const val PROMPT_APPEARANCE_TIMEOUT_MILLIS = 60_000L
         const val SERVICE_TIMEOUT_MILLIS = 15_000L
+        const val CLEANUP_TIMEOUT_MILLIS = 20_000L
+        const val CANCELLATION_DRAIN_MILLIS = 5_000L
         const val POLL_MILLIS = 50L
 
         /**

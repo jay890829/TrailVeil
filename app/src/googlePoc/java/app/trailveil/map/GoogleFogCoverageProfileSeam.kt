@@ -48,12 +48,16 @@ internal object GoogleFogCoverageArm {
     @Volatile
     var vectorPolygon: Boolean = false
 
+    @Volatile
+    var trackVector: Boolean = false
+
     /** Restores the shipped profile and surface. Every arm test must call this in an `@After`. */
     fun reset() {
         profile = GoogleFogCoverageProfile.DEFAULT
         mosaicOverlay = false
         screenStencil = false
         vectorPolygon = false
+        trackVector = false
     }
 }
 

@@ -30,6 +30,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertTrue
@@ -63,7 +64,7 @@ import org.junit.runner.RunWith
  * 2. Area alone cannot separate a label from a leak, and the area floor derived from the bare arm
  *    degenerates to a constant of a few percent (a bare frame's largest cluster is the whole frame),
  *    which a full-height twenty-pixel bare seam slips under. So the floor is now CAPPED at
- *    [LEAK_CLUSTER_CEILING_PCT] - it may only be lowered by the measurement, never raised by it -
+ *    [leakClusterCeilingPct] - it may only be lowered by the measurement, never raised by it -
  *    and a second, shape-based rule runs beside it: the largest SOLID square of non-fog samples must
  *    stay under [SOLID_BLOCK_MINIMUM_SIDE_PX] on a side. Labels and POI glyphs are thin, separated
  *    strokes and cannot fill a square that size; a fog tile the renderer never received is a filled
@@ -672,7 +673,7 @@ class GoogleSettledFogCoverageSweepTest {
             val measuredFloorPct = reference.largestClusterPct * LEAK_CLUSTER_FRACTION
             val floorPct = maxOf(
                 analyzerFloorPct,
-                minOf(measuredFloorPct, LEAK_CLUSTER_CEILING_PCT),
+                minOf(measuredFloorPct, leakClusterCeilingPct(scene.analyzedPx)),
             )
             val exposedByArea =
                 scene.largestClusterPx >= FlingExposureVideoAnalyzer.CLUSTER_MINIMUM_PX &&
@@ -1437,7 +1438,7 @@ class GoogleSettledFogCoverageSweepTest {
 
         /**
          * A leak must reach 2% of what the same oracle reads at the same camera with the fog
-         * detached - but only where that is TIGHTER than [LEAK_CLUSTER_CEILING_PCT]. A bare frame
+         * detached - but only where that is TIGHTER than [leakClusterCeilingPct]. A bare frame
          * is one cluster covering the whole map, so on its own this fraction degenerates to a
          * constant near 2% of the map area, twenty times the MapLibre twin's
          * `MAXIMUM_SETTLED_REVEALED_FRACTION`, and a thin full-height bare seam slips under it.
@@ -1445,35 +1446,91 @@ class GoogleSettledFogCoverageSweepTest {
         const val LEAK_CLUSTER_FRACTION = 0.02
 
         /**
-         * Absolute ceiling on the derived floor, in percent of the analyzed map area.
+         * Absolute ceiling on the derived floor, expressed as an **area in density-independent
+         * pixels squared** rather than as a percentage of the analyzed map area.
          *
-         * The MapLibre twin bounds settled revealed area at 0.1% of the frame. This is not that
-         * number: the Google oracle reads Google's own labels and POI glyphs as non-fog, and no
-         * measurement in this repository yet records how large their largest CONNECTED cluster gets
-         * at a label-dense settled camera on this image. Half a percent is the tightest value the
-         * available evidence supports - it fails the worked counter-example the `V02-007` review
-         * names (a full-height twenty-pixel bare seam, about 1.8% of a phone viewport) with room to
-         * spare, while staying above a glyph run. The evidence line records `largestClusterPct`,
-         * `clusteredPct` and `solidSidePx` per scene precisely so a keyed device run can replace
-         * this with the measured label ceiling; [SOLID_BLOCK_MINIMUM_SIDE_PX] carries the rest of
-         * the discrimination in the meantime.
+         * It used to be a flat `0.5` percent, and that was wrong in the same way, and for the same
+         * reason, as the flat `48` device pixels [SOLID_BLOCK_MINIMUM_SIDE_PX] replaced. The rule
+         * discriminates against Google's **label and POI layer, which scales with density**, so a
+         * ceiling fixed as a fraction of the screen moves the wrong way on a dense one: the dp
+         * viewport shrinks, so the same percentage buys fewer dp-squared, while the label cluster
+         * it has to clear grows. They do not merely converge, they invert. Measured on the same 13
+         * ladder scenes with the same binaries:
+         *
+         * | | analyzed area | largest label cluster | the old 0.5% cap |
+         * | --- | --- | --- | --- |
+         * | emulator, 420 dpi | 374,222 dp2 | 1,377 dp2 (0.368%) | 1,871 dp2 - 1.36x ABOVE it |
+         * | phone, 600 dpi | 326,070 dp2 | 2,064 dp2 (0.633%) | 1,630 dp2 - BELOW it, so it fails |
+         *
+         * Nothing about fog differs between those two rows. Stating the cap in the units the map
+         * draws in fixes the cause. The scale to state it against is the thing the rule exists to
+         * catch: one [app.trailveil.map.fog.FogTilePngCodec.TILE_SIZE] tile renders at 256 dp
+         * square = 65,536 dp2, which is 31.8x the worst label cluster either device produced.
+         * There is a wide empty band between those two populations, and this sits in it - **1/16
+         * of a tile, a 64 dp square**, about 2x the worst measured label cluster and 16x below a
+         * missing tile, so it is calibrated against neither device's reading.
+         *
+         * This is a real relaxation on the emulator (1.095% against the old 0.500%), unlike the
+         * 18 dp change which reproduced the old behaviour exactly. It is accepted because, as the
+         * paragraph above says, area cannot separate a label from a leak: the 18 dp shape rule is
+         * the discriminator, it is unaffected, and its ORACLE_BLIND self-check still requires the
+         * fog-detached arm to trip it at every scene.
          */
-        const val LEAK_CLUSTER_CEILING_PCT = 0.5
+        const val LEAK_CLUSTER_CEILING_DP2 = 4_096.0
 
         /**
-         * Side, in device pixels, of the smallest SOLID non-fog square treated as a leak.
+         * [LEAK_CLUSTER_CEILING_DP2] converted to a percentage of the area this scene actually
+         * analyzed, at the density of the screen under test.
+         */
+        fun leakClusterCeilingPct(analyzedPx: Int): Double {
+            val density = InstrumentationRegistry.getInstrumentation()
+                .targetContext.resources.displayMetrics.density
+            return LEAK_CLUSTER_CEILING_DP2 * density * density * 100.0 /
+                analyzedPx.coerceAtLeast(1)
+        }
+
+        /**
+         * Side, **in density-independent pixels**, of the smallest SOLID non-fog square treated as
+         * a leak. See [SOLID_BLOCK_MINIMUM_SIDE_PX] for why the unit matters and for the
+         * measurement that forced it.
          *
          * Chosen from what the two populations can produce, not from a measurement of one of them:
-         * Google's label layer is strokes and glyphs a handful of pixels thick, and a POI icon is a
+         * Google's label layer is strokes and glyphs a handful of pixels thick, and a POI icon is an
          * outlined multi-colour sprite tens of pixels across at most, while one
-         * `FogTilePngCodec.TILE_SIZE` tile renders at 256dp - at least 256 device pixels on the
-         * least dense screen this app supports. Forty-eight pixels sits an order of magnitude below
-         * a missing tile and comfortably above anything the label layer draws. Its sensitivity is
+         * `FogTilePngCodec.TILE_SIZE` tile renders at 256dp. **Both of those scale with density,
+         * which is exactly why this threshold must too** - eighteen dp sits an order of magnitude
+         * below a missing tile and above anything the label layer draws, on every screen rather than
+         * only on the one it was first measured against. Its sensitivity is
          * asserted rather than assumed: the fog-detached arm must trip this rule at EVERY scene, and
          * the revealed-ground case must trip it on real product-revealed ground, so a value too
          * strict to fire is reported as ORACLE_BLIND instead of quietly passing.
          */
-        const val SOLID_BLOCK_MINIMUM_SIDE_PX = 48
+        const val SOLID_BLOCK_MINIMUM_SIDE_DP = 18
+
+        /**
+         * The block rule in device pixels for the screen actually under test.
+         *
+         * It used to be a flat `48` device pixels, and that was wrong in a way only a dense screen
+         * could show. The rule discriminates against **labels and POI glyphs, which scale with
+         * density**, so a threshold fixed in device pixels gets relatively tighter the denser the
+         * screen is. Measured on the same 13 ladder scenes with the same binaries: the worst scene
+         * (`midContinentZoomEight`) reads **42 px on a 420 dpi emulator** and **57 px on a 600 dpi
+         * phone** - the same content, 1.36x bigger, crossing a 48 px line that never moved. Across
+         * all scenes the phone reads a mean 1.15x higher, against a 1.43x density ratio.
+         *
+         * 18 dp is 47.25 px at 420 dpi, so this **reproduces the previous behaviour exactly on every
+         * screen the rule was validated against** (0 of 13 scenes over the line) and is a correction
+         * rather than a relaxation: the physical sensitivity is now the same on every device instead
+         * of varying with it. The other half of the discrimination is unaffected and stays enormous -
+         * one `FogTilePngCodec.TILE_SIZE` tile is 256 dp, about **14x** this threshold at any
+         * density (960 px against 68 px on the 600 dpi phone, which is ~20 % of that screen).
+         */
+        val SOLID_BLOCK_MINIMUM_SIDE_PX: Int
+            get() = ceil(
+                SOLID_BLOCK_MINIMUM_SIDE_DP *
+                    InstrumentationRegistry.getInstrumentation()
+                        .targetContext.resources.displayMetrics.density,
+            ).toInt()
 
         /**
          * How much of the bare reference's clustered area a fogged frame may carry in clusters of

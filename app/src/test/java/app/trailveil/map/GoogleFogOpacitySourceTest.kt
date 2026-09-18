@@ -62,8 +62,11 @@ class GoogleFogOpacitySourceTest {
 
         assertTrue(
             "the cover's rising edge hides every overlay beneath it",
-            binding.contains("if (coordinator.coverUp && !coverWasUp) hideOverlaysBeneathCover()"),
+            binding.contains("if (coverRose || nativeCoverNeedsCommit()) hideOverlaysBeneathCover()"),
         )
+        val mutation = functionBody(binding, "private fun afterCoordinatorMutation()")
+        assertTrue("publish the synchronous View cover before requesting removal",
+            mutation.indexOf("onStateChanged(state())") < mutation.indexOf("hideOverlaysBeneathCover()"))
         val hideBody = functionBody(binding, "private fun hideOverlaysBeneathCover()")
         assertTrue(hideBody.contains("setTransparencySafely(HIDDEN_FOG_TRANSPARENCY)"))
         assertTrue(
@@ -127,7 +130,16 @@ class GoogleFogOpacitySourceTest {
     @Test
     fun theProverReadsTheRevealedFogWindowAndTheCoverIsFogColouredAndTranslucent() {
         val prover = googleSource("GoogleFogSnapshotProver.kt")
-        assertTrue(prover.contains("FogTilePngCodec.matchesRevealedFog("))
+        // The request-local sampler caches the codec's same RGB windows instead of asking the
+        // codec to rebuild them per pixel. Pin that contract, not the retired wrapper call.
+        val sampler = functionBody(prover, "private class ProofPixels(")
+        assertTrue(sampler.contains("FogTilePngCodec.colorForGeneration(generation)"))
+        listOf("red", "green", "blue").forEachIndexed { index, channel ->
+            assertTrue(sampler.contains("FogTilePngCodec.revealedFogChannelRange(colour.$channel)"))
+            assertTrue(sampler.contains("Color.$channel(pixel)"))
+            assertTrue(sampler.contains("$channel >= range[${index * 2}]"))
+            assertTrue(sampler.contains("$channel <= range[${index * 2 + 1}]"))
+        }
         assertFalse("no opaque-only pixel rule survives", prover.contains("Color.alpha(pixel) == 255"))
 
         val cover = googleSource("GoogleFogSafetyOverlay.kt")
