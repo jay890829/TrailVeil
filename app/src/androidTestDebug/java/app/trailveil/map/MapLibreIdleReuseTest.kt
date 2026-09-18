@@ -54,6 +54,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -272,6 +273,16 @@ class MapLibreIdleReuseTest {
 
     private fun expectedReuseArgument(): Boolean {
         val value = InstrumentationRegistry.getArguments().getString(EXPECT_REUSE_ARGUMENT)
+        // Absent means nobody named an arm. That is exactly what an unfiltered run with no runner
+        // arguments looks like - CI's `connectedDebugAndroidTest` included - and this case has no
+        // meaning until it is told whether the candidate or b47 is installed. Abstain there.
+        // A PRESENT but malformed value still fails hard: that is an operator typo, and skipping
+        // it would hide the typo behind a green run.
+        assumeTrue(
+            "Pass -e $EXPECT_REUSE_ARGUMENT true for the candidate or false for b47; " +
+                "abstaining because no arm was named.",
+            value != null,
+        )
         check(value == "true" || value == "false") {
             "Pass -e $EXPECT_REUSE_ARGUMENT true for the candidate or false for b47"
         }

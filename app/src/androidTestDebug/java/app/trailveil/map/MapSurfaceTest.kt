@@ -863,6 +863,17 @@ class MapSurfaceTest {
 
     @Test
     fun nativeAndRasterFallbackHaveTheSameSettledFogColour() {
+        // Opt-in, like this module's sibling probes. The native geometry path needs a
+        // renderer that actually draws MapLibre fill layers; the hosted CI emulator is
+        // SwiftShader (the workflow comment says so) and quietly serves the raster
+        // fallback, so an unconditional assertion there reports a renderer difference as a
+        // product defect. The device runner injects `-e u1Native true` on every unfiltered
+        // MapLibre leg, so the three matrices still execute this case where the path exists.
+        Assume.assumeTrue(
+            "pass -e u1Native true on a renderer that can draw native fill layers; " +
+                "abstaining rather than reporting the raster fallback as a defect.",
+            InstrumentationRegistry.getArguments().getString("u1Native") == "true",
+        )
         val previousNative = MapLibreVectorFogState.trackEnabled
         val previousVector = MapLibreVectorFogState.enabled
         MapLibreVectorFogState.trackEnabled = true
