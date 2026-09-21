@@ -758,8 +758,9 @@ class MapSurfaceTest {
      * continuous-crossing guarantee the renderer-native extent guard owns: the guard's GeoJSON
      * tiles for a far-away region are extracted on demand, and a teleport can outrun them. For
      * this one class of movement the reactive Compose cover remains the contract - it must rise
-     * after the jump and stay until the rebuilt canonical lands. Continuous gestures never rely on
-     * it; they are audited renderer-natively by the finite-extent crossing gates.
+     * after the jump until safe renderer coverage takes over. A fully rendered opaque placeholder
+     * can do that before canonical fog arrives. Continuous gestures never rely on this cover;
+     * they are audited renderer-natively by the finite-extent crossing gates.
      *
      * The fog runtime is hoisted out of `setContent` deliberately: an inline runtime is a new
      * instance on every recomposition, which re-keys the surface's fog state and composes the
@@ -770,11 +771,33 @@ class MapSurfaceTest {
     @Test
     fun panningBeyondTheRenderedFogRaisesTheSafetyCover() {
         val database = inMemoryDatabase()
+        val releasePlaceholder = CountDownLatch(1)
+        val holdPlaceholder = AtomicBoolean(false)
+        val placeholderTimedOut = AtomicBoolean(false)
+        val heldJobs = java.util.concurrent.CopyOnWriteArrayList<kotlinx.coroutines.Job>()
+        val previousPlaceholderProbe = RasterFogPreparationTestProbe.onPlaceholderStart
         try {
-            val fogRendered = AtomicBoolean(false)
+            assertNull("Another test left its placeholder observer installed", previousPlaceholderProbe)
+            RasterFogPreparationTestProbe.onPlaceholderStart = { job ->
+                if (holdPlaceholder.get() && job?.isActive == true) {
+                    check(Looper.myLooper() != Looper.getMainLooper()) { "Placeholder preparation must not block Main" }
+                    heldJobs += job
+                    // Each still-active retry shares the same bounded gate; a cancelled first
+                    // attempt cannot consume a one-shot hook and let its successor race past.
+                    if (!releasePlaceholder.await(45, TimeUnit.SECONDS)) {
+                        placeholderTimedOut.set(true)
+                        error("Programmed-cover placeholder gate timed out")
+                    }
+                }
+            }
+            val rendered = AtomicReference<FogViewportRender?>(null)
             val installedCoverage = AtomicReference<InstalledFogCoverageSnapshot?>(null)
+            val initial = GeoPoint(25.0330, 121.5654)
+            val destination = GeoPoint(35.0330, 131.5654)
+            val initialCamera = SettledCameraState(initial, 16.0)
+            val destinationCamera = SettledCameraState(destination, 16.0)
             val cameraRequest = mutableStateOf(
-                MapCameraRequest(requestId = 1L, point = GeoPoint(25.0330, 121.5654), zoom = 16.0),
+                MapCameraRequest(requestId = 1L, point = initial, zoom = 16.0),
             )
             val stableFogRuntime = fogRuntime(
                 database,
@@ -792,34 +815,58 @@ class MapSurfaceTest {
                     fogRuntime = stableFogRuntime,
                     fogRequired = true,
                     cameraRequest = cameraRequest.value,
-                    onFogRendered = { fogRendered.set(true) },
+                    onFogRendered = rendered::set,
                     onFogCoverageInstalledForTesting = installedCoverage::set,
                 )
             }
-            composeRule.waitUntil(timeoutMillis = 15_000L) { fogRendered.get() }
-            // The attach-time publish can commit the default camera's world-wrapping generation
-            // first, and `onFogRendered` fires for it too. A world-wrapping surround covers any
-            // camera, so a jump taken then legitimately raises nothing - the renderer shows the
-            // coarse world mosaic's fog, which is safe but not this gate's scenario. Wait for the
-            // requested local canonical (reactions are live here, so it always arrives), so the
-            // jump provably leaves the installed surround.
+            // Non-world coverage alone need not be the requested zoom/target. Bind setup to the
+            // actual initial render and to the same complete/stable renderer fence as gestures.
             composeRule.waitUntil(timeoutMillis = 15_000L) {
-                installedCoverage.get()?.extent?.wrapsWorld == false
+                rendered.get()?.request?.matches(initialCamera) == true &&
+                    installedCoverage.get()?.extent?.wrapsWorld == false
             }
+            val map = checkNotNull(awaitMap())
+            val stableGeneration = awaitPinchPublishedReadiness(map)
+            val baseline = checkNotNull(installedCoverage.get())
+            assertEquals("Setup changed its installed generation", stableGeneration, baseline.generation)
+            assertTrue("Initial render does not match the live camera", rendered.get()?.request?.matches(map.cameraAuditState()) == true)
+            assertFalse("Programmed destination must leave the exact installed extent", baseline.extent.covers(listOf(destination)))
             composeRule.onNodeWithTag(MapSurfaceTestTags.FogSafetyCover).assertDoesNotExist()
             composeRule.runOnUiThread {
+                holdPlaceholder.set(true)
                 cameraRequest.value = MapCameraRequest(
                     requestId = 2L,
-                    point = GeoPoint(35.0330, 131.5654),
+                    point = destination,
                     zoom = 16.0,
                 )
+            }
+            composeRule.waitUntil(timeoutMillis = 15_000L) {
+                heldJobs.any { it.isActive } && destinationCamera.target.matches(map.cameraAuditState().target)
             }
             composeRule.waitUntil(timeoutMillis = 15_000L) {
                 composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover)
                     .fetchSemanticsNodes()
                     .isNotEmpty()
             }
+            assertFalse("Cover observation must precede a worker timeout", placeholderTimedOut.get())
+            assertTrue("A live placeholder preparation must still be held", heldJobs.any { it.isActive })
+            assertEquals("Destination installed before the cover observation", baseline.generation, installedCoverage.get()?.generation)
+            assertTrue("The old renderer generation was lost before placeholder handoff", map.hasOnlyPublishedFogGeneration(baseline.slot))
+            holdPlaceholder.set(false)
+            releasePlaceholder.countDown()
+            composeRule.waitUntil(timeoutMillis = 15_000L) {
+                (installedCoverage.get()?.generation ?: 0L) > baseline.generation &&
+                    rendered.get()?.request?.matches(destinationCamera) == true &&
+                    composeRule.onAllNodesWithTag(MapSurfaceTestTags.FogSafetyCover).fetchSemanticsNodes().isEmpty()
+            }
+            InstrumentationRegistry.getInstrumentation().sendStatus(0, Bundle().apply {
+                putString("stream", "ZC_PROGRAMMED_COVER baseline=${baseline.generation} heldPlaceholderJobs=${heldJobs.size} " +
+                    "released=${installedCoverage.get()?.generation} initialZoom=16 destinationOutside=true coverBeforePlaceholder=true PASS\n")
+            })
         } finally {
+            holdPlaceholder.set(false)
+            releasePlaceholder.countDown()
+            RasterFogPreparationTestProbe.onPlaceholderStart = previousPlaceholderProbe
             database.close()
         }
     }
@@ -2603,6 +2650,11 @@ class MapSurfaceTest {
                         zoomIn = false,
                         spanEdge = PinchSpanEdge.TALLEST,
                         auditEveryMove = true,
+                        // The frame auditor blocks Main during PixelCopy and coverage analysis.
+                        // Three larger setup moves preserve real input time while clearing the
+                        // SDK speed gate: initialize span, begin scaling, then move the camera.
+                        // Both guard arms retain the same formal per-frame sweep and thresholds.
+                        engagementMoves = 3,
                         attemptLimit = FINITE_EXTENT_ENGAGEMENT_ATTEMPTS,
                             onEngaged = onHold,
                         )
@@ -4803,12 +4855,14 @@ class MapSurfaceTest {
         zoomIn: Boolean,
         spanEdge: PinchSpanEdge = PinchSpanEdge.SHORTEST,
         auditEveryMove: Boolean = false,
+        engagementMoves: Int = PINCH_ENGAGE_MOVES,
         attemptLimit: Int = PINCH_ATTEMPTS,
         onEngaged: (() -> Unit)? = null,
         beforeAttempt: (() -> Unit)? = null,
         forceRejectEngagedAttempt: AtomicBoolean? = null,
         onForcedRejectBeforeLift: ((Long) -> Unit)? = null,
     ) {
+        require(engagementMoves >= 3) { "Engagement needs initialization, begin and movement" }
         require(attemptLimit > 0) { "attemptLimit must be positive" }
         val originalCamera = composeRule.runOnIdle {
             val current = map.cameraPosition
@@ -4855,9 +4909,11 @@ class MapSurfaceTest {
                     spanEdge,
                     auditEveryMove,
                     onEngaged,
+                    engagementMoves = engagementMoves,
                     // Abandoning a stream costs an attempt, so only an attempt with a successor may
                     // abandon one. The last attempt measures whatever it engaged: a stream whose
-                    // begin slipped by one move still delivers 4.14 levels on the tall geometry,
+                    // begin slipped by one move in the default eight-step setup still delivers
+                    // 4.14 levels on the tall geometry (other counts retain the measured floor),
                     // above every floor that asks for one, whereas abandoning it here would throw
                     // "never engaged" at a caller that has no attempt left - which is exactly what
                     // the single-attempt composite case would have done.
@@ -4880,6 +4936,7 @@ class MapSurfaceTest {
         spanEdge: PinchSpanEdge = PinchSpanEdge.SHORTEST,
         auditEveryMove: Boolean = false,
         onEngaged: (() -> Unit)? = null,
+        engagementMoves: Int = PINCH_ENGAGE_MOVES,
         retrySlippedBegin: Boolean = false,
         forceRejectEngagedAttempt: AtomicBoolean? = null,
         onForcedRejectBeforeLift: ((Long) -> Unit)? = null,
@@ -5079,8 +5136,8 @@ class MapSurfaceTest {
             PinchSpanEdge.TALLEST -> LONG_PINCH_ENGAGE_TRAVEL
         }
         val engageSpan = startSpan + (endSpan - startSpan) * engageTravel
-        repeat(PINCH_ENGAGE_MOVES) { move ->
-            val span = startSpan + (engageSpan - startSpan) * (move + 1) / PINCH_ENGAGE_MOVES
+        repeat(engagementMoves) { move ->
+            val span = startSpan + (engageSpan - startSpan) * (move + 1) / engagementMoves
             send(MotionEvent.ACTION_MOVE, 2, span, SystemClock.uptimeMillis())
             SystemClock.sleep(GESTURE_MICRO_STEP_MILLIS)
         }
@@ -5109,10 +5166,11 @@ class MapSurfaceTest {
             // Then it begins on the third and the base drops by one step. Under the old geometry
             // that alone decided the case: 4.046 became 3.988 against a 4.0 floor, five times on
             // the hosted `map-0` shard. The opened span fixed that - a begin on the third move
-            // now still delivers 4.14 - so this check is margin, not the fix, and it costs an
+            // still delivers 4.14 with the default eight steps. Other engagement counts
+            // must satisfy the same measured floor; this check costs an
             // attempt. Start a fresh stream while attempts remain; measure what the last one
             // engaged.
-            val earliestBeginSpan = startSpan + (engageSpan - startSpan) * 2 / PINCH_ENGAGE_MOVES
+            val earliestBeginSpan = startSpan + (engageSpan - startSpan) * 2 / engagementMoves
             val began = beginSpan.get()?.div(DETECTOR_SPAN_PER_POINTER_DISTANCE)
             if (began == null || began < earliestBeginSpan - BEGIN_SPAN_TOLERANCE_PX) {
                 rejectAndAwaitCanonical()

@@ -11,21 +11,19 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import app.trailveil.R
-import app.trailveil.harness.DemoExplorationSection
 
 internal object HarnessSettingsTestTags {
     const val Section = "harness_settings_fog_arm"
     const val SelectedScheme = "harness_settings_selected_fog_scheme"
 }
 
-/** Final scheme is fixed at startup; demo-data controls remain independent of fog selection. */
+/** Final scheme is fixed at startup; this section reports it, it does not choose it. */
 @Composable
 internal fun HarnessSettingsSection(modifier: Modifier = Modifier) {
     Column(
         modifier = modifier.fillMaxWidth().testTag(HarnessSettingsTestTags.Section),
         verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        DemoExplorationSection()
         Text(
             text = stringResource(R.string.settings_fog_arm_section),
             style = MaterialTheme.typography.titleSmall,

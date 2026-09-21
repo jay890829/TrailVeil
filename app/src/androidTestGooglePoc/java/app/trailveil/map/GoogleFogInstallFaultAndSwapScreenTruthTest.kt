@@ -6,6 +6,7 @@ import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Rect
 import android.os.Bundle
+import android.os.Looper
 import android.os.SystemClock
 import android.view.WindowInsets
 import androidx.core.graphics.createBitmap
@@ -36,6 +37,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Before
@@ -147,6 +149,58 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
     }
 
     @Test
+    fun aPendingAttemptAllowedByTheFaultHookCanBecomeThePublishedGeneration() {
+        assumeTrue("requires the keyed googlePoc runtime", BuildConfig.GOOGLE_MAPS_POC_KEY_CONFIGURED)
+        GoogleFogArm.RING_2.apply()
+        withSettledFogSurface { hosted ->
+            val rejected = CopyOnWriteArrayList<String>()
+            val allowed = CopyOnWriteArrayList<String>()
+            val stateMark = fogStates.size
+            GoogleMapSurfaceTestHooks.fogInstallFault = {
+                val generation = pendingGenerationAtInstallFault()
+                if (rejected.size < MINIMUM_REJECTED_ATTACHES) {
+                    rejected += generation
+                    throw InjectedCanonicalInstallFault()
+                }
+                allowed += generation
+            }
+            try {
+                appendCanonicalPoint(hosted.dao, hosted.recording, sequence = 0L)
+                val publishedAllowed = AtomicReference<String?>(null)
+                assertTrue("no allowed attach became the published generation",
+                    awaitTag(hosted.mapView, R.id.map_fog_canonical_generation, RECOVERY_POLLS) { value ->
+                        val generation = value?.toString()
+                        if (generation != null && generation != hosted.proven && generation in allowed) {
+                            publishedAllowed.set(generation)
+                            true
+                        } else {
+                            false
+                        }
+                    })
+                val recovered = requireNotNull(publishedAllowed.get())
+                assertEquals(MINIMUM_REJECTED_ATTACHES, rejected.size)
+                assertEquals(MINIMUM_REJECTED_ATTACHES, rejected.toSet().size)
+                assertTrue("the control did not replace the proven predecessor", recovered != hosted.proven)
+                assertTrue("the published generation never passed the fault hook", recovered in allowed)
+                val pending = fogStates.toList().drop(stateMark)
+                    .mapNotNull { it.state.pendingGeneration?.toString() }.toSet()
+                // This is the counterexample to the old oracle: an observed pending ID succeeds
+                // without ever being rejected. Only actual throwing hook calls define rejection.
+                assertTrue("the allowed attempt was never published as pending", recovered in pending)
+                assertTrue("a genuinely rejected attempt became the recovered generation", recovered !in rejected)
+                assertTrue("a rejected attempt lacked a lossless pending publication", pending.containsAll(rejected))
+                assertCameraNeverDrifted(hosted, "the allowed pending-attempt control")
+                report("fog_install_fault_control rejected=$rejected allowed=$allowed recovered=$recovered " +
+                    "oldPendingOracleWouldReject=true actualRejectedOracleAccepts=true")
+            } finally {
+                InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                    GoogleMapSurfaceTestHooks.fogInstallFault = null
+                }
+            }
+        }
+    }
+
+    @Test
     fun badgeExclusionKeepsTheOneTileHoleSignal() {
         val colour = FogTilePngCodec.colorForGeneration(1L)
         fun channel(value: Int) = FogTilePngCodec.revealedFogChannelRange(value).let { (it.first + it.last) / 2 }
@@ -179,13 +233,16 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             assertTrue("fixture did not install the requested native/tile owner: " + describe(hosted.mapView),
                 describe(hosted.mapView).contains("installer[trackNative[") == expectHandoverCover)
             val rejections = AtomicInteger(0)
+            val rejectedGenerations = CopyOnWriteArrayList<String>()
             val stateMark = fogStates.size
             GoogleMapSurfaceTestHooks.fogInstallFault = {
+                rejectedGenerations += pendingGenerationAtInstallFault()
                 rejections.incrementAndGet()
                 throw InjectedCanonicalInstallFault()
             }
             val sampler = Sampler(hosted.mapView)
             val samplerFailure: Throwable?
+            var faultedStates: List<GoogleCanonicalFogState> = emptyList()
             try {
                 appendCanonicalPoint(hosted.dao, hosted.recording, sequence = 0L)
                 val faulted = awaitUntil(FAULT_TIMEOUT_MILLIS) {
@@ -200,12 +257,20 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                 sampler.start()
                 SystemClock.sleep(FAULTED_WINDOW_MILLIS)
             } finally {
-                samplerFailure = sampler.stop()
-                GoogleMapSurfaceTestHooks.fogInstallFault = null
+                try {
+                    samplerFailure = sampler.stop()
+                } finally {
+                    InstrumentationRegistry.getInstrumentation().runOnMainSync {
+                        try {
+                            faultedStates = fogStates.toList().drop(stateMark).map { it.state }
+                        } finally {
+                            GoogleMapSurfaceTestHooks.fogInstallFault = null
+                        }
+                    }
+                }
             }
             val rejectedAttaches = rejections.get()
             val samples = sampler.samples.toList()
-            val faultedStates = fogStates.toList().drop(stateMark).map { it.state }
             assertTrue("a recoverable fault must not terminalize the surface", faultedStates.none { it.terminal })
 
             assertNull(
@@ -269,11 +334,9 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             )
             assertCameraNeverDrifted(hosted, "the faulted window")
 
-            val abandoned = faultedStates
-                .mapNotNull { state -> state.pendingGeneration?.toString() }
-                .toSet()
+            val abandoned = rejectedGenerations.toSet()
             assertTrue(
-                "no faulted attempt was ever published as a pending generation, so the " +
+                "no generation was recorded at a throwing install fault, so the " +
                     "recovered-identity check below would be vacuous: " +
                     describeStates(faultedStates),
                 abandoned.isNotEmpty(),
@@ -306,9 +369,8 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
             val recovered = requireNotNull(
                 tagOnMain(hosted.mapView, R.id.map_fog_canonical_generation),
             ).toString()
-            // A regression guard on the id allocator, and recorded as no more than that: ids come
-            // from `++nextGeneration` in `FogTileProviderAdapter`, so an abandoned id cannot be
-            // reissued today and this line cannot fail in this run. It fails the day that changes.
+            // A pending generation may legitimately attach after fault release. Exclude only IDs
+            // captured at actual throwing hook calls, not every ID seen in the pending state stream.
             assertTrue(
                 "an abandoned faulted attempt's id became the published generation: " +
                     "recovered=$recovered abandoned=$abandoned",
@@ -335,9 +397,18 @@ class GoogleFogInstallFaultAndSwapScreenTruthTest {
                     "baselineCluster=${hosted.baselineCluster} " +
                     "worstCluster=${samples.maxOf { it.largestUncoveredCluster }}/" +
                     "${samples.first().analyzedPoints} " +
-                    "abandonedGenerations=${abandoned.size}",
+                    "abandonedGenerations=${abandoned.size} rejectedGenerations=$abandoned recovered=$recovered",
             )
         }
+    }
+
+    private fun pendingGenerationAtInstallFault(): String {
+        assertEquals("install-fault identity must be sampled on main", Looper.getMainLooper(), Looper.myLooper())
+        // The binding publishes pending synchronously before its posted render/attach executes.
+        // onFogState is lossless and also on main; Compose view tags would lag this publication.
+        val generation = fogStates.lastOrNull()?.state?.pendingGeneration
+        assertNotNull("install fault ran without a published pending generation", generation)
+        return requireNotNull(generation).toString()
     }
 
     /**
